@@ -1,25 +1,29 @@
-//! ChatGPT 的 `conversations.json`。
+//! ChatGPT's `conversations.json`.
 //!
-//! # 它不是一个消息列表，是一棵树
+//! # It is not a message list, it is a tree
 //!
-//! 每段对话有一个 `mapping`：节点 id → `{message, parent, children}`。
-//! 之所以是树，是因为「重新生成」与「编辑上一条」都会开一条新分支 ——
-//! 于是一段对话里同一个位置可能有好几个版本，而 `current_node` 指向
-//! **用户最后看到的那一条**。
+//! Each conversation has a `mapping`: node id → `{message, parent, children}`.
+//! It is a tree because both "regenerate" and "edit the previous message" open
+//! a new branch — so one position in a conversation may hold several versions,
+//! and `current_node` points at **the one the user last saw**.
 //!
-//! # 只取当前那条路径，不取全部分支
+//! # Take only the current path, not every branch
 //!
-//! 从 `current_node` 沿 `parent` 一路上溯到根，反转，就是用户实际留下的
-//! 那次对话。别的分支是**被放弃的草稿**。
+//! Walking up from `current_node` along `parent` to the root and reversing
+//! gives the conversation the user actually kept. The other branches are
+//! **abandoned drafts**.
 //!
-//! 全导的代价有两面：抽取次数成倍增长（直接就是钱），以及**把用户丢掉的
-//! 东西写进他的长期记忆** —— 他重新生成过一次，正说明第一版不是他要的。
+//! Importing everything costs on two fronts: the number of extractions
+//! multiplies (which is money, directly), and **it writes what the user threw
+//! away into their long-term memory** — the fact that they regenerated once is
+//! precisely the evidence that the first version was not what they wanted.
 //!
-//! # 认不出结构就响亮失败
+//! # Fail loudly on an unrecognized structure
 //!
-//! 这个格式没有公开契约，随时可能变。「解析出 0 条然后报成功」是最坏的
-//! 失败方式：用户会以为自己三年的历史就是空的。所以每一处结构假设不成立
-//! 时都带上**实际见到的键**报错。
+//! This format has no published contract and may change at any time. "Parse 0
+//! entries and report success" is the worst failure mode: the user would
+//! conclude that three years of their history is simply empty. So every failed
+//! structural assumption reports an error carrying **the keys actually seen**.
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -33,7 +37,8 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
     for (i, raw) in items.iter().enumerate() {
         match one(raw) {
             Ok(Some(c)) => out.push(c),
-            // 没有可用消息的对话（只有 system、或者整段是空的）不算错
+            // A conversation with no usable messages (system only, or entirely
+            // empty) is not an error
             Ok(None) => skipped += 1,
             Err(e) => bail!("第 {} 段对话解析失败：{e}", i + 1),
         }
@@ -75,8 +80,9 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
         .unwrap_or_default()
         .to_string();
 
-    // 沿 current_node 上溯。没有 current_node 时回落到「所有节点按时间排」——
-    // 那不如树路径准确（会混进被放弃的分支），但比整段丢掉好
+    // Walk up from current_node. With no current_node, fall back to "all nodes
+    // sorted by time" — less accurate than the tree path (abandoned branches
+    // get mixed in), but better than dropping the whole conversation
     let path = match raw.get("current_node").and_then(Value::as_str) {
         Some(leaf) => walk_up(mapping, leaf),
         None => all_nodes_by_time(mapping),
@@ -100,10 +106,12 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
     }))
 }
 
-/// 从叶子沿 `parent` 上溯到根，返回**根到叶**的顺序。
+/// Walk up from the leaf along `parent` to the root, returned in **root-to-leaf**
+/// order.
 ///
-/// 带一个访问集合：导出文件理论上不该有环，但一个环会让这里死循环，
-/// 而「导入卡住不动」是最难查的一种故障。
+/// Carries a visited set: an export file should not contain a cycle in theory,
+/// but one cycle would spin here forever, and "the import hangs" is the hardest
+/// kind of fault to diagnose.
 fn walk_up<'a>(
     mapping: &'a serde_json::Map<String, Value>,
     leaf: &str,
@@ -131,7 +139,8 @@ fn walk_up<'a>(
     chain
 }
 
-/// 没有 `current_node` 时的回落：所有节点按消息时间排。
+/// The fallback when there is no `current_node`: every node sorted by message
+/// time.
 fn all_nodes_by_time(
     mapping: &serde_json::Map<String, Value>,
 ) -> Vec<&serde_json::Map<String, Value>> {
@@ -146,15 +155,17 @@ fn all_nodes_by_time(
     nodes
 }
 
-/// 从一个节点里取出消息。取不出就是 `None`（system、工具调用、空节点）。
+/// Extract the message from a node. `None` when there is none (system, tool
+/// calls, empty nodes).
 fn message_of(node: &serde_json::Map<String, Value>) -> Option<Message> {
     let m = node.get("message")?.as_object()?;
 
     let role = match m.get("author")?.get("role")?.as_str()? {
         "user" => Role::User,
         "assistant" => Role::Assistant,
-        // system / tool 一概不要：前者是平台注入的，后者是工具往返。
-        // 两者都不是「用户与助手之间发生了什么」
+        // system / tool are never taken: the former is injected by the
+        // platform, the latter is a tool round-trip. Neither is "what happened
+        // between the user and the assistant"
         _ => return None,
     };
 
@@ -163,7 +174,8 @@ fn message_of(node: &serde_json::Map<String, Value>) -> Option<Message> {
         return None;
     }
 
-    // id 优先用消息自己的；没有就用节点 id —— 它同样稳定
+    // Prefer the message's own id; failing that use the node id — it is just as
+    // stable
     let source_id = m
         .get("id")
         .and_then(Value::as_str)
@@ -180,11 +192,12 @@ fn message_of(node: &serde_json::Map<String, Value>) -> Option<Message> {
     })
 }
 
-/// 把 `content` 抠成纯文本。
+/// Dig plain text out of `content`.
 ///
-/// 见过三种形状：`{parts: [...]}`（最常见）、`{text: "..."}`、以及直接一个
-/// 字符串。`parts` 里除了字符串还可能是对象（图片、附件的占位），
-/// 那些跳过 —— v1 不处理附件。
+/// Three shapes have been observed: `{parts: [...]}` (most common),
+/// `{text: "..."}`, and a bare string. Besides strings, `parts` may also hold
+/// objects (placeholders for images and attachments); those are skipped — v1
+/// does not handle attachments.
 fn text_of(content: &Value) -> Option<String> {
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -205,10 +218,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 一棵**有分支**的树：用户重新生成过一次。
+    /// A tree **with a branch**: the user regenerated once.
     ///
-    /// root → u1 → a1(被放弃)
-    ///           → a2(current)
+    /// root → u1 → a1 (abandoned)
+    ///           → a2 (current)
     fn branched() -> Value {
         json!([{
             "conversation_id": "c1",
@@ -248,24 +261,27 @@ mod tests {
         }])
     }
 
-    /// **只取 current_node 那条路径。**
+    /// **Only the current_node path is taken.**
     ///
-    /// 被放弃的分支不进记忆：用户重新生成过一次，正说明第一版不是他要的。
-    /// 全导的另一面是抽取次数成倍增长，而那直接是钱。
+    /// Abandoned branches do not enter memory: the user regenerated once, which
+    /// is precisely the evidence that the first version was not what they
+    /// wanted. The other side of importing everything is that the number of
+    /// extractions multiplies, and that is money, directly.
     #[test]
     fn only_the_current_branch_is_imported() {
-        let convs = parse(branched().as_array().unwrap()).expect("应能解析");
+        let convs = parse(branched().as_array().unwrap()).expect("should parse");
         assert_eq!(convs.len(), 1);
 
         let texts: Vec<&str> = convs[0].messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["怎么做异步", "用 tokio"]);
         assert!(
             !texts.contains(&"这是被放弃的那一版"),
-            "被放弃的分支被导进来了 —— 那是用户主动丢掉的东西"
+            "an abandoned branch got imported — that is something the user \
+             actively threw away"
         );
     }
 
-    /// system / tool 消息不进来，空消息也不进来。
+    /// system / tool messages do not come in, and neither do empty ones.
     #[test]
     fn system_and_empty_messages_are_dropped() {
         let v = json!([{
@@ -282,14 +298,15 @@ mod tests {
                     "content":{"parts":["真正的问题"]}}}
             }
         }]);
-        let convs = parse(v.as_array().unwrap()).expect("应能解析");
+        let convs = parse(v.as_array().unwrap()).expect("should parse");
         let texts: Vec<&str> = convs[0].messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["真正的问题"]);
     }
 
-    /// 环不能让它转不出来。
+    /// A cycle must not make it spin forever.
     ///
-    /// 导出文件不该有环，但真有一个的话，「导入卡住不动」是最难查的故障。
+    /// An export file should not contain a cycle, but if one really is there,
+    /// "the import hangs" is the hardest fault to diagnose.
     #[test]
     fn a_cycle_in_the_tree_does_not_hang() {
         let v = json!([{
@@ -303,31 +320,33 @@ mod tests {
                     "content":{"parts":["答"]}}}
             }
         }]);
-        let convs = parse(v.as_array().unwrap()).expect("有环也要能出来");
+        let convs = parse(v.as_array().unwrap()).expect("it must get out even with a cycle");
         assert_eq!(convs[0].messages.len(), 2);
     }
 
-    /// 结构不认识时报错，且**带上实际见到的键**。
+    /// An unrecognized structure is an error, and it **carries the keys
+    /// actually seen**.
     #[test]
     fn a_missing_mapping_says_what_it_actually_saw() {
         let v = json!([{"title": "t", "messages": []}]);
-        let err = parse(v.as_array().unwrap()).expect_err("没有 mapping 就该报错");
+        let err = parse(v.as_array().unwrap()).expect_err("a missing mapping should be an error");
         let msg = err.to_string();
-        assert!(msg.contains("mapping"), "实际：{msg}");
+        assert!(msg.contains("mapping"), "got: {msg}");
         assert!(
             msg.contains("title") && msg.contains("messages"),
-            "报错要列出实际见到的键，否则格式漂移时无从下手。实际：{msg}"
+            "the error must list the keys actually seen, otherwise there is no \
+             way in when the format drifts. Got: {msg}"
         );
     }
 
-    /// 没有稳定 id 就不能做幂等导入 —— 宁可报错。
+    /// Without a stable id there is no idempotent import — better to error.
     #[test]
     fn a_conversation_without_an_id_is_refused() {
         let v = json!([{"title": "t", "mapping": {}, "current_node": "x"}]);
         assert!(parse(v.as_array().unwrap()).is_err());
     }
 
-    /// content 的三种形状都要吃得下。
+    /// All three shapes of `content` have to be handled.
     #[test]
     fn all_three_content_shapes_are_understood() {
         assert_eq!(
@@ -339,7 +358,8 @@ mod tests {
             Some("直接给")
         );
         assert_eq!(text_of(&json!("裸字符串")).as_deref(), Some("裸字符串"));
-        // parts 里混进非字符串（图片占位）时跳过它，不整条丢掉
+        // When a non-string (an image placeholder) is mixed into parts, skip it
+        // rather than dropping the whole message
         assert_eq!(
             text_of(&json!({"parts": ["文字", {"content_type": "image"}]})).as_deref(),
             Some("文字")

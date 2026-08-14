@@ -1,31 +1,36 @@
-//! 多模态冒烟测试：把一张图真的发出去，看两件事。
+//! A multimodal smoke test: actually send an image, and look at two things.
 //!
-//! 1. **本地闸门**：不支持 vision 的模型（DeepSeek）在发请求之前就被
-//!    [`LlmClient::ensure_can_see`] 拦下，错误里点名是哪个模型、怎么改；
-//! 2. **线上行为**：绕过闸门直接走 goose 的 `Provider`，证明消息**构造是对的**
-//!    （goose 按 engine 转成了各家的图像格式），并把远端的真实回复或
-//!    真实错误原样打出来。
+//! 1. **The local gate**: a model without vision support (DeepSeek) gets
+//!    blocked by [`LlmClient::ensure_can_see`] before the request goes out,
+//!    with the error naming which model it was and how to fix it;
+//! 2. **On-the-wire behavior**: bypass the gate and go straight through goose's
+//!    `Provider`, proving the message is **constructed correctly** (goose
+//!    converted it into each vendor's image format per the engine), and print
+//!    the remote end's real reply or real error verbatim.
 //!
-//! 第 2 步刻意用 `client.provider()` 而不是 `client.complete()` —— 后者会被
-//! 我们自己的闸门挡住，那样就永远看不到远端到底怎么回应。这条路只属于本
-//! example，产品代码不该这么写。
+//! Step 2 deliberately uses `client.provider()` rather than
+//! `client.complete()` — the latter would be stopped by our own gate, and then
+//! you would never see how the remote end actually responds. That path belongs
+//! to this example only; production code should not be written this way.
 //!
 //! ```bash
-//! # 默认用 .env 里配置的供应商（deepseek，无 vision → 演示错误路径）
+//! # Defaults to the provider configured in .env (deepseek, no vision →
+//! # demonstrates the error path)
 //! cargo run -p cortex-llm --example vision
 //!
-//! # 指定一家能看图的（本机 Ollama 不需要密钥）
+//! # Name one that can see images (a local Ollama needs no key)
 //! CORTEX_LLM_PROVIDER=ollama CORTEX_LLM_MODEL=gemma4:latest \
-//!   cargo run -p cortex-llm --example vision -- 路径/图.png
+//!   cargo run -p cortex-llm --example vision -- path/to/image.png
 //! ```
 
 use std::path::PathBuf;
 
 use cortex_llm::{LlmClient, Message, MessageImageExt, VisionSupport};
 
-/// 仓库里自带的测试图：一张造出来的「控制台截图」，含中文标题、
-/// 三个指标卡、七根带数值的柱子和一行页脚 —— 专门用来检验描述里
-/// 有没有真的把文字与数字读出来。
+/// The test image that ships with the repository: a synthesized "console
+/// screenshot" with a Chinese title, three metric cards, seven bars carrying
+/// numeric values, and a footer line — built specifically to check whether a
+/// description really read the text and numbers out.
 const DEFAULT_IMAGE: &str = "crates/cortex-memory/tests/fixtures/console_screenshot.png";
 
 #[tokio::main]
@@ -77,13 +82,14 @@ async fn main() -> anyhow::Result<()> {
         cortex_llm::image_count(&messages)
     );
 
-    // ① 本地闸门
+    // ① The local gate
     match client.ensure_can_see(&model, &messages) {
         Ok(()) => println!("① 本地闸门：放行"),
         Err(e) => println!("① 本地闸门：拦下 —— {e}"),
     }
 
-    // ② 真的发出去。绕过闸门只为看清远端行为，见文件头说明。
+    // ② Actually send it. The gate is bypassed only to observe remote
+    // behavior; see the note at the top of the file.
     println!("② 直发供应商（绕过闸门）……");
     match client
         .provider()
@@ -103,8 +109,10 @@ async fn main() -> anyhow::Result<()> {
                 "声明不支持 vision 的模型却成功返回了 —— 定义 JSON 该更新了"
             );
         }
-        // 供应商拒图也是有效结果：它证明请求成功组装并送达，
-        // 差别只在对面认不认。错误必须可读，这正是要看的东西。
+        // The provider refusing the image is also a valid result: it proves the
+        // request was assembled and delivered successfully, and the only
+        // difference is whether the far side accepts it. The error must be
+        // readable, which is exactly what we are here to look at.
         Err(e) => println!("远端拒绝：{e}"),
     }
     Ok(())

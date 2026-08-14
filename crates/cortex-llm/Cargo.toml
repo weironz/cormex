@@ -5,21 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex 供应商层：封装 goose-providers，多 LLM 可切换"
+description = "The Cortex provider layer: wraps goose-providers so LLMs can be swapped"
 
 [dependencies]
 cortex-core.workspace = true
-# 只依赖 goose-providers：它已 `pub use goose_provider_types::{base, conversation, model, ...}`
-# 把类型层整个透出来。根 Cargo.toml 给 goose-provider-types 也写了
-# `features = ["rustls-tls"]`，但该 crate 根本没有这个 feature（alpha.1/alpha.5 都没有，
-# TLS 后端只由 goose-providers 的 feature 转发给 reqwest），直接引用会解析失败。
+# Depends on goose-providers alone: it already does
+# `pub use goose_provider_types::{base, conversation, model, ...}`, exposing the whole type
+# layer. The root Cargo.toml also wrote `features = ["rustls-tls"]` for goose-provider-types,
+# but that crate has no such feature at all (neither alpha.1 nor alpha.5 does; the TLS
+# backend is forwarded to reqwest solely by goose-providers' own feature), so referring to
+# it directly makes resolution fail.
 goose-providers.workspace = true
-# goose 的 `Tool` 就是 rmcp 的。goose-provider-types 没有把 rmcp 再导出一次，
-# 只能自己引一份 —— 版本与 goose 一致，靠 cargo 的 feature 统一保证是同一个类型。
-# 根 Cargo.toml 里没有这条，按约定在本 crate 内写完整声明。
+# goose's `Tool` is rmcp's `Tool`. goose-provider-types does not re-export rmcp, so a copy
+# has to be pulled in here -- at the same version as goose, relying on cargo's feature
+# unification to guarantee it really is the same type.
+# The root Cargo.toml has no entry for it, so by convention the full declaration is written
+# inside this crate.
 rmcp = { version = "1.8", default-features = false }
-# 图像块要把 &[u8] 编成 base64。goose 内部已经用了 0.22，钉同一个大版本
-# 就不会多出一份 base64 实现。同上，根 Cargo.toml 不归本任务维护，写完整声明。
+# Image blocks have to encode &[u8] into base64. goose already uses 0.22 internally, and
+# pinning the same major version keeps a second base64 implementation out. As above, the
+# root Cargo.toml is not this crate's to maintain, so the declaration is written out in full.
 base64 = "0.22"
 tokio.workspace = true
 futures.workspace = true

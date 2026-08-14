@@ -1,8 +1,8 @@
-//! `cortex-evals` 命令行。
+//! The `cortex-evals` command line.
 //!
 //! ```bash
-//! cargo run -p cortex-evals -- validate                      # 只校验题集，不需要数据库
-//! cargo run -p cortex-evals -- run                           # 跑默认题集，出基线数字
+//! cargo run -p cortex-evals -- validate   # validate the suite only, no database needed
+//! cargo run -p cortex-evals -- run        # run the default suite, produce baseline numbers
 //! cargo run -p cortex-evals -- run --json out.json --md out.md
 //! ```
 
@@ -27,12 +27,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 跑一遍评测，输出报告。
+    /// Run the eval once and emit a report.
     ///
-    /// `Box` 不是洁癖：`RunArgs` 已经攒到二十来个旋钮，比 `Validate`
-    /// 大一个数量级，不装箱的话整个 enum 都按它的大小分配
+    /// The `Box` is not fastidiousness: `RunArgs` has accumulated some twenty
+    /// knobs, an order of magnitude more than `Validate`, and without boxing
+    /// the whole enum would be allocated at its size
     Run(Box<RunArgs>),
-    /// 只做题集的静态校验（不连数据库）—— CI 的第一道门
+    /// Static validation of the suite only (no database) — CI's first gate
     Validate {
         #[arg(long, default_value = DEFAULT_SUITE)]
         suite: PathBuf,
@@ -44,103 +45,120 @@ struct RunArgs {
     #[arg(long, default_value = DEFAULT_SUITE)]
     suite: PathBuf,
 
-    /// 候选事实从哪来：seed = 题集手写（确定性，可进 CI）；llm = 真调模型抽取
+    /// Where candidate facts come from: seed = handwritten in the suite
+    /// (deterministic, CI-safe); llm = really call the model to extract
     #[arg(long, value_enum, default_value_t = Mode::Seed)]
     mode: Mode,
 
-    /// 机器可读报告的落盘路径（供 CI 与基线比对）
+    /// Path to write the machine-readable report (for CI and baseline
+    /// comparison)
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// 人类可读报告的落盘路径。不给则只打到 stdout
+    /// Path to write the human-readable report. Without it, stdout only
     #[arg(long)]
     md: Option<PathBuf>,
 
-    /// 只跑 id 里含此子串的题（调 bad case 用）
+    /// Run only the questions whose id contains this substring (for chasing bad
+    /// cases)
     #[arg(long)]
     only: Option<String>,
 
-    /// 算注入预算用的 context 窗口
+    /// The context window used to compute the injection budget
     #[arg(long, default_value_t = 128_000)]
     context_window: usize,
 
-    /// 实体向量近似归并的阈值。不给则用生产默认值
+    /// Threshold for approximate entity-vector merging. Without it, the
+    /// production default
     #[arg(long)]
     entity_threshold: Option<f32>,
 
-    /// 跑完保留临时 schema，便于手工查 bad case
+    /// Keep the temp schema after the run, so bad cases can be inspected by
+    /// hand
     #[arg(long)]
     keep_schema: bool,
 
-    /// 关掉域加权（不把题目的 domain 传给检索器）。跑 A/B 用
+    /// Turn off domain weighting (do not pass the question's domain to the
+    /// retriever). For A/B runs
     #[arg(long)]
     ignore_domain: bool,
 
-    /// 弃权阈值。不给则用生产默认值。扫这条曲线找召回与噪声的平衡点
+    /// Abstention threshold. Without it, the production default. Sweep this
+    /// curve to find the balance point between recall and noise
     #[arg(long)]
     abstain_below: Option<f64>,
 
-    /// 时间近因的形态：channel = 独立一路；decay = 只当融合分乘数；off = 不要。
-    /// 默认与生产一致（off，定案见 `RecencyMode` 的文档）
+    /// The form of temporal recency: channel = its own retrieval path; decay =
+    /// only a multiplier on the fused score; off = none. The default matches
+    /// production (off; the decision is documented on `RecencyMode`)
     #[arg(long, value_enum, default_value_t = Recency::Off)]
     recency: Recency,
 
-    /// `--recency decay` 时的强度与半衰期（天）
+    /// Strength and half-life (in days) when `--recency decay` is used
     #[arg(long, default_value_t = 0.3)]
     recency_strength: f64,
     #[arg(long, default_value_t = 3.0)]
     recency_half_life: f64,
 
-    /// 开 / 关 episodes 那一路（L0 原文倒查）。都不给则用生产默认值
+    /// Turn the episodes path (L0 raw-text reverse lookup) on / off. With
+    /// neither flag, the production default
     #[arg(long)]
     episodes: bool,
     #[arg(long, conflicts_with = "episodes")]
     no_episodes: bool,
 
-    /// 单路强命中的补偿权重。0 = 关。默认与生产一致
+    /// Compensation weight for a strong hit on a single path. 0 = off. The
+    /// default matches production
     #[arg(long, default_value_t = 0.04)]
     peak_bonus: f64,
 
-    /// 语义地板：全库最近的余弦距离超过它就整体弃权。不给则用生产默认值
+    /// Semantic floor: abstain entirely when the closest cosine distance in the
+    /// whole store exceeds it. Without it, the production default
     #[arg(long, conflicts_with = "no_semantic_floor")]
     semantic_floor: Option<f64>,
 
-    /// 强制关掉语义地板（A/B 用）
+    /// Force the semantic floor off (for A/B)
     #[arg(long)]
     no_semantic_floor: bool,
 
-    /// 时间回放退回「纯时间倒序的全貌」（改造前的行为）。A/B 用
+    /// Make time replay fall back to "the full picture in pure reverse
+    /// chronological order" (the pre-rework behavior). For A/B
     #[arg(long)]
     replay_chronological: bool,
 
-    /// Recall@5 的最低门槛。跑出来低于它就以非零码退出 —— CI 回归门
+    /// Minimum threshold for Recall@5. A run below it exits with a non-zero
+    /// code — the CI regression gate
     #[arg(long)]
     min_recall5: Option<f64>,
 
-    /// 灌完语料后跑一遍跨域连接扫描（`relates_to`）。默认关
+    /// Run a cross-domain link scan (`relates_to`) after the corpus is loaded.
+    /// Off by default
     #[arg(long)]
     cross_link: bool,
 
-    /// 谁来判「这一对值不值得连」：prefilter = 预筛全收（确定性，可进 CI）；
-    /// cheap = 真调廉价模型（随模型漂移，不进回归门）
+    /// Who decides "is this pair worth linking": prefilter = accept everything
+    /// the prefilter yields (deterministic, CI-safe); cheap = really call the
+    /// cheap model (drifts with the model, not part of the regression gate)
     #[arg(long, value_enum, default_value_t = Judge::Prefilter)]
     cross_link_judge: Judge,
 
-    /// 候选的余弦距离带。默认与生产一致
+    /// The candidates' cosine distance band. The default matches production
     #[arg(long)]
     cross_link_min_distance: Option<f64>,
     #[arg(long)]
     cross_link_max_distance: Option<f64>,
 
-    /// 单个实体最多连出多少条边
+    /// The maximum number of edges a single entity may link out
     #[arg(long)]
     cross_link_degree_cap: Option<usize>,
 
-    /// 让边的 statement 也进 BM25/向量索引（改造前的行为）。A/B 用
+    /// Let an edge's statement enter the BM25/vector index too (the pre-rework
+    /// behavior). For A/B
     #[arg(long)]
     cross_link_indexed: bool,
 
-    /// 关掉「跨域桥带出来的那一侧免域惩罚」。A/B 用
+    /// Turn off "the side pulled in by a cross-domain bridge is exempt from the
+    /// domain penalty". For A/B
     #[arg(long)]
     no_bridge_exemption: bool,
 }
@@ -254,9 +272,11 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
                     half_life_days: args.recency_half_life,
                 },
             },
-            // 三态：显式开 / 显式关 / 不给就跟着生产默认走。
-            // 用 `!no_episodes` 那种两态写法会让「不给参数」永远等于「开」，
-            // 于是默认一改，评测就悄悄跑的不是生产配置了 —— 踩过一次
+            // Three states: explicitly on / explicitly off / neither, follow
+            // the production default. A two-state form like `!no_episodes`
+            // would make "no flag given" forever equal to "on", so the moment
+            // the default changed, the eval would quietly stop running the
+            // production configuration — hit once already
             episode_channel: match (args.episodes, args.no_episodes) {
                 (true, _) => true,
                 (_, true) => false,
@@ -301,7 +321,8 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
         eprintln!("机器可读报告：{}", path.display());
     }
 
-    // 回归门。数字掉下去就红 —— 这是这套工具唯一能自动阻止倒退的地方
+    // The regression gate. If the number drops, it goes red — this is the only
+    // place in this toolchain that can stop a regression automatically
     if let Some(min) = args.min_recall5 {
         let actual = report.overall.recall.get(&5).copied().unwrap_or(0.0);
         if actual < min {

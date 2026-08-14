@@ -1,30 +1,39 @@
-//! Cortex 存储层：sqlx repository 与 sync_log 写入器。
+//! Cortex storage layer: sqlx repositories and the sync_log writer.
 //!
-//! # 边界
+//! # Boundary
 //!
-//! **全部 SQL 收敛在本 crate。** 上层拿到的是类型安全的方法，不是查询串。
-//! 这不是洁癖 —— 它是将来换驱动、换库、加缓存层时唯一的逃生门。
+//! **All SQL is confined to this crate.** Layers above get type-safe methods,
+//! not query strings. This is not fastidiousness — it is the only escape hatch
+//! we will have when the driver, the database, or the caching layer changes.
 //!
-//! 刻意不用 sqlx 的编译期校验宏（`query!` / `query_as!`）：那需要编译时能连
-//! 数据库或维护 `.sqlx` 离线缓存，给 CI 与新人上手都添麻烦。这里一律用运行时
-//! API（[`sqlx::query_as`] + [`sqlx::FromRow`]），代价是列名写错要到跑测试时
-//! 才发现 —— 集成测试真连数据库覆盖了这一点。
+//! sqlx's compile-time checked macros (`query!` / `query_as!`) are deliberately
+//! not used: they require either a live database connection at compile time or
+//! a maintained `.sqlx` offline cache, which is a nuisance for CI and for
+//! newcomers getting started. Everything here uses the runtime API
+//! ([`sqlx::query_as`] + [`sqlx::FromRow`]); the price is that a misspelled
+//! column name only surfaces when the tests run — integration tests that talk
+//! to a real database cover that gap.
 //!
-//! # 写入纪律
+//! # Write discipline
 //!
-//! 同步正确性的根基。schema 与 docs/memory.md §四、§九 都写死了三条：
+//! The foundation of sync correctness. Both the schema and docs/memory.md §4
+//! and §9 nail down three rules:
 //!
-//! 1. 业务行与 `sync_log` 追加必须**同事务**；
-//! 2. 事务开头执行 `pg_advisory_xact_lock(4272)`，把提交顺序串行化，
-//!    使 `sync_log.seq` 的顺序等于对读端的可见顺序；
-//! 3. 取号事务必须短小、纯写。
+//! 1. The business row and the `sync_log` append must be in the **same
+//!    transaction**;
+//! 2. The transaction opens with `pg_advisory_xact_lock(4272)`, serializing
+//!    commit order so that the order of `sync_log.seq` equals the order in
+//!    which rows become visible to readers;
+//! 3. Sequence-allocating transactions must be short and write-only.
 //!
-//! 本 crate 把这三条做成了**结构性约束**而非约定：唯一的写入口是
-//! [`Store::write_txn`]，它交出的 [`WriteTxn`] 只有写方法，且每个写方法内部
-//! 都经由同一个私有通道落库 —— 那个通道把「写业务行」与「追加 sync_log」
-//! 绑成不可分割的一步。详见 [`txn`] 模块文档。
+//! This crate turns those three rules into **structural constraints** rather
+//! than conventions: the only way in is [`Store::write_txn`], the [`WriteTxn`]
+//! it hands out has write methods only, and every one of those write methods
+//! reaches the database through the same private channel — a channel that binds
+//! "write the business row" and "append to sync_log" into one indivisible step.
+//! See the [`txn`] module docs.
 //!
-//! # 用法
+//! # Usage
 //!
 //! ```no_run
 //! use cortex_store::{NewEntity, NewFact, Store};
@@ -32,7 +41,7 @@
 //! # async fn demo(entity: NewEntity, fact: NewFact) -> cortex_store::Result<()> {
 //! let store = Store::connect("postgres://cortex@localhost:5442/cortex").await?;
 //!
-//! // 一个事务里写多行，sync_log 自动跟上
+//! // Write several rows in one transaction; sync_log follows automatically
 //! store
 //!     .write_txn(async |tx| {
 //!         tx.insert_entity(&entity).await?;
@@ -40,7 +49,7 @@
 //!     })
 //!     .await?;
 //!
-//! // 客户端增量拉取
+//! // Incremental pull from a client
 //! let batch = store.fetch_since(0, 100).await?;
 //! # let _ = batch;
 //! # Ok(())
@@ -80,7 +89,8 @@ pub use sync::{SyncLogEntry, SyncNotifications, SyncPayload, SyncRecord, SyncSig
 pub use tenant::{MAX_RESIDENT_TENANTS, PER_TENANT_CONNECTIONS, SchemaName, TenantPools};
 pub use txn::{SYNC_ADVISORY_LOCK_KEY, WriteTxn};
 
-/// 向量维度，对应 `bge-m3`。换模型见 docs/memory.md §七。
+/// Vector dimensionality, matching `bge-m3`. To switch models, see
+/// docs/memory.md §7.
 pub const EMBEDDING_DIM: usize = 1024;
 
 pub use pgvector::Vector;

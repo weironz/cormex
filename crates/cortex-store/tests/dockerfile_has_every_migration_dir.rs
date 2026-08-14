@@ -1,40 +1,49 @@
-//! `sqlx::migrate!` 要的目录，必须都在镜像的构建上下文里。
+//! Every directory `sqlx::migrate!` needs must be inside the image's build
+//! context.
 //!
-//! # 为什么这条测试值得存在
+//! # Why this test is worth having
 //!
-//! `migrate!` 是**编译期**宏：它在编译时读目录，把每个 `.sql` 连同校验和
-//! 一起烤进二进制。目录不在 `docker build` 的上下文里，编译就直接失败 ——
-//! 而**本机构建永远是绿的**，因为目录就在那儿。
+//! `migrate!` is a **compile-time** macro: it reads the directory at compile
+//! time and bakes every `.sql` into the binary along with its checksum. If the
+//! directory is not in `docker build`'s context, compilation fails outright —
+//! while **the local build is always green**, because the directory is right
+//! there.
 //!
-//! v0.1.5 发版时实际撞到过：加了 `migrations-global/`（认证那套表），
-//! `cargo build` / `cargo test` / CI 全绿，`docker build` 在第 299 秒挂掉，
-//! 报 `error canonicalizing migration directory …/migrations-global`。
-//! 也就是说，**唯一能发现它的地方是发布流水线本身**，而那是最贵的一处。
+//! This actually happened while releasing v0.1.5: `migrations-global/` (the
+//! auth tables) was added, `cargo build` / `cargo test` / CI were all green,
+//! and `docker build` died at the 299th second reporting
+//! `error canonicalizing migration directory …/migrations-global`. In other
+//! words, **the only place that could discover it was the release pipeline
+//! itself**, which is the most expensive place there is.
 //!
-//! 所以这里用一条纯文本检查把它提前到 `cargo test`：
-//! 扫出源码里所有 `migrate!("…")` 的路径，逐个确认 Dockerfile 里
-//! COPY 过。它拦不住所有构建上下文问题，但拦得住**这一类**
-//! —— 而这一类的代价是「发版发到一半才知道」。
+//! So a plain-text check moves it forward to `cargo test`: scan the source for
+//! every `migrate!("…")` path and confirm one by one that the Dockerfile COPYs
+//! it. It cannot stop every build-context problem, but it stops **this class**
+//! — and the cost of this class is "you find out halfway through a release".
 
 use std::path::Path;
 
-/// 从 crate 目录回到仓库根。
+/// Walk back from the crate directory to the repository root.
 fn repo_root() -> &'static Path {
-    // crates/cortex-store → 上两级
+    // crates/cortex-store → two levels up
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("cortex-store 应当在 <repo>/crates/ 下面两级")
+        .expect("cortex-store should be two levels below <repo>/crates/")
 }
 
-/// 扫出所有编译期 migration 宏引用的目录名。
+/// Scan out the directory names referenced by every compile-time migration
+/// macro.
 ///
-/// 只取最后一段：宏里写的是相对 crate 的路径，而 Dockerfile 里写的是
-/// 相对仓库根的。两边唯一稳定的公共部分就是目录名本身。
+/// Only the last segment is taken: the macro writes a path relative to the
+/// crate, while the Dockerfile writes one relative to the repository root. The
+/// only stable part common to both is the directory name itself.
 ///
-/// **只扫 `src/`**，两个理由：镜像里 `cargo build -p cortexd -p cortex-cli`
-/// 根本不编译测试，所以测试用的目录不进构建上下文也无所谓；
-/// 而且这个文件自己的注释里就写着那个宏名，扫到 `tests/` 会先撞上自己。
+/// **Only `src/` is scanned**, for two reasons: the image's
+/// `cargo build -p cortexd -p cortex-cli` does not compile tests at all, so it
+/// does not matter whether test-only directories are in the build context; and
+/// this file's own comments contain that macro name, so scanning `tests/` would
+/// hit itself first.
 fn migration_dirs_referenced_in_source() -> Vec<String> {
     let mut dirs = Vec::new();
     let mut stack = vec![repo_root().join("crates")];
@@ -45,7 +54,7 @@ fn migration_dirs_referenced_in_source() -> Vec<String> {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
-                // 只往 crate 根与其 src/ 里走
+                // Only descend into crate roots and their src/
                 let name = p
                     .file_name()
                     .unwrap_or_default()
@@ -77,53 +86,60 @@ fn migration_dirs_referenced_in_source() -> Vec<String> {
     dirs
 }
 
-/// 每个 `migrate!` 目录都必须被 Dockerfile COPY 进去。
+/// Every `migrate!` directory must be COPYed in by the Dockerfile.
 ///
-/// 断言消息要能独立读懂：这条红的时候，人多半正在发版，
-/// 而下一步该做什么必须写在消息里，不能让人回来读这个文件。
+/// The assertion messages have to be readable standalone: when this goes red,
+/// whoever is looking is most likely mid-release, and what to do next must be in
+/// the message rather than requiring them to come back and read this file.
 #[test]
 fn every_migrate_macro_directory_is_copied_into_the_image() {
     let dockerfile_path = repo_root().join("scripts/docker/Dockerfile.cortexd");
     let dockerfile = std::fs::read_to_string(&dockerfile_path)
-        .unwrap_or_else(|e| panic!("读不到 {}：{e}", dockerfile_path.display()));
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dockerfile_path.display()));
 
     let dirs = migration_dirs_referenced_in_source();
     assert!(
         !dirs.is_empty(),
-        "一个 migrate! 都没扫到 —— 多半是这条测试的扫描逻辑坏了，\
-         而不是真的没有 migration。这种情况下它会永远绿，等于不存在"
+        "not a single migrate! was found -- most likely this test's scanning logic is broken \
+         rather than there genuinely being no migrations. In that state it would be green \
+         forever, which is the same as not existing"
     );
 
     for dir in &dirs {
         assert!(
             dockerfile.contains(&format!("COPY {dir}/ {dir}/")),
-            "源码里有 sqlx::migrate!(\"…/{dir}\")，但 {} 没有 \
-             `COPY {dir}/ {dir}/`。\n\
-             migrate! 是编译期宏，目录不在构建上下文里 docker build 会直接编不过，\
-             而本机 cargo build 照样绿（目录就在那儿）—— 于是只有发布流水线\
-             才会发现，在第 300 秒左右。\n\
-             修法：在 Dockerfile 里 `COPY crates/` 附近补一行 `COPY {dir}/ {dir}/`。",
+            "the source contains sqlx::migrate!(\"…/{dir}\"), but {} has no \
+             `COPY {dir}/ {dir}/`.\n\
+             migrate! is a compile-time macro, so if the directory is not in the build context \
+             docker build fails to compile outright, while the local cargo build stays green \
+             (the directory is right there) -- meaning only the release pipeline finds out, \
+             around the 300th second.\n\
+             Fix: add a `COPY {dir}/ {dir}/` line near `COPY crates/` in the Dockerfile.",
             dockerfile_path.display(),
         );
     }
 }
 
-/// migration 还要随镜像进运行时层，否则 `just prod-migrate` 在容器里跑不了。
+/// The migrations must also ship into the runtime layer of the image, or
+/// `just prod-migrate` cannot run inside the container.
 ///
-/// 与上面那条分开：编不过是**立刻可见**的，而这条漏了要等到有人
-/// 在生产上跑 migration 才发现「目录不存在」。
+/// Kept separate from the one above: a compile failure is **immediately
+/// visible**, whereas missing this one is not discovered until somebody runs a
+/// migration in production and finds "the directory does not exist".
 #[test]
 fn every_migration_directory_also_ships_in_the_runtime_layer() {
     let dockerfile_path = repo_root().join("scripts/docker/Dockerfile.cortexd");
-    let dockerfile = std::fs::read_to_string(&dockerfile_path).expect("读不到 Dockerfile");
+    let dockerfile = std::fs::read_to_string(&dockerfile_path).expect("cannot read the Dockerfile");
 
     for dir in &migration_dirs_referenced_in_source() {
         assert!(
             dockerfile.contains(&format!("/build/{dir} /opt/cortex/{dir}")),
-            "{dir}/ 编进了二进制，但没随镜像进运行时层。\n\
-             `just prod-migrate` 是在容器里跑 sqlx 的，找不到目录时它报\
-             「没有这个文件」——而那时人正在生产上做迁移。\n\
-             修法：补一行 `COPY --from=builder /build/{dir} /opt/cortex/{dir}`。",
+            "{dir}/ is compiled into the binary but does not ship into the image's runtime \
+             layer.\n\
+             `just prod-migrate` runs sqlx inside the container, and when it cannot find the \
+             directory it reports \"no such file\" -- at the moment somebody is performing a \
+             migration in production.\n\
+             Fix: add a `COPY --from=builder /build/{dir} /opt/cortex/{dir}` line.",
         );
     }
 }

@@ -1,58 +1,76 @@
-//! 工具确认回路的**线上**那一半 —— `GET /confirmations` 的响应项。
+//! The **wire** half of the tool confirmation loop — the response items of
+//! `GET /confirmations`.
 //!
-//! # 为什么只剩这一个类型
+//! # Why only this one type is left
 //!
-//! 曾经整本簿子（`ConfirmRegistry` 与它的 oneshot、TTL、`Drop` 清理）也在
-//! 这里，理由是「`GET /confirmations` 的响应体就是它的 `PendingInfo`，
-//! 而 [`crate::dto::ChatEvent::Confirm`] 的字段口径必须与它逐字对齐」。
+//! The whole registry (`ConfirmRegistry` with its oneshots, TTL and `Drop`
+//! cleanup) used to live here too, on the grounds that "the response body of
+//! `GET /confirmations` *is* its `PendingInfo`, and the fields of
+//! [`crate::dto::ChatEvent::Confirm`] have to line up with it word for word".
 //!
-//! 那个理由只覆盖 [`PendingInfo`]，覆盖不了那本簿子。而簿子把整个
-//! `cortex-agent`（agent 循环 + 工具 + 沙箱）拖进了这个**线协议** crate ——
-//! 于是任何想只用记忆那一层的人，都要连 agent 一起编。
+//! That reasoning covers [`PendingInfo`]; it does not cover the registry. And
+//! the registry dragged the whole of `cortex-agent` (agent loop + tools +
+//! sandbox) into this **wire protocol** crate — so anyone who wanted only the
+//! memory layer had to compile the agent along with it.
 //!
-//! 现在簿子在 `cortex-local`（它是唯一的宿主：cortexd 不跑 agent，容器里
-//! 那个不问确认），线上类型留在这里与 `ChatEvent::Confirm` 做邻居。
-//! 契约的两半仍然在同一个文件夹里，而依赖断了。
+//! The registry now lives in `cortex-local` (its only possible host: cortexd
+//! runs no agent, and the one inside a container never asks for confirmation),
+//! while the wire type stays here as a neighbour of `ChatEvent::Confirm`. The
+//! two halves of the contract are still in the same folder, and the dependency
+//! is severed.
 
 use serde::{Deserialize, Serialize};
 
-/// 待确认项的对外形态（`GET /confirmations` 与 SSE 事件共用字段口径）。
+/// The outward form of a pending confirmation (`GET /confirmations` and the SSE
+/// event share the same field vocabulary).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInfo {
     pub token: String,
     pub session_id: String,
     pub tool: String,
-    /// `"safe"` / `"write"` / `"execute"` —— 取值由 `cortex_agent::Risk::as_wire`
-    /// 定死，客户端按它决定确认框长什么样。
+    /// `"safe"` / `"write"` / `"execute"` — the set of values is pinned by
+    /// `cortex_agent::Risk::as_wire`, and clients use it to decide what the
+    /// confirmation dialog looks like.
     ///
-    /// 宿主那侧（`cortex-local` 的 `PendingMeta`）是 `&'static str`，因为它只
-    /// 可能来自那三个字面量。这里必须是 `String`：这个响应要被**读回来**，
-    /// 而 `&'static str` 反序列化不了。
+    /// On the host side (`PendingMeta` in `cortex-local`) this is a
+    /// `&'static str`, because it can only ever come from those three
+    /// literals. Here it has to be a `String`: this response gets **read back**,
+    /// and a `&'static str` cannot be deserialized into.
     pub risk: String,
     pub preview: String,
     pub asked_at: String,
-    /// 还剩多少秒会被按拒绝处理。客户端据此画倒计时，也据此知道
-    /// 一个「看起来还在等」的提示其实早就作废了
+    /// How many seconds remain before this is treated as a rejection. Clients
+    /// draw the countdown from it, and also learn from it that a prompt which
+    /// "looks like it is still waiting" went stale long ago.
     pub expires_in_secs: u64,
-    /// 越界访问的目标绝对路径。`None` = 没有越界。
+    /// The absolute target path of an out-of-scope access. `None` = nothing out
+    /// of scope.
     ///
-    /// 越界批准与普通写入批准是两件不同的事，用户必须能分辨 —— 而只给工具名
-    /// 与 preview 是不够的：preview 里那个 path 可能是相对的，「相对于哪儿」
-    /// 正是他此刻最需要知道、也最容易搞错的东西。
+    /// Approving something out of scope and approving an ordinary write are two
+    /// different things, and the user has to be able to tell them apart — the
+    /// tool name plus the preview is not enough: the path inside the preview
+    /// may well be relative, and "relative to what" is precisely the thing the
+    /// user most needs to know right then, and most easily gets wrong.
     ///
-    /// `default` 是为了老客户端与老服务端能互相读：这个字段是后加的，
-    /// 少了它只是少一行提示，不该让整条确认反序列化失败 ——
-    /// 那会让用户完全看不到弹窗，而不是看到一个信息少一点的弹窗。
+    /// `default` is so old clients and old servers can still read each other:
+    /// this field was added later, and its absence should cost one line of
+    /// detail, not fail the deserialization of the whole confirmation — that
+    /// would leave the user with no dialog at all, rather than a dialog with a
+    /// little less information in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    /// 这次写入会把文件改成什么样。`None` = 没有可看的改动。
+    /// What this write will turn the file into. `None` = no change worth
+    /// showing.
     ///
-    /// **它治的是「盲签」**：只给工具名与 preview，用户看到的是
-    /// 「write_file 要写 config.toml」—— 他批准的是一个他没读过的内容。
+    /// **This is the cure for blind signing**: with only a tool name and a
+    /// preview, what the user sees is "write_file wants to write config.toml" —
+    /// and what they approve is content they have never read.
     ///
-    /// `default` 的理由与 `scope` 逐字相同：后加的字段，少了它只是少一块
-    /// diff，不该让整条确认反序列化失败 —— 那会让用户**完全看不到弹窗**，
-    /// 比看到一个信息少一点的弹窗糟得多。
+    /// The reason for `default` is word for word the one on `scope`: a field
+    /// added later, whose absence should cost one diff, not fail the
+    /// deserialization of the whole confirmation — that would leave the user
+    /// with **no dialog at all**, which is far worse than a dialog with a
+    /// little less information in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }

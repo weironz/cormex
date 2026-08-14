@@ -1,27 +1,33 @@
-//! gold / forbidden 的匹配规则。
+//! Matching rules for gold / forbidden.
 //!
-//! 一组子串全部出现在同一条事实的 `statement` 里，才算命中这条 gold。
+//! A gold entry counts as hit only when every substring in its group appears in
+//! the same fact's `statement`.
 //!
-//! # 为什么不按 fact id
+//! # Why not by fact id
 //!
-//! 事实的 id 是落库时现生成的 ULID，题集里写不出来。llm 模式下连
-//! statement 的措辞都由模型决定。「这几个关键词得在同一条事实里」
-//! 是唯一在 seed 与 llm 两种模式下都成立的标识方式。
+//! A fact's id is a ULID generated at write time, which cannot be written into
+//! a suite. In llm mode even the statement's wording is decided by the model.
+//! "These few keywords have to be in the same fact" is the only identification
+//! scheme that holds in both seed and llm mode.
 //!
-//! # 为什么只看 statement
+//! # Why only the statement
 //!
-//! `statement` 是唯一被要求「能独立读懂」的字段（抽取 prompt 里明写了），
-//! 也是向量化与界面展示用的字段。把 predicate / object 也拼进去匹配会
-//! 显著放宽命中条件 —— gold 越松，分数越虚高，评测就越没用。
+//! `statement` is the only field required to "be readable on its own" (the
+//! extraction prompt says so explicitly), and it is also the field used for
+//! vectorization and UI display. Folding predicate / object into the match too
+//! would loosen the hit condition considerably — the looser the gold, the more
+//! inflated the score, and the more useless the eval.
 
 use crate::suite::Question;
 
-/// 一条 gold（或 forbidden）：一组必须同时出现的子串。
+/// One gold (or forbidden) entry: a group of substrings that must all appear
+/// together.
 #[derive(Debug, Clone)]
 pub struct Matcher {
-    /// 已小写化。中文不受影响，英文标识符（RustFS / rustfs）则需要
+    /// Already lowercased. CJK is unaffected; English identifiers (RustFS /
+    /// rustfs) need it
     parts: Vec<String>,
-    /// 原样保留，报告里要打出来
+    /// Kept verbatim, for printing in the report
     raw: Vec<String>,
 }
 
@@ -34,7 +40,7 @@ impl Matcher {
         }
     }
 
-    /// 全部子串都出现才算命中。
+    /// A hit requires every substring to appear.
     #[must_use]
     pub fn matches(&self, statement: &str) -> bool {
         if self.parts.is_empty() {
@@ -44,7 +50,8 @@ impl Matcher {
         self.parts.iter().all(|p| hay.contains(p))
     }
 
-    /// 在一个已排序的候选列表里找**首个**命中的名次（从 0 起）。
+    /// Find the rank (zero-based) of the **first** hit in an already-sorted
+    /// candidate list.
     #[must_use]
     pub fn first_hit<'a, I>(&self, statements: I) -> Option<usize>
     where
@@ -59,12 +66,13 @@ impl Matcher {
     }
 }
 
-/// 一道题的全部匹配器。
+/// All the matchers for one question.
 #[derive(Debug, Clone)]
 pub struct QuestionMatchers {
     pub gold: Vec<Matcher>,
     pub forbidden: Vec<Matcher>,
-    /// 「根本不该在库里」—— 比对的是语料快照而不是检索结果，见
+    /// "Should not be in the store at all" — compared against the corpus
+    /// snapshot rather than the retrieval results; see
     /// [`crate::suite::Question::never_extracted`]
     pub never_extracted: Vec<Matcher>,
 }
@@ -94,7 +102,8 @@ mod tests {
         assert!(matcher.matches("Cortex 的对象存储换成了 RustFS。"));
         assert!(
             !matcher.matches("Cortex 的对象存储先用 MinIO。"),
-            "少一个关键词就不该算命中，否则 gold 形同虚设"
+            "one keyword short must not count as a hit, otherwise the gold is \
+             meaningless"
         );
     }
 
@@ -102,7 +111,7 @@ mod tests {
     fn matching_is_case_insensitive() {
         assert!(
             m(&["rustfs"]).matches("对象存储用 RustFS"),
-            "英文标识符的大小写不该决定命中与否"
+            "the case of an English identifier must not decide whether it hits"
         );
     }
 
@@ -120,7 +129,8 @@ mod tests {
 
     #[test]
     fn empty_matcher_never_matches() {
-        // 空匹配器若返回 true，一道题就会恒定满分 —— 静默地把评测变成噪声
+        // If an empty matcher returned true, a question would score full marks
+        // unconditionally — silently turning the eval into noise
         assert!(!Matcher::new(&[]).matches("随便什么内容"));
     }
 }

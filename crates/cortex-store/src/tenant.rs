@@ -1,35 +1,47 @@
-//! 多用户：一个用户一个 schema，一个 schema 一个池。
+//! Multi-user: one schema per user, one pool per schema.
 //!
-//! # 为什么不是给每张表加 `user_id`
+//! # Why not just add `user_id` to every table
 //!
-//! 现在有 17 张表、约 77 条查询。加一列意味着 77 个地方都要**记得**过滤，
-//! 而漏掉任何一个的后果是**一个用户读到另一个用户的记忆** —— 没有编译期
-//! 帮助，没有任何现存测试会自然覆盖到，而且症状不是报错，是「多了几条
-//! 不认识的记忆」。
+//! There are currently 17 tables and roughly 77 queries. Adding a column means
+//! 77 places that have to **remember** to filter, and the consequence of
+//! missing any one of them is **one user reading another user's memory** — with
+//! no compile-time help, nothing in the existing tests that would naturally
+//! cover it, and a symptom that is not an error but "a few unfamiliar memories
+//! showed up".
 //!
-//! 换成 schema 隔离之后，那 77 条查询**一条都不用改**：连接的
-//! `search_path` 里只有这个用户的 schema，别人的表根本不在名字解析范围内。
-//! 隔离从「每处都记得写 WHERE」变成「连接建立时定死一次」。
+//! Switching to schema isolation means **not one** of those 77 queries has to
+//! change: the connection's `search_path` contains only this user's schema, so
+//! other people's tables are not even in scope for name resolution. Isolation
+//! goes from "remember to write the WHERE in every place" to "pinned down once,
+//! when the connection is established".
 //!
-//! 这条路在这个仓库里早就跑通了 —— 集成测试的 `common::setup` 就是这么给
-//! 每个测试建独立 schema 的（`tests/common/mod.rs`）。这里做的是把同一个
-//! 手法从测试搬到生产。
+//! This approach has been proven inside this repository for a long time — the
+//! integration tests' `common::setup` builds a dedicated schema per test
+//! exactly this way (`tests/common/mod.rs`). What happens here is moving the
+//! same technique from tests into production.
 //!
-//! # 为什么是「每用户一个池」，不是「共享池 + 每次 SET search_path」
+//! # Why "one pool per user" rather than "a shared pool + SET search_path each
+//! time"
 //!
-//! 共享池省连接，但它把隔离从**结构**降级成**纪律**：每借出一条连接都要
-//! 记得先 `SET search_path`，漏一次就是拿着上一个用户的 search_path 去查。
-//! 而连接是复用的，所以漏掉的那次**大概率真的落在别人的 schema 上**。
+//! A shared pool saves connections, but it demotes isolation from a
+//! **structural** property to a **disciplinary** one: every checked-out
+//! connection has to remember to `SET search_path` first, and missing it once
+//! means querying with the previous user's search_path. Connections are reused,
+//! so that one miss **very likely does land in somebody else's schema**.
 //!
-//! 焊在 [`PgConnectOptions`] 里则物理上不可能出这个错：这条连接从建立到
-//! 关闭都只看得见一个 schema。代价是连接数，而那是个可以算清楚的数
-//! （见 [`TenantPools::new`] 的注释），不是一个会静默发生的数据泄露。
+//! Welding it into [`PgConnectOptions`] makes the mistake physically
+//! impossible: from creation to close, that connection can see exactly one
+//! schema. The price is connection count, and that is a number you can work out
+//! exactly (see the comments on [`TenantPools::new`]) rather than a data leak
+//! that happens silently.
 //!
-//! # 上限是真的上限
+//! # The ceiling is a real ceiling
 //!
-//! Postgres 的 `max_connections` 默认 100。每用户 [`PER_TENANT_CONNECTIONS`]
-//! 条，于是同时驻留的用户数有硬上限。满了**明确报错**而不是排队等 ——
-//! 排队的表现是「所有人都变慢」，而报错至少指得出原因。
+//! Postgres's `max_connections` defaults to 100. At
+//! [`PER_TENANT_CONNECTIONS`] per user, the number of simultaneously resident
+//! users has a hard ceiling. When it is reached we **fail with an explicit
+//! error** rather than queueing — queueing shows up as "everybody got slower",
+//! whereas an error at least points at the cause.
 
 use std::collections::HashMap;
 use std::str::FromStr as _;
@@ -41,50 +53,61 @@ use tokio::sync::Mutex;
 use crate::error::{Result, StoreError};
 use crate::store::Store;
 
-/// 每个用户的连接池上限。
+/// The connection pool ceiling for each user.
 ///
-/// 比单用户时的 16 小得多，而这是**故意的**：单用户部署里池子是给一个人
-/// 的四路召回用的；多用户时同样的总预算要分给所有在线的人。
+/// Far smaller than the 16 used in the single-user case, and that is
+/// **deliberate**: in a single-user deployment the pool serves one person's
+/// four-way retrieval, whereas under multi-user the same total budget has to be
+/// split across everybody online.
 ///
-/// 4 条够一次对话用（四路召回并发 + 一条写事务），再多的收益递减 ——
-/// 写事务本来就被 advisory lock 串行化。
+/// 4 is enough for one conversation (concurrent four-way retrieval + one write
+/// transaction), and beyond that the returns diminish — write transactions are
+/// serialized by the advisory lock anyway.
 pub const PER_TENANT_CONNECTIONS: u32 = 4;
 
-/// 同时驻留多少个用户的池。
+/// How many users' pools stay resident at once.
 ///
-/// `4 × 20 = 80`，给 Postgres 默认的 100 留出运维连接与
-/// `pg_basebackup` 的余量。**这个数是从 `max_connections` 倒推的**，
-/// 不是拍脑袋 —— 改它之前先改数据库那边。
+/// `4 × 20 = 80`, leaving headroom within Postgres's default 100 for
+/// operational connections and `pg_basebackup`. **This number is derived
+/// backwards from `max_connections`**, not picked out of the air — change the
+/// database side first, then this.
 pub const MAX_RESIDENT_TENANTS: usize = 20;
 
-/// 一个用户的 schema 名。
+/// One user's schema name.
 ///
-/// 新建时形如 `u_<26 位 ULID>`；**1 号用户是 `public`** —— 生产库里
-/// 已经有存量数据，把 17 张表搬进新 schema 是一次没有回头路的 DDL，
-/// 而它换来的只是好看。见 `migrations/20260810000002` 的文件头。
+/// Newly minted ones look like `u_<26-character ULID>`; **user #1 is `public`**
+/// — the production database already holds existing data, and moving 17 tables
+/// into a new schema is a one-way DDL whose only reward is tidiness. See the
+/// file header of `migrations/20260810000002`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SchemaName(String);
 
 impl SchemaName {
     /// # Errors
-    /// 形状不对。**这是注入面**：这个字符串会被拼进 `search_path`，
-    /// 而那条语句没法用绑定参数（标识符不能参数化）。
+    /// The shape is wrong. **This is an injection surface**: this string gets
+    /// spliced into `search_path`, and that statement cannot use bind
+    /// parameters (identifiers are not parameterizable).
     ///
-    /// 所以这里不做转义、不做引号，只做**白名单**：转义要求每一处拼接
-    /// 都记得做，而白名单只要写一次，且拼错的后果是拒绝而不是执行。
-    /// # 为什么必须是**小写**
+    /// So there is no escaping and no quoting here, only an **allowlist**:
+    /// escaping requires every splice site to remember to do it, whereas an
+    /// allowlist is written once, and getting it wrong means rejection rather
+    /// than execution.
+    /// # Why it must be **lowercase**
     ///
-    /// `search_path` 里不带引号的标识符会被 Postgres **折成小写**。而这个
-    /// 名字同时要用来 `CREATE SCHEMA "u_..."`（带引号，保留大小写）——
-    /// 两边一旦不一致，`search_path` 指向的就是一个**不存在的 schema**。
+    /// Postgres **folds** unquoted identifiers in `search_path` to lowercase.
+    /// But this same name is also used for `CREATE SCHEMA "u_..."` (quoted,
+    /// preserving case) — and the moment the two disagree, `search_path` points
+    /// at a **schema that does not exist**.
     ///
-    /// 而 Postgres 对 `search_path` 里不存在的 schema 是**静默跳过**的：
-    /// 不报错、不警告，直接落到下一个（也就是 `public`）。实测后果是
-    /// 新租户的 migration 一张表都没建、所有写入都进了 1 号用户的库，
-    /// 而 `migrate()` 返回 `Ok`。
+    /// And Postgres **silently skips** a nonexistent schema in `search_path`:
+    /// no error, no warning, it just falls through to the next one (which is
+    /// `public`). The observed consequence was that a new tenant's migration
+    /// created no tables at all and every write went into user #1's database,
+    /// while `migrate()` returned `Ok`.
     ///
-    /// 小写让「带引号」与「不带引号」两种写法等价，这条路就堵死了。
-    /// ULID 用的 Crockford base32 本来就大小写不敏感，小写不丢任何信息。
+    /// Lowercase makes the quoted and unquoted spellings equivalent, which
+    /// closes that path off. The Crockford base32 that ULIDs use is
+    /// case-insensitive to begin with, so lowercasing loses no information.
     pub fn new(raw: &str) -> Result<Self> {
         let ok = raw == "public"
             || (raw.len() == 28
@@ -100,27 +123,31 @@ impl SchemaName {
         Ok(Self(raw.to_owned()))
     }
 
-    /// 由用户 id 派生一个新 schema 名。
+    /// Derive a new schema name from a user id.
     ///
-    /// **转小写**，理由见 [`Self::new`] —— 大写的名字会让 `search_path`
-    /// 指向一个不存在的 schema，而那是静默的。
+    /// **Lowercased**; for why see [`Self::new`] — an uppercase name makes
+    /// `search_path` point at a schema that does not exist, and that failure is
+    /// silent.
     ///
     /// # Errors
-    /// `user_id` 不是合法 ULID。
+    /// `user_id` is not a valid ULID.
     ///
-    /// **一定要校验**：这个函数一度直接拼串返回，于是一个畸形的 user_id
-    /// 能造出一个连 [`Self::new`] 都过不了的 `SchemaName` —— 而这个类型的
-    /// 全部价值就在于「持有它 == 已经验过」。构造函数不校验，
-    /// 下游每一处（`search_path`、`pg_notify`、对象存储前缀）都得自己再验一遍，
-    /// 而那正是这个 newtype 要消灭的东西。
+    /// **Validation is mandatory**: this function once concatenated the string
+    /// and returned it directly, so a malformed user_id could produce a
+    /// `SchemaName` that [`Self::new`] itself would reject — while the entire
+    /// value of this type is "holding one == it has already been validated".
+    /// If the constructor does not validate, every downstream site
+    /// (`search_path`, `pg_notify`, the object-storage prefix) has to validate
+    /// again itself, which is exactly what this newtype exists to eliminate.
     pub fn derive(user_id: &str) -> Result<Self> {
         Self::new(&format!("u_{}", user_id.to_ascii_lowercase()))
     }
 
-    /// 1 号用户 / 单用户部署的 schema。
+    /// The schema for user #1 / a single-user deployment.
     ///
-    /// 是个常量而不是 `new("public").unwrap()`：后者在每个调用点都留下一个
-    /// 「这里可能 panic」的印象，而它其实永远不会。
+    /// A constant rather than `new("public").unwrap()`: the latter leaves the
+    /// impression of "this could panic" at every call site, when in fact it
+    /// never can.
     #[must_use]
     pub fn public() -> Self {
         Self("public".to_owned())
@@ -131,17 +158,21 @@ impl SchemaName {
         &self.0
     }
 
-    /// 这个用户的写事务锁键。
+    /// This user's write-transaction lock key.
     ///
-    /// `pg_advisory_xact_lock` 原来是全局单键（`SYNC_ADVISORY_LOCK_KEY`），
-    /// 那把所有用户的写事务串行化了 —— 一个人导入三年历史，别人一句话
-    /// 都写不进去。而那把锁保证的是「`sync_log.seq` 的顺序 == 对读端可见的
-    /// 顺序」，**这件事本来就是每 schema 各论各的**。
+    /// `pg_advisory_xact_lock` used to take a single global key
+    /// (`SYNC_ADVISORY_LOCK_KEY`), which serialized the write transactions of
+    /// every user — one person importing three years of history and nobody else
+    /// can write a single sentence. What that lock guarantees is "the order of
+    /// `sync_log.seq` == the order rows become visible to readers", and **that
+    /// is a per-schema matter to begin with**.
     #[must_use]
     pub fn lock_key(&self) -> i32 {
-        // 取 schema 名的稳定哈希。撞了也只是两个用户共用一把锁 ——
-        // 结果仍然正确，只是那两个人的写入互相排队。所以这里不需要
-        // 密码学哈希，需要的是**跨进程、跨版本稳定**
+        // A stable hash of the schema name. A collision only means two users
+        // share one lock — the result is still correct, those two people's
+        // writes merely queue behind each other. So no cryptographic hash is
+        // needed here; what is needed is **stability across processes and
+        // across versions**
         let mut h: u32 = 2_166_136_261;
         for b in self.0.as_bytes() {
             h ^= u32::from(*b);
@@ -151,34 +182,41 @@ impl SchemaName {
         (h as i32)
     }
 
-    /// 这个用户的 NOTIFY 通道名。
+    /// This user's NOTIFY channel name.
     ///
-    /// 原来是全局一个 `cortex_sync`，于是任何人写入都会唤醒**所有人**的
-    /// 监听器。不是正确性问题（各自按自己的游标补拉），但它让每个用户都能
-    /// 观察到「别人正在写」，而且规模一上来就是全员风暴。
+    /// There used to be one global `cortex_sync`, so anybody's write woke
+    /// **everybody's** listener. Not a correctness problem (each catches up
+    /// according to its own cursor), but it let every user observe that
+    /// "somebody else is writing", and at scale it becomes an all-hands storm.
     #[must_use]
     pub fn notify_channel(&self) -> String {
-        // 通道名同样进不了绑定参数，靠的是这个类型已经被白名单校验过。
-        // 前缀取自 sync 模块，那边是监听方 —— 两处各写一个字面量的话，
-        // 改了一处就是「触发器往 A 发、监听器听 B」，而那不报错，只是不刷新
+        // The channel name likewise cannot go through a bind parameter; what
+        // makes it safe is that this type has already passed allowlist
+        // validation. The prefix comes from the sync module, which is the
+        // listening side — if each place wrote its own literal, changing one
+        // would mean "the trigger sends to A while the listener listens on B",
+        // and that raises no error, it just stops refreshing
         format!("{}_{}", crate::sync::NOTIFY_CHANNEL_PREFIX, self.0)
     }
 }
 
-/// 按用户取 [`Store`]，池子按需建、按 LRU 淘汰。
+/// Fetch a [`Store`] by user; pools are built on demand and evicted by LRU.
 pub struct TenantPools {
     database_url: String,
     resident: Mutex<Resident>,
 }
 
-/// 驻留中的池子 + 使用顺序。
+/// The resident pools plus their usage order.
 ///
-/// 用 `Mutex<..>` 而不是 `DashMap`：热路径是「命中已有的池」，而那只是一次
-/// 哈希查找加一次 `Arc::clone`，锁的持有时间以纳秒计。真正慢的是**建池**
-/// （一次 TCP + 认证），而那必须发生在锁外 —— 见 [`TenantPools::get`]。
+/// A `Mutex<..>` rather than a `DashMap`: the hot path is "hit an existing
+/// pool", and that is one hash lookup plus one `Arc::clone`, holding the lock
+/// for nanoseconds. What is genuinely slow is **building a pool** (a TCP
+/// handshake plus authentication), and that has to happen outside the lock —
+/// see [`TenantPools::get`].
 struct Resident {
     pools: HashMap<SchemaName, Arc<Store>>,
-    /// 最近使用在后。条目少（≤20），线性查找比再维护一个索引便宜。
+    /// Most recently used at the back. With few entries (≤20), a linear scan
+    /// is cheaper than maintaining another index.
     order: Vec<SchemaName>,
 }
 
@@ -194,12 +232,14 @@ impl TenantPools {
         }
     }
 
-    /// 拿这个用户的 `Store`。没有就建一个。
+    /// Get this user's `Store`, building one if it does not exist.
     ///
     /// # Errors
-    /// 连不上数据库，或者驻留的用户数已经到顶（见 [`MAX_RESIDENT_TENANTS`]）。
+    /// Cannot reach the database, or the resident user count has hit the
+    /// ceiling (see [`MAX_RESIDENT_TENANTS`]).
     pub async fn get(&self, schema: &SchemaName) -> Result<Arc<Store>> {
-        // 先在锁内看一眼。命中就直接走 —— 绝大多数请求走的是这条
+        // Take one look under the lock first. On a hit we are done — this is
+        // the path the vast majority of requests take
         {
             let mut r = self.resident.lock().await;
             if let Some(store) = r.pools.get(schema).cloned() {
@@ -208,15 +248,17 @@ impl TenantPools {
             }
         }
 
-        // **建池在锁外**：它要跑一次 TCP 握手 + 认证，几十毫秒。
-        // 拿着锁做这件事会让所有别的用户的请求排在后面 ——
-        // 而那正是「一个人登录卡住全服」的经典形状
+        // **Build the pool outside the lock**: it runs a TCP handshake plus
+        // authentication, tens of milliseconds. Doing that while holding the
+        // lock would leave every other user's request queued behind it — the
+        // classic shape of "one person logging in stalls the whole service"
         let store = Arc::new(self.connect(schema).await?);
 
         let mut r = self.resident.lock().await;
-        // 可能有另一个请求在我们建池期间也建了一个。用先到的那个，
-        // 把自己这份丢掉（`Arc` 析构时池子自己关连接）——
-        // 两个池指向同一个 schema 不会出错，但白占 4 条连接
+        // Another request may have built one too while we were building ours.
+        // Use whichever arrived first and drop our own (the pool closes its
+        // connections when the `Arc` is dropped) — two pools pointing at the
+        // same schema is not incorrect, it just wastes 4 connections
         if let Some(existing) = r.pools.get(schema).cloned() {
             r.touch(schema);
             return Ok(existing);
@@ -224,7 +266,8 @@ impl TenantPools {
         if r.pools.len() >= MAX_RESIDENT_TENANTS {
             r.evict_oldest();
         }
-        // 淘汰之后仍然满，说明上限本身就配得太小
+        // Still full after eviction means the ceiling itself is configured too
+        // low
         if r.pools.len() >= MAX_RESIDENT_TENANTS {
             return Err(StoreError::Invalid(format!(
                 "同时在线的用户已达上限 {MAX_RESIDENT_TENANTS}（每人 {PER_TENANT_CONNECTIONS} 条连接）。\
@@ -236,11 +279,12 @@ impl TenantPools {
         Ok(store)
     }
 
-    /// 建一个 `search_path` 焊死的池。
+    /// Build a pool with `search_path` welded in place.
     ///
-    /// `public` 留在 `search_path` 尾部是**必需的**：`vector` 扩展的类型
-    /// 装在那儿，去掉之后 `::vector` 会报「type does not exist」——
-    /// 一条看起来像「扩展没装」的错误。测试 harness 里踩过同一个坑。
+    /// Keeping `public` at the tail of `search_path` is **required**: the
+    /// `vector` extension's types live there, and without it `::vector` reports
+    /// "type does not exist" — an error that looks like "the extension is not
+    /// installed". The test harness stepped into this same trap.
     async fn connect(&self, schema: &SchemaName) -> Result<Store> {
         let options = PgConnectOptions::from_str(&self.database_url)
             .map_err(|e| StoreError::Invalid(format!("DATABASE_URL 不合法：{e}")))?
@@ -253,22 +297,26 @@ impl TenantPools {
         Ok(Store::from_pool_in(pool, schema.clone()))
     }
 
-    /// 建出这片 schema（幂等）。
+    /// Create this schema (idempotent).
     ///
-    /// 用 admin 连接而不是租户池：租户池的 `search_path` 指向一个还不存在的
-    /// schema，而 Postgres 对此是**静默跳过**的 —— 那条连接会落到 `public`，
-    /// 于是「建 schema」这个动作本身看起来成了，实际什么都没发生在正确的地方。
+    /// Uses an admin connection rather than the tenant pool: the tenant pool's
+    /// `search_path` points at a schema that does not exist yet, and Postgres
+    /// **silently skips** such an entry — that connection falls through to
+    /// `public`, so the act of "creating the schema" appears to succeed while
+    /// nothing at all happened in the right place.
     ///
     /// # Errors
-    /// 连不上，或者没有建 schema 的权限。
+    /// Cannot connect, or lacks permission to create schemas.
     pub async fn create_schema(&self, schema: &SchemaName) -> Result<()> {
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&self.database_url)
             .await?;
-        // AssertSqlSafe 背得起：`SchemaName` 的构造函数是白名单校验过的。
-        // 双引号是必需的 —— 不带引号的标识符会被折成小写，而我们铸的名字
-        // 本来就是小写，加引号只是让「建的」与「search_path 找的」逐字一致
+        // AssertSqlSafe is affordable here: `SchemaName`'s constructor is
+        // allowlist-validated. The double quotes are required — an unquoted
+        // identifier gets folded to lowercase, and the names we mint are
+        // lowercase anyway, so quoting merely makes "what was created" and
+        // "what search_path looks for" character-for-character identical
         let sql = format!(r#"CREATE SCHEMA IF NOT EXISTS "{}""#, schema.as_str());
         let result = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&admin).await;
         admin.close().await;
@@ -276,14 +324,16 @@ impl TenantPools {
         Ok(())
     }
 
-    /// 删掉这片 schema 与里面的一切。
+    /// Drop this schema and everything in it.
     ///
-    /// **只在建号中途失败时用**（schema 建了但账号没写成，那是个孤儿）。
-    /// 删一个真实用户的 schema 是不可逆的数据销毁，那条路要走 purge，
-    /// 而 purge 要显式触发、二次确认、留墓碑。
+    /// **Only for use when account provisioning failed partway through** (the
+    /// schema was created but the account row was not, leaving an orphan).
+    /// Dropping a real user's schema is irreversible data destruction; that
+    /// path goes through purge, and purge must be explicitly triggered,
+    /// confirmed twice, and leave a tombstone.
     ///
     /// # Errors
-    /// 连不上，或者没有 DROP 的权限。
+    /// Cannot connect, or lacks DROP permission.
     pub async fn drop_schema(&self, schema: &SchemaName) -> Result<()> {
         let admin = PgPoolOptions::new()
             .max_connections(1)
@@ -296,7 +346,7 @@ impl TenantPools {
         Ok(())
     }
 
-    /// 现在驻留着几个池。给 `/health` 与测试用。
+    /// How many pools are currently resident. For `/health` and for tests.
     pub async fn resident_count(&self) -> usize {
         self.resident.lock().await.pools.len()
     }
@@ -310,10 +360,12 @@ impl Resident {
         }
     }
 
-    /// 淘汰最久没用的。
+    /// Evict the least recently used one.
     ///
-    /// 淘汰只是**丢掉引用**：正在用它的请求手上还有 `Arc`，池子要等最后
-    /// 一个用完才真的关。所以淘汰不会打断在途请求，只会让下一次请求重建。
+    /// Eviction merely **drops a reference**: requests currently using it still
+    /// hold an `Arc`, and the pool does not actually close until the last one
+    /// is done. So eviction never interrupts an in-flight request; it only
+    /// makes the next request rebuild.
     fn evict_oldest(&mut self) {
         if self.order.is_empty() {
             return;
@@ -328,22 +380,24 @@ impl Resident {
 mod tests {
     use super::*;
 
-    /// **schema 名是注入面，白名单必须严。**
+    /// **A schema name is an injection surface, so the allowlist must be
+    /// strict.**
     ///
-    /// 它会被拼进 `search_path` 与 `pg_notify` 的通道名，而标识符不能用
-    /// 绑定参数。放行一个带引号或逗号的名字，等于让调用方指定要查哪个
-    /// schema —— 也就是读别人的记忆。
+    /// It gets spliced into `search_path` and into the `pg_notify` channel
+    /// name, and identifiers cannot use bind parameters. Letting through a name
+    /// containing a quote or a comma amounts to letting the caller choose which
+    /// schema to query — that is, to read somebody else's memory.
     #[test]
     fn a_schema_name_can_never_be_anything_but_the_two_shapes_we_mint() {
         for bad in [
-            "public, evil",               // 逗号 = 往 search_path 里塞第二个
-            "u_01ABC\"; DROP SCHEMA x--", // 引号
+            "public, evil",               // comma = smuggle a second entry into search_path
+            "u_01ABC\"; DROP SCHEMA x--", // quote
             "u_01ABC'",
-            "U_01arz3ndektsv4rrffq69g5fav",  // 大写前缀
-            "u_01ARZ3NDEKTSV4RRFFQ69G5FAV", // 大写 ULID —— search_path 会把它折成小写，指向不存在的 schema
-            "u_01arz3ndektsv4rrffq69g5fa",  // 25 位，短一位
-            "u_01arz3ndektsv4rrffq69g5favx", // 27 位
-            "u_01arz3ndektsv4rrffq69g5fai", // 含 i，不在 ULID 字母表里
+            "U_01arz3ndektsv4rrffq69g5fav",  // uppercase prefix
+            "u_01ARZ3NDEKTSV4RRFFQ69G5FAV", // uppercase ULID -- search_path folds it to lowercase, pointing at a schema that does not exist
+            "u_01arz3ndektsv4rrffq69g5fa",  // 25 characters, one short
+            "u_01arz3ndektsv4rrffq69g5favx", // 27 characters
+            "u_01arz3ndektsv4rrffq69g5fai", // contains i, which is not in the ULID alphabet
             "u_",
             "",
             "pg_catalog",
@@ -351,42 +405,51 @@ mod tests {
         ] {
             assert!(
                 SchemaName::new(bad).is_err(),
-                "这个 schema 名必须被拒：{bad:?} —— 它会被拼进 search_path"
+                "this schema name must be rejected: {bad:?} -- it gets spliced into search_path"
             );
         }
 
-        assert!(SchemaName::new("public").is_ok(), "1 号用户就住在 public");
+        assert!(SchemaName::new("public").is_ok(), "user #1 lives in public");
         assert!(SchemaName::new("u_01arz3ndektsv4rrffq69g5fav").is_ok());
     }
 
-    /// 派生出来的名字必须能过自己的校验 —— 否则新用户建完就用不了。
+    /// A derived name must pass its own validation — otherwise a new user is
+    /// unusable the moment they are created.
     #[test]
     fn a_derived_name_passes_its_own_validation() {
-        // ULID 本身是大写的（`Id::new().to_string()` 就是），派生时必须转小写
-        let s = SchemaName::derive("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("合法 ULID");
+        // ULIDs are uppercase by nature (`Id::new().to_string()` is), so
+        // derivation must lowercase them
+        let s = SchemaName::derive("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("a valid ULID");
         assert_eq!(
             s.as_str(),
             "u_01arz3ndektsv4rrffq69g5fav",
-            "派生出大写名字的话，search_path 会指向一个不存在的 schema ——              而 Postgres 对此是静默跳过的，实测后果是写进了别人的库"
+            "deriving an uppercase name makes search_path point at a schema that does not exist -- \
+             and Postgres silently skips such an entry, with the observed consequence of writing \
+             into somebody else's database"
         );
         assert!(
             SchemaName::new(s.as_str()).is_ok(),
-            "自己派生的名字过不了自己的校验，说明两处规则漂开了"
+            "a name we derived ourselves failing our own validation means the two rules have \
+             drifted apart"
         );
 
-        // 畸形输入必须在这里就被挡住，而不是造出一个「验过」的假象
+        // Malformed input must be stopped right here rather than producing the
+        // illusion of something "validated"
         for bad in ["", "not-a-ulid", "01ARZ3NDEKTSV4RRFFQ69G5FA", "../etc"] {
             assert!(
                 SchemaName::derive(bad).is_err(),
-                "derive 放行了畸形 user_id：{bad:?} —— 这个类型的全部价值就是「持有它 == 已经验过」"
+                "derive let a malformed user_id through: {bad:?} -- the entire value of this type \
+                 is that holding one means it has already been validated"
             );
         }
     }
 
-    /// 锁键与通道名都必须**只由 schema 决定**，且不同用户不同。
+    /// Both the lock key and the channel name must be determined **by the
+    /// schema alone**, and must differ between users.
     ///
-    /// 前半句是跨进程要求：两个 cortexd 进程算出不同的键，那把锁就白上了，
-    /// 而症状是 `sync_log` 偶发漏行 —— 极难查。
+    /// The first half is a cross-process requirement: if two cortexd processes
+    /// compute different keys, the lock buys nothing, and the symptom is
+    /// `sync_log` occasionally dropping rows — extremely hard to track down.
     #[test]
     fn the_lock_key_and_channel_are_stable_and_per_tenant() {
         let a = SchemaName::new("u_01arz3ndektsv4rrffq69g5fav").unwrap();
@@ -395,19 +458,21 @@ mod tests {
         assert_eq!(
             a.lock_key(),
             a.lock_key(),
-            "同一个 schema 必须每次都算出同一个键"
+            "the same schema must compute the same key every time"
         );
         assert_ne!(
             a.lock_key(),
             b.lock_key(),
-            "不同用户拿到同一把锁只是互相排队（仍然正确），但这里应当分开"
+            "two users sharing one lock only makes them queue behind each other (still correct), \
+             but they should be separate here"
         );
-        // 钉死字面量：换一个哈希实现会让**已经在跑的两个进程**算出不同的键，
-        // 而那时锁就形同虚设。改它必须是有意识的
+        // Pin the literal: swapping in a different hash implementation would
+        // make **two processes already running** compute different keys, and at
+        // that point the lock is a formality. Changing it must be deliberate
         assert_eq!(
             a.lock_key(),
             304_439_192,
-            "锁键的算法变了，跨进程一致性会断"
+            "the lock key algorithm changed, which breaks cross-process consistency"
         );
 
         assert_eq!(

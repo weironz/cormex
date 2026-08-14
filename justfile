@@ -1,10 +1,10 @@
-# Cormex —— 记忆服务。
+# Cormex —— the memory service.
 #
-#   just up          起 Postgres + 对象存储
-#   just db-migrate  应用 migration
-#   just run         在宿主进程里跑 cortexd
-#   just serve       整套跑在容器里（含 cortexd）
-#   just ci          本地跑一遍 CI 的全部检查
+#   just up          bring up Postgres + object storage
+#   just db-migrate  apply the migrations
+#   just run         run cortexd in a host process
+#   just serve       run the whole stack in containers (cortexd included)
+#   just ci          run every check CI runs, locally
 
 set shell := ["bash", "-uc"]
 set dotenv-load := true
@@ -12,10 +12,11 @@ set dotenv-load := true
 default:
     @just --list
 
-# ── 依赖 ────────────────────────────────────────────────
+# ── Dependencies ────────────────────────────────────────
 
-# Postgres（带 pgvector）+ RustFS。**不含 cortexd** —— 开发时它在宿主
-# 进程里跑，改一行重启是秒级的。整套容器化见 `just serve`。
+# Postgres (with pgvector) + RustFS. **cortexd is not included** -- during development it
+# runs in a host process, where changing one line and restarting takes a second. For the
+# whole thing containerized see `just serve`.
 up:
     docker compose up -d postgres rustfs
     @echo "postgres :5432 · rustfs :9000"
@@ -23,24 +24,25 @@ up:
 down:
     docker compose down
 
-# 应用 migration。**租户那套与全局那套是两份**，版本表也各在各的 schema
-# 里 —— 混成一套会让新租户建号时撞上 `relation "users" already exists`，
-# 而失败点在建号中途。见 migrations-global/ 的文件头。
+# Apply the migrations. **The tenant set and the global set are two separate sets**, and
+# their version tables live in separate schemas -- merging them into one makes creating a
+# new tenant run into `relation "users" already exists`, with the failure landing halfway
+# through account creation. See the header of migrations-global/.
 db-migrate:
     sqlx migrate run --source migrations
     sqlx migrate run --source migrations-global
 
-# ── 跑起来 ──────────────────────────────────────────────
+# ── Running it ──────────────────────────────────────────
 
 run:
     cargo run -p cortexd
 
-# 整套（含 cortexd 容器）。第一次要编一遍。
+# The whole stack (including the cortexd container). The first run has to compile it.
 serve:
     docker compose up -d --build
     @echo "cortexd http://127.0.0.1:${CORTEXD_PORT:-8080}"
 
-# ── 检查 ────────────────────────────────────────────────
+# ── Checks ──────────────────────────────────────────────
 
 fmt:
     cargo fmt --all
@@ -54,8 +56,8 @@ lint:
 test:
     cargo test --workspace
 
-# 要数据库的那些集成测试。没有 Postgres 时它们会自己跳过，
-# 而「跳过」与「通过」在 CI 输出里长得一样 —— 所以单列一条。
+# The integration tests that need a database. They skip themselves when there is no
+# Postgres, and "skipped" looks exactly like "passed" in CI output -- hence its own recipe.
 test-db: up
     sleep 2 && just db-migrate && cargo test --workspace -- --include-ignored
 

@@ -1,39 +1,50 @@
-//! 把 ChatGPT / Claude 的导出文件灌进记忆库。
+//! Pour ChatGPT / Claude export files into the memory store.
 //!
-//! # 为什么这是一个独立 crate
+//! # Why this is its own crate
 //!
-//! 同一份解析器要在**三处**跑：`cortex-cli`（命令行）、`cortex-local`
-//! （桌面端选本机文件）、`cortexd`（Web 端把文件传上来）。
+//! The same parser has to run in **three places**: `cortex-cli` (the command
+//! line), `cortex-local` (the desktop app picking a local file), and `cortexd`
+//! (the Web client uploading a file).
 //!
-//! 不共用的话就是两三份实现，而它们漂开的症状很难看：同一个导出文件
-//! 在桌面端导进 812 段、在网页端导进 790 段，两边都不报错。
+//! Not sharing it means two or three implementations, and the symptom when they
+//! drift apart is ugly: the same export file imports 812 segments on the desktop
+//! and 790 on the web, with neither side reporting an error.
 //!
-//! 所以这里放的是**与「谁来发请求」无关**的全部东西：解析、配对、
-//! 派生 id、算账。真正发请求的那一步走 [`Sink`] —— 三处各自实现，
-//! 而限速、写入顺序、错误处理只有这一份。
+//! So what lives here is everything **independent of who sends the requests**:
+//! parsing, pairing, id derivation, and the accounting. The step that actually
+//! sends requests goes through [`Sink`] — implemented separately in all three
+//! places — while rate limiting, write ordering, and error handling exist in
+//! this one copy only.
 //!
-//! # 为什么它值得存在
+//! # Why it is worth having
 //!
-//! 这个产品的卖点全在记忆上，而一个空记忆库与普通聊天框没有区别 ——
-//! 新用户装完之后要攒好几周才看得出好处。而抽取管线的输入**正好就是对话**，
-//! 与两家导出的东西是同一个形状：导入大半是格式适配 + 复用已有管线。
+//! This product's entire pitch is memory, and an empty memory store is
+//! indistinguishable from an ordinary chat box — a new user has to accumulate
+//! for weeks after installing before the benefit shows. Meanwhile the
+//! extraction pipeline's input is **exactly conversations**, the same shape as
+//! what both vendors export: import is mostly format adaptation plus reuse of
+//! the existing pipeline.
 //!
-//! # 它不需要任何新的服务端端点
+//! # It needs no new server endpoint
 //!
-//! `POST /episodes` 的形状与这件事完全吻合：user 一条、assistant 一条并带
-//! `anchor_episode_id`，服务端就会把这一对送进抽取。而它**本来就是幂等的**
-//! （按 episode id 判重）—— 配上 [`cortex_core::Id::derived`] 算出的稳定 id，
-//! 断点续传是免费的，不需要任何进度文件。
+//! `POST /episodes` has exactly the right shape for this: one user entry, one
+//! assistant entry carrying `anchor_episode_id`, and the server sends that pair
+//! into extraction. And it is **idempotent to begin with** (deduplicating by
+//! episode id) — paired with the stable ids computed by
+//! [`cortex_core::Id::derived`], resuming is free and needs no progress file.
 //!
-//! # 三件必须先说清楚的事
+//! # Three things that must be stated up front
 //!
-//! 1. **要花钱。** 每一对消息触发一次抽取，也就是一次 LLM 调用。三年历史
-//!    可能是几千次。所以 `--dry-run` 是**默认**：先把数字摆出来再说。
-//! 2. **会压服务器。** 服务端已经有并发闸门（`CORTEX_EXTRACT_CONCURRENCY`），
-//!    但那不是背压 —— 灌得太快只会让队列长在服务端内存里。所以这一侧
-//!    自己限速。
-//! 3. **价值在抽取跑完之后才兑现。** 四路召回返回的是**事实**，
-//!    而 episodes 那一路默认是关的。只把原文灌进去，检索里什么都不会多出来。
+//! 1. **It costs money.** Every message pair triggers one extraction, i.e. one
+//!    LLM call. Three years of history may be thousands of them. So `--dry-run`
+//!    is the **default**: put the numbers on the table first.
+//! 2. **It puts load on the server.** The server already has a concurrency gate
+//!    (`CORTEX_EXTRACT_CONCURRENCY`), but that is not backpressure — pouring too
+//!    fast merely grows the queue in server memory. So this side rate-limits
+//!    itself.
+//! 3. **The value only lands once extraction has run.** The four retrieval paths
+//!    return **facts**, and the episodes path is off by default. Pouring in only
+//!    the raw text adds nothing to retrieval.
 
 pub mod chatgpt;
 pub mod claude;
@@ -45,10 +56,11 @@ use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use cortex_core::Id;
 
-/// 从哪个平台导出来的。
+/// Which platform this was exported from.
 ///
-/// 它进种子串（见 [`Conversation::session_id`]）：不带来源的话，
-/// 两个平台里恰好同号的对话会撞成同一个会话。
+/// It goes into the seed string (see [`Conversation::session_id`]): without a
+/// source, two conversations that happen to share a number across the two
+/// platforms would collide into the same session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     ChatGpt,
@@ -56,7 +68,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    /// 种子前缀，也是会话标题的前缀。
+    /// The seed prefix, and also the prefix of the session title.
     #[must_use]
     pub const fn tag(self) -> &'static str {
         match self {
@@ -65,7 +77,8 @@ impl Platform {
         }
     }
 
-    /// 显示名。会话标题里用它，所以是给人看的写法。
+    /// The display name. It appears in session titles, so it is spelled the way
+    /// a person reads it.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -75,14 +88,16 @@ impl Platform {
     }
 }
 
-/// 一条消息，已经归一化成两家共有的那部分。
+/// One message, already normalized down to the part both vendors share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
-    /// 导出文件里的原始 id。派生 episode id 的种子之一，**必须稳定**
+    /// The original id from the export file. One of the seeds for deriving the
+    /// episode id, so it **must be stable**
     pub source_id: String,
     pub role: Role,
     pub text: String,
-    /// 原始时刻。进 ULID 的时间段，所以顺序与新鲜度都靠它
+    /// The original moment. It becomes the ULID's time part, so both ordering
+    /// and freshness depend on it
     pub at: DateTime<Utc>,
 }
 
@@ -102,21 +117,22 @@ impl Role {
     }
 }
 
-/// 一段对话。
+/// One conversation.
 #[derive(Debug, Clone)]
 pub struct Conversation {
     pub source_id: String,
     pub title: String,
     pub at: DateTime<Utc>,
-    /// 已按时间排好，且**只含 user / assistant**
+    /// Already sorted by time, and **containing only user / assistant**
     pub messages: Vec<Message>,
 }
 
 impl Conversation {
-    /// 这段对话在 Cortex 里的会话 id。
+    /// This conversation's session id inside Cortex.
     ///
-    /// 派生而不是随机：重跑导入要落到**同一个**会话里，否则每跑一次
-    /// 就多出一份同名会话。
+    /// Derived rather than random: a re-run of the import has to land in **the
+    /// same** session, otherwise every run adds another session with the same
+    /// name.
     #[must_use]
     pub fn session_id(&self, platform: Platform) -> Id {
         Id::derived(
@@ -125,27 +141,32 @@ impl Conversation {
         )
     }
 
-    /// 会话标题。**来源写在最前面** —— 这是「这条记忆是导进来的」
-    /// 在界面上唯一的落点（我们刻意没有为此改 schema）。
+    /// The session title. **The source goes first** — this is the only place in
+    /// the UI where "this memory was imported" lands (we deliberately did not
+    /// change the schema for it).
     #[must_use]
     pub fn display_title(&self, platform: Platform) -> String {
         let t = self.title.trim();
         let base = if t.is_empty() { "未命名对话" } else { t };
         let full = format!("{} · {base}", platform.label());
-        // session_events 的 CHECK 限制标题 1..=200 字符
+        // The CHECK on session_events limits titles to 1..=200 characters
         full.chars().take(200).collect()
     }
 
-    /// 成对拆开：一条 user 配它后面**紧邻**的第一条 assistant。
+    /// Split into pairs: one user message with the first assistant message
+    /// **immediately** following it.
     ///
-    /// # 为什么要配对，而不是一条条灌
+    /// # Why pair at all rather than pour them in one at a time
     ///
-    /// 服务端的抽取以「一问一答」为单位（`用户：…\n助手：…`）。落单的 user
-    /// 消息没有 assistant 来触发抽取，落单的 assistant 也没有 anchor ——
-    /// 两者都会写进 episodes（原文不丢），但不产生任何事实。
+    /// Server-side extraction works in units of one question and one answer
+    /// (`用户：…\n助手：…`). A dangling user message has no assistant to trigger
+    /// extraction, and a dangling assistant has no anchor — both still get
+    /// written into episodes (the raw text is not lost), but neither produces
+    /// any facts.
     ///
-    /// 连续多条同角色的情况（用户连发三条）取**最后一条**作为那一问：
-    /// 前面几条通常是补充，而助手回答的是它们的合集。
+    /// When several messages of the same role run consecutively (the user fires
+    /// off three), the **last one** is taken as the question: the earlier ones
+    /// are usually elaboration, and the assistant is answering their union.
     #[must_use]
     pub fn pairs(&self) -> Vec<(&Message, &Message)> {
         let mut out = Vec::new();
@@ -164,7 +185,7 @@ impl Conversation {
     }
 }
 
-/// 一条消息在 Cortex 里的 episode id。
+/// A message's episode id inside Cortex.
 #[must_use]
 pub fn episode_id(platform: Platform, conversation: &str, m: &Message) -> Id {
     Id::derived(
@@ -173,10 +194,12 @@ pub fn episode_id(platform: Platform, conversation: &str, m: &Message) -> Id {
     )
 }
 
-/// 把一对消息变成两个 `POST /episodes` 请求体。
+/// Turn a message pair into two `POST /episodes` request bodies.
 ///
-/// user 那条 `retrieve: false`：导入不需要给历史对话注入记忆 ——
-/// 那既没有意义（回答早就写好了），又会给每一条都加一次检索的开销。
+/// The user one carries `retrieve: false`: import does not need memory injected
+/// into historical conversations — it would be meaningless (the answer was
+/// written long ago) and would add the cost of one retrieval to every single
+/// entry.
 #[must_use]
 pub fn requests_for(
     platform: Platform,
@@ -210,22 +233,25 @@ pub fn requests_for(
             occurred_at: Some(assistant.at.to_rfc3339()),
             attachments: Vec::new(),
             retrieve: false,
-            // 这一条是抽取的开关：服务端拿它把 (user, assistant) 配成一轮
+            // This field is the extraction switch: the server uses it to pair
+            // (user, assistant) into one turn
             anchor_episode_id: Some(user_id),
             tool_calls: Vec::new(),
         },
     ]
 }
 
-/// 解析一个导出文件。
+/// Parse an export file.
 ///
-/// `platform` 为 `None` 时按内容嗅探 —— 两家的顶层结构差别足够大
-/// （ChatGPT 有 `mapping`，Claude 有 `chat_messages`）。
+/// When `platform` is `None`, the platform is sniffed from the content — the
+/// two vendors' top-level structures differ enough (ChatGPT has `mapping`,
+/// Claude has `chat_messages`).
 ///
 /// # Errors
-/// 文件读不了、不是 JSON、或者**结构认不出来**。最后这一条会把实际见到的
-/// 键列出来：格式漂移是这个功能最可能的失败方式，而「解析出 0 条然后报成功」
-/// 会让人以为自己的历史是空的。
+/// The file cannot be read, is not JSON, or **its structure is unrecognized**.
+/// That last case lists the keys actually seen: format drift is this feature's
+/// most likely failure mode, and "parse 0 entries and report success" would
+/// leave someone believing their own history is empty.
 pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<Conversation>)> {
     let root: serde_json::Value =
         serde_json::from_slice(bytes).context("这个文件不是合法的 JSON")?;
@@ -251,7 +277,7 @@ pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<
     Ok((platform, conversations))
 }
 
-/// 按第一条记录的形状认平台。
+/// Identify the platform from the shape of the first record.
 fn sniff(first: &serde_json::Value) -> Result<Platform> {
     if first.get("mapping").is_some() {
         return Ok(Platform::ChatGpt);
@@ -267,7 +293,8 @@ fn sniff(first: &serde_json::Value) -> Result<Platform> {
     );
 }
 
-/// 列出一个 JSON 对象的键。**格式漂移时这是唯一有用的线索。**
+/// List a JSON object's keys. **When the format drifts, this is the only useful
+/// clue.**
 pub fn keys_of(v: &serde_json::Value) -> String {
     match v.as_object() {
         Some(m) if m.is_empty() => "（空对象）".into(),
@@ -287,7 +314,7 @@ fn type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Unix 秒（可能带小数）→ UTC 时刻。
+/// Unix seconds (possibly fractional) → a UTC moment.
 pub fn from_unix_secs(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     let secs = v.as_f64()?;
     if !secs.is_finite() {
@@ -319,7 +346,7 @@ mod tests {
         }
     }
 
-    /// 配对：一问一答，落单的不产生对。
+    /// Pairing: one question, one answer; dangling messages produce no pair.
     #[test]
     fn pairing_takes_one_question_and_its_answer() {
         let c = conv(vec![
@@ -334,10 +361,11 @@ mod tests {
         assert_eq!(pairs[0].1.text, "回答一");
     }
 
-    /// 连发多条时取**最后一条**作为那一问。
+    /// In a burst of messages, the **last one** is taken as the question.
     ///
-    /// 前面几条通常是补充说明，而助手回答的是它们的合集 ——
-    /// 取第一条会让「问题」与「回答」对不上。
+    /// The earlier ones are usually clarification, and the assistant is
+    /// answering their union — taking the first would leave "question" and
+    /// "answer" mismatched.
     #[test]
     fn a_burst_of_user_messages_pairs_on_the_last_one() {
         let c = conv(vec![
@@ -350,7 +378,8 @@ mod tests {
         assert_eq!(pairs[0].0.text, "补充一下，其实我想问的是 X");
     }
 
-    /// 落单的消息不产生对（但它们仍会被写进 episodes —— 原文不丢）。
+    /// Dangling messages produce no pair (but they are still written into
+    /// episodes — the raw text is not lost).
     #[test]
     fn dangling_messages_produce_no_pair() {
         assert!(
@@ -365,23 +394,26 @@ mod tests {
         );
     }
 
-    /// 会话 id 稳定，且**跨平台不撞**。
+    /// Session ids are stable and **do not collide across platforms**.
     #[test]
     fn session_ids_are_stable_and_platform_scoped() {
         let c = conv(vec![]);
         assert_eq!(
             c.session_id(Platform::ChatGpt),
             c.session_id(Platform::ChatGpt),
-            "重跑导入必须落回同一个会话，否则每跑一次多一份同名会话"
+            "a re-run of the import must land back in the same session, \
+             otherwise each run adds another session with the same name"
         );
         assert_ne!(
             c.session_id(Platform::ChatGpt),
             c.session_id(Platform::Claude),
-            "两家里同号的对话不能撞成一个会话"
+            "conversations sharing a number across the two vendors must not \
+             collide into one session"
         );
     }
 
-    /// 标题带来源前缀，空标题有回落，且不超过 schema 的 200 字符上限。
+    /// The title carries the source prefix, an empty title has a fallback, and
+    /// it stays within the schema's 200-character limit.
     #[test]
     fn titles_announce_where_they_came_from() {
         assert_eq!(
@@ -397,11 +429,13 @@ mod tests {
         long.title = "很".repeat(500);
         assert!(
             long.display_title(Platform::ChatGpt).chars().count() <= 200,
-            "超过 session_events 的 CHECK 上限会让改标题整个失败"
+            "exceeding the CHECK limit on session_events makes the whole title \
+             update fail"
         );
     }
 
-    /// 请求体：user 不检索，assistant 带 anchor（否则不触发抽取）。
+    /// The request bodies: user does not retrieve, assistant carries the anchor
+    /// (without which extraction is not triggered).
     #[test]
     fn the_assistant_request_carries_the_anchor_that_triggers_extraction() {
         let c = conv(vec![
@@ -411,27 +445,39 @@ mod tests {
         let (u, a) = c.pairs()[0];
         let [user_req, asst_req] = requests_for(Platform::ChatGpt, &c, u, a);
 
-        assert!(!user_req.retrieve, "导入不需要给历史对话注入记忆");
+        assert!(
+            !user_req.retrieve,
+            "import does not need memory injected into historical conversations"
+        );
         assert_eq!(
             asst_req.anchor_episode_id.as_deref(),
             Some(user_req.id.as_str()),
-            "anchor 是抽取的开关 —— 少了它这一对只会落原文，一条事实都不出"
+            "the anchor is the extraction switch — without it the pair only \
+             lands as raw text and not a single fact comes out"
         );
         assert_eq!(user_req.session_id, asst_req.session_id);
     }
 
-    /// 认不出的结构必须**响亮失败**，并带上实际见到的键。
+    /// An unrecognized structure must **fail loudly**, carrying the keys it
+    /// actually saw.
     ///
-    /// 「解析出 0 条然后报成功」是这里最坏的失败方式：用户会以为
-    /// 自己三年的历史就是空的。
+    /// "Parse 0 entries and report success" is the worst failure mode here: the
+    /// user would conclude that three years of their history is simply empty.
     #[test]
     fn an_unrecognised_shape_fails_loudly_with_the_keys_it_saw() {
-        let err = parse(br#"[{"foo": 1, "bar": 2}]"#, None).expect_err("认不出就该报错");
+        let err = parse(br#"[{"foo": 1, "bar": 2}]"#, None)
+            .expect_err("an unrecognized shape should be an error");
         let msg = err.to_string();
-        assert!(msg.contains("foo") && msg.contains("bar"), "实际：{msg}");
+        assert!(msg.contains("foo") && msg.contains("bar"), "got: {msg}");
 
-        assert!(parse(b"{}", None).is_err(), "顶层不是数组要报错");
-        assert!(parse(b"[]", None).is_err(), "空文件要报错，而不是静默成功");
+        assert!(
+            parse(b"{}", None).is_err(),
+            "a non-array at the top level must be an error"
+        );
+        assert!(
+            parse(b"[]", None).is_err(),
+            "an empty file must be an error rather than a silent success"
+        );
         assert!(parse(b"not json", None).is_err());
     }
 }

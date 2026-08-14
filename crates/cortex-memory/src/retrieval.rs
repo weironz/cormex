@@ -1,31 +1,40 @@
-//! 检索器 —— 把四路召回、RRF 融合、预算截断串成一条。
+//! The retriever — stringing four-channel recall, RRF fusion, and budget
+//! truncation into one path.
 //!
-//! 分工：
-//! - `cortex-store::recall_*` 负责各路的**捞取**，不做排序策略
-//! - [`fusion`](crate::fusion) 负责**融合**
-//! - [`injection`](crate::injection) 负责**出库格式**
-//! - 本模块只负责把它们编排起来，并决定各路的召回宽度
+//! Division of labour:
+//! - `cortex-store::recall_*` handles the **fetching** for each channel and
+//!   makes no ranking-policy decisions
+//! - [`fusion`](crate::fusion) handles **fusion**
+//! - [`injection`](crate::injection) handles **the egress format**
+//! - this module only orchestrates them, and decides each channel's recall width
 //!
-//! # 哪几路，以及为什么
+//! # Which channels, and why
 //!
-//! 每一路都有明确的盲区，且盲区互不重叠 —— 这是多路的全部理由。
-//! 「独占题数」（只有这一路捞到 gold 的题数）是唯一能证伪它的数字。
+//! Each channel has a well-defined blind spot, and the blind spots do not
+//! overlap — that is the entire justification for having several. The "exclusive
+//! question count" (how many questions only this channel found the gold for) is
+//! the one number that can falsify it.
 //!
-//! | 路 | 强 | 盲 | 默认 |
+//! | Channel | Strong at | Blind to | Default |
 //! |---|---|---|---|
-//! | BM25 | 专有名词、精确措辞 | 换个说法就召不回 | 开 |
-//! | 向量 | 语义相近 | 极短的专名查询 | 开 |
-//! | 图遍历 | 关系推理（「他负责的那个项目用什么」） | 与查询词面无关时不触发 | 开 |
-//! | episodes | 出处追问（用户复述的是**原话**） | 兄弟事实成块挤占前排 | **关**，见 [`Retriever::episode_channel`] |
-//! | 近因 | —— | 与查询完全无关 | **关**，见 [`RecencyMode`] |
+//! | BM25 | Proper nouns, exact wording | Say it differently and nothing comes back | on |
+//! | Vector | Semantic proximity | Very short proper-noun queries | on |
+//! | Graph | Relational reasoning ("what does the project he owns use") | Doesn't fire when the query's surface words are unrelated | on |
+//! | episodes | Provenance follow-ups (the user is quoting **the original words**) | Sibling facts take the top slots as a block | **off**, see [`Retriever::episode_channel`] |
+//! | Recency | — | Completely unrelated to the query | **off**, see [`RecencyMode`] |
 //!
-//! 后两条不是被砍掉的（实现与开关都在），是**默认不启用**：评测里它们
-//! 各自都让排序变差，唯一变好的指标（误召）经查是稀释而非判别。
+//! The last two were not cut (both the implementation and the switch are still
+//! here); they are **not enabled by default**: in the evals each of them made
+//! ranking worse, and the one metric that improved (false recall) turned out on
+//! inspection to be dilution rather than discrimination.
 //!
-//! 融合之后还有两道与「哪几路」无关的闸门，两道都不可省：
+//! After fusion there are two more gates that have nothing to do with "which
+//! channels", and neither can be skipped:
 //!
-//! - [`fusion::apply_peak_bonus`] —— 修 RRF「弱共识压过强命中」的代价
-//! - [`BGE_M3_SEMANTIC_FLOOR`] —— 修 RRF 分不含绝对相关性的代价
+//! - [`fusion::apply_peak_bonus`] — fixes RRF's "weak consensus outranks a strong
+//!   hit" cost
+//! - [`BGE_M3_SEMANTIC_FLOOR`] — fixes the cost of RRF scores carrying no
+//!   absolute relevance
 
 use chrono::{DateTime, Utc};
 use cortex_core::{CortexError, Result};
@@ -36,73 +45,91 @@ use crate::fusion::{self, Channel, Fused};
 use crate::injection::{Budget, MemoryItem};
 use crate::tokenize;
 
-/// 弃权阈值的定值。含义与取值依据见 [`Retriever::abstain_below`]。
+/// The fixed value of the abstention threshold. For what it means and how the
+/// value was chosen, see [`Retriever::abstain_below`].
 ///
-/// 公开出来只为一个用途：报告与回归门要能记下「这次跑的是哪个阈值」。
+/// It is public for exactly one purpose: reports and the regression gate need to
+/// be able to record which threshold a given run used.
 pub const DEFAULT_ABSTAIN_BELOW: f64 = 0.030;
 
-/// 语义地板：全库最近的一条事实的**余弦距离**超过它就整体弃权。
+/// The semantic floor: if the **cosine distance** of the nearest fact in the
+/// whole database exceeds it, abstain entirely.
 ///
-/// # 这个数字只在 bge-m3 的向量空间里成立
+/// # This number holds only inside bge-m3's vector space
 ///
-/// 它是评测扫出来的（`evals/sweep.py floor:0.40,0.45,0.50,0.55,0.60`）：
+/// It was swept out by the evals (`evals/sweep.py
+/// floor:0.40,0.45,0.50,0.55,0.60`):
 ///
-/// | 地板 | R@5 | MRR | 误召@5 | 「应召不到」注入条数 |
+/// | Floor | R@5 | MRR | False recall@5 | Injected count on "should find nothing" |
 /// |---|---|---|---|---|
-/// | 不设 | 0.943 | 0.833 | 0.393 | 32.9 |
+/// | none | 0.943 | 0.833 | 0.393 | 32.9 |
 /// | 0.55 | 0.923 | 0.817 | 0.393 | 32.9 |
 /// | **0.50** | **0.923** | **0.812** | **0.286** | **22.4** |
 /// | 0.45 | 0.851 | 0.766 | 0.143 | 6.4 |
 /// | 0.40 | 0.675 | 0.617 | 0.107 | 3.5 |
 ///
-/// 0.55 白白付掉了 0.50 的召回代价却一点噪声都没换到，严格劣于 0.50；
-/// 0.45 起步就是丢七道题换四道，比例倒挂。0.50 用 0.020 的 R@5
-/// （两道题）换掉了 0.107 的误召（三道题）—— 按本模块自己的取舍
-/// （「宁可不给记忆，也不要给错记忆」）这笔买卖成立。
+/// 0.55 pays 0.50's full recall cost and buys back not one bit of noise
+/// reduction, so it is strictly worse than 0.50; 0.45 starts out losing seven
+/// questions to gain four, an inverted ratio. 0.50 trades 0.020 of R@5 (two
+/// questions) for 0.107 of false recall (three questions) — under this module's
+/// own preference ("better to give no memory than to give the wrong memory")
+/// that trade holds up.
 ///
-/// 代价是具体的、已知的两道题：`赵敏是谁`、`jieba-rs`。
-/// 都是**极短的专名查询** —— 两三个字的 query 向量本来就发散，
-/// 最近邻距离必然偏大，哪怕 BM25 精准命中。它们的结果是**弃权**
-/// （一条都不给）而不是给错，正是设计上偏好的那种失败。
+/// The cost is two specific, known questions: `赵敏是谁` and `jieba-rs`. Both are
+/// **very short proper-noun queries** — the query vector for two or three
+/// characters is inherently diffuse, so its nearest-neighbour distance is bound to
+/// run large even when BM25 hits it exactly. Their outcome is **abstention**
+/// (nothing returned at all) rather than a wrong answer, which is precisely the
+/// failure mode this design prefers.
 ///
-/// **换 embedding 模型必须重扫这条曲线。** 距离由模型定标，
-/// 换个空间这个数字什么也不是 —— 所以 [`Retriever::new`] 只在
-/// 真实语义后端下才装上它。
+/// **Changing the embedding model requires re-sweeping this curve.** Distance is
+/// calibrated by the model, and in a different space this number means nothing —
+/// which is why [`Retriever::new`] only installs it for a genuinely semantic
+/// backend.
 pub const BGE_M3_SEMANTIC_FLOOR: f64 = 0.50;
 
-/// 该不该给这个向量空间装语义地板。
+/// Whether a semantic floor should be installed for this vector space.
 ///
-/// 这是一张**白名单**，方向是刻意的。两种错法的代价不对称：
+/// This is an **allowlist**, and that direction is deliberate. The costs of the
+/// two ways of being wrong are not symmetric:
 ///
-/// - 该装不装 → 噪声多进来一些，看得见、可调
-/// - 不该装却装了 → 召回**静默清零**，检索照常返回、只是永远返回空
+/// - Should have installed one but didn't → a bit more noise gets in; visible and
+///   tunable
+/// - Installed one that shouldn't be there → recall is **silently zeroed**;
+///   retrieval returns as usual, it just always returns empty
 ///
-/// 散列桩（`hash-stub-v1`）正是后者：它的「距离」只反映字符 bigram
-/// 的重合度，与相关性无关，套上 0.50 会让离线开发与无网 CI 全线归零。
+/// The hash stub (`hash-stub-v1`) is exactly the latter case: its "distance"
+/// reflects only character-bigram overlap and has nothing to do with relevance, so
+/// putting 0.50 on it would zero out offline development and network-free CI
+/// across the board.
 ///
-/// # `api:` 前缀的注意事项
+/// # A note on the `api:` prefix
 ///
-/// 走远端 `/v1/embeddings` 的后端写进库的是 `api:<模型名>`。它是真实语义
-/// 空间，所以装地板；**但 0.50 这个数是在 bge-m3-int8 上扫出来的**，
-/// 换成别的模型（text-embedding-v3、jina-v3……）时它什么也不是 ——
-/// 距离由模型定标。换模型要重扫 `evals/` 里那条曲线，
-/// 或者用 [`Retriever::with_semantic_floor`] 显式给一个。
+/// Backends going through a remote `/v1/embeddings` write `api:<model name>` into
+/// the database. That is a genuine semantic space, so a floor is installed;
+/// **but the number 0.50 was swept on bge-m3-int8**, and against a different
+/// model (text-embedding-v3, jina-v3, …) it means nothing — distance is calibrated
+/// by the model. Changing models means re-sweeping that curve in `evals/`, or
+/// passing an explicit value via [`Retriever::with_semantic_floor`].
 fn default_semantic_floor(model_id: &str) -> Option<f64> {
     let semantic = model_id.starts_with("fastembed:") || model_id.starts_with("api:");
     semantic.then_some(BGE_M3_SEMANTIC_FLOOR)
 }
 
-/// 图遍历取多少个种子实体。
+/// How many seed entities graph traversal starts from.
 ///
-/// 公开出来是因为评测的逐路诊断要复刻同一份编排 —— 原来它是私有硬编码，
-/// 评测侧只能抄一个 12 过去，改了这边那边不会跟着变，逐路数字就悄悄失真。
+/// It is public because the evals' per-channel diagnostics have to reproduce this
+/// same orchestration — it used to be a private hard-coded constant, so the eval
+/// side could only copy a 12 across, and changing it here would not change it
+/// there, quietly distorting the per-channel numbers.
 pub const GRAPH_SEED_LIMIT: i64 = 12;
 
-/// 把一串已按时间倒序的事实包装成融合结果。
+/// Wrap a list of facts already ordered newest-first into fusion results.
 ///
-/// 分数用 `1/(i+1)` 而非 RRF 的 `1/(k+i+1)`：这条路径上没有第二路可融合，
-/// 用陡峭的核可以让「弃权阈值」在全貌回放上仍有区分度 ——
-/// 否则整份快照的分都挤在 0.0164 附近，要么全进要么全不进。
+/// The score is `1/(i+1)` rather than RRF's `1/(k+i+1)`: there is no second
+/// channel to fuse with on this path, and a steeper kernel keeps the abstention
+/// threshold discriminating on a full-snapshot replay — otherwise every score in
+/// the snapshot bunches up around 0.0164 and it becomes all-in or all-out.
 fn chronological(facts: Vec<Fact>) -> Vec<Fused<Fact>> {
     facts
         .into_iter()
@@ -115,32 +142,41 @@ fn chronological(facts: Vec<Fact>) -> Vec<Fused<Fact>> {
         .collect()
 }
 
-/// 图遍历这一路里，被 `relates_to` 边连上的实体。
+/// The entities connected by a `relates_to` edge within the graph channel.
 ///
-/// # 豁免范围：为什么是「边的两个端点」而不是「整条通道」
+/// # Scope of the exemption: why "the edge's two endpoints" and not "the whole
+/// channel"
 ///
-/// [`crate::crosslink`] 架的桥要能真的起作用，域惩罚就得放它一马
-/// （roadmap 原话：「融合时该通道需豁免域惩罚」）。但「豁免整条图遍历通道」
-/// 太宽：图遍历本来就会带出一堆与桥无关的跨域事实（比如「张伟」这种
-/// 天然横跨两域的实体），把它们一并免罚等于借着这个改动顺手削掉了
-/// 域加权的一半作用域，而且没有任何评测依据。
+/// For the bridges [`crate::crosslink`] builds to actually do anything, the domain
+/// penalty has to let them past (the roadmap's words: "that channel needs an
+/// exemption from the domain penalty during fusion"). But "exempt the entire graph
+/// channel" is far too broad: graph traversal naturally drags in a pile of
+/// cross-domain facts that have nothing to do with any bridge (entities like
+/// "张伟" that inherently straddle two domains), and sparing all of them would
+/// amount to using this change to quietly cut away half of domain weighting's
+/// scope, with no eval evidence for it whatsoever.
 ///
-/// 这里取的是最窄的那个能自洽的范围：**只有当这次召回里确实出现了一条
-/// `relates_to` 边时，才豁免它连着的那两个实体所锚定的事实。** 桥没被走到
-/// （查询压根没命中桥的任何一端）时，这个集合是空的，行为与改动前逐位相同。
+/// What is taken here is the narrowest self-consistent scope: **only when a
+/// `relates_to` edge actually appeared in this recall are the facts anchored to
+/// its two connected entities exempted.** When the bridge was never walked (the
+/// query didn't hit either of its ends at all) this set is empty, and behaviour is
+/// bit-for-bit what it was before the change.
 ///
-/// 两个端点一起豁免而不是只豁免「远端」，是因为「哪端是远端」取决于当前
-/// 领域，而近端本来就在当前领域、免罚对它是恒等操作
-/// （见 `fusion::exemption_is_not_a_double_boost`）。不用算远端，也就不用
-/// 把种子实体一路传下来。
+/// Both endpoints are exempted rather than only the "far" one because which end
+/// counts as far depends on the current domain, and the near end is already in the
+/// current domain, where sparing the penalty is the identity operation (see
+/// `fusion::exemption_is_not_a_double_boost`). Not having to work out the far end
+/// means not having to thread the seed entities all the way down here.
 ///
-/// # 已知的粗糙处
+/// # A known imprecision
 ///
-/// 端点实体的**全部**事实都被免罚，不只是「因为这座桥才被带出来的那些」。
-/// 精确做法要重放一遍遍历路径，而 `recall_graph` 返回的是截断过的结果集，
-/// 重放出来的可达性本身就是错的。所以这里选了一个会略微过宽、但爆炸半径
-/// 不超过图遍历自身的近似 —— 度数上限（`crosslink::DEFAULT_DEGREE_CAP`）
-/// 才是真正把这个半径钉住的东西。
+/// **All** of an endpoint entity's facts are spared, not just the ones that got
+/// pulled in because of this bridge. Doing it exactly would require replaying the
+/// traversal path, and `recall_graph` returns a truncated result set, so the
+/// reachability such a replay reconstructs would itself be wrong. So this takes an
+/// approximation that is slightly too broad but whose blast radius never exceeds
+/// graph traversal's own — the degree cap (`crosslink::DEFAULT_DEGREE_CAP`) is
+/// what actually pins that radius down.
 fn bridged_entities(channels: &[(Channel, Vec<Fact>)]) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for (channel, facts) in channels {
@@ -160,24 +196,31 @@ fn bridged_entities(channels: &[(Channel, Vec<Fact>)]) -> std::collections::Hash
     out
 }
 
-/// 把当前空间与旧空间的向量召回合成**同一条** [`Channel::Vector`]。
+/// Merge the vector recalls from the current space and the old space into **one**
+/// [`Channel::Vector`].
 ///
-/// # 为什么按名次交替，而不是当前空间全排前面
+/// # Why interleave by rank instead of putting the whole current space first
 ///
-/// 回填期间旧空间里的事实**更多**（存量全在那边），当前空间只有新写的那些。
-/// 让当前空间整体排前面，等于给刚写的几条事实每人一个前排名次，
-/// 而把全部历史记忆压到 41 名之后 —— RRF 的核是 `1/(k+rank)`，
-/// 那基本等于没召回。
+/// During a backfill there are **more** facts in the old space (the entire
+/// existing corpus is over there) and only the newly written ones in the current
+/// space. Putting the current space wholesale in front hands each of those few
+/// new facts a front-row rank while pushing every historical memory past position
+/// 41 — and since RRF's kernel is `1/(k+rank)`, that is essentially the same as
+/// not recalling them at all.
 ///
-/// 交替取（新1、旧1、新2、旧2……）让两个空间在名次上平权。
-/// 这不是「更准」，是**在两边距离不可比的前提下唯一不引入偏置的合法做法**。
+/// Interleaving (new 1, old 1, new 2, old 2, …) puts the two spaces on equal
+/// footing by rank. This isn't "more accurate"; it is **the only legitimate way
+/// to avoid introducing a bias given that the two sides' distances are not
+/// comparable**.
 ///
-/// # 为什么不按距离归并
+/// # Why not merge by distance
 ///
-/// 两个模型的余弦距离不在同一个尺度上。看起来能比（都是 0~2 的实数），
-/// 排出来的序却没有意义 —— 而且它不会报错，只会让检索质量莫名其妙地差。
+/// The cosine distances of two models are not on the same scale. They look
+/// comparable (both are reals in 0..2), but the resulting order is meaningless —
+/// and it raises no error, it just makes retrieval quality inexplicably bad.
 ///
-/// 没挂 legacy 时 `legacy` 是空的，函数退化成「原样返回当前空间」。
+/// When no legacy model is attached `legacy` is empty and the function degenerates
+/// into "return the current space unchanged".
 fn merge_vector_spaces(current: Vec<(Fact, f64)>, legacy: Vec<(Fact, f64)>) -> Vec<Fact> {
     if legacy.is_empty() {
         return current.into_iter().map(|(f, _)| f).collect();
@@ -191,8 +234,9 @@ fn merge_vector_spaces(current: Vec<(Fact, f64)>, legacy: Vec<(Fact, f64)>) -> V
         for it in [&mut a as &mut dyn Iterator<Item = (Fact, f64)>, &mut b] {
             if let Some((f, _)) = it.next() {
                 progressed = true;
-                // 同一条事实两边都命中时只留先出现的那个 —— 也就是
-                // 名次更靠前的那个空间给它的位置
+                // When the same fact is hit on both sides, keep only the first
+                // occurrence — that is, the position given to it by whichever
+                // space ranked it higher
                 if seen.insert(f.id.clone()) {
                     out.push(f);
                 }
@@ -215,23 +259,25 @@ fn is_bridged(f: &Fact, bridged: &std::collections::HashSet<String>) -> bool {
             .is_some_and(|id| bridged.contains(id))
 }
 
-/// 各路的召回宽度。
+/// The recall width of each channel.
 ///
-/// 比最终注入条数大一个量级 —— RRF 要有融合空间才有意义，
-/// 每路只给 5 条的话「跨路共识」根本无从体现。
+/// An order of magnitude larger than the final injected count — RRF only means
+/// anything if it has room to fuse, and with five entries per channel
+/// "cross-channel consensus" has no way to show itself at all.
 #[derive(Debug, Clone, Copy)]
 pub struct RecallWidth {
     pub bm25: i64,
     pub vector: i64,
     pub graph: i64,
     pub recent: i64,
-    /// episodes 那一路取多少条事实
+    /// How many facts the episodes channel takes
     pub episode: i64,
-    /// episodes 那一路先取多少条原文（再由它们展开成事实）
+    /// How many raw documents the episodes channel takes first (they are then
+    /// expanded into facts)
     pub episode_docs: i64,
-    /// 近因那一路回看多少天
+    /// How many days back the recency channel looks
     pub recent_days: i64,
-    /// 图遍历的跳数
+    /// The hop count for graph traversal
     pub graph_hops: i32,
 }
 
@@ -242,8 +288,10 @@ impl Default for RecallWidth {
             vector: 40,
             graph: 30,
             recent: 20,
-            // 比其它路窄一截：一条 episode 常能展开出三五条事实，
-            // 给到 40 会让这一路的尾部全是「同一段对话里顺带提到的别的事」
+            // A notch narrower than the other channels: one episode routinely
+            // expands into three to five facts, so a width of 40 would fill this
+            // channel's tail entirely with "other things mentioned in passing
+            // during the same conversation"
             episode: 20,
             episode_docs: 8,
             recent_days: 7,
@@ -252,53 +300,64 @@ impl Default for RecallWidth {
     }
 }
 
-/// 「时间近因」这件事该以什么形态存在。
+/// What form "recency" should take, if any.
 ///
-/// # 定案：`Off`
+/// # Decision: `Off`
 ///
-/// roadmap 把它列为待定项（「保留为独立召回路」还是「改为对融合分乘
-/// recency decay」）。评测给出的答案是**两个都不选**：
+/// The roadmap listed this as undecided ("keep it as a separate recall channel"
+/// versus "change it to a recency decay multiplied into the fused score"). The
+/// answer the evals gave is **neither**:
 ///
-/// | 形态 | R@1 | R@5 | R@10 | MRR | gold 均名次 | 平均注入 | 误召@5 |
+/// | Form | R@1 | R@5 | R@10 | MRR | Mean gold rank | Mean injected | False recall@5 |
 /// |---|---|---|---|---|---|---|---|
 /// | `Channel` | 0.570 | 0.928 | 0.959 | 0.745 | 3.05 | 38.3 | 0.250 |
 /// | **`Off`** | **0.673** | 0.923 | **0.969** | **0.812** | **2.78** | **29.5** | 0.286 |
 /// | `Decay` 0.3/3d | 0.673 | 0.923 | 0.969 | 0.812 | 2.78 | 40.1 | 0.286 |
 ///
-/// **`Channel` 出局**：独占题数 **0**，自己的 R@5 只有 0.094，
-/// 却把 R@1 压低 0.103、MRR 压低 0.067，还让注入条数涨了 30%。
-/// 它唯一「赢」的那一列（误召 0.250 < 0.286）是假的 —— 它同时把
-/// 「应召不到」题的注入量从 22.4 抬到 28.2，也就是**用更多无关记忆
-/// 把那条已知的干扰项挤出了 top-5**。forbidden 只是错误答案的一个抽样，
-/// 拿没被抽到的错误答案换掉被抽到的，指标好看而已。
+/// **`Channel` is out**: its exclusive question count is **0**, its own R@5 is
+/// only 0.094, and yet it drags R@1 down by 0.103 and MRR by 0.067 while pushing
+/// the injected count up 30%. The one column it "wins" (false recall 0.250 <
+/// 0.286) is fake — it simultaneously raises the injected count on "should find
+/// nothing" questions from 22.4 to 28.2, which means **it used more irrelevant
+/// memories to push the known distractor out of the top 5**. The forbidden set is
+/// only a sample of the wrong answers, so swapping a sampled wrong answer for an
+/// unsampled one just makes the metric look better.
 ///
-/// 更根本的问题是它的对象不对：`recall_recent` 返回的是**最近入库**的
-/// 事实，而不是「刚才在聊的」。抽取是异步的，两者在时间上并不重合。
-/// 「刚才说的那个」本来就由对话 history 直接承载，不需要检索；
-/// 真要从记忆里倒查原话，那是 [`Channel::Episode`] 那一路的活。
+/// The more fundamental problem is that it is aimed at the wrong thing:
+/// `recall_recent` returns the facts **most recently persisted**, not "what we
+/// were just talking about". Extraction is asynchronous, so those two do not
+/// coincide in time. "That thing we just said" is already carried directly by the
+/// conversation history and needs no retrieval at all; and genuinely tracing the
+/// original wording back out of memory is [`Channel::Episode`]'s job.
 ///
-/// **`Decay` 无法证伪也无法证实**：本题集的全部事实是在一次 ingest 里
-/// 几秒内写完的，`created_at` 没有任何跨度，衰减系数对每条都一样 ——
-/// 表里 `Decay` 与 `Off` 的排序指标逐位相同，差别只有注入条数（乘数把
-/// 所有分一起抬过了弃权阈值）。要判它，题集得先有「跨越数周的语料」
-/// 这一维，那是题集的下一步工作，不是现在能拍板的事。
-/// 实现保留在这里，默认不启用。
+/// **`Decay` can be neither falsified nor confirmed**: every fact in this dataset
+/// was written within seconds during a single ingest, so `created_at` has no
+/// spread at all and the decay coefficient is identical for every entry — the
+/// ranking metrics for `Decay` and `Off` in the table match digit for digit, and
+/// the only difference is the injected count (the multiplier lifts every score
+/// past the abstention threshold together). Judging it requires the dataset to
+/// grow a "corpus spanning weeks" dimension first, which is the dataset's next
+/// piece of work and not something that can be settled now. The implementation
+/// stays here, disabled by default.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecencyMode {
-    /// 作为独立一路进 RRF（历史行为，已被数据否掉）
+    /// As its own channel feeding into RRF (the historical behaviour, since ruled
+    /// out by the data)
     Channel,
-    /// 不占召回路，只对融合分乘一个新鲜度系数（未定案，默认不用）
+    /// Occupies no recall channel; merely multiplies a freshness coefficient into
+    /// the fused score (undecided, off by default)
     Decay { strength: f64, half_life_days: f64 },
-    /// 完全不要 —— **当前定案**
+    /// Not at all — **the current decision**
     Off,
 }
 
-/// 一次检索的完整结果，含可归因的逐路命中。
+/// The complete result of one retrieval, with attributable per-channel hits.
 #[derive(Debug)]
 pub struct Retrieved {
-    /// 已按融合分降序、已按预算截断
+    /// Already sorted descending by fused score and already truncated to budget
     pub items: Vec<MemoryItem>,
-    /// 与 `items` 等长的归因信息 —— bad case 时这是唯一能定位问题的东西
+    /// Attribution information, the same length as `items` — on a bad case this
+    /// is the only thing that can locate the problem
     pub attribution: Vec<Attribution>,
 }
 
@@ -306,98 +365,125 @@ pub struct Retrieved {
 pub struct Attribution {
     pub fact_id: String,
     pub score: f64,
-    /// 命中它的召回路
+    /// The recall channels that hit it
     pub channels: Vec<&'static str>,
 }
 
-/// 克隆是廉价的：`E` 是 `SharedEmbedder`（`Arc`），其余全是标量。
-/// 多租户接线要按请求换库，那一步会连带克隆检索器。
+/// Cloning is cheap: `E` is a `SharedEmbedder` (an `Arc`) and everything else is
+/// a scalar. Multi-tenant wiring swaps the database per request, and that step
+/// clones the retriever along with it.
 #[derive(Clone)]
 pub struct Retriever<E: Embedder> {
     embedder: E,
     width: RecallWidth,
     budget: Budget,
-    /// 当前对话领域的加权系数。1.0 即不加权。
+    /// The weighting coefficient for the current conversation's domain. 1.0 means
+    /// no weighting.
     domain_boost: f64,
-    /// 融合分低于此值的条目不进注入。
+    /// Entries scoring below this after fusion are not injected.
     ///
-    /// # 它管的是「注入多少条」，**不是**「相不相关」
+    /// # It governs "how many to inject", **not** "is this relevant"
     ///
-    /// 这一点一开始搞错了，值得写清楚。RRF 分是**排名**的函数，不含任何
-    /// 绝对相关性：库里根本没有答案时，各路照样各自返回自己最好的几条、
-    /// 照样互相印证、融合分照样很高。评测把阈值从 0 一路扫到 0.030，
-    /// 误召率**逐位不动**地停在 0.286；一直扫到 0.055 才开始降，
-    /// 而那时 R@5 已经从 0.923 掉到 0.840。
+    /// This was misunderstood at first, and is worth spelling out. An RRF score is
+    /// a function of **rank** and carries no absolute relevance whatsoever: when
+    /// the answer simply isn't in the database, every channel still returns its
+    /// own best few, they still corroborate each other, and the fused score is
+    /// still high. Sweeping the threshold from 0 all the way to 0.030 left the
+    /// false-recall rate sitting at 0.286, **unmoved to the last digit**; it only
+    /// starts falling at 0.055, by which point R@5 has already dropped from 0.923
+    /// to 0.840.
     ///
-    /// 换句话说：**任何能压住误召的阈值都已经把召回打死了。**
-    /// 「该不该注入」那道判断由 [`Self::semantic_floor`] 用余弦距离做，
-    /// 那才是带绝对量纲的信号。
+    /// In other words: **any threshold that can hold false recall down has already
+    /// killed recall.** The "should we inject at all" judgement is made by
+    /// [`Self::semantic_floor`] using cosine distance, which is the signal that
+    /// actually carries an absolute scale.
     ///
-    /// 它真正的价值是砍注入量，而注入量本身就是成本与攻击面：无关记忆
-    /// 进了 prompt，既是幻觉的素材，也是记忆投毒的载体 —— 攻击者只要
-    /// 让一条恶意事实入库，它就会在**所有**对话里被注入。
+    /// Its real value is cutting the injected volume, and that volume is itself
+    /// cost and attack surface: an irrelevant memory that reaches the prompt is
+    /// both raw material for hallucination and a vehicle for memory poisoning —
+    /// an attacker only has to get one malicious fact persisted and it will be
+    /// injected into **every** conversation.
     ///
-    /// | 阈值 | R@5 | R@10 | MRR | 误召@5 | 平均注入 |
+    /// | Threshold | R@5 | R@10 | MRR | False recall@5 | Mean injected |
     /// |---|---|---|---|---|---|
-    /// | 0（关） | 0.923 | 0.969 | 0.817 | 0.286 | 45.2 |
-    /// | 0.017（旧值） | 0.923 | 0.969 | 0.817 | 0.286 | 29.5 |
+    /// | 0 (off) | 0.923 | 0.969 | 0.817 | 0.286 | 45.2 |
+    /// | 0.017 (old value) | 0.923 | 0.969 | 0.817 | 0.286 | 29.5 |
     /// | **0.030** | **0.923** | **0.969** | **0.817** | 0.286 | **12.9** |
     /// | 0.040 | 0.923 | 0.938 | 0.809 | 0.250 | 6.0 |
     /// | 0.055 | 0.840 | 0.845 | 0.769 | 0.179 | 2.3 |
     ///
-    /// 取值依据见 [`Retriever::new`]。
+    /// For how the value was chosen, see [`Retriever::new`].
     abstain_below: f64,
-    /// 时间近因的形态。见 [`RecencyMode`]。
+    /// What form recency takes. See [`RecencyMode`].
     recency: RecencyMode,
-    /// 是否启用 episodes 那一路（L0 原文倒查）。
+    /// Whether the episodes channel (tracing back through L0 raw text) is
+    /// enabled.
     ///
-    /// # 定案：默认关，但实现与题目都留着
+    /// # Decision: off by default, but both the implementation and the eval
+    /// questions stay
     ///
-    /// 动机是真的：前四路全部只看 `facts.statement`，也就是抽取器改写过的
-    /// 一句话，「上次我们说的那个」这类**出处追问**里用户复述的是原话，
-    /// 而原话的措辞常常一个字都没进 statement。`episodes.tsv` 的 GIN 索引
-    /// 建了却从来没人用。为此专门补了六道出处追问题（q106–q111）。
+    /// The motivation is real: all four other channels look only at
+    /// `facts.statement`, i.e. the single sentence the extractor rewrote, whereas
+    /// in a **provenance follow-up** like "that thing we talked about last time"
+    /// the user is quoting the original words — and the original phrasing often
+    /// doesn't have a single character in the statement. The GIN index on
+    /// `episodes.tsv` was built and then never used by anyone. Six provenance
+    /// follow-up questions (q106–q111) were added specifically for this.
     ///
-    /// 但数据不支持把它设成默认。111 题、`episodes × 强命中补偿` 的 2×2：
+    /// But the data does not support making it the default. Across 111 questions,
+    /// the 2×2 of `episodes × peak bonus`:
     ///
-    /// | | R@5 | R@10 | MRR | 均名次 | 误召@5 | 平均注入 |
+    /// | | R@5 | R@10 | MRR | Mean rank | False recall@5 | Mean injected |
     /// |---|---|---|---|---|---|---|
-    /// | 都不开 | 0.887 | 0.931 | 0.786 | 2.92 | 0.286 | 22.9 |
-    /// | 只开 episodes | 0.887 | 0.911 | 0.778 | 3.27 | 0.214 | 27.5 |
-    /// | **只开补偿** | **0.923** | **0.969** | **0.812** | **2.78** | 0.286 | 29.5 |
-    /// | 两个都开 | 0.912 | 0.948 | 0.804 | 2.93 | 0.214 | 33.6 |
+    /// | Neither on | 0.887 | 0.931 | 0.786 | 2.92 | 0.286 | 22.9 |
+    /// | episodes only | 0.887 | 0.911 | 0.778 | 3.27 | 0.214 | 27.5 |
+    /// | **peak bonus only** | **0.923** | **0.969** | **0.812** | **2.78** | 0.286 | 29.5 |
+    /// | Both on | 0.912 | 0.948 | 0.804 | 2.93 | 0.214 | 33.6 |
     ///
-    /// 开它在两种补偿设置下都让排序变差（R@10 −0.020，均名次 +0.35），
-    /// 唯一变好的是误召 —— 而那是**稀释**不是**判别**：同一组里
-    /// 「应召不到」题的注入条数从 22.4 涨到 26.9，是多塞进来的无关事实
-    /// 把题集恰好标注了的那条干扰项挤出了 top-5。forbidden 只是错误答案的
-    /// 一个抽样，用没被抽到的错误答案换掉被抽到的，指标好看而已。
-    /// （同一把尺子也否掉了近因那一路，见 [`RecencyMode`]。）
+    /// Turning it on makes ranking worse under both bonus settings (R@10 −0.020,
+    /// mean rank +0.35), and the only thing that improves is false recall — which
+    /// is **dilution**, not **discrimination**: within the same pairing, the
+    /// injected count on "should find nothing" questions goes from 22.4 to 26.9,
+    /// so it is the extra irrelevant facts crowding the one distractor the dataset
+    /// happens to have labelled out of the top 5. The forbidden set is only a
+    /// sample of the wrong answers, and swapping an unsampled wrong answer for a
+    /// sampled one just makes the metric look better. (The same ruler also ruled
+    /// out the recency channel; see [`RecencyMode`].)
     ///
-    /// 结构性原因：这一路按 **episode 的 `ts_rank`** 排序，于是命中那一段
-    /// 对话里抽出来的**全部**事实会成块地占住前几名 —— gold 的兄弟事实
-    /// 把 gold 自己挤下去。要翻案得先解决这个，而不是调宽度。
+    /// The structural cause: this channel sorts by **the episode's `ts_rank`**, so
+    /// **every** fact extracted from the matching stretch of conversation occupies
+    /// the top slots as a block — the gold's sibling facts push the gold itself
+    /// down. Overturning this decision means solving that first, not widening the
+    /// channel.
     ///
-    /// 补的六道题里 q106/q107/q108 确实因它上升、无一下降，但它们在
-    /// 69 条语料下**不开也答得对**（R@5 已经是 1.0）—— 语料太小，
-    /// BM25 在几十条里瞎撞也撞得上。这一路的真实价值要到语料上千条、
-    /// 原话与 statement 真正分叉之后才测得出来。
+    /// Of the six added questions, q106/q107/q108 did rise because of it and none
+    /// fell — but with a 69-entry corpus they **answer correctly with it off too**
+    /// (R@5 is already 1.0). The corpus is simply too small; BM25 blundering
+    /// around a few dozen entries hits the target anyway. This channel's real
+    /// value can only be measured once the corpus is in the thousands and the
+    /// original wording genuinely diverges from the statement.
     episode_channel: bool,
-    /// 单路强命中的补偿权重，见 [`fusion::apply_peak_bonus`]。0 = 关。
+    /// The compensation weight for a lone strong hit; see
+    /// [`fusion::apply_peak_bonus`]. 0 = off.
     peak_bonus: f64,
-    /// 语义地板：全库最近的一条事实的余弦距离超过它，就整体弃权。
+    /// The semantic floor: if the cosine distance of the nearest fact in the whole
+    /// database exceeds it, abstain entirely.
     ///
-    /// 与 [`Self::abstain_below`] 是两种不同的闸门，缺一不可：
-    /// 前者管**注入多少条**，后者管**该不该注入**。RRF 分是排名的函数，
-    /// 库里没有答案时它照样很高；余弦距离才是模型定标的绝对量。
-    /// `None` = 不设地板。
+    /// This and [`Self::abstain_below`] are two different gates and neither can be
+    /// dropped: the latter governs **how many to inject**, this one governs
+    /// **whether to inject at all**. An RRF score is a function of rank and stays
+    /// high even when the answer isn't in the database; cosine distance is the
+    /// absolute quantity the model calibrates. `None` = no floor.
     semantic_floor: Option<f64>,
-    /// 被 `relates_to` 边带出来的那一侧，要不要免掉域惩罚。
-    /// 见 [`bridged_entities`]。留成开关是为了能 A/B。
+    /// Whether the side pulled in by a `relates_to` edge is spared the domain
+    /// penalty. See [`bridged_entities`]. It is kept as a switch so it can be
+    /// A/B tested.
     bridge_exemption: bool,
-    /// **上一个** embedding 模型。设了就在回填期间也从旧空间捞一遍。
+    /// The **previous** embedding model. When set, the old space is queried too
+    /// during a backfill.
     ///
-    /// 见 [`Self::with_legacy`]。默认 `None` —— 绝大多数部署从没换过模型。
+    /// See [`Self::with_legacy`]. `None` by default — the overwhelming majority of
+    /// deployments have never changed models.
     legacy: Option<crate::embed::SharedEmbedder>,
 }
 
@@ -409,47 +495,64 @@ impl<E: Embedder> Retriever<E> {
             width: RecallWidth::default(),
             budget: Budget::default(),
             domain_boost: 1.3,
-            // 0.030 = 曲线上**最后一个五项主指标与「完全不设阈值」逐位相同**
-            // 的点（R@1 / R@5 / R@10 / MRR / 误召@5 全都一样），而注入条数
-            // 从 45.2 砍到 12.9。再往上（0.040）才开始拿 R@10 与 MRR 换。
+            // 0.030 = the **last point on the curve at which all five headline
+            // metrics still match "no threshold at all" digit for digit** (R@1 /
+            // R@5 / R@10 / MRR / false recall@5 are all identical), while the
+            // injected count drops from 45.2 to 12.9. Only above that (0.040) does
+            // it start trading away R@10 and MRR.
             //
-            // 前一版取 0.017，理由是「略高于单路第一名的 1/61≈0.0164，
-            // 即只被一路捞到就不要」。那个推理本身没错，但它把阈值锚在了
-            // 一个**与真命中的分数无关**的量上：真命中普遍在 0.03 以上，
-            // 所以 0.017 白白多放进了一倍的噪声。锚点应该是「真命中的分布」，
-            // 只有扫一遍才知道它在哪 —— 这正是先有尺子再调参的意思。
+            // The previous version used 0.017, on the reasoning that it is "just
+            // above a single channel's first place at 1/61≈0.0164, i.e. discard
+            // anything only one channel found". That reasoning is not wrong in
+            // itself, but it anchors the threshold to a quantity that has
+            // **nothing to do with the scores of true hits**: true hits sit
+            // broadly above 0.03, so 0.017 was letting in twice as much noise for
+            // nothing. The anchor should be "the distribution of true hits", and
+            // the only way to know where that is is to sweep — which is exactly
+            // what "build the ruler before tuning the parameters" means.
             //
-            // 注意它与 `peak_bonus` 有交互（补偿项给真命中普遍抬了 0.02），
-            // 动其中任何一个都要重扫这条曲线。
+            // Note that it interacts with `peak_bonus` (the compensation term
+            // lifts true hits by roughly 0.02 across the board), so moving either
+            // one means re-sweeping this curve.
             abstain_below: DEFAULT_ABSTAIN_BELOW,
-            // 定案见 `RecencyMode` 的文档：独占 0 题、自己 R@5 只有 0.101，
-            // 却压低 R@1 与 MRR 并让注入涨 27%。砍掉。
+            // For the decision see the docs on `RecencyMode`: 0 exclusive
+            // questions, an own R@5 of only 0.101, and yet it drags R@1 and MRR
+            // down and pushes injection up 27%. Cut.
             recency: RecencyMode::Off,
-            // 定案见 `Retriever::retrieve` 上方关于 episodes 一路的长注释：
-            // 实现留着、题目补了，但实测排序上是中性偏负，默认不开。
+            // For the decision see the long comment on the episodes channel above
+            // `Retriever::retrieve`: the implementation stays and the questions
+            // were added, but measured ranking is neutral-to-negative, so it is
+            // off by default.
             episode_channel: false,
-            // 见 `fusion::apply_peak_bonus`。取 0.04 的依据是量纲而非曲线极值：
-            // 补偿项对一个「某路排第一」的结果值 0.04/2 = 0.02，
-            // 约等于 1.2 个 RRF 单位（0.0164）——也就是「白送它一路共识」。
-            // 够把单路强命中从被三路弱共识淹没里捞出来，又不足以盖过真共识。
+            // See `fusion::apply_peak_bonus`. The basis for 0.04 is scale, not the
+            // curve's maximum: for a result ranked first in some channel the
+            // compensation term is worth 0.04/2 = 0.02, roughly 1.2 RRF units
+            // (0.0164) — that is, "hand it one channel's worth of consensus for
+            // free". Enough to rescue a lone strong hit from being drowned by weak
+            // three-channel consensus, and not enough to override real consensus.
             //
-            // 实测（111 题，其余按生产默认）：开它 R@5 0.887→0.923、
-            // R@10 0.931→0.969、MRR 0.786→0.812、gold 均名次 2.92→2.78，
-            // 误召@5 纹丝不动 —— 这一项是纯赚的。
+            // Measured (111 questions, everything else at production defaults):
+            // turning it on moves R@5 0.887→0.923, R@10 0.931→0.969, MRR
+            // 0.786→0.812, and mean gold rank 2.92→2.78, with false recall@5
+            // completely unmoved — this one is pure gain.
             //
-            // 曲线上更大的权重分数还能更高（w=0.12 时 R@5 0.948），但那时
-            // 补偿项已经超过各路 RRF 的总和，排序实际上退化成「取各路最好名次」，
-            // RRF 的共识语义名存实亡，注入条数也从 33 涨到 41。
-            // 曲线极值不等于对的默认值。
+            // Larger weights score higher still on the curve (R@5 is 0.948 at
+            // w=0.12), but by then the compensation term exceeds the sum of the
+            // channels' RRF contributions, the ranking has effectively degenerated
+            // into "take the best rank across channels", RRF's consensus semantics
+            // exist in name only, and the injected count has gone from 33 to 41.
+            // The maximum of a curve is not the same thing as the right default.
             peak_bonus: 0.04,
-            // roadmap 原话：「融合时该通道需豁免域惩罚」。豁免范围与它
-            // 为什么不是「整条图遍历通道」，见 `bridged_entities`
+            // The roadmap's words: "that channel needs an exemption from the domain
+            // penalty during fusion". For the scope of the exemption, and why it
+            // isn't "the whole graph channel", see `bridged_entities`
             bridge_exemption: true,
             legacy: None,
         }
     }
 
-    /// 关掉跨域桥的域惩罚豁免。评测 A/B 用。
+    /// Turn off the domain-penalty exemption for cross-domain bridges. For eval
+    /// A/B testing.
     #[must_use]
     pub fn with_bridge_exemption(mut self, on: bool) -> Self {
         self.bridge_exemption = on;
@@ -468,78 +571,88 @@ impl<E: Embedder> Retriever<E> {
         self
     }
 
-    /// 调整弃权阈值。设为 0 即关闭弃权（评测 A/B 用）。
+    /// Adjust the abstention threshold. Setting it to 0 disables abstention (for
+    /// eval A/B testing).
     #[must_use]
     pub fn with_abstain_below(mut self, threshold: f64) -> Self {
         self.abstain_below = threshold;
         self
     }
 
-    /// 换一种时间近因的形态。评测 A/B 用。
+    /// Switch to a different form of recency. For eval A/B testing.
     #[must_use]
     pub fn with_recency(mut self, mode: RecencyMode) -> Self {
         self.recency = mode;
         self
     }
 
-    /// 开关 episodes 那一路。评测 A/B 用。
+    /// Toggle the episodes channel. For eval A/B testing.
     #[must_use]
     pub fn with_episode_channel(mut self, on: bool) -> Self {
         self.episode_channel = on;
         self
     }
 
-    /// 单路强命中补偿的权重。评测 A/B 用。
+    /// The weight of the lone-strong-hit compensation. For eval A/B testing.
     #[must_use]
     pub fn with_peak_bonus(mut self, weight: f64) -> Self {
         self.peak_bonus = weight;
         self
     }
 
-    /// 挂上**上一个** embedding 模型，回填期间也从旧空间捞一遍。
+    /// Attach the **previous** embedding model so the old space is queried too
+    /// during a backfill.
     ///
-    /// # 为什么需要它
+    /// # Why it is needed
     ///
-    /// 换模型之后旧事实的向量只在旧空间里，而向量查询按 `embedding_model`
-    /// 过滤，于是它们**在回填补到它们之前**一直进不了向量召回。库大到
-    /// 回填要跑几天时，那是几天的部分失忆。
+    /// After a model change, the vectors of old facts exist only in the old space,
+    /// and vector queries filter on `embedding_model` — so those facts cannot
+    /// enter vector recall at all **until the backfill reaches them**. On a
+    /// database large enough that the backfill takes days, that is days of partial
+    /// amnesia.
     ///
-    /// 挂上之后查询会被**同时编到两个空间**，各捞一次，按 id 去重后
-    /// 合成同一条 [`Channel::Vector`]。
+    /// With it attached, the query is **encoded into both spaces**, each is
+    /// queried once, and the results are deduplicated by id and merged into a
+    /// single [`Channel::Vector`].
     ///
-    /// # 为什么不新开一条 channel
+    /// # Why not add a new channel
     ///
-    /// RRF 的输入结构一变，`scripts/evals-baseline.*.json` 里的每个数字就
-    /// 不可比了 —— 而那份基线是判断「这次改动有没有让检索变差」的**唯一**
-    /// 依据。一个只在回填期间存在的临时状态，不值得让基线作废。
+    /// The moment RRF's input structure changes, every number in
+    /// `scripts/evals-baseline.*.json` becomes incomparable — and that baseline is
+    /// the **only** basis for judging whether a change made retrieval worse. A
+    /// temporary state that exists solely during a backfill is not worth
+    /// invalidating the baseline for.
     ///
-    /// # ⚠️ 它救不了 fastembed → api 那一次迁移
+    /// # ⚠️ It cannot rescue the fastembed → api migration
     ///
-    /// 旧模型是进程内的 fastembed，而它默认已经不编进二进制。见
-    /// [`crate::embed_api::ApiEmbedder::legacy_from_env`]。
+    /// There the old model is in-process fastembed, which is no longer compiled
+    /// into the binary by default. See
+    /// [`crate::embed_api::ApiEmbedder::legacy_from_env`].
     #[must_use]
     pub fn with_legacy(mut self, legacy: Option<crate::embed::SharedEmbedder>) -> Self {
         self.legacy = legacy;
         self
     }
 
-    /// 语义地板（余弦距离上限）。`None` 关闭。
+    /// The semantic floor (an upper bound on cosine distance). `None` disables it.
     #[must_use]
     pub fn with_semantic_floor(mut self, max_distance: Option<f64>) -> Self {
         self.semantic_floor = max_distance;
         self
     }
 
-    /// 当前生效的语义地板。默认值取决于 embedding 后端，
-    /// 所以调用方问不出来就没法把它写进日志或评测报告。
+    /// The semantic floor currently in effect. The default depends on the
+    /// embedding backend, so without a way for callers to ask, there is no way for
+    /// them to record it in a log or an eval report.
     #[must_use]
     pub fn semantic_floor(&self) -> Option<f64> {
         self.semantic_floor
     }
 
-    /// 四路召回 + RRF + 域加权 + 预算截断。
+    /// Four-channel recall + RRF + domain weighting + budget truncation.
     ///
-    /// `context_window` 用于算注入预算；`domain` 是当前对话领域。
+    /// `context_window` is used to compute the injection budget; `domain` is the
+    /// current conversation's domain.
     pub async fn retrieve(
         &self,
         store: &Store,
@@ -549,8 +662,10 @@ impl<E: Embedder> Retriever<E> {
     ) -> Result<Retrieved> {
         let (channels, nearest) = self.recall_all(store, query).await?;
 
-        // 语义地板：全库最近的一条都够不着，说明这个问题的答案根本不在记忆里。
-        // 必须在融合**之前**判，因为融合分只反映跨路共识，不反映相关性。
+        // The semantic floor: if even the nearest fact in the whole database is out
+        // of reach, the answer to this question simply isn't in memory. This has to
+        // be judged **before** fusion, because a fused score reflects only
+        // cross-channel consensus, never relevance.
         if let (Some(floor), Some(d)) = (self.semantic_floor, nearest)
             && d > floor
         {
@@ -560,9 +675,11 @@ impl<E: Embedder> Retriever<E> {
             });
         }
 
-        // 域惩罚的豁免名单必须在融合**之前**从图遍历那一路算出来：
-        // 融合会把逐路的原始列表揉成一张扁平表，`Fused::hits` 只留了通道名，
-        // 走到那一步就已经分不清「哪条是被桥带出来的」了
+        // The domain-penalty exemption list has to be computed from the graph
+        // channel **before** fusion: fusion kneads the per-channel raw lists into
+        // one flat table, and `Fused::hits` keeps only the channel names, so by
+        // that point there is no longer any way to tell which entry was pulled in
+        // by a bridge
         let bridged = if self.bridge_exemption {
             bridged_entities(&channels)
         } else {
@@ -582,16 +699,21 @@ impl<E: Embedder> Retriever<E> {
         Ok(self.finish(fused, context_window))
     }
 
-    /// 按**系统时间**回放，取「当时的全貌」：按 `created_at` 降序的快照。
+    /// Replay by **system time** to get "the whole picture as it stood": a snapshot
+    /// ordered descending by `created_at`.
     ///
-    /// 只在**没有可用查询词**时才该走这条（例如「把当时的状态导出来」这类
-    /// 全量导出）。带问题的回放一律走 [`Retriever::retrieve_as_of_ranked`] ——
-    /// 详见那里关于「全貌不等于可用」的评测数字。
+    /// This path should only be taken when there are **no usable query terms**
+    /// (for example a bulk export along the lines of "dump the state as of then").
+    /// Any replay that comes with a question goes through
+    /// [`Retriever::retrieve_as_of_ranked`] — see the eval numbers there on why
+    /// "the whole picture" is not the same as "usable".
     ///
-    /// **待办（不在本次改动的边界内）**：`cortexd::live::AppState::retrieve`
-    /// 目前对所有带 `as_of` 的请求都走这条，而它那里 `q.q`（用户的问题）
-    /// 就在手边。把那一处换成 `retrieve_as_of_ranked(&self.store, &q.q, …)`
-    /// 就能把时间回放题的 R@5 从 0.417 抬到 0.833。
+    /// **TODO (outside the boundary of this change)**:
+    /// `cortexd::live::AppState::retrieve` currently routes every request carrying
+    /// an `as_of` through this method, even though `q.q` (the user's question) is
+    /// right there in hand. Changing that one call site to
+    /// `retrieve_as_of_ranked(&self.store, &q.q, …)` would lift R@5 on the time
+    /// replay questions from 0.417 to 0.833.
     pub async fn retrieve_as_of(
         &self,
         store: &Store,
@@ -607,36 +729,47 @@ impl<E: Embedder> Retriever<E> {
         Ok(self.finish(chronological(facts), context_window))
     }
 
-    /// 回放 + 检索：在 `as_of` 那一刻的快照**之上**做相关性排序。
+    /// Replay + retrieval: relevance ranking **on top of** the snapshot as it stood
+    /// at `as_of`.
     ///
-    /// # 为什么原来那版不行
+    /// # Why the original version didn't work
     ///
-    /// 最初的实现只有 [`Retriever::retrieve_as_of`]，理由写的是「回放要的是
-    /// 当时的全貌而非与查询最相关的，混入相关性排序会让回放结果取决于问法」。
-    /// 这个理由在语料只有几十条时看不出问题，评测把它证伪了：
+    /// The first implementation had only [`Retriever::retrieve_as_of`], on the
+    /// stated reasoning that "a replay wants the whole picture as it stood, not
+    /// what is most relevant to the query; mixing in relevance ranking would make
+    /// the replay result depend on how the question was phrased". That reasoning
+    /// shows no problems with a corpus of a few dozen entries, and the evals
+    /// falsified it:
     ///
-    /// - 时间回放题 R@5 只有 **0.417**，而 gold 的平均名次是 **23.4**
-    /// - 也就是说 gold **全都在快照里**，只是排在几十名开外
-    /// - 预算截断一上，连 R@∞ 都掉到 0.806 —— gold 被整个截没了
+    /// - R@5 on the time replay questions was only **0.417**, while the gold's mean
+    ///   rank was **23.4**
+    /// - That is, the gold was **in the snapshot every time**, just sitting dozens
+    ///   of positions down
+    /// - Add budget truncation and even R@∞ fell to 0.806 — the gold was being
+    ///   truncated away entirely
     ///
-    /// 「问三个月前的对象存储方案，拿回最近 40 条**无关**事实」，
-    /// 这不是全貌，是噪声。十万条记忆时它只会更糟。
+    /// "Ask about the object storage plan from three months ago, get back the 40
+    /// most recent **unrelated** facts" is not the whole picture, it is noise. At a
+    /// hundred thousand memories it only gets worse.
     ///
-    /// # 现在的做法
+    /// # What it does now
     ///
-    /// 三路都**限定在同一份 as-of 快照上**，再 RRF：
+    /// Three channels, all **confined to the same as-of snapshot**, then RRF:
     ///
-    /// | 路 | 作用 |
+    /// | Channel | Role |
     /// |---|---|
-    /// | BM25（快照内） | 「MinIO」「5442」这种精确措辞 |
-    /// | 向量（快照内） | 「那会儿的存储方案」这种换说法 |
-    /// | 时间倒序（快照内） | 兜底 —— 前两路都哑火时退化回全貌 |
+    /// | BM25 (within the snapshot) | Exact wording like "MinIO" or "5442" |
+    /// | Vector (within the snapshot) | Rephrasings like "the storage plan from back then" |
+    /// | Reverse chronological (within the snapshot) | The fallback — degenerates to the whole picture when the first two come up empty |
     ///
-    /// 关键在于**快照是共同的前提而不是排序依据**：三路查的都是
-    /// 「`created_at <= as_of` 且当时未被 invalidate」的那一批，
-    /// 所以「当时以为什么」这个语义一点没丢，丢掉的只是「按时间倒序」
-    /// 这个跟问题无关的排序。第三路留着，`把当时所有结论过一遍`
-    /// 这种没有检索信号的问法才不会退化成空手而归。
+    /// The key point is that **the snapshot is a shared precondition, not a ranking
+    /// criterion**: all three channels query the same set of facts with
+    /// `created_at <= as_of` and not invalidated as of then, so the "what was
+    /// believed at the time" semantics are entirely preserved. What is discarded is
+    /// only "sorted reverse chronologically", an ordering unrelated to the question.
+    /// The third channel stays so that a phrasing with no retrieval signal at all,
+    /// like "walk me through every conclusion from back then", doesn't degenerate
+    /// into coming back empty-handed.
     pub async fn retrieve_as_of_ranked(
         &self,
         store: &Store,
@@ -664,14 +797,16 @@ impl<E: Embedder> Retriever<E> {
 
         let mut fused = fusion::rrf(&channels, |f: &Fact| f.id.clone());
         fusion::apply_peak_bonus(&mut fused, self.peak_bonus);
-        // 这里**不**叠 recency decay：快照内的「新」是相对 `as_of` 而不是
-        // 相对 now，用 now 去算 age 会把整个快照一视同仁地压平
+        // Recency decay is **not** stacked on here: within a snapshot, "new" is
+        // relative to `as_of` rather than to now, and computing age against now
+        // would flatten the entire snapshot uniformly
         Ok(self.finish(fused, context_window))
     }
 
-    // ─────────────────────── 内部 ───────────────────────
+    // ─────────────────────── Internals ───────────────────────
 
-    /// 各路的原始召回，外加**全库最近的余弦距离**（供语义地板判定）。
+    /// The raw recall from each channel, plus **the nearest cosine distance in the
+    /// whole database** (for the semantic floor decision).
     async fn recall_all(
         &self,
         store: &Store,
@@ -681,7 +816,8 @@ impl<E: Embedder> Retriever<E> {
         let qvec = self.embedder.embed_one(query).await?;
         let embedding = cortex_store::Vector::from(qvec);
 
-        // 图遍历的种子：从查询里切出的词去匹配实体名
+        // Seeds for graph traversal: the tokens cut out of the query are matched
+        // against entity names
         let terms: Vec<String> = tokenize::to_tsvector_input(query)
             .split_whitespace()
             .map(str::to_string)
@@ -692,21 +828,26 @@ impl<E: Embedder> Retriever<E> {
             .await
             .map_err(|e| CortexError::Store(e.to_string()))?;
 
-        // 各路并发 —— 它们互不依赖，串行跑纯属浪费。
-        // 关掉的路仍然发查询会白白多一次往返，所以宽度直接置 0 是不行的
-        // （存储层会 clamp 到 1），必须整条跳过。
+        // The channels run concurrently — they don't depend on each other, and
+        // running them serially is pure waste. A disabled channel that still issues
+        // its query costs a round trip for nothing, and simply setting its width to
+        // 0 does not work (the storage layer clamps it to 1), so the whole channel
+        // has to be skipped.
         let want_recent = self.recency == RecencyMode::Channel;
-        // 旧空间那一路也放进这个 join：它要先跑一次 embedding（一次 HTTP），
-        // 串在前面等于给每次检索白加一个往返。没挂 legacy 时是一个立刻
-        // 返回空的 future，代价为零
+        // The old-space channel goes into this join too: it has to run an embedding
+        // first (one HTTP call), and putting it in front in series would add a round
+        // trip to every retrieval for nothing. When no legacy model is attached it
+        // is a future that returns empty immediately, at zero cost
         let legacy_vector = async {
             let Some(legacy) = &self.legacy else {
                 return Vec::new();
             };
             let Ok(qvec) = legacy.embed_one(query).await else {
-                // 旧模型那侧连不上**不该让整次检索失败** —— 它是回填期间的
-                // 补充，主路径已经返回了当前空间的结果。降级成「只查新空间」，
-                // 也就是没挂 legacy 时的行为
+                // The old model being unreachable **must not fail the whole
+                // retrieval** — it is a supplement that exists during the
+                // backfill, and the main path has already returned the current
+                // space's results. Degrade to "query the new space only", which is
+                // exactly the behaviour when no legacy model is attached
                 tracing::warn!("旧模型 embedding 失败，本次只查当前空间");
                 return Vec::new();
             };
@@ -746,12 +887,16 @@ impl<E: Embedder> Retriever<E> {
 
         let to_err = |e: cortex_store::StoreError| CortexError::Store(e.to_string());
         let scored = vector.map_err(to_err)?;
-        // 已按距离升序，第一条就是全库最近的。
+        // Already sorted ascending by distance, so the first entry is the nearest in
+        // the whole database.
         //
-        // **只取当前空间的**：语义地板 0.50 是在 bge-m3 上标定的，
-        // 旧空间的距离由旧模型定标，两者不可比。拿旧空间的距离去撞这个阈值
-        // 得到的是一个没有含义的判断 —— 而它的表现是「弃权与否变得随机」，
-        // 没有任何报错。当前空间为空时 nearest 是 None，也就是不做弃权判断
+        // **Taken from the current space only**: the semantic floor of 0.50 is
+        // calibrated on bge-m3, whereas the old space's distances are calibrated by
+        // the old model, and the two are not comparable. Running an old-space
+        // distance against this threshold yields a judgement with no meaning — and
+        // the way that manifests is "whether we abstain becomes random", with no
+        // error raised anywhere. When the current space is empty, nearest is None,
+        // which means no abstention decision is made at all
         let nearest = scored.first().map(|(_, d)| *d);
         let vector = merge_vector_spaces(scored, legacy_vector);
 
@@ -767,7 +912,7 @@ impl<E: Embedder> Retriever<E> {
         ))
     }
 
-    /// RRF 之后、域加权之前的调整。
+    /// Adjustments made after RRF and before domain weighting.
     fn post_fuse(&self, fused: &mut [Fused<Fact>]) {
         fusion::apply_peak_bonus(fused, self.peak_bonus);
         if let RecencyMode::Decay {
@@ -781,13 +926,15 @@ impl<E: Embedder> Retriever<E> {
         }
     }
 
-    /// 融合结果 → 注入条目 + 归因，按预算截断。
+    /// Fusion results → injection items + attribution, truncated to budget.
     fn finish(&self, fused: Vec<Fused<Fact>>, context_window: usize) -> Retrieved {
         let max_tokens = self.budget.tokens_for(context_window);
 
-        // 弃权：没有任何一条够格就一条都不给。
-        // 注意是**整体弃权**而非逐条过滤 —— 逐条过滤会让「勉强够格的一条」
-        // 单独进注入块，而单独一条弱相关记忆比零条更容易误导模型。
+        // Abstention: if not a single entry qualifies, give back none at all.
+        // Note this is **abstaining wholesale** rather than filtering entry by
+        // entry — filtering entry by entry would let a single barely-qualifying
+        // entry into the injection block on its own, and one weakly related memory
+        // by itself misleads the model more easily than zero do.
         let fused: Vec<Fused<Fact>> = if fused
             .first()
             .is_none_or(|top| top.score < self.abstain_below)
@@ -818,9 +965,11 @@ impl<E: Embedder> Retriever<E> {
                 known_since: f.item.created_at.to_rfc3339(),
                 source_episode_id: Some(f.item.source_episode_id),
                 domain: f.item.domain,
-                // 下面四个**不进注入块**，是给客户端记忆抽屉的（见 MemoryItem 文档）。
-                // 它们此前在这里被丢掉，于是抽屉上每条记忆都显示「100%」——
-                // 那个数字是 cortexd 写死的常量，不是这条事实的打分
+                // The four below **do not enter the injection block**; they are for
+                // the client's memory drawer (see the MemoryItem docs). They used
+                // to be dropped right here, which is why every memory in the drawer
+                // displayed "100%" — that number was a constant hard-coded in
+                // cortexd, not this fact's score
                 predicate: Some(f.item.predicate),
                 confidence: Some(f.item.confidence),
                 source_channel: Some(f.item.source_channel.as_str().to_string()),
@@ -829,7 +978,8 @@ impl<E: Embedder> Retriever<E> {
             .collect();
 
         let kept = crate::injection::fit_to_budget(items, max_tokens);
-        // 归因表要与截断后的条目对齐，否则 UI 上分数会错位
+        // The attribution table has to line up with the truncated items, otherwise
+        // the scores shown in the UI are offset against the wrong rows
         let attribution = attribution.into_iter().take(kept.len()).collect();
 
         Retrieved {
@@ -846,18 +996,29 @@ mod tests {
     #[test]
     fn recall_width_leaves_room_for_fusion() {
         let w = RecallWidth::default();
-        // 每路的宽度必须显著大于最终注入条数，否则 RRF 没有融合空间：
-        // 各路只给三五条时，「跨路共识」这个核心信号根本无从体现
-        assert!(w.bm25 >= 20 && w.vector >= 20, "召回过窄会让 RRF 退化");
-        assert!(w.graph_hops <= 3, "跳数过大会让图遍历吃掉整个延迟预算");
+        // Each channel's width must be substantially larger than the final injected
+        // count, otherwise RRF has no room to fuse: with three to five entries per
+        // channel, the core signal of cross-channel consensus has no way to show
+        // itself
+        assert!(
+            w.bm25 >= 20 && w.vector >= 20,
+            "recall that is too narrow degenerates RRF"
+        );
+        assert!(
+            w.graph_hops <= 3,
+            "too many hops lets graph traversal eat the entire latency budget"
+        );
     }
 
     #[test]
     fn abstains_when_nothing_is_relevant() {
-        // recency 一路恒定返回最近 N 条与查询无关的事实。
-        // 若不弃权，任何问题都会带回一堆记忆 —— 这是幻觉与记忆投毒的温床。
+        // The recency channel invariably returns the N most recent facts,
+        // unrelated to the query. Without abstention, any question at all brings
+        // back a pile of memories — a breeding ground for hallucination and memory
+        // poisoning.
         let r = Retriever::new(crate::embed::HashEmbedder::new());
-        // 单路排名第 40 名的贡献 ≈ 1/(60+41) ≈ 0.0099，低于阈值
+        // A single channel's rank-40 contribution is ≈ 1/(60+41) ≈ 0.0099, below
+        // the threshold
         let weak = vec![Fused {
             item: dummy_fact(),
             score: 0.0099,
@@ -865,15 +1026,16 @@ mod tests {
         }];
         assert!(
             r.finish(weak, 128_000).items.is_empty(),
-            "只被近因一路捞到且排名靠后，不应注入任何记忆"
+            "found only by the recency channel and ranked low: no memory should be injected at all"
         );
     }
 
     #[test]
     fn keeps_results_with_cross_channel_consensus() {
         let r = Retriever::new(crate::embed::HashEmbedder::new());
-        // 两路都排第一：0.0164 × 2 ≈ 0.0328，再叠上 `peak_bonus` 的 0.02
-        // 就是 0.053 —— 阈值 0.030 正是照着这个分布定的，见 `abstain_below`
+        // First place in two channels: 0.0164 × 2 ≈ 0.0328, plus `peak_bonus`'s
+        // 0.02, gives 0.053 — the threshold of 0.030 was set against exactly this
+        // distribution; see `abstain_below`
         let strong = vec![Fused {
             item: dummy_fact(),
             score: 0.0328 + 0.02,
@@ -882,11 +1044,11 @@ mod tests {
         assert_eq!(
             r.finish(strong, 128_000).items.len(),
             1,
-            "跨路共识的强命中必须保留"
+            "a strong hit with cross-channel consensus must be kept"
         );
     }
 
-    /// 造一条指定 id 的事实，用来断言合并顺序。
+    /// Build a fact with a given id, for asserting on merge order.
     fn fact_with_id(id: &str) -> Fact {
         let mut f = dummy_fact();
         f.id = id.to_owned();
@@ -895,9 +1057,11 @@ mod tests {
 
     #[test]
     fn merging_two_spaces_interleaves_by_rank() {
-        // 回填期间旧空间里的事实更多（存量全在那边），当前空间只有新写的。
-        // 让当前空间整体排前面，等于把全部历史记忆压到 41 名之后 ——
-        // RRF 的核是 1/(k+rank)，那基本等于没召回
+        // During a backfill there are more facts in the old space (the entire
+        // existing corpus is over there) and only newly written ones in the current
+        // space. Putting the current space wholesale in front pushes every
+        // historical memory past position 41 — and since RRF's kernel is
+        // 1/(k+rank), that is essentially the same as not recalling them at all
         let current = vec![
             (fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA1"), 0.1),
             (fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA2"), 0.2),
@@ -918,14 +1082,15 @@ mod tests {
                 "01AAAAAAAAAAAAAAAAAAAAAAA2",
                 "01BBBBBBBBBBBBBBBBBBBBBBB2",
             ],
-            "两个空间必须按名次交替，否则其中一边会被整体压到后面"
+            "the two spaces must interleave by rank, otherwise one side gets pushed wholesale to the back"
         );
     }
 
     #[test]
     fn merging_dedups_and_keeps_the_better_rank() {
-        // 同一条事实两边都命中：只留一次，且留在**先出现**的位置上。
-        // 留两次的后果是 RRF 给它双份排名 —— 一个悄悄放大的偏置，不是报错
+        // The same fact hit on both sides: keep it once, at the position where it
+        // **appeared first**. Keeping it twice means RRF credits it with two ranks
+        // — a quietly amplified bias, not an error
         let shared = "01CCCCCCCCCCCCCCCCCCCCCCC1";
         let current = vec![
             (fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA1"), 0.1),
@@ -939,13 +1104,14 @@ mod tests {
         assert_eq!(
             ids,
             vec!["01AAAAAAAAAAAAAAAAAAAAAAA1", shared],
-            "重复的事实只该出现一次，且在两边给它的更靠前的那个位置上"
+            "a duplicated fact should appear only once, at the better of the two positions the two sides gave it"
         );
     }
 
     #[test]
     fn merging_without_legacy_is_the_identity() {
-        // 绝大多数部署从没换过模型 —— 那条路径必须与改动前逐位相同
+        // The overwhelming majority of deployments have never changed models — that
+        // path must be bit-for-bit what it was before the change
         let current = vec![
             (fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA1"), 0.1),
             (fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA2"), 0.2),
@@ -957,14 +1123,15 @@ mod tests {
         assert_eq!(
             ids,
             vec!["01AAAAAAAAAAAAAAAAAAAAAAA1", "01AAAAAAAAAAAAAAAAAAAAAAA2"],
-            "没挂 legacy 时必须原样返回当前空间"
+            "with no legacy model attached, the current space must be returned unchanged"
         );
     }
 
     #[test]
     fn merging_handles_uneven_lengths() {
-        // 一边先取完时另一边要继续取完，不能提前停 ——
-        // 提前停的表现是「旧记忆只回来一半」，而那一半是随机的
+        // When one side runs out first the other must keep going to exhaustion,
+        // never stopping early — stopping early manifests as "only half the old
+        // memories came back", and which half is arbitrary
         let current = vec![(fact_with_id("01AAAAAAAAAAAAAAAAAAAAAAA1"), 0.1)];
         let legacy = vec![
             (fact_with_id("01BBBBBBBBBBBBBBBBBBBBBBB1"), 0.2),
@@ -974,7 +1141,7 @@ mod tests {
         assert_eq!(
             merge_vector_spaces(current, legacy).len(),
             4,
-            "长度不等时不能丢条目"
+            "no entries may be dropped when the two sides differ in length"
         );
     }
 
@@ -1008,12 +1175,13 @@ mod tests {
 
     #[test]
     fn semantic_floor_only_applies_to_a_semantic_space() {
-        // 散列桩的「距离」跟相关性无关。给它装上 0.50 会把离线开发与无网 CI
-        // 的召回**静默**清零 —— 检索照常返回，只是永远返回空
+        // The hash stub's "distance" has nothing to do with relevance. Installing
+        // 0.50 on it would **silently** zero out recall for offline development and
+        // network-free CI — retrieval returns as usual, it just always returns empty
         assert_eq!(
             default_semantic_floor("hash-stub-v1"),
             None,
-            "散列桩不是语义空间，不能套用向量模型标定出来的地板"
+            "the hash stub is not a semantic space, so a floor calibrated on a vector model must not be applied to it"
         );
         assert_eq!(
             default_semantic_floor("fastembed:gpahal/bge-m3-onnx-int8"),
@@ -1024,34 +1192,36 @@ mod tests {
         assert_eq!(
             r.semantic_floor(),
             None,
-            "构造时就该按后端决定，而不是事后打补丁"
+            "this should be decided from the backend at construction time, not patched up afterwards"
         );
     }
 
     #[test]
     fn chronological_replay_is_not_gated_by_the_abstain_threshold() {
-        // 全貌回放没有第二路可融合，若沿用 RRF 的 1/(60+i+1)，头一条只有
-        // 0.0164，会被 0.017 的弃权阈值整个吃掉 —— 用户明确要求回放，
-        // 却拿回空的
+        // A full-picture replay has no second channel to fuse with, so keeping RRF's
+        // 1/(60+i+1) would leave even the top entry at 0.0164 and the abstention
+        // threshold of 0.017 would swallow the whole thing — the user explicitly
+        // asked for a replay and got back nothing
         let r = Retriever::new(crate::embed::HashEmbedder::new());
         let fused = chronological(vec![dummy_fact()]);
         assert_eq!(
             r.finish(fused, 128_000).items.len(),
             1,
-            "显式的时间回放不该被为四路召回标定的阈值挡掉"
+            "an explicit time replay must not be blocked by a threshold calibrated for four-channel recall"
         );
     }
 
     #[test]
     fn recency_is_off_by_default() {
-        // 这条挡的是「有人顺手把它改回 Channel」：定案的依据是评测数字
-        // （独占 0、R@5 0.101、压低 R@1 0.088、注入涨 27%），
-        // 改回去必须连带重跑评测，见 `RecencyMode` 的表
+        // This guards against someone casually switching it back to Channel: the
+        // decision rests on eval numbers (0 exclusive questions, own R@5 of 0.101,
+        // R@1 dragged down by 0.088, injection up 27%), and switching it back means
+        // re-running the evals along with it — see the table on `RecencyMode`
         let r = Retriever::new(crate::embed::HashEmbedder::new());
         assert_eq!(r.recency, RecencyMode::Off);
         assert!(
             !r.episode_channel,
-            "episodes 一路实测排序上中性偏负，默认关；翻案要连带重跑 2×2"
+            "the episodes channel measures neutral-to-negative on ranking, so it is off by default; overturning that means re-running the 2×2 as well"
         );
     }
 }

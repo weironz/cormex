@@ -1,43 +1,52 @@
-//! 多路召回的融合排序。
+//! Fusion ranking over the multi-channel recall.
 //!
-//! 用 **RRF（Reciprocal Rank Fusion）**而非加权求和：
-//! 各路的分数量纲完全不同（BM25 是无上界的 tf-idf、向量是 [-1,1] 余弦、
-//! 图遍历是跳数、时间近因是时间戳），加权求和的权重根本调不出来。
-//! RRF 只用**排名**不用分数，因此对量纲免疫、无需训练、无需调参。
+//! Uses **RRF (Reciprocal Rank Fusion)** rather than a weighted sum: the score
+//! scales of the channels have nothing in common (BM25 is unbounded tf-idf, the
+//! vector channel is a [-1,1] cosine, graph traversal is a hop count, recency is
+//! a timestamp), so there is simply no way to tune weights for a weighted sum.
+//! RRF uses only **rank**, never the score, which makes it immune to scale,
+//! training-free, and free of tuning parameters.
 //!
 //! ```text
 //! score(d) = Σ  1 / (k + rank_i(d))       k = 60
-//!           i∈召回路
+//!           i∈recall channels
 //! ```
 //!
-//! 附带好处：换 embedding 模型期间新旧向量不在同一语义空间、分数不可比，
-//! 但 RRF 只看各自路内的排名，**天然兼容混合状态**（见 memory.md §七）。
+//! A side benefit: while an embedding model is being swapped, old and new vectors
+//! do not share a semantic space and their scores are not comparable — but RRF
+//! looks only at ranks within each channel, so it is **inherently compatible with
+//! that mixed state** (see memory.md §7).
 //!
-//! # 它的两个代价，以及各自的解药
+//! # Its two costs, and the antidote to each
 //!
-//! 1. **弱共识压过强命中** —— 见 [`apply_peak_bonus`]。
-//! 2. **分数不含绝对相关性** —— RRF 分是排名的函数，库里根本没有答案时
-//!    各路照样各自返回最好的几条、照样互相印证、分照样很高。
-//!    这一条**在这个模块里解决不了**，必须由检索器拿余弦距离
-//!    （`retrieval::BGE_M3_SEMANTIC_FLOOR`）在融合之前判。
+//! 1. **Weak consensus outranks a strong hit** — see [`apply_peak_bonus`].
+//! 2. **The score carries no absolute relevance.** An RRF score is a function of
+//!    rank, so when the answer simply isn't in the database, every channel still
+//!    returns its own best few, they still corroborate each other, and the score
+//!    is still high. This one **cannot be solved in this module**; the retriever
+//!    has to judge it using cosine distance
+//!    (`retrieval::BGE_M3_SEMANTIC_FLOOR`) *before* fusion happens.
 
 use std::collections::HashMap;
 
-/// RRF 的平滑常数。60 是原论文的经验值，也是各家实现的事实默认。
+/// RRF's smoothing constant. 60 is the empirical value from the original paper,
+/// and the de facto default across implementations.
 pub const RRF_K: f64 = 60.0;
 
-/// 一路召回的来源标识，用于可观测性（哪条路贡献了这个结果）。
+/// Which recall channel a result came from, for observability (which channel
+/// contributed this result).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
-    /// BM25 全文 —— 专有名词与精确匹配
+    /// BM25 full text — proper nouns and exact matches
     Bm25,
-    /// 向量余弦 —— 语义相近
+    /// Vector cosine — semantic proximity
     Vector,
-    /// 图遍历 —— 从命中实体扩展关联事实
+    /// Graph traversal — expanding from a matched entity to related facts
     Graph,
-    /// 时间近因 —— 上下文连续性
+    /// Recency — continuity of context
     Recency,
-    /// L0 原文全文 —— 从 episode 倒查它抽出来的事实（出处追问）
+    /// L0 raw full text — going backwards from an episode to the facts extracted
+    /// from it (following up on provenance)
     Episode,
 }
 
@@ -54,23 +63,24 @@ impl Channel {
     }
 }
 
-/// 融合后的一条结果。
+/// One fused result.
 #[derive(Debug, Clone)]
 pub struct Fused<T> {
     pub item: T,
     pub score: f64,
-    /// 命中它的召回路及在该路内的排名（从 0 起）。
-    /// 保留下来是为了 bad case 能归因到具体通道——没有这个，
-    /// 检索出问题时只能靠猜。
+    /// The recall channels that hit it, and its rank within each (0-based).
+    /// This is kept so that a bad case can be attributed to a specific channel —
+    /// without it, all you can do when retrieval misbehaves is guess.
     pub hits: Vec<(Channel, usize)>,
 }
 
-/// 对多路召回结果做 RRF 融合。
+/// Fuse multi-channel recall results with RRF.
 ///
-/// `channels` 中每一路是**已按该路自身相关性降序排好**的候选列表。
-/// `key` 从候选中取出去重用的稳定标识（通常是 fact id）。
+/// Each channel in `channels` is a candidate list **already sorted descending by
+/// that channel's own notion of relevance**. `key` pulls a stable identifier out
+/// of a candidate for deduplication (usually the fact id).
 ///
-/// 返回按融合分降序排列的结果。
+/// Returns the results sorted descending by fused score.
 pub fn rrf<T, K, F>(channels: &[(Channel, Vec<T>)], key: F) -> Vec<Fused<T>>
 where
     T: Clone,
@@ -96,15 +106,19 @@ where
         }
     }
 
-    // 分数降序；同分时按命中路数多的优先（多路共识更可信）；
-    // 再同则按 key 定序 —— **这一层不是洁癖**：
+    // Descending by score; on a tie, more channel hits wins (consensus across
+    // channels is more trustworthy); on a further tie, order by key — **this last
+    // layer is not fastidiousness**:
     //
-    // `into_values()` 给出的是 `HashMap` 的迭代序，它随 hash 种子逐进程变化。
-    // 同分在这里是常态（只被一路捞到、名次又相同的条目一抓一大把），于是
-    // 同一份语料同一套参数跑两遍，top-1 会换人。实测评测跑三遍
-    // R@1 在 0.630/0.640/0.650 之间跳、MRR 跳 0.012 —— 也就是说
-    // **这套评测当时分辨不了小于 0.02 的改动**，而绝大多数调参改动都在这个量级。
-    // 后续的 `apply_*` 用的是稳定排序，只要这里定死，全链路就定死了。
+    // `into_values()` yields `HashMap` iteration order, which varies per process
+    // with the hash seed. Ties are the norm here (entries picked up by exactly one
+    // channel at the same rank come by the handful), so running the same corpus
+    // with the same parameters twice would change who lands at top-1. Measured:
+    // three eval runs put R@1 at 0.630/0.640/0.650 and moved MRR by 0.012 —
+    // meaning **the eval suite at that point could not resolve any change smaller
+    // than 0.02**, and the vast majority of tuning changes are exactly that size.
+    // The `apply_*` steps that follow use stable sorts, so pinning the order down
+    // here pins down the whole chain.
     let mut out: Vec<(K, Fused<T>)> = acc.into_iter().collect();
     out.sort_by(|(ka, a), (kb, b)| {
         b.score
@@ -116,32 +130,40 @@ where
     out.into_iter().map(|(_, f)| f).collect()
 }
 
-/// 单路强命中的补偿项 —— RRF 的已知代价的解药。
+/// The compensation term for a lone strong hit — the antidote to a known cost of
+/// RRF.
 ///
-/// # 它修的是什么
+/// # What it fixes
 ///
-/// RRF 只认排名，于是「两路都排第 10」（0.0141×2 ≈ 0.028）会压过
-/// 「一路排第 1」（0.0164）。多数时候这正是想要的 —— 跨路共识确实更可信 ——
-/// 但当某一路给出的是**强信号**时它就成了误伤：一条被 BM25 精确命中在
-/// 榜首的事实，会被几条「哪一路都排在十几名」的话题相邻项挤下去。
+/// RRF only sees rank, so "rank 10 in two channels" (0.0141×2 ≈ 0.028) beats
+/// "rank 1 in one channel" (0.0164). Most of the time that is exactly what you
+/// want — cross-channel consensus really is more trustworthy — but when one
+/// channel is delivering a **strong signal** it becomes collateral damage: a fact
+/// that BM25 matched exactly at the very top gets pushed down by a handful of
+/// topically-adjacent entries that sit somewhere in the teens in every channel.
 ///
-/// 解法不是给某一路加权（那要按题型调，调不出来），而是**再叠一个更陡的核**：
+/// The fix is not to weight one channel (that would have to be tuned per question
+/// type, and it cannot be tuned), but to **stack on a second, much steeper
+/// kernel**:
 ///
 /// ```text
 /// score(d) += weight / (PEAK_K + min_i rank_i(d))
 /// ```
 ///
-/// `PEAK_K` 取 2 而不是 60：排名 0 与排名 10 在 k=60 下只差 15%，
-/// 根本区分不出「强命中」；k=2 下差 6 倍，只有真正的头部才拿得到补偿。
-/// `weight` 为 0 即关闭。
+/// `PEAK_K` is 2 rather than 60: under k=60, rank 0 and rank 10 differ by only
+/// 15%, which cannot distinguish a "strong hit" at all; under k=2 they differ by
+/// 6×, so only genuine top-of-list entries collect the compensation. A `weight`
+/// of 0 disables it.
 ///
-/// 它**不是**「保底进 top-N」那种硬插队。硬插队要么改写排序、要么占死名额，
-/// 两者都会在「强命中其实是错的」时把错误顶到最前；而这里只是加一项，
-/// 真正的强共识（三路以上）仍然压得过它。权重取值见
-/// `retrieval::Retriever::new` 里的注释与那条扫描曲线。
+/// This is **not** the "guarantee a slot in top-N" kind of hard insertion. Hard
+/// insertion either rewrites the ordering or reserves a fixed slot, and both push
+/// an error to the very front whenever the strong hit turns out to be wrong;
+/// here we merely add a term, and genuine strong consensus (three or more
+/// channels) still outweighs it. For how the weight was chosen, see the comments
+/// in `retrieval::Retriever::new` and the sweep curve there.
 pub const PEAK_K: f64 = 2.0;
 
-/// 见 [`PEAK_K`]。`weight` 为 0 时直接返回，不重排。
+/// See [`PEAK_K`]. Returns immediately without re-sorting when `weight` is 0.
 pub fn apply_peak_bonus<T>(fused: &mut [Fused<T>], weight: f64) {
     if weight <= 0.0 {
         return;
@@ -156,15 +178,19 @@ pub fn apply_peak_bonus<T>(fused: &mut [Fused<T>], weight: f64) {
     sort_by_score(fused);
 }
 
-/// 新鲜度衰减：越新的事实分越高。
+/// Freshness decay: the newer a fact is, the higher it scores.
 ///
-/// 这是「时间近因」的**另一种形态** —— 不占一路召回，只当融合分的乘数。
-/// 两种形态互斥，孰优孰劣见 `retrieval::RecencyMode` 的注释与评测数字。
+/// This is **the other form** recency can take — it does not occupy a recall
+/// channel, it acts purely as a multiplier on the fused score. The two forms are
+/// mutually exclusive; which is better, and the eval numbers behind that, are in
+/// the comments on `retrieval::RecencyMode`.
 ///
-/// 系数是 `1 + strength · 0.5^(age / half_life)`：最新的事实拿满
-/// `1 + strength`，一个半衰期前的拿一半，很久以前的趋近 1（即不加权）。
-/// 用**乘数**而不是加数，是为了不改变「零分即弃权」这个语义 ——
-/// 加数会把所有事实的分抬到弃权阈值之上。
+/// The coefficient is `1 + strength · 0.5^(age / half_life)`: the newest facts
+/// get the full `1 + strength`, one half-life back gets half of it, and anything
+/// long past approaches 1 (that is, no weighting at all). It is a **multiplier**
+/// rather than an addend so as not to disturb the "a score of zero means
+/// abstain" semantics — an addend would lift every fact's score above the
+/// abstention threshold.
 pub fn apply_recency_decay<T, F>(
     fused: &mut [Fused<T>],
     now: chrono::DateTime<chrono::Utc>,
@@ -193,21 +219,26 @@ fn sort_by_score<T>(fused: &mut [Fused<T>]) {
     });
 }
 
-/// 领域加权：当前对话领域内的事实加分。
+/// Domain weighting: boost facts that are in the current conversation's domain.
 ///
-/// 这是**融合之后**的调整，不是第五路召回——领域是过滤维度不是相关性维度。
-/// `boost` 取 1.0 即不加权。
+/// This is an adjustment **after** fusion, not a fifth recall channel — domain is
+/// a filtering dimension, not a relevance dimension. A `boost` of 1.0 means no
+/// weighting.
 ///
-/// # `exempt` —— 为什么需要一个豁免口
+/// # `exempt` — why an exemption hatch is needed
 ///
-/// 给「当前领域」加分等价于给跨域的减分。绝大多数时候这正是想要的：
-/// 聊代码时不该被上周的会议纪要打断。但有一类结果**按定义就是跨域的**，
-/// 对它们施加同一份惩罚等于把刚架好的桥又压回水里 ——
-/// 那就是 [`crate::crosslink`] 的 `relates_to` 边带出来的那一侧。
+/// Boosting "the current domain" is equivalent to penalizing everything
+/// cross-domain. Almost always that is what you want: talking about code should
+/// not be interrupted by last week's meeting notes. But one class of result is
+/// **cross-domain by definition**, and applying the same penalty to it amounts to
+/// pushing a bridge you just built back under water — namely the far side brought
+/// in by [`crate::crosslink`]'s `relates_to` edges.
 ///
-/// `exempt` 返回真的条目**不参与惩罚**（即也拿到 `boost`，与当前领域同权），
-/// 而不是「拿双倍」：豁免的语义是「别惩罚它」，不是「优待它」。
-/// 判定范围的取舍见 `retrieval::bridged_entities`。
+/// Entries for which `exempt` returns true **do not take the penalty** (that is,
+/// they also receive `boost`, putting them on equal footing with the current
+/// domain) rather than receiving double. The meaning of an exemption is "don't
+/// punish this", not "favour this". For the trade-offs in how broadly that is
+/// decided, see `retrieval::bridged_entities`.
 pub fn apply_domain_boost<T, F, X>(
     fused: &mut [Fused<T>],
     current_domain: Option<&str>,
@@ -247,14 +278,18 @@ mod tests {
 
     #[test]
     fn multi_channel_consensus_wins() {
-        // A 在两路都排第二，B 只在一路排第一。
-        // RRF 的核心行为：跨路共识应当压过单路的高排名。
+        // A is second in both channels; B is first in only one.
+        // The core RRF behaviour: cross-channel consensus should beat a high rank
+        // in a single channel.
         let channels = vec![
             (Channel::Bm25, vec![d("B"), d("A")]),
             (Channel::Vector, vec![d("C"), d("A")]),
         ];
         let out = rrf(&channels, |x| x.id);
-        assert_eq!(out[0].item.id, "A", "两路共识应排第一：{out:?}");
+        assert_eq!(
+            out[0].item.id, "A",
+            "consensus across two channels should rank first: {out:?}"
+        );
         assert_eq!(out[0].hits.len(), 2);
     }
 
@@ -266,8 +301,12 @@ mod tests {
             (Channel::Graph, vec![d("A")]),
         ];
         let out = rrf(&channels, |x| x.id);
-        assert_eq!(out.len(), 2, "同一条不应重复出现");
-        assert_eq!(out[0].hits.len(), 3, "应记录全部三路的命中");
+        assert_eq!(out.len(), 2, "the same entry must not appear twice");
+        assert_eq!(
+            out[0].hits.len(),
+            3,
+            "hits from all three channels should be recorded"
+        );
     }
 
     #[test]
@@ -305,13 +344,17 @@ mod tests {
         );
         assert_eq!(fused[0].item.id, "work");
         apply_domain_boost(&mut fused, Some("coding"), 2.0, |x| x.domain, |_| false);
-        assert_eq!(fused[0].item.id, "code", "当前领域的事实应被提上来");
+        assert_eq!(
+            fused[0].item.id, "code",
+            "facts in the current domain should be lifted up"
+        );
     }
 
     #[test]
     fn domain_boost_exemption_spares_the_bridged_side() {
-        // 跨域连接带出来的那一侧按定义就是跨域的：不豁免就等于架了桥
-        // 又把它压回水里
+        // The far side brought in by a cross-domain link is cross-domain by
+        // definition: not exempting it amounts to building a bridge and then
+        // pushing it back under water
         let mut fused = rrf(
             &[(
                 Channel::Bm25,
@@ -331,7 +374,7 @@ mod tests {
         let before = fused
             .iter()
             .position(|f| f.item.id == "bridged")
-            .expect("应在列表里");
+            .expect("should be in the list");
 
         apply_domain_boost(
             &mut fused,
@@ -343,19 +386,24 @@ mod tests {
         let after = fused
             .iter()
             .position(|f| f.item.id == "bridged")
-            .expect("应在列表里");
+            .expect("should be in the list");
         assert!(
             fused[0].score / fused[1].score < 1.3,
-            "被豁免的一侧应当与当前领域同权，实际分差 {:.3}",
+            "the exempted side should carry the same weight as the current domain, actual score ratio {:.3}",
             fused[0].score / fused[1].score
         );
-        assert_eq!(before, after, "豁免只是免罚，不该把它顶到别人前面");
+        assert_eq!(
+            before, after,
+            "an exemption only spares the penalty; it must not push the entry ahead of others"
+        );
     }
 
     #[test]
     fn exemption_is_not_a_double_boost() {
-        // 「免罚」与「优待」是两回事：豁免一条当前领域的事实必须是恒等操作，
-        // 否则同时命中两个条件的条目会拿到 boost²，排序悄悄跑偏
+        // "Sparing a penalty" and "granting a favour" are different things:
+        // exempting a fact that is already in the current domain must be the
+        // identity operation, otherwise entries matching both conditions collect
+        // boost² and the ordering quietly drifts
         let build = || {
             rrf(
                 &[(
@@ -386,15 +434,18 @@ mod tests {
         );
         assert_eq!(
             plain[0].score, exempted[0].score,
-            "已在当前领域的条目再被豁免一次，分数不该变"
+            "exempting an entry that is already in the current domain must not change its score"
         );
     }
 
     #[test]
     fn ties_break_by_key_not_by_hash_order() {
-        // 每条各占一路、名次都是 0 ⇒ 分数与命中路数全相等，唯一还能定序的只有 key。
-        // 用十二条而不是三条：`HashMap` 的迭代序随 hash 种子逐进程变化，
-        // 三条时它有六分之一的概率碰巧就是升序，测试会变成偶尔才红的哑弹
+        // Each entry occupies one channel at rank 0 ⇒ scores and hit counts are
+        // all equal, and the only thing left that can order them is the key.
+        // Twelve entries rather than three: `HashMap` iteration order varies per
+        // process with the hash seed, and with three entries there is a one-in-six
+        // chance it happens to come out ascending anyway, which would turn this
+        // test into a dud that only goes red occasionally
         let ids = [
             "m4", "b7", "z1", "a9", "q3", "c8", "k2", "w5", "e6", "t0", "n1", "h4",
         ];
@@ -407,7 +458,7 @@ mod tests {
         assert_eq!(
             out.iter().map(|f| f.item.id).collect::<Vec<_>>(),
             want.to_vec(),
-            "完全同分时必须按 key 升序 —— 否则顺序落回 HashMap 的桶序，             同一份语料跑两遍 top-1 就会换人（实测让评测的 R@1 在 0.630/0.640/0.650 之间跳）"
+            "on an exact score tie the order must be ascending by key — otherwise it falls back to HashMap bucket order, and running the same corpus twice changes who lands at top-1 (measured: it made the eval's R@1 jump between 0.630/0.640/0.650)"
         );
     }
 
@@ -417,8 +468,9 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// 两路都把 `consensus` 排在第 11 名（rank 10），一路把 `strong` 排第一。
-    /// 填充项各路互不相同，免得它们自己攒出共识来。
+    /// Two channels put `consensus` in 11th place (rank 10); one channel puts
+    /// `strong` first. The filler entries differ between channels so that they
+    /// don't accumulate consensus of their own.
     fn lone_strong_vs_deep_consensus() -> Vec<(Channel, Vec<Doc>)> {
         let deep = |tag: &'static str| -> Vec<Doc> {
             (0..10)
@@ -438,32 +490,36 @@ mod tests {
 
     #[test]
     fn peak_bonus_rescues_a_lone_strong_hit() {
-        // 只比这两条的相对位置：填充项自己也在各路排前面，会拿到同样的补偿，
-        // 把它们卷进断言只会测出「rank 0 的都涨了」这种废话
+        // Only the relative positions of these two entries are compared: the
+        // filler entries also sit near the top of their own channels and collect
+        // the same compensation, so dragging them into the assertion would only
+        // prove the triviality that "everything at rank 0 went up"
         let rank_of = |out: &[Fused<Doc>], id: &str| {
             out.iter()
                 .position(|f| f.item.id == id)
-                .expect("应当在列表里")
+                .expect("should be in the list")
         };
 
         let mut out = rrf(&lone_strong_vs_deep_consensus(), |x| x.id);
         assert!(
             rank_of(&out, "consensus") < rank_of(&out, "strong"),
-            "没有补偿时两路的深共识（≈0.028）本就压过单路第一（≈0.016）—— 这正是要修的那个代价"
+            "without compensation, deep consensus across two channels (≈0.028) does outrank a lone first place (≈0.016) — that is exactly the cost being fixed"
         );
 
-        // 生产默认权重。0.04/2 = 0.02，约等于「白送它一路共识」
+        // The production default weight. 0.04/2 = 0.02, roughly "hand it one
+        // channel's worth of consensus for free"
         apply_peak_bonus(&mut out, 0.04);
         assert!(
             rank_of(&out, "strong") < rank_of(&out, "consensus"),
-            "某一路排第一的强命中应当被补偿项抬到深共识之上：{out:?}"
+            "a strong hit ranked first in some channel should be lifted above deep consensus by the compensation term: {out:?}"
         );
     }
 
     #[test]
     fn peak_bonus_does_not_beat_real_consensus() {
-        // 它是**补偿**不是**保底**：三路都排前列的结果仍然该赢，
-        // 否则 RRF 的共识语义就名存实亡了
+        // It is **compensation**, not a **guaranteed slot**: a result near the top
+        // of three channels should still win, otherwise RRF's consensus semantics
+        // exist in name only
         let channels = vec![
             (Channel::Bm25, vec![d("strong")]),
             (Channel::Vector, vec![d("agreed"), d("strong")]),
@@ -475,7 +531,7 @@ mod tests {
         assert_eq!(
             out[0].item.id,
             "agreed",
-            "三路共识不该被单路补偿掀翻：{:?}",
+            "consensus across three channels must not be overturned by a single-channel compensation: {:?}",
             &out[..2]
         );
     }
@@ -487,17 +543,24 @@ mod tests {
         let before: Vec<f64> = out.iter().map(|f| f.score).collect();
         apply_peak_bonus(&mut out, 0.0);
         let after: Vec<f64> = out.iter().map(|f| f.score).collect();
-        assert_eq!(before, after, "权重为 0 必须是恒等操作，否则默认行为会漂");
+        assert_eq!(
+            before, after,
+            "a weight of 0 must be the identity operation, otherwise the default behaviour drifts"
+        );
     }
 
     #[test]
     fn recency_decay_reorders_by_age() {
-        // 这条断言是 `RecencyMode::Decay` 唯一的正确性保证：评测题集的语料
-        // 是一次 ingest 写完的，created_at 没有跨度，衰减在那里量不出来
+        // This assertion is the only correctness guarantee `RecencyMode::Decay`
+        // has: the eval dataset's corpus is written in a single ingest, so
+        // created_at has no spread and decay cannot be measured there at all
         let now = chrono::Utc::now();
         let channels = vec![(Channel::Bm25, vec![d("old"), d("new")])];
         let mut out = rrf(&channels, |x| x.id);
-        assert_eq!(out[0].item.id, "old", "衰减前按 BM25 名次");
+        assert_eq!(
+            out[0].item.id, "old",
+            "before decay, the order follows the BM25 ranking"
+        );
 
         apply_recency_decay(&mut out, now, 0.5, 3.0, |x: &Doc| {
             if x.id == "new" {
@@ -508,7 +571,7 @@ mod tests {
         });
         assert_eq!(
             out[0].item.id, "new",
-            "同为一路命中时，九十天前的那条不该压过刚发生的"
+            "when both are hit by the same single channel, one from ninety days ago must not outrank one that just happened"
         );
     }
 }

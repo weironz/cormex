@@ -1,44 +1,52 @@
--- 沙箱工作区的快照索引。
+-- Snapshot index for the sandbox workspace.
 --
--- # 为什么需要它
+-- # Why it is needed
 --
--- 容器沙箱的 `/workspace` 是一个持久卷，对办公类用户往往是**唯一一份**。
--- 调研里那条不变式（Codex / Claude web / Devin 的沙箱文件系统从不是
--- system of record，权威副本在 git 远端）在我们这里不成立 ——
--- 于是同一个 `rm -rf`，在它们那儿是重跑一次，在这儿是永久损失。
+-- The `/workspace` of a container sandbox is a persistent volume, and for office-type users
+-- it is often the **only copy there is**. The invariant from the research (the sandbox
+-- filesystem of Codex / Claude web / Devin is never the system of record -- the
+-- authoritative copy lives on a git remote) does not hold for us -- so the very same
+-- `rm -rf` that costs them one re-run costs us a permanent loss.
 --
--- 卷内 git 已经能兜住覆盖写 / 误改（见 `cortex-local/src/checkpoint.rs`），
--- 但 `.git` 就在同一个卷上：**整卷删只有这一层救得回来**。
+-- git inside the volume already catches overwrites and mistaken edits (see
+-- `cortex-local/src/checkpoint.rs`), but `.git` sits on that same volume: **when the whole
+-- volume goes, this is the only layer that can bring it back**.
 --
--- # 为什么快照由宿主驱动、索引落在这儿
+-- # Why the host drives the snapshot and the index lands here
 --
--- 沙箱令牌只放行 5 条回调路由，里面没有任何一条碰得到这张表或对象存储。
--- 也就是说**被攻陷的容器删不掉自己的备份** —— 这条性质是拓扑给的，
--- 不是靠权限判断，所以它不会因为哪天多放行了一条路由而悄悄失效。
+-- The sandbox token admits only 5 callback routes, and not one of them can reach this table
+-- or the object storage. Which is to say **a compromised container cannot delete its own
+-- backups** -- and that property is granted by the topology rather than by a permission
+-- check, so it will not quietly stop holding the day one more route gets admitted.
 --
 -- # append-only
 --
--- 与全库一致：不 UPDATE、不 DELETE。淘汰旧快照走 purge 那条路
--- （显式触发、二次确认、留墓碑），不在这里就地删。
+-- As everywhere else in this database: no UPDATE, no DELETE. Retiring old snapshots goes
+-- down the purge road (triggered explicitly, confirmed twice, leaving a tombstone), not an
+-- in-place delete here.
 CREATE TABLE sandbox_snapshots (
     id           TEXT PRIMARY KEY,
-    -- 沙箱的 owner。当前一个用户一个沙箱，所以它同时也标识「哪个卷」。
-    -- 将来一个用户多个沙箱时，这一列换成 sandbox_id，owner 另立一列。
+    -- The sandbox's owner. Today one user has one sandbox, so this also identifies "which
+    -- volume". Once one user can have several sandboxes, this column becomes sandbox_id and
+    -- owner gets a column of its own.
     --
-    -- 注意这张表在**用户自己的 schema** 里，所以 owner 恒等于这个 schema
-    -- 的主人。留着它是为了排查时一眼看得出，不是为了过滤。
+    -- Note that this table lives in **the user's own schema**, so owner is always the owner
+    -- of that schema. It is kept so that it can be seen at a glance while investigating,
+    -- not for filtering.
     owner        TEXT        NOT NULL,
-    -- 对象存储里的内容哈希（`BlobStore::put` 的返回）。
+    -- The content hash in the object storage (the return value of `BlobStore::put`).
     --
-    -- 内容寻址天然去重：两次快照之间没改过任何文件时，第二次的哈希与第一次
-    -- 相同，对象存储不会真的再存一份 —— 而这张表仍然记两行，
-    -- 因为「什么时候拍的」是这里唯一的信息。
+    -- Content addressing dedupes for free: when no file has changed between two snapshots,
+    -- the second hash equals the first and the object storage does not really store another
+    -- copy -- while this table still records two rows, because "when it was taken" is the
+    -- only information kept here.
     blob_hash    TEXT        NOT NULL,
-    -- tar 的字节数，用来算配额与在界面上说人话。
+    -- Byte size of the tar, used for quota arithmetic and for saying something human in the UI.
     size_bytes   BIGINT      NOT NULL CHECK (size_bytes >= 0),
     taken_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 「这个 owner 最近的快照」是唯一的热查询（列快照、拿最新一份来恢复）。
+-- "The most recent snapshots of this owner" is the only hot query (listing snapshots,
+-- taking the newest one to restore from).
 CREATE INDEX sandbox_snapshots_owner_time
     ON sandbox_snapshots (owner, taken_at DESC);

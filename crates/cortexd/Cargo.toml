@@ -5,36 +5,39 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex 守护进程：记忆引擎与同步服务"
+description = "The Cortex daemon: the memory engine and the sync service"
 
 [dependencies]
 cortex-core.workspace = true
 cortex-memory.workspace = true
-# **这里没有 bollard / tar / reqwest**，它们跟着容器编排一起去了
-# `cortex-agentd`。这个进程不起容器、不解 tar、也不主动发 HTTP
-#（LLM 那侧的请求由 goose 的供应商层自己发）。
+# **There is no bollard / tar / reqwest here** -- they left for `cortex-agentd` together
+# with the container orchestration. This process starts no containers, unpacks no tars and
+# initiates no HTTP of its own (requests on the LLM side are sent by goose's provider layer).
 bytes = "1"
 cortex-llm.workspace = true
 cortex-store.workspace = true
-# **这里没有 `cortex-agent`，而且不许加回来。**
+# **There is no `cortex-agent` here, and it must not be added back.**
 #
-# 它曾经为三样东西在这儿：进程内的 agent 循环（删了）、容器编排（搬去
-# cortex-agentd 了）、以及两个小工具（`status_line` 与 `workspace::validate`，
-# 一个不再有意义、一个改走 `live::workspace_patch`）。
+# It was here once, for three things: the in-process agent loop (deleted), the container
+# orchestration (moved out to cortex-agentd), and two small utilities (`status_line` and
+# `workspace::validate` -- one no longer meaningful, the other rerouted through
+# `live::workspace_patch`).
 #
-# 加回来的代价是：只想用记忆那一层的人要连 agent 循环 + 工具 + 沙箱一起编。
-# 记忆这一半要独立开源（Cormex），这条边是必须断的那一条。
+# The price of adding it back is that anyone who only wants the memory layer has to compile
+# the agent loop + the tools + the sandbox along with it. This memory half is to be open
+# sourced on its own (Cormex), and this is the edge that has to be cut.
 cortex-proto.workspace = true
-# 导入的解析器三处共用，见 cortex-import 的 crate 文档
+# The import parsers are shared by all three sites, see the crate docs of cortex-import
 cortex-import.workspace = true
 
 cortex-blob.workspace = true
 
-# 这里**没有 sqlx**，而且不该再有。
-# 曾经为了 LISTEN/NOTIFY 的 PgListener 直接依赖过它，理由听着充分
-# （连接级能力，repository 抽象覆盖不到），但那个口子一开就会扩散：
-# 下一个「只需要一句 SQL」的功能会理所当然地跟着写在这里。
-# 现在它下沉成了 cortex_store::Store::listen_sync()。
+# There is **no sqlx** here, and there should not be one again.
+# It was once depended on directly for PgListener and LISTEN/NOTIFY, and the reasoning
+# sounded sufficient (a connection-level capability the repository abstraction cannot cover),
+# but a hole like that spreads once opened: the next feature that "only needs one line of
+# SQL" would end up written here as a matter of course.
+# It has since sunk down into cortex_store::Store::listen_sync().
 async-trait.workspace = true
 
 tokio.workspace = true
@@ -48,23 +51,29 @@ serde_json.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 
-# 认证与确认凭据。三个都已经在依赖树里（cortex-blob 的内容寻址用 sha2+hex，
-# getrandom 由 rustls / rand 一路带进来），这里只是把边加到 cortexd 上。
+# Authentication and confirmation credentials. All three are already in the dependency tree
+# (cortex-blob's content addressing uses sha2+hex, and getrandom comes along through rustls /
+# rand), so this merely adds the edge to cortexd.
 #
-# 刻意**不**引入 argon2 / bcrypt：慢 KDF 防的是低熵口令被离线爆破，
-# 而这里的凭据是 256 位内核随机数，慢一百万倍也还是爆破不动。见 src/auth.rs。
+# argon2 / bcrypt are deliberately **not** introduced: a slow KDF defends a low-entropy
+# password against offline cracking, whereas the credential here is a 256-bit kernel random
+# number -- a million times slower and it would still not be crackable. See src/auth.rs.
 sha2 = "0.10"
 hex = "0.4"
-# 自带 key 的 AES-256-GCM。已经在依赖树里（rustls 拉的），这里显式声明
+# AES-256-GCM for a bring-your-own key. Already in the dependency tree (pulled in by rustls);
+# declared explicitly here
 ring = "0.17"
-# 凭据必须直接来自内核 CSPRNG。不用 ULID 凑数：它高 48 位是时间戳，
-# 随机位只有 80，而「窗口很短」不该被算进熵里。见 src/confirm.rs。
+# Credentials have to come straight from the kernel CSPRNG. Not a ULID pressed into service:
+# its top 48 bits are a timestamp, leaving only 80 random bits, and "the window is very
+# short" has no business being counted as entropy. See src/confirm.rs.
 getrandom = "0.3"
-# 密码哈希。**不能沿用上面那个 sha2** —— auth.rs 里「慢 KDF 不是必需」
-# 那段论证有个前提：token 是高熵随机的。人选的密码不满足它。
-# 账号表住在 cortex_auth 里，而那不是记忆库的一部分 —— cortex-store 的
-# repository 层刻意不认识它（那一层的每个查询都假设自己在租户 schema 里）。
-# 所以这里直接用 sqlx，池子也是单独一个
+# Password hashing. **The sha2 above must not be reused** -- the argument in auth.rs that "a
+# slow KDF is not required" rests on a premise: that the token is high-entropy and random. A
+# password chosen by a human does not satisfy it.
+# The account tables live in cortex_auth, and that is not part of the memory database --
+# cortex-store's repository layer deliberately does not know about it (every query in that
+# layer assumes it is inside a tenant schema).
+# So sqlx is used directly here, with a pool of its own
 sqlx.workspace = true
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["alloc"] }
@@ -73,14 +82,15 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 
-# 记忆对外的 MCP 门面（`src/mcp.rs`）。
+# The MCP facade memory presents to the outside world (`src/mcp.rs`).
 #
-# **钉在 1.8，与 cortex-llm / cortex-agent 同一份** —— 那两处是为了 goose 的
-# `Tool` 类型引进来的。让它们分叉的后果与 pgvector 那次一样：两份 rmcp 共存、
-# 类型名字一样却不兼容。goose 上游已经在 3.0，我们不跟。
-# 工具参数的 JSON Schema。**必须与 rmcp 用的是同一份**（1.0）：
-# `#[derive(JsonSchema)]` 展开出来的代码引用的是裸 `schemars::`，
-# 而 rmcp 只把它 re-export 出来、不负责让 derive 找得到
+# **Pinned at 1.8, the same copy as cortex-llm / cortex-agent** -- those two pulled it in for
+# goose's `Tool` type. Letting them diverge has the same consequence as the pgvector episode:
+# two copies of rmcp coexisting, with identically named yet incompatible types. goose
+# upstream is already on 3.0; we are not following.
+# The JSON Schema for tool arguments. **It has to be the very copy rmcp uses** (1.0): the
+# code `#[derive(JsonSchema)]` expands into refers to a bare `schemars::`, and rmcp merely
+# re-exports it -- it takes no responsibility for making the derive able to find it
 schemars = { version = "1.0", features = ["chrono04"] }
 
 rmcp = { version = "1.8", default-features = false, features = [
@@ -91,16 +101,20 @@ rmcp = { version = "1.8", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-# 工作区路径校验的测试要真的建目录、建文件、建符号链接 ——
-# 「什么目录配当工作区」是关于真实文件系统的判断，mock 不出来
+# The workspace path validation tests really do create directories, files and symlinks --
+# "what kind of directory deserves to be a workspace" is a judgement about a real
+# filesystem, and there is no mocking it
 tempfile = "3"
 
-# `ServiceExt::oneshot`：不起监听端口，直接把请求喂给**真实的** `router()`。
-# 路由的认证覆盖只能这么测 —— 起一个真服务要先有数据库与 API key，
-# 而那正是「路由测试做不了」这个结论当初的由来。
-# tower 已经在依赖树里（tower-http 依赖它），这里只是把边加到 cortexd 上。
+# `ServiceExt::oneshot`: no listening port is started, the request is fed straight into the
+# **real** `router()`. Authentication coverage across the routes can only be tested this way
+# -- standing up a real service would first require a database and an API key, which is
+# exactly where the conclusion "route tests cannot be done" originally came from.
+# tower is already in the dependency tree (tower-http depends on it), so this merely adds
+# the edge to cortexd.
 tower = { version = "0.5", features = ["util"] }
 
-# `#[tokio::test(start_paused = true)]`：确认超时默认 180 秒，
-# 真等一遍的测试没人会跑。虚拟时钟让它变成微秒级，而且**测的是同一段代码**
+# `#[tokio::test(start_paused = true)]`: the confirmation timeout defaults to 180 seconds,
+# and nobody is going to run a test that really sits through it. A virtual clock turns that
+# into microseconds, and **it exercises the same code**
 tokio = { workspace = true, features = ["test-util"] }

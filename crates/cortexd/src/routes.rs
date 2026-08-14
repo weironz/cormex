@@ -1,7 +1,7 @@
-//! HTTP 路由。
+//! HTTP routes.
 //!
-//! 处理器只做协议转换（HTTP ↔ 领域类型），业务逻辑一律下沉到
-//! cortex-memory / cortex-agent / cortex-store。
+//! Handlers do protocol conversion only (HTTP ↔ domain types); all business
+//! logic sinks into cortex-memory / cortex-agent / cortex-store.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -26,36 +26,45 @@ use crate::state::AppState;
 use cortex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
 use cortex_proto::llm::{LlmStreamChunk, LlmStreamError, LlmStreamRequest};
 
-/// 声明全部受保护路由 —— **注册与清单出自同一份声明**。
+/// Declare every protected route — **the registration and the inventory come
+/// from one declaration**.
 ///
-/// # 为什么必须是宏
+/// # Why this has to be a macro
 ///
-/// 「哪些路由在认证中间件后面」在此之前没有任何测试拦得住它变坏，而想补
-/// 测试的第一反应（手写一张要断言的路径表）等于把「容易忘的地方」从一处
-/// 变成两处：加路由的人同样会忘记更新那张表，于是新路由既没被保护、
-/// 也没被测到，而编译、clippy、既有测试**全绿**。
+/// "Which routes sit behind the authentication middleware" previously had no
+/// test capable of catching it going wrong, and the first instinct for adding
+/// one (hand-writing a table of paths to assert on) turns one easy-to-forget
+/// place into two: whoever adds a route equally forgets to update that table, so
+/// the new route is neither protected nor tested, while compilation, clippy and
+/// the existing tests are **all green**.
 ///
-/// 这里用与 `cortex-store` 的 `table::ALL` 同一个手法：宏在展开注册链的
-/// 同时生成 [`PROTECTED_ROUTES`]，`mod tests` 拿它逐条打真实的 `router()`。
-/// 加一条路由就必然进清单，忘不掉。
+/// This uses the same technique as `cortex-store`'s `table::ALL`: the macro
+/// generates [`PROTECTED_ROUTES`] while it expands the registration chain, and
+/// `mod tests` uses it to hit the real `router()` entry by entry. Adding a route
+/// necessarily adds it to the inventory; it cannot be forgotten.
 ///
-/// # 展开顺序是这条围栏的另一半，别动
+/// # The expansion order is the other half of this fence; leave it alone
 ///
-/// 所有 `.route()` 在前、`.route_layer()` 在最后一句 —— axum 的
-/// `route_layer` **只覆盖它之前注册的路由**。真有人把它挪到中间，那之后的
-/// 路由会失去认证，但它们仍然在 [`PROTECTED_ROUTES`] 里，于是
-/// `every_protected_route_rejects_anonymous_requests` 当场变红。
-/// `$state` 是**调用方给那个 `AppState` 绑定起的名字**。
+/// Every `.route()` comes first and `.route_layer()` is the final statement —
+/// axum's `route_layer` **only covers routes registered before it**. If somebody
+/// moves it into the middle, the routes after it lose authentication while
+/// remaining in [`PROTECTED_ROUTES`], so
+/// `every_protected_route_rejects_anonymous_requests` goes red on the spot.
 ///
-/// 必须由调用方命名，不能在宏里硬写一个：macro_rules 的卫生规则让宏内部
-/// 造出来的标识符在调用点根本不可见，于是 handler 表达式里写 `state`
-/// 会是「找不到这个变量」。`/mcp` 那条要拿它构造 tower service，
-/// 是第一条真的需要它的路由。
+/// `$state` is **the name the caller binds that `AppState` to**.
+///
+/// It has to be named by the caller and cannot be hard-coded inside the macro:
+/// macro_rules hygiene makes an identifier created inside the macro invisible at
+/// the call site, so writing `state` in a handler expression would be "cannot
+/// find this variable". The `/mcp` entry needs it to construct a tower service,
+/// making it the first route that genuinely requires it.
 macro_rules! protected_routes {
     ($state:ident; $( $path:literal [$($method:ident),+ $(,)?] => $handler:expr ),+ $(,)?) => {
-        /// 全部**应当**需要认证的路由，与上面的注册链同源。
+        /// Every route that **should** require authentication, from the same
+        /// source as the registration chain above.
         ///
-        /// 路径里的 `{…}` 是 axum 的参数占位符，测试会替换成一个具体的探针值。
+        /// The `{…}` in a path is an axum parameter placeholder; the tests
+        /// substitute a concrete probe value.
         #[cfg(test)]
         const PROTECTED_ROUTES: &[(&str, &[axum::http::Method])] = &[
             $( ($path, &[$(axum::http::Method::$method),+]) ),+
@@ -64,11 +73,13 @@ macro_rules! protected_routes {
         fn protected_router($state: AppState) -> Router<AppState> {
             Router::new()
                 $( .route($path, $handler) )+
-                // route_layer：只对**匹配到的**路由生效。不匹配的路径照常 404，
-                // 不会先被判成 401 —— 后者会让「路径打错了」与「凭据不对」
-                // 在客户端看来是同一件事。
+                // route_layer: applies only to routes that **matched**. A
+                // non-matching path still 404s and is not judged 401 first —
+                // the latter would make "the path was typed wrong" and "the
+                // credential is wrong" look identical to the client.
                 //
-                // 这一句必须是最后一句，理由见宏的文档
+                // This must be the final statement; reasoning in the macro's
+                // documentation
                 .route_layer(axum::middleware::from_fn_with_state(
                     $state,
                     crate::auth::require,
@@ -80,84 +91,112 @@ macro_rules! protected_routes {
 protected_routes! {
     state;
     "/auth/ticket" [POST] => post(issue_ticket),
-    // 自带 API key。三个动作一条路径：看状态 / 存 / 撤下
+    // Bring-your-own API key. Three actions on one path: read status / store /
+    // withdraw
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)
         .put(crate::byo_key::put)
         .delete(crate::byo_key::delete),
-    // 这里**没有** `/chat`，也没有 `/sandbox/*`。它们归 `cortex-agentd`
-    // ——那个进程有 docker，这个没有。分流在边缘（dev 的 nginx、prod 的
-    // traefik），不在任何一个服务里：让 cortexd 知道 agentd 在哪，等于给
-    // 这一半留一条「agent 服务地址」的配置，而独立部署它的人根本没有 agentd。
-    // 这里**没有** `/confirmations`。工具确认属于 agent，而 agent 在别的
-    // 进程里：桌面端问的是本机 `cortex-local`，容器里那一轮压根不问
-    //（越界路径直接拒绝，那是 agent 那一侧 `ExecEnvironment::Container` 的语义）。
+    // There is **no** `/chat` here, and no `/sandbox/*`. Those belong to
+    // `cortex-agentd` — that process has docker, this one does not. The routing
+    // split happens at the edge (nginx in dev, traefik in prod) and inside no
+    // service: letting cortexd know where agentd lives would leave this half
+    // carrying an "agent service address" setting, and whoever deploys it
+    // standalone has no agentd at all.
     //
-    // cortexd 曾经也有一份，服务的是它自己那个进程内 agent。那个 agent 删了
-    // 之后这份簿子就再没有生产者 —— 留着它等于留一个永远回空列表、永远 404
-    // 的端点，而那是本仓库列在第一条的老毛病：**造好了没人调用**。
-    // 委托凭据：给一个**不受信调用方**签一把绑在某个会话上的短期钥匙。
-    // 见 `cortex_proto::delegate` 的模块头 —— 这是 cortexd 自己的入站授权
-    // 策略，不是沙箱编排；至于拿到钥匙的是容器还是别的什么，它不关心。
+    // There is **no** `/confirmations` here either. Tool confirmation belongs to
+    // the agent, and the agent lives in a different process: the desktop client
+    // asks its local `cortex-local`, and the in-container turn does not ask at
+    // all (out-of-bounds paths are refused outright, which is the semantics of
+    // `ExecEnvironment::Container` on the agent side).
     //
-    // 签发用的是**调用者自己那把 bearer**，所以它只能为「把 token 交给它的
-    // 那个用户」签发，不产生任何新特权。
+    // cortexd used to have one too, serving its own in-process agent. Once that
+    // agent was deleted this ledger had no producer left — keeping it would
+    // mean keeping an endpoint that forever returns an empty list and forever
+    // 404s, which is this repository's number-one recurring ailment: **built and
+    // never called**.
+    //
+    // Delegated credentials: sign a short-lived key for an **untrusted caller**,
+    // bound to one session. See `cortex_proto::delegate`'s module header — this
+    // is cortexd's own inbound authorization policy, not sandbox orchestration;
+    // whether a container or something else receives the key is not its concern.
+    //
+    // Issuing uses **the caller's own bearer**, so it can only issue for "the
+    // user who handed it that token" and creates no new privilege.
     "/delegated-tokens" [POST, DELETE] => post(delegate).delete(revoke_delegation),
     "/memory/search" [GET] => get(memory_search),
-    // 记忆对外的 MCP 门面。见 `crate::mcp` 的模块头。
+    // Memory's outward-facing MCP frontage. See `crate::mcp`'s module header.
     //
-    // **它必须在这份清单里**：这条路能读一个人的全部记忆，落到公开侧就是
-    // 一个无认证的记忆读写口，而它不会以任何方式表现出来 —— 没有报错、
-    // 没有告警，只有「谁都能读你的记忆」。下面那条
-    // `every_protected_route_rejects_anonymous_requests` 是唯一能拦住它的东西。
+    // **It must be on this list**: this route can read a person's entire memory,
+    // and on the public side it is an unauthenticated read/write port into
+    // memory that manifests in no way whatsoever — no error, no alert, just
+    // "anyone can read your memory". The
+    // `every_protected_route_rejects_anonymous_requests` test below is the only
+    // thing capable of catching it.
     //
-    // 三个方法是 streamable-http 传输要的：POST 发消息、GET 开 SSE 回程、
-    // DELETE 结束会话。`on_service` 把 rmcp 那个 tower Service 变成
-    // `MethodRouter`，于是这条路与其余路由的注册形状**完全一样** ——
-    // 用 `route_service` 就绕开了这个宏，也就绕开了那条覆盖测试。
+    // The three methods are what the streamable-http transport needs: POST to
+    // send messages, GET to open the SSE return channel, DELETE to end the
+    // session. `on_service` turns rmcp's tower Service into a `MethodRouter`, so
+    // this route's registration shape is **identical** to every other route —
+    // using `route_service` would bypass this macro, and with it the coverage
+    // test.
     //
-    // **必须是 `on_service` 而不是 `any_service`**：后者对所有方法开门，
-    // 于是覆盖测试那根「用未声明的方法打过去应当 405」的探针会一路走到
-    // MCP 服务里、拿回一个 400。那条探针存在的意义是证明「路径真的匹配上了」，
-    // 被 400 顶掉之后，紧跟着那条 401 断言就成了空的 —— 而它才是重点。
+    // **It must be `on_service` and not `any_service`**: the latter opens the
+    // door to every method, so the coverage test's probe ("an undeclared method
+    // should give 405") would travel all the way into the MCP service and come
+    // back with a 400. That probe exists to prove "the path genuinely matched",
+    // and once a 400 displaces it, the 401 assertion right after it becomes
+    // vacuous — and that assertion is the whole point.
     "/mcp" [POST, GET, DELETE] => axum::routing::on_service(
         axum::routing::MethodFilter::POST
             .or(axum::routing::MethodFilter::GET)
             .or(axum::routing::MethodFilter::DELETE),
         crate::mcp::service(state.clone()),
     ),
-    // LLM 代理。本地 agent 默认走这条路 —— API key 只在服务端一处，
-    // 多设备不用每台配一遍。它**不碰记忆、不写库**，纯转发
+    // The LLM proxy. The local agent takes this path by default — the API key
+    // lives in exactly one place on the server, so it does not have to be
+    // configured on every device. It **touches no memory and writes to no
+    // database**; it is pure forwarding
     "/llm/stream" [POST] => post(llm_stream),
-    // 本地 agent 把一轮对话写回来。GET 那条是回放，两者共用路径前缀但
-    // 方向相反 —— 写在同一行会让「哪个方法归哪个 handler」读起来靠位置
+    // The local agent writing a turn back. The GET below is replay; the two
+    // share a path prefix but run in opposite directions — written on one line,
+    // "which method belongs to which handler" would have to be read positionally
     "/episodes" [POST] => post(write_episode),
     "/episodes/{id}" [GET] => get(get_episode),
     "/sessions" [GET] => get(list_sessions),
-    // PATCH 而非 PUT：客户端只送要改的字段，没送的原样不动。
-    // PUT 的语义是整体替换，那会逼客户端先 GET 一遍再回传全量 ——
-    // 而两次请求之间别的设备改了什么，就被这次 PUT 悄悄回滚了
+    // PATCH rather than PUT: the client sends only the fields it wants changed,
+    // and anything it does not send stays as it was. PUT means wholesale
+    // replacement, which would force the client to GET first and send everything
+    // back — and whatever another device changed between those two requests
+    // gets quietly rolled back by that PUT
     "/sessions/{id}" [GET, PATCH] => get(get_session).patch(patch_session),
-    // 项目 —— 会话的分组容器。
+    // Projects — the grouping container for sessions.
     //
-    // DELETE 在这里是名副其实的：项目本身确实没了。它与
-    // 「归档会话」用不同动词是刻意的 —— 删项目**不删内容**，
-    // 里面的会话变回未分组，消息与记忆一条不少
+    // DELETE here is literally accurate: the project itself really is gone. Using
+    // a different verb from "archive a session" is deliberate — deleting a
+    // project **does not delete content**: the sessions inside revert to
+    // ungrouped, with every message and memory intact
     "/projects" [GET, POST] => get(list_projects).post(create_project),
     "/projects/{id}" [PATCH, DELETE] => axum::routing::patch(patch_project)
         .delete(delete_project),
-    // axum 默认体积上限是 2 MiB —— 对「直传小文件」这个用途太紧
-    // （随手一张手机照片就超了）。放宽到 DIRECT_UPLOAD_LIMIT，
-    // 再大的请走 /blobs/presign 直传对象存储，不经服务端中转
+    // axum's default body limit is 2 MiB — far too tight for "direct upload of
+    // small files" (one casual phone photo exceeds it). Widened to
+    // DIRECT_UPLOAD_LIMIT; anything larger should go through /blobs/presign
+    // straight to object storage without relaying through the server
     "/blobs" [POST] => post(upload_blob).layer(DefaultBodyLimit::max(DIRECT_UPLOAD_LIMIT)),
-    // Web 端的导入：浏览器读不到磁盘，只能先把 conversations.json 传上来。
-    // 桌面端不走这条（文件在本机，本地 agent 直接读）。
-    // 体积上限由 crate::import 自己按流式计数管，所以这里把 axum 的
-    // 默认闸门整个撤掉 —— 留着它只会在读到一半时把连接掐了，
-    // 而那时暂存文件已经写了一半
-    // 「我是谁」必须先证明你是谁，所以它在受保护这一侧。
-    // login / refresh / logout / register 在公开侧，理由见 `public_routes`
+    // Import from the web client: a browser cannot read the disk, so
+    // conversations.json has to be uploaded first. The desktop client does not
+    // take this path (its file is local and the local agent reads it directly).
+    // The size ceiling is enforced by crate::import itself with a streaming
+    // counter, so axum's default gate is removed entirely here — leaving it in
+    // would only cut the connection halfway through the read, by which point the
+    // spool file is already half written.
+    //
+    // "Who am I" requires proving who you are first, so it lives on the
+    // protected side. login / refresh / logout / register are on the public
+    // side; reasoning in `public_routes`
     "/auth/me" [GET] => get(crate::accounts::whoami),
-    // 「我还剩多少」。放在受保护侧 —— 它回答的是当前这个人的用量
+    // "How much do I have left". On the protected side — it answers for the
+    // usage of this particular person
     "/auth/usage" [GET] => get(crate::accounts::usage),
     "/import/upload" [POST] => post(crate::import::upload).layer(DefaultBodyLimit::disable()),
     "/import/preview" [POST] => post(crate::import::preview),
@@ -168,31 +207,40 @@ protected_routes! {
     "/blobs/{hash}/url" [GET] => get(get_blob_url),
     "/sync" [GET] => get(sync),
     "/ws" [GET] => get(crate::ws::handler),
-    // 沙箱工作区快照的**索引**。字节走已有的 `/blobs`。
+    // The **index** for sandbox workspace snapshots. The bytes go through the
+    // existing `/blobs`.
     //
-    // 拍快照要 docker（导出 tar），存快照要库与对象存储 —— 前者只有
-    // agentd 有，后者只有这里有。所以切在中间：agentd 出 tar 交上来，
-    // 这里只记一行。见 `crate::snapshots` 的模块头。
+    // Taking a snapshot needs docker (to export the tar); storing one needs the
+    // database and object storage — only agentd has the former, only this side
+    // has the latter. So the cut runs down the middle: agentd produces the tar
+    // and hands it over, and this side merely records a row. See
+    // `crate::snapshots`'s module header.
     "/sandbox-snapshots" [GET, POST] => get(crate::snapshots::list).post(crate::snapshots::record),
 }
 
-/// 路由表。
+/// The route table.
 ///
-/// # 认证的形状：豁免靠**不挂中间件**表达，不靠路径白名单
+/// # The shape of authentication: exemptions are expressed by **not attaching
+/// # the middleware**, never by a path allow-list
 ///
-/// 「中间件里判断 `path == "/health"` 就放行」是这类代码最经典的出事点：
-/// 加新路由的人不会想起去更新那张表，而漏掉的方向是**默认放行**。
-/// 这里把它拆成两个 `Router`：`public` 那个只有 `/health`，其余全部由
-/// [`protected_router`] 生成并整体套一层 [`crate::auth::require`]。
-/// 新加的路由默认落在受保护那一侧 —— 失败方向反过来了。
+/// "Check `path == "/health"` inside the middleware and let it through" is the
+/// single most classic failure point of this kind of code: whoever adds a new
+/// route will not remember to update that table, and the direction the omission
+/// falls in is **allow by default**. So this splits into two `Router`s: the
+/// `public` one holds `/health` and friends, and everything else is generated by
+/// [`protected_router`] with a single [`crate::auth::require`] layer wrapped
+/// around it. A newly added route lands on the protected side by default — the
+/// failure direction is inverted.
 ///
-/// # 这个函数体里只允许出现 `/health` 一条 `.route()`
+/// # Only the `/health` `.route()` is allowed inside this function body
 ///
-/// 别的路由一律写进上面的 `protected_routes!`。写在这里的两种下场都很糟：
-/// 加进 `public` 就是**完全不认证**；加在 `protected_router(...)` 返回值
-/// 之后（也就是 `route_layer` 之后）同样不认证，而且更隐蔽。
-/// `router_registers_no_routes_outside_the_macro` 这条测试直接读本文件的
-/// 源码来守这一条 —— 它是唯一能拦住「在宏之外注册路由」的手段。
+/// Every other route goes into the `protected_routes!` macro above. Both ways of
+/// writing one here end badly: adding it to `public` means **no authentication
+/// at all**; adding it after `protected_router(...)`'s return value (i.e. after
+/// `route_layer`) is equally unauthenticated, and more insidious. The test
+/// `router_registers_no_routes_outside_the_macro` reads this file's own source
+/// to guard this — it is the only means of catching "a route registered outside
+/// the macro".
 pub fn router(state: AppState) -> Router {
     let mut public = Router::new();
     for (path, method_router) in public_routes() {
@@ -204,26 +252,30 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// 不需要认证的那几条，**一处清单**。
+/// The handful of routes that need no authentication, **as one inventory**.
 ///
-/// # 为什么它们必须在公开侧
+/// # Why each of them has to be on the public side
 ///
-/// - `/health`：消费者是 Docker HEALTHCHECK 与负载均衡探针，那些东西配不了
-///   凭据。给它加认证的直接后果是容器一直 unhealthy，然后有人把 HEALTHCHECK
-///   删掉。回的内容全是**部署形态**，不是用户数据（见 `Health::auth`）。
-/// - `/auth/login`、`/auth/register`：登录是「还没有凭据」时做的事。
-///   要求带凭据才能登录是个死循环。
-/// - `/auth/refresh`、`/auth/logout`：它们带的是 **refresh token**，
-///   那本身就是凭据 —— 校验在 handler 里（摘要比对 + 重放检测）。
-///   要求同时带一个还没过期的 access token，等于让「过期后自动续期」
-///   这件事只在没过期时可用。
+/// - `/health`: its consumers are Docker HEALTHCHECK and load balancer probes,
+///   neither of which can be given a credential. The direct consequence of
+///   requiring authentication is a container that stays unhealthy forever, and
+///   then somebody deletes the HEALTHCHECK. What it returns is entirely
+///   **deployment shape**, not user data (see `Health::auth`).
+/// - `/auth/login`, `/auth/register`: logging in is what you do when you do not
+///   yet have a credential. Requiring one in order to log in is a deadlock.
+/// - `/auth/refresh`, `/auth/logout`: what they carry is a **refresh token**,
+///   which is itself the credential — verified inside the handler (digest
+///   comparison plus replay detection). Also requiring an unexpired access token
+///   would make "renew automatically after expiry" available only while
+///   unexpired.
 ///
-/// # 往里加一条之前
+/// # Before adding one
 ///
-/// 这个函数是整个服务**唯一**的免认证入口。加东西的正确姿势是先在上面
-/// 补一段「为什么这一条不能要凭据」—— 补不出来就说明它该待在
-/// `protected_routes!` 里。`the_public_list_stays_short` 会在这份清单
-/// 变长时红，逼人回来看这段话。
+/// This function is the **only** unauthenticated entrance to the whole service.
+/// The correct way to add something is to first write a paragraph above saying
+/// "why this one cannot require a credential" — if you cannot write one, it
+/// belongs in `protected_routes!`. `the_public_list_stays_short` goes red when
+/// this inventory grows, forcing whoever changed it back here to read this.
 fn public_routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
     vec![
         ("/health", get(health)),
@@ -236,7 +288,8 @@ fn public_routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)>
 
 // ─────────────────────────── /health ───────────────────────────
 
-/// 存活探针。**唯一不需要认证的端点**，理由见 [`Health::auth`]。
+/// The liveness probe. **The only endpoint that needs no authentication**;
+/// reasoning in [`Health::auth`].
 async fn health(State(st): State<AppState>) -> Json<Health> {
     Json(Health {
         status: st.status().into(),
@@ -248,18 +301,20 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
         blob_backend: Some(st.blob_backend().into()),
         auth: Some(st.auth_mode().as_str().into()),
         embedding: st.embedding_health().await,
-        // 服务端没有这两项：沙箱状态由启动日志承担，记忆库就是它自己
+        // The server has neither of these: sandbox status is carried by the
+        // startup log, and the memory database is this process itself
         sandbox: None,
         memory: None,
     })
 }
 
-// ──────────────────── /auth/ticket（R9）────────────────────
+// ──────────────────── /auth/ticket (R9) ────────────────────
 
-/// 用长期 token 换一张短命票据。
+/// Exchange the long-lived token for a short-lived ticket.
 ///
-/// 给那些**加不了请求头**的连接用：浏览器的 `EventSource`、`WebSocket`、
-/// `<img src>`。票据以 `?ticket=` 传，60 秒过期。见 [`crate::auth`]。
+/// For connections that **cannot set request headers**: the browser's
+/// `EventSource`, `WebSocket`, `<img src>`. The ticket travels as `?ticket=` and
+/// expires after 60 seconds. See [`crate::auth`].
 async fn issue_ticket(State(st): State<AppState>) -> Json<TicketResponse> {
     Json(TicketResponse {
         ticket: st.ticket_book().issue(),
@@ -267,23 +322,22 @@ async fn issue_ticket(State(st): State<AppState>) -> Json<TicketResponse> {
     })
 }
 
-// ──────────────────────────── /chat ────────────────────────────
+// ─────────────────── delegation scope ──────────────────────────
 
-/// 流式对话。
+/// This session's sandbox scope: whose it is, and which project.
 ///
-/// 用 SSE 而非 WebSocket：对话是单向流，SSE 自带重连与文本帧语义，
-/// 且在 Flutter Web 上比 WS 少一层坑。WS 留给多端同步推送。
-/// 这个会话的沙箱作用域：谁的、哪个项目的。
+/// # A missing project is treated as ungrouped rather than an error
 ///
-/// # 查不到项目时按未分组处理，而不是报错
+/// The session row is created along with the first episode, so **the first turn
+/// of a new session necessarily finds nothing** (the same thing shows up on the
+/// `cortex-local` side as a 404; see "the 404 on a new session's first turn" in
+/// the roadmap). A new session has not been moved into any project yet, so
+/// ungrouped is the correct answer.
 ///
-/// 会话行是随第一条 episode 建的，所以**新会话第一轮必然查不到**
-/// （同一件事在 `cortex-local` 那边表现为 404，见 roadmap 的「新会话第一轮的
-/// 404」）。新会话本来就还没被移进任何项目，未分组就是正确答案。
-///
-/// 租户库连不上时同样按未分组：那时该报错的是紧接着的那次真正的读写，
-/// 而不是「决定用哪个容器」这一步 —— 在这里报，错误信息会指向一件
-/// 与病因完全无关的事。
+/// An unreachable tenant database is likewise treated as ungrouped: at that
+/// point the thing that should raise an error is the actual read or write that
+/// follows, not the step "decide which container to use" — raising it here
+/// makes the error message point at something entirely unrelated to the cause.
 async fn delegation_scope(
     st: &AppState,
     owner: &str,
@@ -292,8 +346,10 @@ async fn delegation_scope(
     crate::delegated_token::DelegatedScope,
     cortex_store::SessionRuntime,
 ) {
-    // 项目与执行归属来自**同一行**。分两次查的话，两个判断会在并发改动下
-    // 看到不同的快照，而症状是「偶尔进错容器」—— 没有比这更难复现的
+    // The project and the runtime assignment come from **the same row**.
+    // Queried separately, the two decisions would see different snapshots under
+    // concurrent modification, and the symptom is "occasionally lands in the
+    // wrong container" — there is nothing harder to reproduce than that
     let state = match st.tenant_store_for_user(owner).await {
         Ok(store) => store.session_state(session_id).await.ok().flatten(),
         Err(e) => {
@@ -314,24 +370,31 @@ async fn delegation_scope(
     )
 }
 
-/// 给这个作用域签一把委托凭据 —— **有就复用，没有才签新的**。
+/// Sign a delegated credential for this scope — **reuse an existing one, and
+/// only sign a new one when there is none**.
 ///
-/// # 为什么复用而不是每轮签一把
+/// # Why reuse instead of signing one per turn
 ///
-/// 令牌的生命周期**跟着容器**，不跟着轮次。容器的入站认证用的是它启动时
-/// env 里那把（`cortex-local` 的入站与出站共用一个 token）。每轮签新的话，
-/// 第二轮反代过去就是 401 —— 而那条错误读起来像「沙箱坏了」。
-/// 真机第一轮通、第二轮 401，就是这个。
+/// A token's lifetime **follows the container**, not the turn. The container's
+/// inbound authentication uses the token in its startup env (`cortex-local`
+/// shares one token between inbound and outbound). Signing a new one each turn
+/// means the second turn's proxied request is a 401 — and that error reads like
+/// "the sandbox is broken". The real-machine symptom "first turn works, second
+/// turn 401s" was exactly this.
 ///
-/// 复用的判据是**作用域键**而不是 owner：同一个用户切到另一个项目时，
-/// 那是另一个容器、另一把令牌。按 owner 找会把 A 项目的令牌交给 B 项目的
-/// 容器，而它起来之后照常应答，第二轮才 401。
+/// The reuse criterion is the **scope key**, not the owner: when the same user
+/// switches to a different project, that is a different container and a
+/// different token. Looking up by owner would hand project A's token to project
+/// B's container, which then comes up and answers normally, only 401ing on the
+/// second turn.
 ///
-/// # 为什么单独一个函数
+/// # Why this is its own function
 ///
-/// 两个调用方：cortexd 自己那几条要摸容器的路由，以及 `POST /delegated-tokens`
-/// （agent 编排器走的那条）。**必须是同一份** —— 签发规则漂开的表现是
-/// 「换一条路进来的容器第二轮 401」，而那两条路的用户是不同的人群。
+/// It has two callers: cortexd's own routes that touch containers, and
+/// `POST /delegated-tokens` (the one the agent orchestrator uses). **They must
+/// share one implementation** — the symptom of the issuing rules drifting apart
+/// is "a container that came in via the other path 401s on its second turn", and
+/// those two paths serve different populations of users.
 fn delegate_token(st: &AppState, scope: crate::delegated_token::DelegatedScope) -> String {
     let key = scope.key();
     match st.delegations().find_by_key(&key) {
@@ -343,10 +406,12 @@ fn delegate_token(st: &AppState, scope: crate::delegated_token::DelegatedScope) 
     }
 }
 
-/// `POST /delegated-tokens` —— 给调用方签一把绑在某个会话上的钥匙。
+/// `POST /delegated-tokens` — sign the caller a key bound to one session.
 ///
-/// 见 [`cortex_proto::delegate`] 的模块头：这是**记忆服务的入站授权**，
-/// 不是沙箱编排。owner 从凭据来，项目与执行归属从会话行来，三样一次给全。
+/// See [`cortex_proto::delegate`]'s module header: this is **the memory
+/// service's inbound authorization**, not sandbox orchestration. The owner comes
+/// from the credential, the project and runtime assignment come from the session
+/// row, and all three are returned at once.
 async fn delegate(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -355,8 +420,9 @@ async fn delegate(
     let owner = crate::accounts::current_user(&st, &headers).await;
     let (scope, runtime) = delegation_scope(&st, &owner, &req.session_id).await;
     let scope_key = scope.key();
-    // 额度只**报告**不拦：这把钥匙不只用于对话，拿它列文件、下载工作区
-    // 一个 token 都不花。见 `Delegation::quota_exhausted`
+    // The quota is **reported**, never enforced here: this key is not used only
+    // for conversation, and listing files or downloading the workspace with it
+    // spends not a single token. See `Delegation::quota_exhausted`
     let quota_exhausted = st.enforce_quota(&owner).await.is_err();
     Ok(Json(cortex_proto::delegate::Delegation {
         token: delegate_token(&st, scope),
@@ -370,10 +436,11 @@ async fn delegate(
     }))
 }
 
-/// `DELETE /delegated-tokens` —— 收回一把没派上用场的钥匙。
+/// `DELETE /delegated-tokens` — take back a key that was never put to use.
 ///
-/// 幂等：收回一把不存在的（伪造的、已经过期的、别人的）同样回 204。
-/// 分开报会让「猜一个 token 试试」变成一个可用的探测口。
+/// Idempotent: revoking one that does not exist (forged, already expired,
+/// somebody else's) also returns 204. Reporting those separately would turn
+/// "guess a token and see" into a usable probe.
 async fn revoke_delegation(
     State(st): State<AppState>,
     Json(req): Json<cortex_proto::delegate::RevokeRequest>,
@@ -384,33 +451,44 @@ async fn revoke_delegation(
 
 // ───────────────────────── /llm/stream ─────────────────────────
 
-/// LLM 代理 —— 把一次流式调用原样转给供应商。
+/// The LLM proxy — forward one streaming call to the provider verbatim.
 ///
-/// 本地 agent 默认走这条路：API key 只在服务端一处，多设备不用每台配一遍。
-/// 想换模型 / 换供应商 / 走自己的中转而不碰服务器的人，把本地那侧配成直连即可。
+/// The local agent takes this path by default: the API key lives in exactly one
+/// place on the server, so it does not have to be configured on every device.
+/// Anyone who wants to switch models, switch providers, or use their own relay
+/// without touching the server simply configures the local side to connect
+/// directly.
 ///
-/// # 两类错误走的是两条路，这不是不一致
+/// # The two classes of error take two different paths, and that is not an
+/// # inconsistency
 ///
-/// **建流之前**失败（mock 后端没有供应商、鉴权错、模型名不合法）→ 普通
-/// HTTP 状态码。此时一个字都还没发出去，客户端该看到的就是一次失败的请求。
+/// Failing **before the stream is established** (the mock backend has no
+/// provider, wrong credentials, an invalid model name) → an ordinary HTTP status
+/// code. Not a single byte has gone out yet, so what the client should see is a
+/// failed request.
 ///
-/// **建流之后**失败（限流、上下文超长、供应商中途 5xx）→ SSE 上的
-/// `event: error`。这时候 200 与响应头早就发出去了，改不了状态码；
-/// 而且前面可能已经有几百个 token 到了用户眼前，静默截断会让客户端
-/// 分不清「说完了」和「断了」。
+/// Failing **after the stream is established** (rate limiting, context too long,
+/// the provider 5xxing partway through) → an `event: error` on the SSE stream.
+/// By then the 200 and the response headers went out long ago and the status
+/// code cannot be changed; moreover, several hundred tokens may already have
+/// reached the user's eyes, and a silent truncation would leave the client
+/// unable to distinguish "it finished" from "it broke".
 async fn llm_stream(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LlmStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // 桌面端的每一次模型调用都走这条，所以它是配额最该守住的地方。
-    // 在**发起之前**查：事后扣意味着最后那一次一定会超，而那一次
-    // 可能是一场六千次调用的导入
+    // Every model call from the desktop client goes through here, which makes it
+    // the place the quota most needs to hold. Check **before issuing**: deducting
+    // afterwards means the final call always overshoots, and that call might be
+    // an import of six thousand calls
     let user = crate::accounts::current_user(&st, &headers).await;
 
-    // 自带 key 的人走自己的、不占配额，所以**先看有没有 key，再决定要不要查配额**。
-    // 顺序反过来会把一个填了自己 key 的人拦在他自己的额度外面 ——
-    // 而配额消息里恰恰写着「填自己的 key 就不占配额」
+    // Someone with their own key uses it and does not count against the quota,
+    // so **look for a key first and only then decide whether to check the
+    // quota**. The other order would lock someone who supplied their own key out
+    // of their own allowance — while the quota message says, in so many words,
+    // that supplying your own key exempts you from it
     let tenant = st.tenant(&headers).await?;
     let own = st.own_key(&tenant).await;
     if own.is_none() {
@@ -431,29 +509,36 @@ async fn llm_stream(
         .await?;
     let used_own_key = own.is_some();
 
-    // 记账：流里每一帧都带着 `ProviderUsage`，而**最后一帧的累计值**
-    // 才是这次调用的总量。所以边转发边留最新的那个，流结束时写一行。
+    // Accounting: every frame in the stream carries a `ProviderUsage`, and the
+    // **cumulative value on the last frame** is this call's total. So keep the
+    // latest one while forwarding and write a row when the stream ends.
     //
-    // 不在这里 await 写库：那会把一次数据库往返插进用户等回复的路径里。
-    // 用 `spawn` 在流结束后补记 —— 漏记的后果只是这一次不计入配额，
-    // 而卡住的后果是每次对话都慢一截
+    // The database write is not awaited here: that would insert a database round
+    // trip into the path where the user is waiting for a reply. It is recorded
+    // after the stream ends instead — the consequence of missing a record is
+    // only that this one call does not count against the quota, while the
+    // consequence of blocking is that every conversation is a bit slower
     let usage_seen = std::sync::Arc::new(std::sync::Mutex::new((0_i64, 0_i64, String::new())));
 
     let seen = std::sync::Arc::clone(&usage_seen);
     let stream = upstream.map(move |item| {
         let ev = match item {
             Ok((message, usage)) => {
-                // 只有带用量的那些帧才更新。**取最新的那份而不是相加** ——
-                // 供应商报的是「到目前为止」的累计值，相加会把总量翻好几倍
+                // Only frames carrying usage update it. **Take the latest,
+                // never sum** — the provider reports a running cumulative
+                // total, and summing would multiply the figure several times
+                // over
                 if let (Some(pu), Ok(mut g)) = (usage.as_ref(), seen.lock()) {
                     g.0 = i64::from(pu.usage.input_tokens.unwrap_or(0));
                     g.1 = i64::from(pu.usage.output_tokens.unwrap_or(0));
                     g.2 = pu.model.clone();
                 }
                 let chunk = LlmStreamChunk { message, usage };
-                // 序列化失败也当成流内错误发出去，理由同上：这时候
-                // 已经不能改状态码了，静默丢一项等于让本地那侧收到
-                // 一段缺了中间的对话，而它没有任何办法察觉
+                // A serialization failure is also emitted as an in-stream
+                // error, for the same reason as above: the status code can no
+                // longer be changed at this point, and silently dropping an
+                // item would leave the local side with a conversation missing
+                // its middle, with no way whatsoever to notice
                 match serde_json::to_string(&chunk) {
                     Ok(json) => return Some(Ok(Event::default().data(json))),
                     Err(e) => LlmStreamError {
@@ -472,12 +557,14 @@ async fn llm_stream(
         Some(Ok(Event::default().event("error").data(json)))
     });
 
-    // 流走完之后把这次的用量记下来。
+    // Record this call's usage once the stream has run out.
     //
-    // 用 `chain` 挂一个空尾巴而不是 `spawn`：后者要把 stream 的所有权
-    // 交出去或者另开一条任务盯着它结束，而这里只需要「最后一帧之后再做一件事」。
-    // 记账失败只写日志（见 `record_usage`）—— 对话已经跑完了，
-    // 为了记不上账把结果丢掉是本末倒置
+    // A `chain`ed empty tail rather than a `spawn`: the latter would require
+    // handing over ownership of the stream or starting another task to watch for
+    // its end, whereas all that is needed here is "do one more thing after the
+    // last frame". A failed accounting write only logs (see `record_usage`) —
+    // the conversation has already completed, and throwing its result away
+    // because the ledger entry failed has the priorities backwards
     let st_for_usage = st.clone();
     let user_for_usage = user.clone();
     let tail = futures::stream::once(Box::pin(async move {
@@ -492,26 +579,30 @@ async fn llm_stream(
                 crate::quota::Usage {
                     input_tokens: input,
                     output_tokens: output,
-                    // 自带 key 的用量照记，但不占配额 ——「我这个月花了多少」
-                    // 与「我还剩多少额度」是两个问题
+                    // Bring-your-own-key usage is still recorded but does not
+                    // count against the quota — "how much did I spend this
+                    // month" and "how much allowance do I have left" are two
+                    // different questions
                     own_key: used_own_key,
                 },
                 &model,
             )
             .await;
-        // 这一帧不发给客户端：`filter_map` 之后它就消失了
+        // This frame is not sent to the client: `filter_map` makes it disappear
         Option::<Result<Event, Infallible>>::None
     }));
-    // 显式指名 futures 的 trait： 也在作用域里，
-    // 而它的  是同步的（收 Option 不收 Future）——
-    // 让编译器自己挑会挑到那一个，报的错还指向 async 块
+    // Name futures' trait explicitly: tokio_stream's StreamExt is also in scope,
+    // and its filter_map is synchronous (it takes an Option, not a Future) —
+    // letting the compiler pick would select that one, and the resulting error
+    // points at the async block
     let stream = futures::StreamExt::filter_map(
         futures::StreamExt::chain(stream, tail),
         |x| async move { x },
     );
 
-    // keep-alive 与 /chat 同一个理由：模型「想」得久的时候，
-    // 中间代理会把一条没有字节流动的连接当成死连接掐掉
+    // keep-alive for the same reason as any other streaming endpoint: while the
+    // model is "thinking" for a long time, intermediate proxies treat a
+    // connection with no bytes flowing as dead and cut it
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -519,7 +610,7 @@ async fn llm_stream(
     ))
 }
 
-// ─────────────────────────── 记忆检索 ──────────────────────────
+// ────────────────────────── memory retrieval ──────────────────
 
 async fn memory_search(
     State(st): State<AppState>,
@@ -532,36 +623,44 @@ async fn memory_search(
 
 // ────────────────────────── episodes ───────────────────────────
 
-/// 本地 agent 把一轮对话写回记忆库。
+/// The local agent writing one conversational turn back into the memory
+/// database.
 ///
-/// 一次请求做完「写 episode + 检索 + 归因」三件事，理由见
-/// [`cortex_proto::episodes`] 的模块注释（拆开会让归因变成客户端说了算）。
+/// One request does all three of "write the episode + retrieve + attribute";
+/// reasoning in [`cortex_proto::episodes`]'s module comment (splitting them
+/// would put attribution in the client's hands).
 ///
-/// **幂等**：同一个 id 写第二次返回 200 且 `already_existed = true`，
-/// 不是 409。离线队列重放会重复投递，那是预期内的正常路径 ——
-/// 报错会逼客户端把正常结果当异常处理，而那段代码平时跑不到、
-/// 真出事时才第一次执行。
+/// **Idempotent**: writing the same id a second time returns 200 with
+/// `already_existed = true`, not 409. Offline queue replay delivers duplicates,
+/// and that is an expected, normal path — an error would force the client to
+/// handle a normal outcome as an exception, and that code never runs day to day
+/// and executes for the first time exactly when something has gone wrong.
 async fn write_episode(
     State(st): State<AppState>,
     headers: HeaderMap,
-    // 委托凭据带的作用域，由认证中间件塞进来。**来源由凭据决定，
-    // 不由请求体决定** —— 这一点是整条记忆写入路径的关键：
-    // 让客户端自报「我是低信任的」等于让被注入的 agent 自己选信任级。
-    // `None` 表示这是一把完整的用户凭据，没有降级。
+    // The scope carried by a delegated credential, inserted by the
+    // authentication middleware. **The origin is decided by the credential, not
+    // by the request body** — this is the crux of the entire memory write path:
+    // letting the client declare "I am low trust" is letting a prompt-injected
+    // agent pick its own trust tier. `None` means this is a full user
+    // credential, with no downgrade.
     delegation: Option<axum::Extension<crate::delegated_token::DelegatedScope>>,
     Json(req): Json<NewEpisodeRequest>,
 ) -> Result<Json<EpisodeAck>, ApiError> {
-    // **只有带 anchor 的那一条会花钱**（它触发抽取）。不带的只是落原文，
-    // 拦下来毫无意义 —— 而那正是导入时占多数的那一半，
-    // 拦它会让「额度用完」变成「原文也存不进去」，白丢数据
+    // **Only the one carrying an anchor costs money** (it triggers extraction).
+    // One without merely stores the raw text, and blocking that is pointless —
+    // it is also the majority half during an import, so blocking it would turn
+    // "out of allowance" into "the raw text cannot be stored either", losing
+    // data for nothing
     if req.anchor_episode_id.is_some() {
         let user = crate::accounts::current_user(&st, &headers).await;
         st.enforce_quota(&user).await?;
     }
     let tenant = st.tenant(&headers).await?;
-    // 被委托的调用方只能写**它自己那个会话**。没有这一条的话，一个被注入的
-    // agent 可以把编造的「用户说过的话」写进这个人的**任意**会话里 ——
-    // 而作用域绑 session 的全部意义就在这儿
+    // A delegated caller may only write to **its own session**. Without this, a
+    // prompt-injected agent could write fabricated "things the user said" into
+    // **any** of that person's sessions — and binding the scope to a session is
+    // entirely about this
     if let Some(axum::Extension(scope)) = &delegation
         && scope.session_id != req.session_id
     {
@@ -577,9 +676,11 @@ async fn write_episode(
         st.write_episode(
             &tenant,
             req,
-            // **来源由凭据决定**（见上面那段）。委托凭据 → tier 3；
-            // 完整的用户凭据 → tier 2。第三方经 MCP 写进来的那一档
-            // （tier 4）不走这条路由，走 `crate::mcp` 的 remember 工具
+            // **The origin is decided by the credential** (see the paragraph
+            // above). A delegated credential → tier 3; a full user credential →
+            // tier 2. The tier for third parties writing in over MCP (tier 4)
+            // does not use this route; it goes through `crate::mcp`'s remember
+            // tool
             if delegation.is_some() {
                 cortex_memory::extract::TurnOrigin::Delegated
             } else {
@@ -601,7 +702,8 @@ async fn get_episode(
 
 // ─────────────────────────── /projects ─────────────────────────
 
-/// 现存的项目。已删除的不返回 —— 删项目就是「从列表里消失」。
+/// The projects that exist. Deleted ones are not returned — deleting a project
+/// means "disappear from the list".
 async fn list_projects(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -612,7 +714,8 @@ async fn list_projects(
     }))
 }
 
-/// 建一个项目。id 由服务端生成并在响应里给出。
+/// Create a project. The id is generated server-side and returned in the
+/// response.
 async fn create_project(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -622,7 +725,7 @@ async fn create_project(
     Ok(Json(st.create_project(&tenant, &req.name).await?))
 }
 
-/// 改名。返回改完之后的项目。
+/// Rename. Returns the project as it stands after the change.
 async fn patch_project(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -633,14 +736,15 @@ async fn patch_project(
     Ok(Json(st.patch_project(&tenant, &id, patch).await?))
 }
 
-/// 删项目 —— **解散分组，不动内容**。
+/// Delete a project — **dissolve the grouping, leave the content alone**.
 ///
-/// 里面的会话变回未分组，消息、附件、已抽取的记忆一条不少。所以这个
-/// DELETE 与 `redact` / `purge` 完全不是一回事，界面文案上别把它说成
-/// 「彻底删除」。
+/// The sessions inside revert to ungrouped, with every message, attachment and
+/// extracted memory intact. So this DELETE is nothing at all like `redact` /
+/// `purge`, and the UI copy must not describe it as "permanently delete".
 ///
-/// 回一个空对象而不是 204：客户端那套 JSON 解码路径统一，
-/// 少一条「这个响应没有 body」的特例。
+/// Returns an empty object rather than a 204: it keeps the client's JSON
+/// decoding path uniform, with one fewer "this response has no body" special
+/// case.
 async fn delete_project(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -651,8 +755,10 @@ async fn delete_project(
     Ok(Json(serde_json::json!({})))
 }
 
-/// 会话列表。**已归档的默认不返回** —— 归档的产品语义就是「从列表里消失」。
-/// 要看全部传 `?include_archived=true`；只看某个项目传 `?project_id=`。
+/// The session list. **Archived ones are not returned by default** — the
+/// product semantics of archiving is precisely "disappear from the list". Pass
+/// `?include_archived=true` to see everything, or `?project_id=` to see one
+/// project.
 async fn list_sessions(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -663,11 +769,13 @@ async fn list_sessions(
     }))
 }
 
-/// 单个会话的详情：概览 + **一页**消息。
+/// One session's detail: the summary plus **one page** of messages.
 ///
-/// 默认给最新的一页，往回翻传 `?before=`（取上一次响应的 `next_cursor`）。
-/// 不带参数的老客户端拿到的是**最新** N 条 —— 在此之前它拿到的是最老的
-/// N 条，也就是一段没有结尾的对话，而且看不出被截断了。
+/// The newest page by default; page backwards with `?before=` (taking
+/// `next_cursor` from the previous response). An older client sending no
+/// parameters receives the **newest** N — previously it received the oldest N,
+/// i.e. a conversation with no ending, with no way to tell it had been
+/// truncated.
 async fn get_session(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -678,11 +786,14 @@ async fn get_session(
     Ok(Json(st.session_detail(&tenant, &id, &q).await?))
 }
 
-/// 改名 / 归档 / 绑定工作区。返回改完之后的会话概览。
+/// Rename / archive / bind a workspace. Returns the session summary as it stands
+/// after the change.
 ///
-/// 归档走这里而不是 `DELETE /sessions/{id}`：那个动词会让客户端（和读代码
-/// 的人）以为数据没了。在 append-only 体系里数据一条没少，只是不再出现在
-/// 默认列表里 —— 真要销毁内容是 redact / purge，另一条路、要二次确认。
+/// Archiving goes through here rather than `DELETE /sessions/{id}`: that verb
+/// would leave the client (and whoever reads the code) believing the data is
+/// gone. In an append-only system not one row is lost; it simply stops appearing
+/// in the default list — actually destroying content is redact / purge, a
+/// different path requiring a second confirmation.
 async fn patch_session(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -695,8 +806,9 @@ async fn patch_session(
 
 // ──────────────────────────── /blobs ───────────────────────────
 
-/// 服务端中转上传。请求体就是裸字节，`Content-Type` 作为 MIME 的**后备**声明
-/// （能从字节头认出来时一律以字节头为准）。
+/// Server-relayed upload. The request body is raw bytes, and `Content-Type` is
+/// a **fallback** MIME declaration (whenever the byte header identifies the
+/// type, the byte header wins).
 async fn upload_blob(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -705,7 +817,8 @@ async fn upload_blob(
     let declared = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        // 去掉 `; charset=utf-8` 之类的参数：blobs.mime 存的是纯类型
+        // Strip parameters such as `; charset=utf-8`: blobs.mime stores the bare
+        // type
         .map(|v| v.split(';').next().unwrap_or(v).trim())
         .filter(|v| !v.is_empty());
     let tenant = st.tenant(&headers).await?;
@@ -720,9 +833,11 @@ async fn presign_blob(
     Ok(Json(st.presign_upload(&req.hash).await?))
 }
 
-/// 本地回落后端签不出 URL。**先判断再发请求**，回 501 而不是 500 ——
-/// 前者告诉客户端「本部署不支持直传，改走 POST /blobs 中转」，
-/// 后者会让它把这当成暂时故障，在一条永远走不通的路上反复重试。
+/// The local fallback backend cannot sign URLs. **Check before issuing the
+/// request**, and answer 501 rather than 500 — the former tells the client
+/// "this deployment does not support direct upload, switch to relaying through
+/// POST /blobs", while the latter leaves it treating this as a transient fault
+/// and retrying forever down a road that will never open.
 fn ensure_presign_supported(st: &AppState) -> Result<(), ApiError> {
     if st.supports_presign() {
         Ok(())
@@ -753,16 +868,20 @@ async fn get_blob_url(
     Ok(Json(st.blob_download_url(&tenant, &hash).await?))
 }
 
-/// 取回字节，支持 `Range`。
+/// Fetch the bytes, with `Range` support.
 ///
-/// # 为什么中转而不是一律 302 到 presigned URL
+/// # Why relay rather than always 302 to a presigned URL
 ///
-/// 重定向省带宽，但它把两件事绑死了：客户端必须能直连对象存储，且
-/// `LocalFsBlobStore` 根本签不出 URL。中转这条路两个后端都通、内网部署也通，
-/// 是那条**总是能用**的底线。想省带宽的客户端走 `GET /blobs/{hash}/url`
-/// 自己拿 presigned URL —— 显式选择，而不是让服务端替它猜。
+/// A redirect saves bandwidth, but it welds two requirements together: the
+/// client must be able to reach object storage directly, and
+/// `LocalFsBlobStore` cannot sign a URL at all. Relaying works on both backends
+/// and on an intranet deployment, making it the floor that **always works**. A
+/// client that wants to save bandwidth uses `GET /blobs/{hash}/url` to fetch a
+/// presigned URL itself — an explicit choice, rather than the server guessing
+/// on its behalf.
 ///
-/// Range 必须支持：没有它，播放器要拖到 31:40 就得先把整段视频拉下来。
+/// Range support is mandatory: without it, a player scrubbing to 31:40 has to
+/// pull the entire video down first.
 async fn get_blob(
     State(st): State<AppState>,
     Path(hash): Path<String>,
@@ -784,8 +903,9 @@ async fn get_blob(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mime),
-                    // 没有这个头，播放器根本不会尝试发 Range —— 它会老实地
-                    // 从头拉整个文件，然后拖动进度条就是一场灾难
+                    // Without this header a player never even attempts a
+                    // Range — it dutifully pulls the whole file from the
+                    // start, and scrubbing then becomes a disaster
                     (header::ACCEPT_RANGES, "bytes".to_string()),
                 ],
                 bytes,
@@ -793,7 +913,8 @@ async fn get_blob(
                 .into_response())
         }
         RangeSpec::Partial(r) => {
-            // Content-Range 的右端是**闭**的，与 Rust 的开区间差一位
+            // Content-Range's right end is **closed**, one off from Rust's
+            // half-open interval
             let (start, end) = (r.start, r.end - 1);
             let bytes = st.blob_bytes(&hash, Some(r)).await?;
             Ok((
@@ -812,8 +933,9 @@ async fn get_blob(
         }
         RangeSpec::Unsatisfiable => Ok((
             StatusCode::RANGE_NOT_SATISFIABLE,
-            // 416 必须带上 `bytes */总长` —— 客户端据此知道自己该要哪一段，
-            // 否则它只能盲目重试同一个越界区间
+            // A 416 must carry `bytes */total` — that is how the client learns
+            // which range it should have asked for; without it, all it can do is
+            // blindly retry the same out-of-bounds range
             [(header::CONTENT_RANGE, format!("bytes */{total}"))],
         )
             .into_response()),
@@ -831,33 +953,38 @@ async fn sync(
     Ok(Json(st.sync_since(&tenant, q).await?))
 }
 
-// ──────────────────────────── 错误 ─────────────────────────────
+// ──────────────────────────── errors ──────────────────────────
 
 #[derive(Debug)]
 pub struct ApiError {
     inner: cortex_core::CortexError,
-    /// 覆盖 `inner` 的文案。
+    /// Overrides `inner`'s wording.
     ///
-    /// `CortexError` 的 `Display` 会给每个变体加前缀（「存储错误：」之类），
-    /// 那对内部日志有用，对用户是噪声 —— 一句「用户名或密码不对」前面挂
-    /// 「存储错误：」只会让人以为服务坏了。借用它的变体来携带状态码时，
-    /// 文案必须能单独给。
+    /// `CortexError`'s `Display` prefixes every variant ("storage error:" and
+    /// the like), which is useful for internal logs and noise for the user —
+    /// "wrong username or password" with "storage error:" in front of it only
+    /// leaves people thinking the service is broken. When one of its variants is
+    /// borrowed merely to carry a status code, the wording has to be supplied
+    /// separately.
     message: Option<String>,
-    /// 覆盖 [`cortex_core::CortexError::http_status`] 的默认映射。
+    /// Overrides the default mapping in
+    /// [`cortex_core::CortexError::http_status`].
     ///
-    /// 只在**领域错误分不出来**的那几处用。`CortexError` 刻意没有
-    /// 「本部署不支持」这个变体 —— 它是部署形态的属性，不是领域概念，
-    /// 为它污染全局错误类型不划算。
+    /// Used only in the few places where **the domain error cannot express the
+    /// distinction**. `CortexError` deliberately has no "this deployment does
+    /// not support it" variant — that is a property of the deployment shape,
+    /// not a domain concept, and polluting the global error type for it does not
+    /// pay.
     status: Option<StatusCode>,
 }
 
 impl ApiError {
-    /// 400：客户端送来的东西不对。
+    /// 400: what the client sent is wrong.
     pub fn bad_request(message: impl Into<String>) -> Self {
         cortex_core::CortexError::Invalid(message.into()).into()
     }
 
-    /// 401：没有有效凭据。
+    /// 401: no valid credential.
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             message: Some(message.into()),
@@ -866,10 +993,11 @@ impl ApiError {
         }
     }
 
-    /// 429：额度用完了。
+    /// 429: the allowance is used up.
     ///
-    /// 与 403 分开：403 的意思是「这件事你永远不能做」，429 是
-    /// 「现在不行，等等就行」。客户端据此决定要不要显示重试。
+    /// Kept apart from 403: 403 means "you may never do this", 429 means "not
+    /// now, but you can later". The client uses that to decide whether to offer
+    /// a retry.
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             message: Some(message.into()),
@@ -878,10 +1006,11 @@ impl ApiError {
         }
     }
 
-    /// 403：认得出你是谁，但这件事不允许。
+    /// 403: we recognise who you are, but this is not permitted.
     ///
-    /// 与 401 分开：401 的意思是「去登录」，403 是「登录了也不行」。
-    /// 注册关闭时回 403 而不是 401，否则客户端会去弹一个没用的登录框。
+    /// Kept apart from 401: 401 means "go log in", 403 means "logging in will
+    /// not help". Closed registration answers 403 rather than 401, or the client
+    /// pops up a login box that cannot help.
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             message: Some(message.into()),
@@ -890,13 +1019,13 @@ impl ApiError {
         }
     }
 
-    /// 500：我们这边出了问题。
+    /// 500: something went wrong on our side.
     pub fn internal(message: impl Into<String>) -> Self {
         cortex_core::CortexError::Store(message.into()).into()
     }
 
-    /// 给人看的那句话。SSE 那条路要把它塞进事件里 ——
-    /// 那里没有 HTTP 状态码可用，只有一个 `error` 事件。
+    /// The sentence a human reads. The SSE path has to put it inside an event —
+    /// there is no HTTP status code available there, only an `error` event.
     #[must_use]
     pub fn message(&self) -> String {
         self.message
@@ -904,15 +1033,18 @@ impl ApiError {
             .unwrap_or_else(|| self.inner.to_string())
     }
 
-    /// 501：请求本身没错，是这个部署形态**永远**提供不了这个能力。
+    /// 501: nothing is wrong with the request; this deployment shape can
+    /// **never** provide this capability.
     ///
-    /// 客户端把 501 当成「这条路不会开」，据此把功能降级掉并且**不重试**
-    /// （`api_exception.dart` 的 `isUnsupported`，注释里写着「retrying a 501
-    /// is a loop on a road that will never open」）。所以只有真正的永久缺失
-    /// 才配用它。
+    /// The client treats a 501 as "this road will not open", degrades the
+    /// feature accordingly, and **does not retry** (`isUnsupported` in
+    /// `api_exception.dart`, whose comment reads "retrying a 501 is a loop on a
+    /// road that will never open"). So only a genuinely permanent absence
+    /// deserves it.
     ///
-    /// 与 [`Self::conflict`] 的分界：那个说的是「能力在，只是**这个会话**
-    /// 不在这儿」，用户做件事就好了；这个说的是「这条路永远不会开」。
+    /// The boundary with [`Self::conflict`]: that one says "the capability
+    /// exists, **this session** simply is not here", which the user can fix by
+    /// doing something; this one says "this road will never open".
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self {
             message: Some(message.into()),
@@ -950,24 +1082,28 @@ impl IntoResponse for ApiError {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  「哪些路由在认证中间件后面」
+//  "Which routes sit behind the authentication middleware"
 // ══════════════════════════════════════════════════════════════
 //
-// 这一组测试守的是一件在此之前**完全没有防护**的事。两条真实的失效路径：
+// This group of tests guards something that previously had **no protection
+// whatsoever**. Two real failure paths:
 //
-// 1. 新加路由的人手滑加进 `public`
-// 2. 在 `route_layer` **之后**再 `.route(...)` —— axum 的 `route_layer`
-//    只覆盖它之前注册的路由，之后那条就是裸的，而编译、clippy、
-//    既有测试全都是绿的
+// 1. Whoever adds a route slips and adds it to `public`
+// 2. A `.route(...)` **after** `route_layer` — axum's `route_layer` only covers
+//    routes registered before it, so anything after is bare, while compilation,
+//    clippy and the existing tests are all green
 //
-// 分两把锁对付这两条：
+// Two separate locks handle those two:
 //
-// - 宏里注册的路由 → `every_protected_route_rejects_anonymous_requests`
-//   遍历 [`PROTECTED_ROUTES`]（与注册链同源，不可能漏），对**真实的**
-//   `router()` 发请求。它同时覆盖了「有人把 route_layer 挪到宏展开的中间」。
-// - 宏**之外**注册的路由 → `router_registers_no_routes_outside_the_macro`
-//   直接读本文件源码。这是唯一能拦住它的手段：axum 不暴露路由表，
-//   运行时无从枚举「我不知道存在的那条路径」。
+// - Routes registered inside the macro → `every_protected_route_rejects_
+//   anonymous_requests` walks [`PROTECTED_ROUTES`] (same source as the
+//   registration chain, so nothing can be missed) and issues requests against
+//   the **real** `router()`. It simultaneously covers "somebody moved
+//   route_layer into the middle of the macro expansion".
+// - Routes registered **outside** the macro →
+//   `router_registers_no_routes_outside_the_macro` reads this file's own source.
+//   That is the only means of catching it: axum does not expose its route table,
+//   so there is no way at runtime to enumerate "the path I do not know exists".
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,10 +1113,12 @@ mod tests {
     use axum::http::{Method, Request};
     use tower::ServiceExt as _;
 
-    /// 参数占位符替换成的探针值。
+    /// The probe value that parameter placeholders are replaced with.
     ///
-    /// 从模式里**自动**推出探针路径，而不是让人在清单里再写一遍具体路径 ——
-    /// 那又会变成一份要手工维护的东西，也就又有了忘记更新的地方。
+    /// The probe path is derived from the pattern **automatically** rather than
+    /// having somebody write concrete paths into the inventory a second time —
+    /// that would become yet another hand-maintained artifact, and therefore
+    /// another place to forget to update.
     const PROBE: &str = "cortex-route-guard";
 
     fn probe_path(pattern: &str) -> String {
@@ -997,21 +1135,24 @@ mod tests {
             .join("/")
     }
 
-    /// 一份开着认证的状态，外加那份 token 的明文。
+    /// A state with authentication enabled, plus the plaintext of that token.
     fn app_with_token() -> (Router, String) {
         let (token, digest_hex) = crate::auth::generate();
-        let raw = hex::decode(&digest_hex).expect("生成的摘要应当是合法十六进制");
-        let digest: [u8; 32] = raw.try_into().expect("SHA-256 应当是 32 字节");
+        let raw = hex::decode(&digest_hex).expect("a generated digest should be valid hex");
+        let digest: [u8; 32] = raw.try_into().expect("SHA-256 should be 32 bytes");
         let rt = Runtime {
             auth: AuthMode::Token { digest },
             tickets: std::sync::Arc::new(crate::auth::TicketBook::default()),
-            // 这几条路由测试不碰账号端点，所以不接数据库。
-            // 账号端点在没有它时会 panic，而那正是它们不该被路由到的信号
+            // These route tests do not touch the account endpoints, so no
+            // database is attached. The account endpoints panic without one, and
+            // that is precisely the signal that they should not have been routed
+            // to
             accounts: None,
             access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
             delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
-            // 路由测试不碰 docker。`sandbox: true` 的请求在这里会拿到
-            // 「这个部署没有云沙箱」，而那正是它该拿到的
+            // The route tests do not touch docker. A request with
+            // `sandbox: true` gets "this deployment has no cloud sandbox" here,
+            // which is exactly what it should get
         };
         (router(crate::state::AppState::for_tests(rt)), token)
     }
@@ -1026,62 +1167,71 @@ mod tests {
         if let Some(t) = bearer {
             req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
-        // 所有写方法都带一个合法的空 JSON 体：没有它，请求会在**处理器**里
-        // 因为解析失败而挂掉。那不影响 401 的断言（中间件在前），但会让
-        // 「带了凭据之后不再是 401」那半条断言变得没那么有说服力
+        // Every write method carries a valid empty JSON body: without one the
+        // request dies inside the **handler** on a parse failure. That does not
+        // affect the 401 assertion (the middleware runs first), but it would
+        // make the other half — "with a credential it is no longer 401" — far
+        // less convincing
         let req = req
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}"))
-            .expect("构造请求不该失败");
+            .expect("building the request must not fail");
         app.clone()
             .oneshot(req)
             .await
-            .expect("router 的错误类型是 Infallible")
+            .expect("the router's error type is Infallible")
             .status()
     }
 
-    /// 清单里的每一条，无凭据时必须 401。
+    /// Every entry on the inventory must 401 without a credential.
     ///
-    /// # 为什么还要先证明探针真的打到了路由
+    /// # Why the probe must first be proven to have reached a route
     ///
-    /// `route_layer` 只对**匹配到的**路由生效，所以一个拼错的探针路径拿到的
-    /// 是 404 —— 而 `404 != 401` 这件事会让「这条路由没被保护」和
-    /// 「这条路由压根不存在」变成同一个绿。也就是说，光断言 401 的测试
-    /// 有可能是**空的**。
+    /// `route_layer` applies only to routes that **matched**, so a mistyped
+    /// probe path comes back 404 — and `404 != 401` makes "this route is not
+    /// protected" and "this route does not exist at all" produce the same green.
+    /// In other words, a test that only asserts 401 may be **vacuous**.
     ///
-    /// 证明的办法是拿一个这条路由**没有**声明的方法去打：路径匹配上了就是
-    /// 405，没匹配上才是 404。这个判据与处理器的业务返回无关 ——
-    /// `GET /sessions/{id}` 本来就会因为「mock 里没有这个会话」而正当地
-    /// 返回 404，用 404 做判据会把它误判成路由不存在。
+    /// The way to prove it is to hit the path with a method this route does
+    /// **not** declare: a matched path gives 405, and only an unmatched one
+    /// gives 404. That criterion is independent of what the handler returns for
+    /// business reasons — `GET /sessions/{id}` legitimately returns 404 because
+    /// "the mock has no such session", so using 404 as the criterion would
+    /// misjudge it as a nonexistent route.
     #[tokio::test]
     async fn every_protected_route_rejects_anonymous_requests() {
         let (app, token) = app_with_token();
         assert!(
             !PROTECTED_ROUTES.is_empty(),
-            "清单是空的 —— 宏没有生成任何东西，这组测试等于没跑"
+            "the inventory is empty —— the macro generated nothing, so this group of tests did \
+             not really run"
         );
 
         for (pattern, methods) in PROTECTED_ROUTES {
             let path = probe_path(pattern);
 
-            // 先证明这条探针路径真的能匹配到路由，否则下面的断言是空的
-            // 候选里要至少有一个是这条路由没声明的。三个是因为
-            // `/settings/llm-key` 一条路径上同时挂了 GET / PUT / DELETE ——
-            // 原先只有两个候选，加上那条路由之后这里直接 panic。
-            // 那不是坏事：它逼着人来看一眼探针还成不成立
+            // First prove this probe path genuinely matches a route, or the
+            // assertions below are vacuous. At least one candidate must be a
+            // method this route does not declare. There are three because
+            // `/settings/llm-key` carries GET / PUT / DELETE on one path —
+            // there used to be only two candidates, and adding that route made
+            // this panic outright. That is not a bad thing: it forces somebody
+            // to come and check that the probe still holds
             let unsupported = [Method::DELETE, Method::PUT, Method::PATCH]
                 .into_iter()
                 .find(|m| !methods.contains(m))
                 .expect(
-                    "DELETE / PUT / PATCH 全被某条路由占了 ——                      换一个这条路由没声明的方法当探针，或者给它单独写一条测试",
+                    "DELETE / PUT / PATCH are all taken by some route —— pick another method \
+                     this route does not declare as the probe, or give it a test of its own",
                 );
             let routed = status_of(&app, &unsupported, &path, Some(&token)).await;
             assert_eq!(
                 routed,
                 StatusCode::METHOD_NOT_ALLOWED,
-                "探针路径 {path}（来自 {pattern}）用未声明的 {unsupported} 打过去得到 {routed}，\
-                 预期 405。405 说明路径匹配上了、只是方法不对；404 说明这条探针根本没打到路由，\
-                 此时下面那条 401 断言是空的"
+                "probe path {path} (from {pattern}) hit with the undeclared {unsupported} \
+                 returned {routed}, expected 405. A 405 means the path matched and only the \
+                 method was wrong; a 404 means this probe never reached a route at all, in which \
+                 case the 401 assertion below is vacuous"
             );
 
             for method in *methods {
@@ -1089,22 +1239,23 @@ mod tests {
                 assert_eq!(
                     anon,
                     StatusCode::UNAUTHORIZED,
-                    "{method} {pattern} 在没有凭据时返回了 {anon}，而不是 401 —— \
-                     这条路由不在认证中间件后面。检查它是不是被加进了 public，\
-                     或者被加在了 route_layer 之后"
+                    "{method} {pattern} returned {anon} without a credential instead of 401 —— \
+                     this route is not behind the authentication middleware. Check whether it was \
+                     added to public, or added after route_layer"
                 );
 
                 let authed = status_of(&app, method, &path, Some(&token)).await;
                 assert_ne!(
                     authed,
                     StatusCode::UNAUTHORIZED,
-                    "{method} {pattern} 带上正确凭据仍然 401 —— 认证本身坏了"
+                    "{method} {pattern} still 401s with a correct credential —— authentication \
+                     itself is broken"
                 );
             }
         }
     }
 
-    /// 错误的凭据与没有凭据一样被拒。
+    /// A wrong credential is refused just like no credential.
     #[tokio::test]
     async fn a_wrong_token_is_rejected_on_every_protected_route() {
         let (app, _) = app_with_token();
@@ -1115,32 +1266,38 @@ mod tests {
                 assert_eq!(
                     got,
                     StatusCode::UNAUTHORIZED,
-                    "{method} {pattern} 接受了一个错误的 token（返回 {got}）"
+                    "{method} {pattern} accepted a wrong token (returned {got})"
                 );
             }
         }
     }
 
-    /// **cortexd 不跑 agent，也不编排容器。** 这几条路径压根不在它身上。
+    /// **cortexd runs no agent and orchestrates no containers.** These paths are
+    /// simply not on it.
     ///
-    /// # 这条不变量分两次变强，别把它改回去
+    /// # This invariant got stronger twice; do not revert it
     ///
-    /// 第一次：cortexd 里曾有一份进程内的 agent 循环（`chat_here` +
-    /// `run_turn`），工具目录只有 `memory_search`，只在「接不上 docker」时
-    /// 走到。它是**第二份实现** —— 同一个 `Turn::run` 两处装配，每加一个
-    /// 工具、每改一次注入纪律都得改两遍，而漏掉的那一遍不会有任何测试红。
-    /// 删掉它之后，这里断的是「明说要 docker」的 501。
+    /// The first time: cortexd once contained an in-process agent loop
+    /// (`chat_here` + `run_turn`) whose tool catalogue held only
+    /// `memory_search`, reached only when docker was unavailable. It was a
+    /// **second implementation** — the same `Turn::run` assembled in two
+    /// places, so every added tool and every change to injection discipline had
+    /// to be made twice, and the one that was missed made no test go red.
+    /// After deleting it, this test asserted a 501 that said "docker required"
+    /// out loud.
     ///
-    /// 第二次（现在）：容器编排也搬去 `cortex-agentd` 了，于是 `/chat` 与
-    /// `/sandbox/*` **在这个进程上根本不存在**。断言从 501 变成 404 是
-    /// 变强而不是放松 —— 501 说的是「这条路我有但不支持」，404 说的是
-    /// 「这条路不归我」，而后者才是实情。
+    /// The second time (now): container orchestration moved to `cortex-agentd`
+    /// too, so `/chat` and `/sandbox/*` **do not exist on this process at all**.
+    /// Changing the assertion from 501 to 404 makes it stronger, not weaker —
+    /// 501 says "I have this road but do not support it", 404 says "this road is
+    /// not mine", and the latter is the truth.
     ///
-    /// 独立部署 cortexd 的人（Cormex 的用户）拿到的正是这一份：它是记忆
-    /// 服务，没有 agent、没有 docker、也不假装有。
+    /// Whoever deploys cortexd standalone (a Cormex user) gets exactly this: a
+    /// memory service, with no agent, no docker, and no pretence of either.
     ///
-    /// 把任何一条加回来在别处不会有症状：编译过、别的测试全绿、我们自己的
-    /// 部署因为边缘分流照常工作。**只有这条会红。**
+    /// Adding any one of them back produces no symptom anywhere else: it
+    /// compiles, every other test is green, and our own deployment keeps working
+    /// thanks to edge routing. **This is the only test that goes red.**
     #[tokio::test]
     async fn cortexd_serves_no_agent_shaped_route() {
         let (app, token) = app_with_token();
@@ -1156,23 +1313,24 @@ mod tests {
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from("{}"))
-                .expect("构造请求不该失败");
+                .expect("building the request must not fail");
             let got = app
                 .clone()
                 .oneshot(req)
                 .await
-                .expect("router 的错误类型是 Infallible")
+                .expect("the router's error type is Infallible")
                 .status();
             assert_eq!(
                 got,
                 StatusCode::NOT_FOUND,
-                "{method} {path} 归 cortex-agentd —— 它有 docker，这个进程没有。\
-                 实际回了 {got}"
+                "{method} {path} belongs to cortex-agentd —— that process has docker, this one \
+                 does not. Actually returned {got}"
             );
         }
     }
 
-    /// `/health` 是**唯一**不需要认证的端点。理由见 [`Health::auth`]。
+    /// `/health` is the **only** endpoint that needs no authentication.
+    /// Reasoning in [`Health::auth`].
     #[tokio::test]
     async fn health_is_the_only_endpoint_open_to_anonymous_callers() {
         let (app, _) = app_with_token();
@@ -1180,14 +1338,17 @@ mod tests {
         assert_eq!(
             got,
             StatusCode::OK,
-            "/health 必须免认证 —— 它的消费者是配不了凭据的容器探针"
+            "/health must be unauthenticated —— its consumers are container probes that cannot \
+             be given a credential"
         );
     }
 
-    /// 不存在的路径必须 404，不能被中间件抢先判成 401。
+    /// A nonexistent path must 404 and must not be judged 401 by the middleware
+    /// first.
     ///
-    /// 这是 `route_layer`（而不是 `layer`）的全部意义：否则「路径打错了」
-    /// 与「凭据不对」在客户端看来是同一件事。
+    /// This is the entire point of `route_layer` (rather than `layer`):
+    /// otherwise "the path was typed wrong" and "the credential is wrong" look
+    /// identical to the client.
     #[tokio::test]
     async fn an_unknown_path_is_a_404_not_a_401() {
         let (app, _) = app_with_token();
@@ -1195,38 +1356,44 @@ mod tests {
         assert_eq!(
             got,
             StatusCode::NOT_FOUND,
-            "未知路径返回了 {got} —— route_layer 被换成 layer 了？"
+            "an unknown path returned {got} —— was route_layer replaced with layer?"
         );
     }
 
-    /// `router()` 函数体里只允许注册 `/health` 一条路由。
+    /// Only the `/health` route may be registered inside `router()`'s body.
     ///
-    /// # 为什么只能读源码
+    /// # Why this can only be done by reading the source
     ///
-    /// 前面那些测试遍历的是宏生成的清单，它们对「在宏之外注册的路由」
-    /// 天然是瞎的 —— 而那恰恰是最危险的一条：`.route_layer()` 之后再
-    /// `.route(...)`，那条路由没有认证，编译与 clippy 全绿。axum 不暴露
-    /// 已注册的路由表，运行时没有任何办法枚举出「我不知道存在的那条路径」。
+    /// The tests above walk the macro-generated inventory, which makes them
+    /// inherently blind to "a route registered outside the macro" — and that is
+    /// exactly the most dangerous one: a `.route(...)` after `.route_layer()`
+    /// leaves that route unauthenticated while compilation and clippy stay
+    /// green. axum does not expose its registered route table, so there is no
+    /// way at runtime to enumerate "the path I do not know exists".
     ///
-    /// 于是退而求其次：直接看这个文件里 `pub fn router` 的函数体。
-    /// 它短、形状固定，且**任何**想绕过认证的新路由都必须先出现在这里。
-    /// 从本文件源码里切出一段，并去掉整行注释。
+    /// So this settles for the next best thing: look directly at the body of
+    /// `pub fn router` in this file. It is short, its shape is fixed, and **any**
+    /// new route seeking to bypass authentication has to appear here first.
     ///
-    /// 注释里出现 `.route(` 会误伤判断。这个文件里没有任何字符串字面量含
-    /// `//`，所以按行判断就够 —— 真有人往字符串里写了 `//`，这条测试会
-    /// 变红而不是变松，方向是对的。
+    /// Cut a span out of this file's source and drop whole-line comments.
+    ///
+    /// A `.route(` appearing inside a comment would corrupt the check. No string
+    /// literal in this file contains `//`, so a line-based test is enough — and
+    /// if somebody does write `//` into a string, this test goes red rather than
+    /// lax, which is the right direction.
     fn code_between(src: &str, from: &str, to: &str) -> String {
-        // 先把 CRLF 归一。Windows 上一次 `core.autocrlf=true` 的检出就足以让
-        // 「找 `\n}\n`」全部落空，而那时这几条测试会以「找不到结尾」的形式
-        // 失败 —— 方向是安全的（红而不是绿），但那是一次纯噪声的红
+        // Normalise CRLF first. One checkout with `core.autocrlf=true` on
+        // Windows is enough to make every search for `\n}\n` come up empty, at
+        // which point these tests fail with "cannot find the end" — a safe
+        // direction (red, not green), but pure noise
         let src = src.replace("\r\n", "\n");
-        let start = src
-            .find(from)
-            .unwrap_or_else(|| panic!("源码里找不到 {from:?} —— 它被改名了？这条测试要跟着改"));
+        let start = src.find(from).unwrap_or_else(|| {
+            panic!("cannot find {from:?} in the source —— was it renamed? this test has to follow")
+        });
         let rest = &src[start..];
         let end = rest
             .find(to)
-            .unwrap_or_else(|| panic!("从 {from:?} 起找不到结尾 {to:?}"));
+            .unwrap_or_else(|| panic!("cannot find the end {to:?} starting from {from:?}"));
         rest[..end]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -1243,24 +1410,28 @@ mod tests {
         let registrations = code.matches(".route(").count();
         assert_eq!(
             registrations, 1,
-            "router() 的函数体里出现了 {registrations} 处 `.route(`，应当只有 public_routes() 那个循环。
-             新路由请写进 protected_routes! 宏里：
-             · 加进 public_routes() = 完全不需要认证（那里每一条都得写明理由）；
-             · 加在 protected_router(...) 之后 = 在 route_layer 之后注册，同样不认证，而且更隐蔽。
-             实际的函数体：
+            "router()'s body contains {registrations} occurrences of `.route(`, and there should \
+             be only the public_routes() loop.
+             New routes belong in the protected_routes! macro:
+             · adding to public_routes() = no authentication at all (every entry there must state \
+             its reason);
+             · adding after protected_router(...) = registered after route_layer, equally \
+             unauthenticated and more insidious.
+             The actual function body:
 {code}"
         );
         assert!(
             code.contains("public_routes()"),
-            "router() 里那一处 .route() 应当来自 public_routes() 那份清单"
+            "the single .route() in router() should come from the public_routes() inventory"
         );
     }
 
-    /// **免认证清单只该有这几条。**
+    /// **The unauthenticated inventory should hold only these.**
     ///
-    /// 它是整个服务唯一的免认证入口，而往里加一条的代价是无声的：
-    /// 那条路径从此对任何人开放，而没有任何运行时手段能发现它本不该如此。
-    /// 这条测试让「清单变长」这件事必须被显式确认一次。
+    /// It is the service's only unauthenticated entrance, and the cost of adding
+    /// one entry is silent: that path is open to everyone from then on, with no
+    /// runtime means of discovering it should not have been. This test forces
+    /// "the inventory grew" to be confirmed explicitly, once.
     #[test]
     fn the_public_list_stays_short() {
         let paths: Vec<&str> = super::public_routes().into_iter().map(|(p, _)| p).collect();
@@ -1273,18 +1444,22 @@ mod tests {
                 "/auth/logout",
                 "/auth/register",
             ],
-            "免认证清单变了。改它之前先回 public_routes() 的文档里补一句             「为什么这一条不能要凭据」—— 补不出来就说明它该进 protected_routes!"
+            "the unauthenticated inventory changed. Before changing it, go add a sentence to \
+             public_routes()'s documentation saying \"why this one cannot require a \
+             credential\" —— if you cannot write one, it belongs in protected_routes!"
         );
     }
 
-    /// 宏展开里 `.route_layer()` 必须排在**所有** `.route()` 之后。
+    /// In the macro expansion, `.route_layer()` must come after **every**
+    /// `.route()`.
     ///
-    /// axum 的 `route_layer` 只覆盖它之前注册的路由。把它挪到中间，之后那些
-    /// 路由就是裸的 —— [`PROTECTED_ROUTES`] 会照样列出它们，所以
-    /// `every_protected_route_rejects_anonymous_requests` 拦得住这一种；
-    /// 但**在宏里、在 route_layer 之后新写一条 `.route()` 并且不进清单**
-    /// 那一种，运行时没有任何办法发现（清单里没有它，也就没人去打它）。
-    /// 这条测试补的正是那个缺口。
+    /// axum's `route_layer` only covers routes registered before it. Move it
+    /// into the middle and the routes after it are bare — [`PROTECTED_ROUTES`]
+    /// still lists them, so `every_protected_route_rejects_anonymous_requests`
+    /// catches that variant. But the variant where **a new `.route()` is written
+    /// inside the macro, after route_layer, and not added to the inventory** is
+    /// undetectable at runtime (it is not on the inventory, so nobody hits it).
+    /// This test fills exactly that gap.
     #[test]
     fn the_auth_layer_is_applied_after_every_route_in_the_macro() {
         const SRC: &str = include_str!("routes.rs");
@@ -1292,36 +1467,41 @@ mod tests {
         let code = code_between(SRC, "macro_rules! protected_routes", "\n}\n");
         let last_route = code
             .rfind(".route(")
-            .expect("宏里应当有 .route() 注册 —— 没有的话整个宏是空的");
-        let layer = code
-            .rfind(".route_layer(")
-            .expect("宏里应当有 .route_layer() —— 没有它，所有路由都不认证");
+            .expect("the macro should contain .route() registrations —— without any, the whole macro is empty");
+        let layer = code.rfind(".route_layer(").expect(
+            "the macro should contain .route_layer() —— without it, no route is authenticated",
+        );
         assert!(
             layer > last_route,
-            "protected_routes! 宏里有 .route() 排在 .route_layer() 之后。\n\
-             axum 的 route_layer 只覆盖它之前注册的路由 —— 之后那条没有认证，\n\
-             而且编译、clippy、既有测试全绿。把 .route_layer() 移回最后一句。"
+            "the protected_routes! macro has a .route() after .route_layer().\n\
+             axum's route_layer only covers routes registered before it —— the one after has no \
+             authentication,\n\
+             and compilation, clippy and the existing tests are all green. Move .route_layer() \
+             back to the final statement."
         );
     }
 
-    /// 清单里不该出现 `/health`。
+    /// `/health` must not appear on the inventory.
     ///
-    /// 守的是反方向：有人「顺手」把 /health 也搬进宏里，容器探针会集体 401，
-    /// 然后多半有人去把 HEALTHCHECK 删掉。
+    /// This guards the opposite direction: somebody "helpfully" moves /health
+    /// into the macro too, every container probe 401s, and then somebody most
+    /// likely deletes the HEALTHCHECK.
     #[test]
     fn health_is_not_in_the_protected_list() {
         assert!(
             !PROTECTED_ROUTES.iter().any(|(p, _)| *p == "/health"),
-            "/health 必须留在 public 一侧 —— 它的消费者配不了凭据"
+            "/health has to stay on the public side —— its consumers cannot be given a credential"
         );
     }
 
-    // ─────────────── 失效事实在检索结果里看得出来 ───────────────
+    // ────── invalidated facts are visible in retrieval results ─────
 
-    /// mock 后端上：日常检索不返回失效事实，回放返回但带 `invalidated`。
+    /// On the mock backend: ordinary retrieval returns no invalidated facts,
+    /// while replay returns them carrying `invalidated`.
     ///
-    /// 走真实路由而不是直接调 `AppState`：这条契约的消费者是客户端 CI，
-    /// 它看到的就是 HTTP 响应体。
+    /// This goes through the real routes rather than calling `AppState`
+    /// directly: the consumer of this contract is the client's CI, and what it
+    /// sees is the HTTP response body.
     #[tokio::test]
     async fn replay_shows_invalidated_facts_and_plain_search_does_not() {
         async fn facts(app: &Router, token: &str, query: &str) -> Vec<serde_json::Value> {
@@ -1330,34 +1510,43 @@ mod tests {
                 .uri(query)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
-                .expect("构造请求不该失败");
+                .expect("building the request must not fail");
             let resp = app.clone().oneshot(req).await.expect("Infallible");
-            assert_eq!(resp.status(), StatusCode::OK, "检索端点应当返回 200");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "the retrieval endpoint should return 200"
+            );
             let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
                 .await
-                .expect("应能读出响应体");
-            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("应当是 JSON");
-            v["facts"].as_array().expect("facts 应当是数组").clone()
+                .expect("the response body should be readable");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("should be JSON");
+            v["facts"]
+                .as_array()
+                .expect("facts should be an array")
+                .clone()
         }
 
         let (app, token) = app_with_token();
 
         let plain = facts(&app, &token, "/memory/search?q=").await;
-        assert!(!plain.is_empty(), "mock 检索不该是空的");
+        assert!(!plain.is_empty(), "mock retrieval should not be empty");
         assert!(
             plain.iter().all(|f| f["invalidated"] == false),
-            "日常检索里不该出现已失效的事实 —— 四路召回只查 active_facts"
+            "no invalidated fact may appear in ordinary retrieval —— all four retrieval paths \
+             query active_facts only"
         );
 
         let replayed = facts(&app, &token, "/memory/search?q=&as_of=2026-08-31T00:00:00Z").await;
         assert!(
             replayed.iter().any(|f| f["invalidated"] == true),
-            "回放必须返回当时有效、现在已被推翻的事实，并且标出来 —— \
-             「三个月前我以为什么」正是这个项目的卖点，过滤掉它等于砍掉卖点"
+            "replay must return facts that were valid then and have since been overturned, and \
+             mark them as such —— \"what did I believe three months ago\" is exactly this \
+             project's selling point, and filtering it out amounts to cutting that point away"
         );
         assert!(
             replayed.iter().all(|f| f.get("invalidated").is_some()),
-            "每条事实都必须带 invalidated 字段，客户端不该靠猜"
+            "every fact must carry the invalidated field; the client should not have to guess"
         );
     }
 }

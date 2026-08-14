@@ -1,47 +1,55 @@
 name: cortex
 
-# ─── 关于下面每一处 `${CORTEX_BIND_ADDR:-127.0.0.1}:` ────────────────────
+# ─── About every `${CORTEX_BIND_ADDR:-127.0.0.1}:` below ────────────────────
 #
-# 端口默认只绑**回环**而不是 `0.0.0.0`，收掉的是**局域网**那一面：
-# 一台开着 Wi-Fi 的开发机，原来是把带默认口令的 postgres 与对象存储
-# 摆在整个网段面前。
+# Ports bind to the **loopback** by default instead of `0.0.0.0`; what that takes away is
+# the **LAN** side: a development machine with Wi-Fi on used to be holding a postgres with
+# a default password, and an object store, out in front of the entire subnet.
 #
-# # 但它挡不住沙箱容器 —— 这条是实测出来的，别照字面信
+# # But it does not keep the sandbox containers out -- this was measured, do not take it at face value
 #
-# 原以为这一改顺带也把沙箱关在外面了。真机测下来**不成立**（Docker Desktop
-# / Windows）：
+# The assumption was that this change shut the sandbox out as well. On a real machine it
+# **does not hold** (Docker Desktop / Windows):
 #
-#   沙箱内 → cortex-postgres:5432（DNS 名）        拒绝   ← 拓扑隔离生效
-#   沙箱内 → host.docker.internal:15432（绑 0.0.0.0）可达
-#   沙箱内 → host.docker.internal:15432（改绑 127.0.0.1 之后）**仍然可达**
+#   from a sandbox → cortex-postgres:5432 (DNS name)                    refused   ← topological isolation works
+#   from a sandbox → host.docker.internal:15432 (bound to 0.0.0.0)      reachable
+#   from a sandbox → host.docker.internal:15432 (after rebinding to 127.0.0.1)  **still reachable**
 #
-# Docker Desktop 的端口转发跑在那台 Linux 虚拟机里，容器经
-# `host.docker.internal` 到达的正是转发器这一侧，绑不绑回环都一样。
-# 更难看的是同一次实测里它还连上了这台机器上**另一个项目**的 postgres
-# 与对象存储 —— 那两个不归这份 compose 管，改这里也管不着。
+# Docker Desktop's port forwarding runs inside that Linux virtual machine, and what a
+# container reaches through `host.docker.internal` is the forwarder's side of it -- binding
+# to loopback or not makes no difference at all.
+# Uglier still, the same run also got through to the postgres and the object store of
+# **another project** on this machine -- neither of which is governed by this compose file,
+# so changing anything here cannot reach them either.
 #
-# 唯一实测有效的是把沙箱网段设成 `internal: true`（容器里连默认路由都没有，
-# `host.docker.internal` 解析得出、路由不过去，上面三条全部拒绝）。
-# 代价是**内部网段上已发布端口失效**（同样实测过：宿主 curl 连不上），
-# 而 cortexd 眼下正是靠已发布端口反代进容器的 —— 所以那一步要连着一个
-# 双宿的中继容器一起做，记在 roadmap 的 B3。
+# The only thing measured to actually work is putting the sandbox network on
+# `internal: true` (a container then has no default route at all, `host.docker.internal`
+# still resolves but nothing routes there, and all three lines above are refused).
+# The price is that **published ports stop working on an internal network** (measured too:
+# curl from the host cannot connect), and cortexd currently reverse-proxies into the
+# containers through exactly those published ports -- so that step has to be taken together
+# with a dual-homed relay container, noted as B3 on the roadmap.
 #
-# 在原生 Linux 上（生产就是）绑回环**确实**是一道边界：docker-proxy 绑的是
-# 宿主 netns 的 127.0.0.1，容器经网桥网关 172.17.0.1 过来碰不到它。
-# 这一条是推理不是实测 —— 这台机器上没有原生 Linux docker 可验。
-# 而生产 `deploy/docker-compose.yml` 一个 `ports:` 都没有，本来就不暴露。
+# On native Linux (which is what production is), binding to loopback **is** a boundary:
+# docker-proxy binds to 127.0.0.1 in the host netns, and a container arriving through the
+# bridge gateway 172.17.0.1 never touches it.
+# That line is reasoning, not measurement -- there is no native Linux docker on this machine
+# to verify it on. And the production `deploy/docker-compose.yml` has not a single `ports:`
+# entry, so it is not exposed in the first place.
 #
-# 想从局域网另一台机器连，设 `CORTEX_BIND_ADDR=0.0.0.0`。
+# To connect from another machine on the LAN, set `CORTEX_BIND_ADDR=0.0.0.0`.
 #
-# **cortexd 自己的端口不在此列**：容器必须够得着它才能回调（记忆写入、
-# 拉历史），那条路由被沙箱令牌收窄到 5 条白名单路由 —— 那是有意留的门。
+# **cortexd's own port is not in this group**: a container has to be able to reach it in
+# order to call back (writing memory, pulling history), and that route is narrowed down by
+# the sandbox token to 5 allowlisted routes -- that door is left open deliberately.
 services:
 
-  # ─── cortexd：记忆服务本体 ────────────────────────────
+  # ─── cortexd: the memory service itself ────────────────────────────
   #
-  # 这一份是**独立可跑**的：Postgres + 对象存储 + 一个 LLM 供应商的 key，
-  # 没有别的前置。agent 那一侧（对话循环、容器编排）不在这个仓库里，
-  # 也不该在 —— 用它做记忆层的人一行都用不上。
+  # This one **runs on its own**: Postgres + object storage + a key for one LLM provider,
+  # and nothing else in front. The agent side (the conversation loop, container
+  # orchestration) is not in this repository, and should not be -- someone using this as a
+  # memory layer has no use for a single line of it.
   cortexd:
     build:
       context: .
@@ -61,7 +69,8 @@ services:
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
       CORTEXD_BIND: 0.0.0.0:8080
       RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
-      # 不配任何凭据时 cortexd **拒绝启动**。要关就得显式说 —— 见 auth.rs
+      # With no credential configured at all, cortexd **refuses to start**. Switching that
+      # off has to be said out loud -- see auth.rs
       CORTEX_AUTH: ${CORTEX_AUTH:-}
       CORTEX_TOKEN_SHA256: ${CORTEX_TOKEN_SHA256:-}
       CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
@@ -88,19 +97,22 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-cortex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cortex_dev_only}
       POSTGRES_DB: ${POSTGRES_DB:-cortex}
-      # 中文分词在 Rust 侧用 jieba-rs 完成，此处无需任何分词扩展
+      # Chinese tokenization happens on the Rust side with jieba-rs, so no tokenizer
+      # extension is needed here
       #
-      # 【新库才生效】initdb 的额外参数。data-checksums 让每一页都带校验和，
-      # 是「静默位翻转能被发现」的前提 —— 没有它，损坏会一路复制进备份。
-      # 已经建好的库改不了这个开关，用 `just pg-enable-checksums` 离线补
-      # （见 docs/operations.md）。
+      # [Only takes effect on a fresh database] Extra arguments to initdb. data-checksums
+      # gives every page a checksum, which is the precondition for "a silent bit flip can be
+      # noticed" -- without it, corruption propagates all the way into the backups.
+      # An existing database cannot have this switch flipped; use
+      # `just pg-enable-checksums` to retrofit it offline (see docs/operations.md).
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---data-checksums}
-    # WAL 归档。archive_mode 只能在启动时设，所以写在 command 里而不是 SQL。
-    #   archive_timeout=60  即使没有写入也每 60s 强制切段 —— RPO 的上界由它决定
-    #   archive_command     文档标准写法：目标已存在就报错，绝不静默覆盖
-    #                       （同名不同内容的 WAL 段是灾难，宁可停下来让人看见）
-    #   summarize_wal=on    PG17 的 WAL 摘要器，pg_basebackup --incremental 的前提。
-    #                       现在用不上增量，但打开它才留得住这条升级路
+    # WAL archiving. archive_mode can only be set at startup, hence in command rather than in SQL.
+    #   archive_timeout=60  force a segment switch every 60s even with no writes -- this is what bounds the RPO
+    #   archive_command     the standard form from the docs: fail if the target already exists, never overwrite silently
+    #                       (two WAL segments with the same name and different contents are a disaster;
+    #                        better to stop and be seen)
+    #   summarize_wal=on    PG17's WAL summarizer, the precondition for pg_basebackup --incremental.
+    #                       Incremental is not in use yet, but turning it on is what keeps that upgrade road open
     command:
       - postgres
       - -c
@@ -119,9 +131,10 @@ services:
       - "${CORTEX_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
-      # 备份落在宿主机目录而不是 named volume：脚本要能直接读、能被 rclone
-      # 推到第二存储、能在容器全没了之后还翻得出来。默认 ./data/backup，
-      # 而仓库根的 data/ 已在 .gitignore 里。
+      # Backups land in a host directory rather than a named volume: scripts have to be able
+      # to read them directly, rclone has to be able to push them to a second store, and
+      # they have to still be findable after every container is gone. Defaults to
+      # ./data/backup, and the repository's data/ is already in .gitignore.
       - ${CORTEX_BACKUP_DIR:-./data/backup}:/backup
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cortex} -d ${POSTGRES_DB:-cortex}"]
@@ -130,7 +143,7 @@ services:
       retries: 10
       start_period: 10s
 
-  # ─── RustFS（S3 兼容对象存储）──────────────────────────
+  # ─── RustFS (S3-compatible object storage) ──────────────────────────
   rustfs:
     image: rustfs/rustfs:latest
     container_name: cormex-rustfs
@@ -138,9 +151,10 @@ services:
     security_opt:
       - "no-new-privileges:true"
     environment:
-      # 开发环境单卷。四卷纠删码要求四块**独立物理盘**，
-      # 开发机只有一块盘时那是假冗余，RustFS 也会检测到共享设备并拒绝启动。
-      # 生产部署改为 /data/rustfs{0...3} 并挂到真实独立磁盘。
+      # One volume in development. Four-volume erasure coding requires four **physically
+      # independent disks**, and on a development machine with a single disk that is fake
+      # redundancy -- RustFS detects the shared device and refuses to start anyway.
+      # Production deployments switch to /data/rustfs{0...3} mounted on genuinely separate disks.
       RUSTFS_VOLUMES: /data
       RUSTFS_UNSAFE_BYPASS_DISK_CHECK: ${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -148,16 +162,17 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
-      # strict = 每次写入落盘后才确认。「永不丢失」的前提，勿调为 relaxed
+      # strict = a write is acknowledged only once it has hit the disk. The precondition for
+      # "never lose anything"; do not turn it down to relaxed
       RUSTFS_DURABILITY_MODE: strict
-      # RustFS 无按桶的 CORS 接口，允许来源是服务级配置。
-      # 开发环境放开，以便 Flutter Web 直接 presigned PUT。
+      # RustFS has no per-bucket CORS interface, so allowed origins are a service-level setting.
+      # Opened up in development so that Flutter Web can do presigned PUTs directly.
       RUSTFS_CORS_ALLOWED_ORIGINS: "*"
       RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
       RUSTFS_OBS_LOGGER_LEVEL: info
     ports:
       - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_API_PORT:-9000}:9000"      # S3 API
-      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9001}:9001"  # 控制台
+      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9001}:9001"  # console
     volumes:
       - rustfs_data:/data
     healthcheck:
@@ -167,24 +182,26 @@ services:
       retries: 5
       start_period: 30s
 
-  # ─── embedding 服务（OpenAI 兼容 /v1/embeddings）────────
+  # ─── The embedding service (OpenAI-compatible /v1/embeddings) ────────
   #
-  # 放在 `embed` profile 里，**默认不起**。理由：它是这套栈里最重的一个
-  # （bge-m3 fp32 权重 2.2 GB，常驻 2.5–3 GB），而 `just up` 应该是
-  # 「起个数据库就能开工」，不该在开发机上默默吃掉 3 GB。
+  # Lives in the `embed` profile and is **not started by default**. The reason: it is the
+  # heaviest thing in this stack (bge-m3 fp32 weights are 2.2 GB, 2.5-3 GB resident), while
+  # `just up` ought to mean "a database comes up and you can start working" -- it has no
+  # business quietly eating 3 GB on a development machine.
   #
-  #   docker compose --profile embed up -d     # 想在本地自建
+  #   docker compose --profile embed up -d     # to self-host it locally
   #
-  # 不想自建就把 .env 指到任何一家 OpenAI 兼容的服务：
+  # If you would rather not self-host, point .env at any OpenAI-compatible service:
   #
   #   CORTEX_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
   #   CORTEX_EMBED_MODEL=text-embedding-v3
   #   CORTEX_EMBED_API_KEY=sk-...
   #
-  # 两条路都不走的话，离线开发用 CORTEX_EMBED_BACKEND=hash ——
-  # 但要记住**它不是语义空间**，检索质量的评测结果在它上面没有意义。
+  # If neither road appeals, offline development can use CORTEX_EMBED_BACKEND=hash --
+  # but bear in mind that **it is not a semantic space**, so retrieval-quality evaluation
+  # results mean nothing on top of it.
   #
-  # **模型必须是 1024 维**：schema 写死 VECTOR(1024)。
+  # **The model has to be 1024-dimensional**: the schema hard-codes VECTOR(1024).
   embeddings:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
     container_name: cormex-embeddings
@@ -197,33 +214,36 @@ services:
     environment:
       HF_HOME: /data
     ports:
-      # 开发时 cortexd 跑在宿主机上（不在 compose 里），所以要映出来。
-      # 对应 .env：CORTEX_EMBED_ENDPOINT=http://127.0.0.1:8090/v1/embeddings
+      # During development cortexd runs on the host (not inside compose), so this has to be
+      # mapped out. Matches .env:
+      # CORTEX_EMBED_ENDPOINT=http://127.0.0.1:8090/v1/embeddings
       - "${CORTEX_BIND_ADDR:-127.0.0.1}:${CORTEX_EMBED_PORT:-8090}:80"
     volumes:
       - embed_models:/data
     healthcheck:
-      # 权重载入完成前 /health 不通，正好当就绪探针。
-      # start_period 给 5 分钟：第一次要下 2.2 GB
+      # /health does not answer until the weights have finished loading, which makes it a
+      # readiness probe as it is.
+      # start_period gets 5 minutes: the first run has 2.2 GB to download
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
       start_period: 300s
 
-  # ─── 沙箱网段唯一的双宿出口 ─────────────────────────────
+  # ─── The one dual-homed exit from the sandbox network ─────────────────────────────
   #
-  # 放在 `sandbox` profile 里，**默认不起**（同 embeddings 的理由：
-  # `just up` 该是「起个数据库就能开工」）。
+  # Lives in the `sandbox` profile and is **not started by default** (same reason as
+  # embeddings: `just up` should mean "a database comes up and you can start working").
   #
-  #   docker compose --profile sandbox up -d      # 或 just sandbox-up
+  #   docker compose --profile sandbox up -d      # or just sandbox-up
   #
-  # 它同时接两张网：
-  #   cortex-sandbox-net  internal，沙箱在这儿，**没有默认路由**
-  #   default             普通网桥，它靠这张网出去
+  # It is attached to two networks at once:
+  #   cortex-sandbox-net  internal, where the sandboxes live, **with no default route**
+  #   default             an ordinary bridge, which is how it gets out
   #
-  # 于是它是这张拓扑上唯一两边都够得着的点，两个方向都由它做：
-  # 出网（沙箱 → 放行的外网）与反向中继（cortexd → 指定的沙箱容器）。
+  # That makes it the only point in this topology able to reach both sides, and it serves
+  # both directions: egress (sandbox → the permitted outside world) and the reverse relay
+  # (cortexd → a designated sandbox container).
 networks:
   default:
     name: cortex_default

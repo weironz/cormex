@@ -1,20 +1,26 @@
-//! 先摊开账，再动手。
+//! Lay out the bill first, then act.
 //!
-//! # 为什么 dry-run 是默认
+//! # Why dry-run is the default
 //!
-//! 每一对消息触发一次抽取，也就是一次 LLM 调用。三年历史可能是几千次 ——
-//! 那是真金白银，而且跑起来之后没有「撤销」这个操作（记忆是 append-only，
-//! 撤销要走 redact，而它要显式触发、二次确认、留墓碑）。
+//! Every message pair triggers one extraction, i.e. one LLM call. Three years
+//! of history may be thousands of them — that is real money, and once it is
+//! running there is no "undo" (memory is append-only, and undoing means redact,
+//! which must be explicitly triggered, confirmed twice, and leaves a
+//! tombstone).
 //!
-//! 所以默认只算不做：把对话数、消息数、会触发多少次抽取、多少 token、
-//! 时间跨度全摆出来，然后停下。**这条规矩对界面同样成立** ——
-//! 桌面端与网页端的导入页也必须先给这份账，再给「开始」按钮。
+//! So the default is to count without doing: put the conversation count,
+//! message count, number of extractions to be triggered, token count, and time
+//! span all on the table, then stop. **This rule holds for the UI too** — the
+//! desktop and web import pages must also show this bill before showing a
+//! "Start" button.
 //!
-//! # 为什么报 token 而不是报钱
+//! # Why report tokens rather than money
 //!
-//! 各家定价不同、还在变，而且抽取走的是**服务端配的**廉价模型 ——
-//! 客户端根本不知道那是哪个。硬编一个价格只会给出一个看起来精确的错数字。
-//! 报 token，由知道自己价格的人自己乘。
+//! Each vendor prices differently and the prices keep changing, and extraction
+//! runs on the cheap model **configured on the server** — the client has no
+//! idea which one that is. Hardcoding a price would only produce a wrong number
+//! that looks precise. Report tokens, and let whoever knows their own price do
+//! the multiplication.
 
 use std::time::Duration;
 
@@ -24,45 +30,52 @@ use cortex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
 
 use crate::{Conversation, Platform, requests_for};
 
-/// 两次投递之间至少隔这么久。
+/// The minimum gap between two deliveries.
 ///
-/// 服务端有抽取并发闸门，但**那不是背压** —— 灌得太快只会让队列长在服务端
-/// 内存里，而生产那台是 2 核 3.5 GB。这里主动慢下来，是客户端该做的事。
+/// The server has an extraction concurrency gate, but **that is not
+/// backpressure** — pouring too fast merely grows the queue in server memory,
+/// and the production box has 2 cores and 3.5 GB. Slowing down voluntarily here
+/// is the client's job.
 ///
-/// 150ms ≈ 每秒 6~7 对。三年历史（假设 5000 对）大约 15 分钟 ——
-/// 一次性操作，这个速度完全可以接受，而它让服务端始终有余量伺候正常对话。
+/// 150ms ≈ 6–7 pairs per second. Three years of history (say 5000 pairs) takes
+/// roughly 15 minutes — a one-time operation, so that pace is entirely
+/// acceptable, and it leaves the server with headroom to serve normal
+/// conversations throughout.
 pub const PACE: Duration = Duration::from_millis(150);
 
-/// 一次导入要做什么。
+/// What one import is going to do.
 #[derive(Debug)]
 pub struct Plan {
     pub platform: Platform,
     pub conversations: Vec<Conversation>,
 }
 
-/// 摊开的账。
+/// The bill, laid out.
 ///
-/// 派生 `serde` 是为了原样走 HTTP 给界面 —— 界面显示的数字与 CLI
-/// 打印的数字**必须是同一次计算的结果**，各算各的迟早会对不上。
+/// `serde` is derived so this can go over HTTP to the UI unchanged — the
+/// numbers the UI shows and the numbers the CLI prints **must come from the
+/// same computation**; computing them separately will disagree sooner or later.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Estimate {
     pub conversations: usize,
     pub messages: usize,
-    /// 会触发多少次抽取 = 多少次 LLM 调用
+    /// How many extractions will be triggered = how many LLM calls
     pub pairs: usize,
-    /// 送进抽取的文本量（粗估）
+    /// The volume of text fed into extraction (rough estimate)
     pub tokens: usize,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
-    /// 有多少条消息落了单（进 episodes，但不产生事实）
+    /// How many messages are left dangling (they enter episodes, but produce no
+    /// facts)
     pub unpaired: usize,
 }
 
 impl Estimate {
-    /// 转成下发给客户端的形状。
+    /// Convert into the shape sent down to clients.
     ///
-    /// 转换写在这一侧而不是 `cortex-proto` 里：那个 crate 是**纯契约**，
-    /// 不依赖任何实现。反过来让它 `use cortex_import` 会把依赖方向倒过来。
+    /// The conversion lives on this side rather than in `cortex-proto`: that
+    /// crate is **pure contract** and depends on no implementation. Having it
+    /// `use cortex_import` instead would invert the dependency direction.
     #[must_use]
     pub fn to_wire(&self, platform: Platform) -> cortex_proto::import::ImportEstimate {
         cortex_proto::import::ImportEstimate {
@@ -78,7 +91,7 @@ impl Estimate {
         }
     }
 
-    /// 按当前限速，至少要跑多少分钟。
+    /// At the current pace, the minimum number of minutes this will take.
     #[must_use]
     pub fn minutes(&self) -> f64 {
         #[allow(clippy::cast_precision_loss)]
@@ -105,8 +118,9 @@ impl Plan {
             e.pairs += pairs.len();
             e.unpaired += c.messages.len() - pairs.len() * 2;
             for (u, a) in pairs {
-                // 与服务端拼给模型的那一段同构（`用户：…\n助手：…`），
-                // 所以这个数字是「真的会被送进去的量」，不是文件大小
+                // Isomorphic to the passage the server assembles for the model
+                // (`用户：…\n助手：…`), so this number is "the volume that will
+                // really be fed in", not the file size
                 e.tokens += cortex_core::injection::estimate_tokens(&u.text)
                     + cortex_core::injection::estimate_tokens(&a.text);
             }
@@ -119,26 +133,32 @@ impl Plan {
     }
 }
 
-/// 灌入的出口。三处各实现一份：CLI 打远端 HTTP、本地 agent 打远端 HTTP、
-/// cortexd 直接走自己的写入路径。
+/// The outlet for pouring data in. Implemented once in each of three places:
+/// the CLI over remote HTTP, the local agent over remote HTTP, and cortexd
+/// straight down its own write path.
 ///
-/// # 为什么要抽成 trait，而不是让三处各抄一遍 [`execute`]
+/// # Why abstract this into a trait rather than copy [`execute`] three times
 ///
-/// 那个循环里有三件**顺序敏感**的事，抄错任何一件都不报错、只是结果不对：
+/// That loop contains three **order-sensitive** things, and copying any of them
+/// wrong raises no error — the result is simply wrong:
 ///
-/// 1. user 必须先于 assistant 落库（anchor 指向它，服务端要回读原文）
-/// 2. 两次投递之间要限速（不然队列长在服务端内存里）
-/// 3. 改标题必须在内容之后（会话要先存在）
+/// 1. user must land before assistant (the anchor points at it, and the server
+///    reads the original text back)
+/// 2. deliveries must be rate-limited (otherwise the queue grows in server
+///    memory)
+/// 3. the title must come after the content (the session has to exist first)
 ///
-/// 抽成 trait，这三条只有一份实现。
+/// As a trait, those three exist in exactly one implementation.
 pub trait Sink {
-    /// 写一条 episode。已经存在时 `already_existed` 为真（幂等靠它）。
+    /// Write one episode. `already_existed` is true when it is already there
+    /// (idempotency rests on it).
     fn write_episode(
         &self,
         req: &NewEpisodeRequest,
     ) -> impl Future<Output = Result<EpisodeAck>> + Send;
 
-    /// 给会话改名。失败不致命 —— 内容已经进去了，少个标题而已。
+    /// Rename a session. Failure is not fatal — the content is already in, and
+    /// only a title is missing.
     fn rename_session(
         &self,
         session_id: &str,
@@ -146,32 +166,35 @@ pub trait Sink {
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
-/// 一次导入跑到哪儿了。
+/// How far an import has got.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
-    /// 已处理的对话数
+    /// Conversations processed
     pub conversations_done: usize,
     pub conversations_total: usize,
-    /// 已灌入的对数
+    /// Pairs poured in
     pub pairs_done: usize,
-    /// 服务端认出「早就有了」的条数 —— 没有重复计费
+    /// Entries the server recognized as "already there" — no double billing
     pub skipped: usize,
     pub failures: usize,
 }
 
-/// 真跑。
+/// Actually run it.
 ///
-/// # 断点续传是免费的
+/// # Resuming is free
 ///
-/// episode id 由 [`cortex_core::Id::derived`] 从「原始时刻 + 稳定种子」算出，
-/// 而 `POST /episodes` 按 id 判重。所以中断之后重跑同一条命令即可 ——
-/// 已经写过的会被服务端识别出来（`already_existed`），不重复计费。
-/// 不需要任何进度文件，也就没有「进度文件与实际状态不一致」这条故障。
+/// Episode ids are computed by [`cortex_core::Id::derived`] from "original
+/// moment + stable seed", and `POST /episodes` deduplicates by id. So after an
+/// interruption, re-running the same command is all it takes — anything already
+/// written is recognized by the server (`already_existed`) and is not billed
+/// again. No progress file is needed, and so the failure mode of "the progress
+/// file disagrees with the actual state" does not exist.
 ///
 /// # Errors
-/// 目前不返回 `Err` —— 单条写入失败只计数不中断（重跑会补上）。
-/// 签名留着 `Result` 是为了将来能加「连续失败太多就停」这类判据，
-/// 而那时改签名会波及三个调用方。
+/// Currently never returns `Err` — a single failed write is counted without
+/// interrupting the run (a re-run fills it in). The signature keeps `Result` so
+/// criteria like "stop after too many consecutive failures" can be added later,
+/// and changing the signature at that point would ripple through three callers.
 pub async fn execute<S: Sink, F: FnMut(Progress)>(
     sink: &S,
     plan: &Plan,
@@ -196,9 +219,11 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
 
         for (u, a) in pairs {
             let [user_req, asst_req] = requests_for(plan.platform, conv, u, a);
-            // user 必须先落：assistant 那条的 anchor 指向它，而服务端会拿
-            // anchor 去库里读回 user 的原文来拼抽取输入。反过来的话，
-            // 抽取会因为「找不到对应的 user episode」而整轮跳过
+            // user has to land first: the assistant entry's anchor points at
+            // it, and the server uses that anchor to read the user's original
+            // text back out of the store to assemble the extraction input. The
+            // other way round, extraction skips the whole turn because "the
+            // corresponding user episode cannot be found"
             match sink.write_episode(&user_req).await {
                 Ok(ack) if ack.already_existed => p.skipped += 1,
                 Ok(_) => {}
@@ -224,8 +249,9 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
             tokio::time::sleep(PACE).await;
         }
 
-        // 标题放在最后：会话要先有内容，改名才有东西可改。
-        // 失败不算致命 —— 内容已经进去了，少一个标题而已
+        // The title goes last: the session needs content before there is
+        // anything to rename. Failure is not fatal — the content is already in,
+        // and only a title is missing
         if let Err(e) = sink
             .rename_session(&session, &conv.display_title(plan.platform))
             .await
@@ -239,10 +265,11 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
     Ok(p)
 }
 
-/// 解析一份已经读进内存的导出文件，顺带做时间与数量的裁剪。
+/// Parse an export file already read into memory, applying the time and count
+/// filters along the way.
 ///
 /// # Errors
-/// 解析不了，或者裁剪之后一段对话都不剩。
+/// It cannot be parsed, or no conversation remains after filtering.
 pub fn plan_from_bytes(
     bytes: &[u8],
     platform: Option<Platform>,
@@ -254,7 +281,8 @@ pub fn plan_from_bytes(
     if let Some(since) = since {
         conversations.retain(|c| c.messages.iter().any(|m| m.at >= since));
     }
-    // 新的排前面：`--max-conversations 5` 试水时，要试的显然是最近的那几段
+    // Newest first: when testing the water with `--max-conversations 5`, the
+    // ones to test with are obviously the most recent
     conversations.sort_by_key(|c| std::cmp::Reverse(c.at));
     if let Some(n) = max {
         conversations.truncate(n);
@@ -269,10 +297,10 @@ pub fn plan_from_bytes(
     })
 }
 
-/// 读文件并解析成 `Plan`。
+/// Read a file and parse it into a `Plan`.
 ///
 /// # Errors
-/// 文件读不了，或者 [`plan_from_bytes`] 报的任何错。
+/// The file cannot be read, or any error reported by [`plan_from_bytes`].
 pub fn load(
     path: &std::path::Path,
     platform: Option<Platform>,
@@ -320,9 +348,11 @@ mod tests {
         }
     }
 
-    /// 账要算对：**抽取次数等于对数**，不是消息数。
+    /// The bill has to be right: **the number of extractions equals the number
+    /// of pairs**, not the number of messages.
     ///
-    /// 这个数字直接就是钱。按消息数报会让用户以为要花两倍。
+    /// This number is money, directly. Reporting by message count would leave
+    /// the user thinking it costs twice as much.
     #[test]
     fn the_estimate_counts_extraction_calls_not_messages() {
         let plan = Plan {
@@ -332,15 +362,16 @@ mod tests {
         let e = plan.estimate();
         assert_eq!(e.conversations, 2);
         assert_eq!(e.messages, 10);
-        assert_eq!(e.pairs, 5, "5 对 = 5 次 LLM 调用，不是 10 次");
+        assert_eq!(e.pairs, 5, "5 pairs = 5 LLM calls, not 10");
         assert!(e.tokens > 0);
         assert_eq!(e.unpaired, 0);
     }
 
-    /// 落单的消息要单独报出来。
+    /// Dangling messages have to be reported separately.
     ///
-    /// 它们会写进原文却不产生任何事实 —— 用户看到「导入了 100 条消息」
-    /// 却只多了 40 条记忆时，需要有个地方解释这个差。
+    /// They land as raw text yet produce no facts — when a user sees "imported
+    /// 100 messages" but only 40 memories appeared, something has to explain
+    /// that gap.
     #[test]
     fn dangling_messages_are_reported_separately() {
         let plan = Plan {
@@ -349,10 +380,14 @@ mod tests {
         };
         let e = plan.estimate();
         assert_eq!(e.pairs, 2);
-        assert_eq!(e.unpaired, 1, "最后那一问没人答，要报出来");
+        assert_eq!(
+            e.unpaired, 1,
+            "the last question went unanswered and has to be reported"
+        );
     }
 
-    /// 时间跨度取的是**消息**的时刻，不是对话的创建时刻。
+    /// The time span comes from the **messages'** moments, not the
+    /// conversation's creation moment.
     #[test]
     fn the_span_comes_from_the_messages() {
         let plan = Plan {
@@ -370,8 +405,9 @@ mod tests {
         );
     }
 
-    /// `Estimate` 要能原样走 HTTP —— 界面上的数字必须与 CLI 打印的
-    /// 出自**同一次计算**，各算各的迟早会对不上。
+    /// `Estimate` has to survive HTTP unchanged — the numbers in the UI and the
+    /// numbers the CLI prints must come from **the same computation**;
+    /// computing them separately will disagree sooner or later.
     #[test]
     fn the_estimate_survives_a_round_trip() {
         let plan = Plan {
@@ -379,15 +415,18 @@ mod tests {
             conversations: vec![conv(2, true)],
         };
         let e = plan.estimate();
-        let back: Estimate =
-            serde_json::from_str(&serde_json::to_string(&e).expect("序列化")).expect("反序列化");
+        let back: Estimate = serde_json::from_str(&serde_json::to_string(&e).expect("serialize"))
+            .expect("deserialize");
         assert_eq!(back.pairs, e.pairs);
         assert_eq!(back.tokens, e.tokens);
         assert_eq!(back.unpaired, e.unpaired);
-        assert_eq!(back.earliest, e.earliest, "时刻不能在往返里丢精度");
+        assert_eq!(
+            back.earliest, e.earliest,
+            "moments must not lose precision in the round trip"
+        );
     }
 
-    /// 一个假的出口，用来验 [`execute`] 那三条顺序敏感的规矩。
+    /// A fake outlet, used to verify [`execute`]'s three order-sensitive rules.
     #[derive(Default)]
     struct Recorder {
         calls: std::sync::Mutex<Vec<String>>,
@@ -414,10 +453,12 @@ mod tests {
         }
     }
 
-    /// **user 必须先落，改标题必须最后。**
+    /// **user must land first, and the title must come last.**
     ///
-    /// 顺序反了都不报错：assistant 先落会让服务端读不回 user 的原文，
-    /// 于是整轮抽取被跳过 —— 原文进去了，事实一条没有。
+    /// Either order being reversed raises no error: assistant landing first
+    /// leaves the server unable to read the user's original text back, so the
+    /// whole turn's extraction is skipped — the raw text went in and not a
+    /// single fact came out.
     #[tokio::test]
     async fn writes_go_user_first_and_the_title_comes_last() {
         let sink = Recorder::default();
@@ -425,15 +466,25 @@ mod tests {
             platform: Platform::Claude,
             conversations: vec![conv(2, false)],
         };
-        execute(&sink, &plan, |_| {}).await.expect("跑通");
+        execute(&sink, &plan, |_| {})
+            .await
+            .expect("should run through");
 
         let calls = sink.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 5, "两对写四条 + 一次改名，实际：{calls:?}");
-        assert!(calls[0].starts_with("write:user"), "第一条必须是 user");
+        assert_eq!(
+            calls.len(),
+            5,
+            "two pairs write four entries plus one rename, got: {calls:?}"
+        );
+        assert!(
+            calls[0].starts_with("write:user"),
+            "the first entry must be user"
+        );
         assert!(calls[1].starts_with("write:assistant"));
         assert!(
             calls[4].starts_with("rename:"),
-            "改标题必须在内容之后 —— 会话要先有东西才改得动"
+            "the title must come after the content — the session needs \
+             something in it before it can be renamed"
         );
     }
 }

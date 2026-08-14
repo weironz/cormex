@@ -1,46 +1,57 @@
-//! 各表的行结构体、写入输入与受约束列的枚举。
+//! Row structs for each table, the inputs used to write them, and enums for the
+//! constrained columns.
 //!
-//! 三条约定：
+//! Three conventions:
 //!
-//! 1. **`tsv` 不出现在任何结构体里。** 它是纯派生的检索产物，Rust 侧没有对应
-//!    类型，读回来也无用。写入侧改为传 `tsv_source`（已分词、空格分隔的词串），
-//!    由 SQL 里的 `to_tsvector('simple', $n)` 与主行同事务落库 ——
-//!    docs/memory.md §八、§九 要求 tsv 永不异步补写。
-//! 2. **`embedding` 保留。** 它是行内容的一部分：多端同步要下发它，
-//!    换 embedding 模型要按 `embedding_model` 分批回填它。
-//! 3. **有 CHECK 约束的列用枚举，开放的列用 `String`。**
-//!    `entities.kind` 与 `facts.predicate` 在 schema 中刻意不枚举
-//!    （枚举则新领域进不来），这里也就不能枚举。
+//! 1. **`tsv` appears in no struct.** It is a purely derived retrieval artifact
+//!    with no corresponding Rust type, and reading it back serves no purpose.
+//!    The write side instead passes `tsv_source` (a tokenized, space-separated
+//!    term string), which the `to_tsvector('simple', $n)` in the SQL persists in
+//!    the same transaction as the main row — docs/memory.md §8 and §9 require
+//!    that tsv is never backfilled asynchronously.
+//! 2. **`embedding` is kept.** It is part of the row's content: multi-device
+//!    sync has to ship it, and switching embedding models has to backfill it in
+//!    batches keyed by `embedding_model`.
+//! 3. **Columns with a CHECK constraint get an enum; open columns get
+//!    `String`.** `entities.kind` and `facts.predicate` are deliberately not
+//!    enumerated in the schema (enumerating them would shut new domains out), so
+//!    they cannot be enumerated here either.
 //!
-//! 主键在**写入侧**用 [`Id`]（编译期保证形如 ULID），在**读出侧**用 `String`
-//! （数据库列是 `ulid` 域，本质是文本；读回来再解析只会平添失败路径）。
-//! 调用方需要 [`Id`] 时自行 `parse()`。
+//! Primary keys use [`Id`] on the **write side** (which guarantees ULID shape at
+//! compile time) and `String` on the **read side** (the database column is the
+//! `ulid` domain, which is text underneath; parsing it back would only add a
+//! failure path). A caller who needs an [`Id`] can `parse()` it themselves.
 
 use chrono::{DateTime, Utc};
 use cortex_core::Id;
 use pgvector::Vector;
 use sqlx::FromRow;
 
-/// 表名常量。`sync_log.table_name` 与 [`crate::SyncPayload`] 共用这一组字面量。
+/// Table name constants. `sync_log.table_name` and [`crate::SyncPayload`] share
+/// this one set of literals.
 ///
-/// # 为什么用宏生成，而不是直接写十三个 `const`
+/// # Why a macro generates them instead of writing thirteen `const`s
 ///
-/// 漏一支的后果不是「这张表同步不了」，是**整条 `/sync` 断掉**：
-/// `load_payloads` 撞上不认识的表名会返回 `UnknownTable`，那一批拉取整个
-/// 失败，客户端游标从此卡死在它前面 —— 而且只在那张表**第一次被写**时
-/// 才发作，可能是上线几周之后。
+/// Missing one does not mean "this table fails to sync", it means **the whole
+/// of `/sync` breaks**: `load_payloads` hitting a table name it does not know
+/// returns `UnknownTable`, that entire batch fails, and the client's cursor is
+/// stuck in front of it from then on — and it only goes off the **first time
+/// that table is written**, which may be weeks after release.
 ///
-/// 宏顺带生成 [`table::ALL`]，`tests/sync_coverage.rs` 拿它逐个撞
-/// `load_payloads`。于是加表的人只要加了常量，忘记加 match 分支就会
-/// **当场红**，而不是等用户的游标卡死。（那条测试自己也做过故障注入验证：
-/// 塞一个假表名进列表，它确实变红。）
+/// The macro also generates [`table::ALL`], which `tests/sync_coverage.rs` uses
+/// to hit `load_payloads` with every name in turn. So whoever adds a table only
+/// has to add the constant, and forgetting the match arm **fails immediately**
+/// rather than waiting for a user's cursor to jam. (That test has itself been
+/// fault-injection verified: sticking a fake table name into the list does turn
+/// it red.)
 ///
-/// 单靠人写 `ALL` 不行 —— 那只是把「容易忘的地方」从一处挪到两处。
+/// Having a human maintain `ALL` by hand would not do — that merely moves the
+/// easy-to-forget spot from one place to two.
 pub mod table {
     macro_rules! tables {
         ($($name:ident = $lit:literal),+ $(,)?) => {
             $(pub const $name: &str = $lit;)+
-            /// 全部会出现在 `sync_log.table_name` 里的表名。
+            /// Every table name that can appear in `sync_log.table_name`.
             pub const ALL: &[&str] = &[$($lit),+];
         };
     }
@@ -63,37 +74,45 @@ pub mod table {
         PROJECT_EVENTS    = "project_events",
     }
 
-    // ── 刻意**不**在上面那个宏里的两张表 ──────────────────────
+    // ── The two tables deliberately **not** in the macro above ────
     //
-    // `fact_embeddings` / `entity_embeddings` 是换模型时补出来的向量
-    // （见 migrations/20260808000001）。它们**永不进 sync_log**，
-    // 所以也不该出现在 `ALL` 里 —— `ALL` 的定义就是「全部会出现在
-    // sync_log.table_name 里的表名」。
+    // `fact_embeddings` / `entity_embeddings` hold the vectors backfilled when
+    // the model changes (see migrations/20260808000001). They **never enter
+    // sync_log**, so they must not appear in `ALL` either — the definition of
+    // `ALL` is precisely "every table name that can appear in
+    // sync_log.table_name".
     //
-    // 为什么不同步：`sync_payload.rs` 的模块注释早就把理由写死了 ——
-    // 「tsv 与 embedding 是服务端派生列，不进同步 payload……
-    //  **换 embedding 模型时会全量变化，白白撑爆增量同步**」。
-    // 那句话说的正是这件事。十万条事实的一次回填会推出十万条 sync_log，
-    // 而每个客户端拿到的载荷里没有一个字段是它用得上的。
+    // Why they are not synced: the module comment of `sync_payload.rs` nailed
+    // the reasoning down long ago — "tsv and embedding are server-derived
+    // columns and do not enter the sync payload... **they change wholesale when
+    // the embedding model changes, blowing up incremental sync for nothing**".
+    // That sentence is about exactly this. One backfill over a hundred thousand
+    // facts would push out a hundred thousand sync_log rows, and not one field
+    // in the payload each client receives is of any use to it.
     //
-    // 代价是它们不能走 `Guarded::insert_row`（那条通道强制写 sync_log），
-    // 必须走 `insert_derived_row`。那个方法的注释里写了它的适用边界。
+    // The price is that they cannot go through `Guarded::insert_row` (that
+    // channel forces a sync_log write) and must use `insert_derived_row`. That
+    // method's comments spell out the boundary of where it applies.
     pub const FACT_EMBEDDINGS: &str = "fact_embeddings";
     pub const ENTITY_EMBEDDINGS: &str = "entity_embeddings";
 }
 
-/// `facts` 表的全部列。四路召回、三条回放召回、按主键 / 主语 / 宾语 / 出处
-/// 取事实，以及同步载荷，全都要原样取回。
+/// Every column of the `facts` table. The four retrieval channels, the three
+/// replay retrievals, fetching facts by primary key / subject / object /
+/// provenance, and the sync payload all need them back verbatim.
 ///
-/// 抄十几遍的下场是加一列时漏改其中一处 —— 而漏改的报错是运行时的
-/// 「`FromRow` 找不到列 x」，且只在恰好走到那一条查询时才响。
-/// 本次加 `source_channel` / `trust_tier` 两列时，query.rs 里那五份手抄
-/// 副本正好演示了这个风险，于是一并收编到这里。
+/// Copying the list a dozen times means that adding a column misses one of the
+/// copies — and the error from a missed copy is the runtime "`FromRow` cannot
+/// find column x", which only goes off when that particular query happens to be
+/// exercised. Adding the `source_channel` / `trust_tier` columns this time
+/// around, the five hand-copied duplicates in query.rs demonstrated exactly
+/// that risk, so they were consolidated here.
 macro_rules! fact_columns {
     () => {
         fact_columns!("")
     };
-    // 有 JOIN 的查询必须带表别名前缀，否则 `id` 会与被 JOIN 的一侧撞名
+    // Queries with a JOIN must carry a table alias prefix, or `id` collides
+    // with the joined side
     ($p:literal) => {
         concat!(
             $p,
@@ -137,13 +156,14 @@ macro_rules! fact_columns {
 pub(crate) use fact_columns;
 
 // ══════════════════════════════════════════════════════════
-//  受 CHECK 约束的列 —— 以 TEXT 存储的枚举
+//  Columns with a CHECK constraint — enums stored as TEXT
 // ══════════════════════════════════════════════════════════
 
-/// 生成一个以 TEXT 存储的枚举，连同 sqlx 的 `Type` / `Encode` / `Decode`。
+/// Generate an enum stored as TEXT, together with sqlx's `Type` / `Encode` /
+/// `Decode`.
 ///
-/// 不用 `#[derive(sqlx::Type)]`：那套宏面向 Postgres 原生 ENUM 类型，
-/// 而 schema 里这些列是带 CHECK 的 TEXT。
+/// `#[derive(sqlx::Type)]` is not used: those macros target Postgres's native
+/// ENUM type, whereas these columns in the schema are TEXT with a CHECK.
 macro_rules! text_enum {
     (
         $(#[$meta:meta])*
@@ -159,7 +179,8 @@ macro_rules! text_enum {
         }
 
         impl $name {
-            /// 落库时使用的字面量，与 migration 里的 CHECK 一一对应。
+            /// The literal used when persisting, corresponding one-to-one with
+            /// the CHECK in the migration.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self { $( Self::$variant => $text ),+ }
@@ -227,7 +248,7 @@ text_enum! {
 }
 
 text_enum! {
-    /// `blob_transcripts.kind` —— 媒体转录的来源 pipeline
+    /// `blob_transcripts.kind` — which pipeline produced the media transcript
     pub enum TranscriptKind {
         Asr => "asr",
         VisionCaption => "vision_caption",
@@ -239,8 +260,10 @@ text_enum! {
 text_enum! {
     /// `fact_events.op`
     ///
-    /// `Invalidate` / `Revoke` 是**状态**事件，末态由最后一条决定；
-    /// `Flag` 只是批注（「矛盾待人工确认」），不改变状态。
+    /// `Invalidate` / `Revoke` are **status** events, and the final state is
+    /// determined by the last one; `Flag` is merely an annotation
+    /// ("contradiction awaiting human confirmation") and does not change the
+    /// status.
     pub enum FactOp {
         Invalidate => "invalidate",
         Revoke => "revoke",
@@ -249,15 +272,17 @@ text_enum! {
 }
 
 text_enum! {
-    /// `fact_events.kind` —— 失效原因。四者时间语义不同，混用会让认知回放出错。
+    /// `fact_events.kind` — the reason for invalidation. The four have
+    /// different temporal semantics, and conflating them makes cognitive replay
+    /// wrong.
     pub enum InvalidationKind {
-        /// 曾经为真，世界变了。`superseded_by` 必填。
+        /// Was once true; the world changed. `superseded_by` is required.
         Superseded => "superseded",
-        /// 从未为真，抽取错误。
+        /// Was never true; an extraction error.
         Corrected => "corrected",
-        /// 用户主动删除，不对真值表态。
+        /// The user deleted it deliberately, taking no position on its truth.
         Retracted => "retracted",
-        /// 曾经为真，到期失效。
+        /// Was once true; expired.
         Expired => "expired",
     }
 }
@@ -273,14 +298,17 @@ text_enum! {
 text_enum! {
     /// `session_events.op`
     ///
-    /// 四个互相独立的维度，各自是一台「末态由最后一条决定」的状态机：
-    /// `Rename` 管标题，`Archive` / `Unarchive` 管归档，
-    /// `BindWorkspace` / `UnbindWorkspace` 管工作区，
-    /// `MoveToProject` / `RemoveFromProject` 管所属项目。
+    /// Four mutually independent dimensions, each a state machine whose final
+    /// state is determined by its last event: `Rename` governs the title,
+    /// `Archive` / `Unarchive` the archived flag, `BindWorkspace` /
+    /// `UnbindWorkspace` the workspace, and `MoveToProject` /
+    /// `RemoveFromProject` the owning project.
     ///
-    /// **归档不是删除**：归档只把会话从默认列表隐藏，消息与派生记忆一概不动，
-    /// 随时可 `Unarchive` 恢复。真正销毁内容的是 [`RedactionMode`]，
-    /// 它要显式触发、二次确认、留墓碑（docs/memory.md §十一）。
+    /// **Archiving is not deleting**: archiving only hides the session from the
+    /// default list, touching neither the messages nor the derived memory, and
+    /// `Unarchive` restores it at any time. What actually destroys content is
+    /// [`RedactionMode`], which must be explicitly triggered, confirmed twice,
+    /// and leave a tombstone (docs/memory.md §11).
     pub enum SessionOp {
         Rename => "rename",
         Archive => "archive",
@@ -294,27 +322,34 @@ text_enum! {
 }
 
 text_enum! {
-    /// 这个会话在**哪儿**跑。
+    /// **Where** this session runs.
     ///
-    /// # 为什么它必须写在会话上
+    /// # Why this has to be recorded on the session
     ///
-    /// 同一个会话在两端各自跑，而两端指着完全不同的文件系统 —— Web 是云端
-    /// 容器的 `/workspace`，桌面端是本机某个目录。不记下来的话，用户在 A 端
-    /// 让 agent 写的文件，到 B 端就「不存在」，而 agent 说的是实话。
+    /// The same session running on two clients points at completely different
+    /// filesystems — on the web that is a cloud container's `/workspace`, on
+    /// the desktop some local directory. Without recording it, a file the user
+    /// had the agent write on client A simply "does not exist" on client B, and
+    /// the agent is telling the truth.
     ///
-    /// 调研过的四家（Claude Code / Codex / Cursor / OpenHands）没有一家允许
-    /// 同一个会话在两端各跑各的：**执行环境是会话身份的一部分**。
+    /// Of the four systems surveyed (Claude Code / Codex / Cursor / OpenHands),
+    /// not one allows the same session to run independently on two clients:
+    /// **the execution environment is part of the session's identity**.
     ///
-    /// # 为什么 Local 不带「哪一台设备」
+    /// # Why Local does not record "which machine"
     ///
-    /// 链路上没有客户端设备身份（`device_id` 盖的是 cortexd 自己的章）。
-    /// 但那个身份不必引入：本地绑定存在 `workspaces.json`，天然只在那一台
-    /// 机器上，于是「这台机器有没有这个会话的绑定」本身就是设备检查 ——
-    /// 而且比一个 id 更硬，id 在重装 / 克隆之后会骗人。
+    /// There is no client device identity on the wire (`device_id` carries
+    /// cortexd's own stamp). But that identity need not be introduced: the
+    /// local binding lives in `workspaces.json`, which by nature exists only on
+    /// that one machine, so "does this machine have a binding for this session"
+    /// is itself the device check — and a firmer one than an id, since ids lie
+    /// after a reinstall or a clone.
     pub enum SessionRuntime {
-        /// 云端容器工作区。**默认**，也是唯一处处可续的那个。
+        /// A cloud container workspace. **The default**, and the only one that
+        /// can be resumed anywhere.
         Cloud => "cloud",
-        /// 钉在某台机器的本机目录上。别的设备打开它只能看，不能续。
+        /// Pinned to a local directory on one machine. Other devices can open
+        /// it to look, but not to continue.
         Local => "local",
     }
 }
@@ -322,15 +357,18 @@ text_enum! {
 text_enum! {
     /// `project_events.op`
     ///
-    /// 两台状态机共用一张表：`Create` / `Delete` 决定项目还在不在，
-    /// `Create` / `Rename` 决定它此刻叫什么。`Create` 同时是两台机的起点。
+    /// Two state machines share one table: `Create` / `Delete` decide whether
+    /// the project still exists, and `Create` / `Rename` decide what it is
+    /// currently called. `Create` is the starting point of both machines.
     ///
-    /// **刻意没有 archive**：项目是个轻量分组，再加一层「已归档的项目」
-    /// 只会让界面多一个没人用的过滤器。理由见
-    /// `migrations/20260812000003_projects.sql` 的表头。
+    /// **There is deliberately no archive**: a project is a lightweight
+    /// grouping, and adding a layer of "archived projects" would only give the
+    /// UI one more filter nobody uses. For the reasoning see the table header of
+    /// `migrations/20260812000003_projects.sql`.
     ///
-    /// **`Delete` 删的是分组，不是内容**：项目从列表消失，里面的会话变成
-    /// 未分组，消息与派生记忆一概不动。
+    /// **`Delete` deletes the grouping, not the content**: the project
+    /// disappears from the list, the sessions inside it become ungrouped, and
+    /// neither the messages nor the derived memory are touched.
     pub enum ProjectOp {
         Create => "create",
         Rename => "rename",
@@ -339,32 +377,38 @@ text_enum! {
 }
 
 text_enum! {
-    /// `facts.source_channel` —— 读出侧的完整取值集。
+    /// `facts.source_channel` — the complete value set on the read side.
     ///
-    /// 写入侧用的是 [`FactSource`]，它**不含** [`Self::UnknownLegacy`]：
-    /// 那个取值只属于加列之前的存量行，新写入必须说清楚自己从哪来。
+    /// The write side uses [`FactSource`], which **does not include**
+    /// [`Self::UnknownLegacy`]: that value belongs only to rows that predate the
+    /// column, and a new write must say where it came from.
     pub enum SourceChannel {
-        /// 用户亲口说的
+        /// The user said it themselves
         UserStated => "user_stated",
-        /// 模型从对话里推断出来的
+        /// The model inferred it from the conversation
         Conversation => "conversation",
-        /// 模型从已有事实派生出来的（如 crosslink 的跨域边）
+        /// The model derived it from existing facts (e.g. crosslink's
+        /// cross-domain edges)
         Derived => "derived",
-        /// 本地执行的工具输出
+        /// Output from a locally executed tool
         ToolOutput => "tool_output",
-        /// 外部内容：网页 / 他人文档 / MCP。默认不进抽取
+        /// External content: web pages / other people's documents / MCP. Not
+        /// extracted by default
         External => "external",
-        /// 加列之前的存量行。真实来源无法事后重建 —— 标「不知道」，
-        /// 而不是伪造一个查询时会被当真的档位。见 migration 20260807000006
+        /// Rows that predate the column. The real source cannot be
+        /// reconstructed after the fact — so it is labelled "unknown" rather
+        /// than fabricating a tier that would be taken at face value at query
+        /// time. See migration 20260807000006
         UnknownLegacy => "unknown_legacy",
     }
 }
 
-/// 写入侧的来源通道。
+/// The source channel on the write side.
 ///
-/// 与 [`SourceChannel`] 分成两个类型，只为一件事：
-/// **让「新写入被标成 unknown_legacy」在编译期就不可能**。
-/// 存量行的「不知道」是一次性的历史债，不该成为新代码的懒惰出口。
+/// It is a separate type from [`SourceChannel`] for exactly one reason: **to
+/// make "a new write labelled unknown_legacy" impossible at compile time**. The
+/// "unknown" of pre-existing rows is a one-off historical debt and should not
+/// become a lazy escape hatch for new code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactSource {
@@ -376,7 +420,7 @@ pub enum FactSource {
 }
 
 impl FactSource {
-    /// 落库的通道名。
+    /// The channel name as persisted.
     #[must_use]
     pub const fn channel(self) -> SourceChannel {
         match self {
@@ -388,18 +432,22 @@ impl FactSource {
         }
     }
 
-    /// 信任级，1 最高。
+    /// The trust tier; 1 is highest.
     ///
-    /// 映射在 Rust 与 SQL 里各写了一遍，由 migration 20260807000006 的
-    /// `facts_trust_tier_matches_channel` 做最终裁决：两处漂移会在插入时
-    /// 直接 23514，而不是悄悄写进一个自相矛盾的组合。
+    /// The mapping is written out once in Rust and once in SQL, with migration
+    /// 20260807000006's `facts_trust_tier_matches_channel` as the final
+    /// arbiter: drift between the two produces a 23514 outright at insert time
+    /// rather than quietly persisting a self-contradictory combination.
     #[must_use]
     pub const fn trust_tier(self) -> i16 {
         match self {
             Self::UserStated => 1,
-            // Derived 与 Conversation 同档：两者都是模型的推断，区别在输入。
-            // ⚠️ Derived 现在不继承输入事实的档位（信任洗白，见 migration
-            // 20260807000006 的注释）—— 那要等 derivations 被读侧用起来
+            // Derived shares a tier with Conversation: both are inferences by
+            // the model, differing only in their input.
+            // ⚠️ Derived currently does not inherit the tier of its input facts
+            // (trust laundering; see the comments in migration
+            // 20260807000006) -- that has to wait until derivations are
+            // actually used by the read side
             Self::Conversation | Self::Derived => 2,
             Self::ToolOutput => 3,
             Self::External => 4,
@@ -408,7 +456,7 @@ impl FactSource {
 }
 
 text_enum! {
-    /// `derivations.derived_kind` —— 派生物一侧的种类。
+    /// `derivations.derived_kind` — the kind on the derived-record side.
     pub enum DerivedKind {
         Fact => "fact",
         Summary => "summary",
@@ -416,9 +464,10 @@ text_enum! {
 }
 
 text_enum! {
-    /// `derivations.source_kind` —— 源一侧的种类。
+    /// `derivations.source_kind` — the kind on the source side.
     ///
-    /// 比 [`DerivedKind`] 多一个 `Episode`：L0 原文只会当源，不会是谁的派生物。
+    /// One more variant than [`DerivedKind`]: `Episode`. L0 raw text is only
+    /// ever a source, never something derived from anything else.
     pub enum SourceKind {
         Episode => "episode",
         Fact => "fact",
@@ -446,15 +495,17 @@ text_enum! {
 text_enum! {
     /// `redactions.mode`
     pub enum RedactionMode {
-        /// 清除库内全部派生落点，保留墓碑与审计链。
+        /// Clear every derived landing spot inside the database, keeping the
+        /// tombstone and the audit chain.
         Redact => "redact",
-        /// 在 redact 基础上再删除对象存储中的 blob 及备份镜像。
+        /// Everything redact does, plus deleting the blob in object storage and
+        /// its backup mirrors.
         Purge => "purge",
     }
 }
 
 // ══════════════════════════════════════════════════════════
-//  L0 原始层
+//  L0 raw layer
 // ══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -466,9 +517,9 @@ pub struct Episode {
     pub text: Option<String>,
     pub domain: Option<String>,
     pub device_id: String,
-    /// 事件发生时间（客户端时钟，经单调化处理）
+    /// When the event occurred (client clock, after monotonization)
     pub occurred_at: DateTime<Utc>,
-    /// 服务端入库时间
+    /// When the server persisted it
     pub created_at: DateTime<Utc>,
 }
 
@@ -477,11 +528,13 @@ pub struct NewEpisode {
     pub id: Id,
     pub session_id: String,
     pub role: Role,
-    /// 原始消息，含供应商特有的 thinking / reasoning 不透明块，无损保存。
+    /// The raw message, including provider-specific opaque thinking / reasoning
+    /// blocks, preserved losslessly.
     pub content: serde_json::Value,
-    /// 从 `content` 提取的纯文本
+    /// The plain text extracted from `content`
     pub text: Option<String>,
-    /// jieba 分词后、空格分隔的词串；落库时转成 `tsv`。`None` 则 `tsv` 为 NULL。
+    /// A space-separated term string after jieba segmentation, converted to
+    /// `tsv` when persisted. `None` leaves `tsv` NULL.
     pub tsv_source: Option<String>,
     pub domain: Option<String>,
     pub device_id: String,
@@ -499,7 +552,8 @@ pub struct Blob {
 
 #[derive(Debug, Clone)]
 pub struct NewBlob {
-    /// SHA-256 十六进制小写。内容寻址 —— 同内容同 hash，天然幂等。
+    /// Lowercase hex SHA-256. Content-addressed — identical content yields an
+    /// identical hash, so it is idempotent by nature.
     pub hash: String,
     pub mime: String,
     pub size_bytes: i64,
@@ -511,11 +565,12 @@ pub struct EpisodeBlob {
     pub episode_id: String,
     pub blob_hash: String,
     pub kind: Option<String>,
-    /// 这次引用时的原始文件名。
+    /// The original filename at the time of this reference.
     ///
-    /// 属于**引用**而非内容：内容寻址下同一份字节可以有多个文件名
-    /// （同一张图今天叫「设计稿.png」，下周转发过来叫「IMG_2043.png」）。
-    /// `None` = 未知（老数据，或客户端没提供）。
+    /// It belongs to the **reference**, not to the content: under content
+    /// addressing the same bytes can carry several filenames (the same image is
+    /// "design-draft.png" today and arrives forwarded as "IMG_2043.png" next
+    /// week). `None` = unknown (old data, or the client did not supply one).
     pub filename: Option<String>,
 }
 
@@ -524,23 +579,26 @@ pub struct NewEpisodeBlob {
     pub episode_id: Id,
     pub blob_hash: String,
     pub kind: Option<String>,
-    /// 见 [`EpisodeBlob::filename`]
+    /// See [`EpisodeBlob::filename`]
     pub filename: Option<String>,
 }
 
 impl NewEpisodeBlob {
-    /// `sync_log.record_id` 的复合键约定：`episode_id:blob_hash`。
+    /// The composite key convention for `sync_log.record_id`:
+    /// `episode_id:blob_hash`.
     #[must_use]
     pub fn record_id(&self) -> String {
         format!("{}:{}", self.episode_id, self.blob_hash)
     }
 }
 
-/// 换 embedding 模型时给一条已有事实补出来的向量。
+/// A vector backfilled for an existing fact when the embedding model changes.
 ///
-/// 不是就地改 `facts.embedding` —— CLAUDE.md 的 append-only 不给这条路，
-/// 而且「回填期间双模型召回」要求同一条事实**同时**持有两个空间的向量，
-/// 一个列装不下两个。见 `migrations/20260808000001_embedding_backfill.sql`。
+/// Not an in-place modification of `facts.embedding` — CLAUDE.md's append-only
+/// rule does not allow that path, and "dual-model retrieval during backfill"
+/// requires one fact to hold vectors from two spaces **at the same time**, which
+/// one column cannot do. See
+/// `migrations/20260808000001_embedding_backfill.sql`.
 #[derive(Debug, Clone)]
 pub struct NewFactEmbedding {
     pub fact_id: Id,
@@ -549,17 +607,19 @@ pub struct NewFactEmbedding {
 }
 
 impl NewFactEmbedding {
-    /// `sync_log.record_id` 的复合键约定：`fact_id:embedding_model`。
+    /// The composite key convention for `sync_log.record_id`:
+    /// `fact_id:embedding_model`.
     ///
-    /// 模型名进 record_id 是必须的：同一条事实在不同模型下是**不同的行**，
-    /// 只用 fact_id 会让第二次回填看起来像是第一次的重复。
+    /// Putting the model name in record_id is mandatory: the same fact under
+    /// different models is a **different row**, and using fact_id alone would
+    /// make a second backfill look like a duplicate of the first.
     #[must_use]
     pub fn record_id(&self) -> String {
         format!("{}:{}", self.fact_id, self.embedding_model)
     }
 }
 
-/// 同上，实体侧。
+/// The same, on the entity side.
 #[derive(Debug, Clone)]
 pub struct NewEntityEmbedding {
     pub entity_id: Id,
@@ -568,26 +628,28 @@ pub struct NewEntityEmbedding {
 }
 
 impl NewEntityEmbedding {
-    /// `sync_log.record_id` 的复合键约定：`entity_id:embedding_model`。
+    /// The composite key convention for `sync_log.record_id`:
+    /// `entity_id:embedding_model`.
     #[must_use]
     pub fn record_id(&self) -> String {
         format!("{}:{}", self.entity_id, self.embedding_model)
     }
 }
 
-/// 一条附件引用**连同它的内容元信息**。
+/// One attachment reference **together with its content metadata**.
 ///
-/// [`EpisodeBlob`] 是裸表行，只有 hash；客户端拿它渲染出来的是
-/// 「文档 · a1b2c3d4」。真正要显示的 `mime` 与 `size_bytes` 在 `blobs` 里，
-/// 于是读路径统一走这个 JOIN 出来的结构 —— 而不是让每个调用方
-/// 自己再查一次 `blobs`（那是 N+1，且各处会渲染出不一样的东西）。
+/// [`EpisodeBlob`] is the raw table row and carries only the hash; what a client
+/// renders from it is "document · a1b2c3d4". The `mime` and `size_bytes` it
+/// actually needs to display live in `blobs`, so the read path uniformly uses
+/// this joined struct — rather than making every caller query `blobs` again
+/// itself (which is N+1, and would render differently in different places).
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct EpisodeAttachment {
     pub episode_id: String,
     pub blob_hash: String,
     pub kind: Option<String>,
     pub filename: Option<String>,
-    /// 由字节头嗅探得出，来自 `blobs.mime`
+    /// Sniffed from the byte header; comes from `blobs.mime`
     pub mime: String,
     pub size_bytes: i64,
 }
@@ -599,7 +661,8 @@ pub struct BlobTranscript {
     pub kind: TranscriptKind,
     pub text: String,
     pub embedding: Option<Vector>,
-    /// 音视频转录的片段毫秒偏移；图片 / OCR 为 NULL
+    /// The segment offset in milliseconds for audio/video transcripts; NULL for
+    /// images / OCR
     pub span_start_ms: Option<i64>,
     pub span_end_ms: Option<i64>,
     pub transcribed_by: String,
@@ -622,7 +685,7 @@ pub struct NewBlobTranscript {
 }
 
 // ══════════════════════════════════════════════════════════
-//  L1 事实层
+//  L1 fact layer
 // ══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq, FromRow)]
@@ -631,7 +694,8 @@ pub struct Entity {
     pub kind: String,
     pub name: String,
     pub summary: Option<String>,
-    /// 仅用于抽取期的实体消解，不参与四路召回
+    /// Used only for entity resolution during extraction; takes no part in
+    /// four-way retrieval
     pub embedding: Option<Vector>,
     pub embedding_model: String,
     pub device_id: String,
@@ -641,7 +705,7 @@ pub struct Entity {
 #[derive(Debug, Clone)]
 pub struct NewEntity {
     pub id: Id,
-    /// person / project / file / org / concept / tool …… 开放不枚举
+    /// person / project / file / org / concept / tool … open, not enumerated
     pub kind: String,
     pub name: String,
     pub summary: Option<String>,
@@ -683,19 +747,20 @@ pub struct Fact {
     pub embedding_model: String,
     pub domain: Option<String>,
     pub confidence: f32,
-    /// 【事件时间】何时开始为真。NULL = 未知或一直如此
+    /// [event time] When it started being true. NULL = unknown, or always so
     pub valid_at: Option<DateTime<Utc>>,
     pub source_episode_id: String,
-    /// 这条事实从哪个通道进来
+    /// Which channel this fact came in through
     pub source_channel: SourceChannel,
-    /// 来源信任级，1 最高。
+    /// The trust tier of the source; 1 is highest.
     ///
-    /// `None` **只可能**出现在加列之前的存量行上（`unknown_legacy`）——
-    /// 「不知道」不是信任标尺上的一个点，所以它是 NULL 而不是某个哨兵档位。
+    /// `None` can **only** occur on rows that predate the column
+    /// (`unknown_legacy`) — "unknown" is not a point on the trust scale, so it
+    /// is NULL rather than some sentinel tier.
     pub trust_tier: Option<i16>,
     pub extracted_by: String,
     pub device_id: String,
-    /// 【系统时间】Cortex 何时知道这件事
+    /// [system time] When Cortex learned of this
     pub created_at: DateTime<Utc>,
 }
 
@@ -703,7 +768,7 @@ pub struct Fact {
 pub struct NewFact {
     pub id: Id,
     pub subject_id: Id,
-    /// prefers / decided / owns / blocked_by …… 开放不枚举
+    /// prefers / decided / owns / blocked_by … open, not enumerated
     pub predicate: String,
     pub object_text: Option<String>,
     pub object_entity_id: Option<Id>,
@@ -712,28 +777,35 @@ pub struct NewFact {
     pub embedding: Option<Vector>,
     pub embedding_model: String,
     pub domain: Option<String>,
-    /// 抽取器对「该事实忠实反映原文」的一次性打分，此后不可变
+    /// The extractor's one-time score for "this fact faithfully reflects the
+    /// original text"; immutable thereafter
     pub confidence: f32,
     pub valid_at: Option<DateTime<Utc>>,
     pub source_episode_id: Id,
-    /// 来源通道。落库时连带写出 `trust_tier`（[`FactSource::trust_tier`]）。
+    /// The source channel. Persisting it also emits `trust_tier` (see
+    /// [`FactSource::trust_tier`]).
     ///
-    /// 没有默认值是刻意的：给它一个默认值就等于让「忘记表态」静默变成
-    /// 「用户亲述」或「不知道」，而这一列存在的全部理由就是出事之后
-    /// 还能按来源把东西挑出来。
+    /// The absence of a default is deliberate: giving it one would let
+    /// "forgetting to say" silently become "the user said it" or "unknown", and
+    /// the entire reason this column exists is to be able to pick things out by
+    /// source after an incident.
     pub source: FactSource,
-    /// `source_episode_id` **之外**的源。
+    /// Sources **other than** `source_episode_id`.
     ///
-    /// 单源派生（抽取器：一条 episode → 若干事实）留空即可 ——
-    /// `source_episode_id NOT NULL` 已经是它的血缘。需要用到这里的是**多源**
-    /// 派生：crosslink 的跨域边由两条事实推出，只记左边那条的出处会让
-    /// 右边那条被 redact 时这行边悄悄活下来（见 `cortex_memory::crosslink`）。
+    /// Single-source derivation (the extractor: one episode → several facts)
+    /// can leave this empty — `source_episode_id NOT NULL` already is its
+    /// provenance. What needs this field is **multi-source** derivation:
+    /// crosslink's cross-domain edges are inferred from two facts, and
+    /// recording only the left one's provenance would let this edge quietly
+    /// survive when the right one is redacted (see
+    /// `cortex_memory::crosslink`).
     pub derived_from: Vec<ProvenanceRef>,
     pub extracted_by: String,
     pub device_id: String,
 }
 
-/// 一条源引用：`derivations` 表里源那一侧的 (kind, id)。
+/// One source reference: the (kind, id) on the source side of the
+/// `derivations` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProvenanceRef {
     pub kind: SourceKind,
@@ -741,7 +813,7 @@ pub struct ProvenanceRef {
 }
 
 impl ProvenanceRef {
-    /// 源是一条 L0 原始消息。
+    /// The source is an L0 raw message.
     #[must_use]
     pub const fn episode(id: Id) -> Self {
         Self {
@@ -750,7 +822,7 @@ impl ProvenanceRef {
         }
     }
 
-    /// 源是一条事实。
+    /// The source is a fact.
     #[must_use]
     pub const fn fact(id: Id) -> Self {
         Self {
@@ -759,7 +831,8 @@ impl ProvenanceRef {
         }
     }
 
-    /// 源是一条摘要（血缘可以多层：画像块 → 摘要 → episode）。
+    /// The source is a summary (provenance can be multi-level: profile block →
+    /// summary → episode).
     #[must_use]
     pub const fn summary(id: Id) -> Self {
         Self {
@@ -769,8 +842,9 @@ impl ProvenanceRef {
     }
 }
 
-/// `derivations` 的表行。写入侧不单独拆 `New*`：这张表没有 tsv / embedding
-/// 这类只写不读的列，而 `id` 与 `created_at` 由写入方法自己填。
+/// The `derivations` table row. The write side gets no separate `New*`: this
+/// table has no write-only columns like tsv / embedding, and `id` and
+/// `created_at` are filled in by the write method itself.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct Derivation {
     pub id: String,
@@ -802,10 +876,11 @@ pub struct NewFactEvent {
     pub id: Id,
     pub fact_id: Id,
     pub op: FactOp,
-    /// `op = Invalidate` 时必填，其余必须为 `None`（schema CHECK 强制）
+    /// Required when `op = Invalidate`, and must be `None` otherwise (enforced
+    /// by a schema CHECK)
     pub kind: Option<InvalidationKind>,
     pub invalid_at: Option<DateTime<Utc>>,
-    /// `kind = Superseded` 时必填，否则事实演化链断裂
+    /// Required when `kind = Superseded`, or the fact's evolution chain breaks
     pub superseded_by: Option<Id>,
     pub actor: Actor,
     pub reason: Option<String>,
@@ -814,7 +889,8 @@ pub struct NewFactEvent {
 }
 
 impl NewFactEvent {
-    /// 系统自动失效：旧事实被新事实取代。
+    /// Automatic invalidation by the system: an old fact superseded by a new
+    /// one.
     #[must_use]
     pub fn superseded(
         fact_id: Id,
@@ -836,7 +912,8 @@ impl NewFactEvent {
         }
     }
 
-    /// 用户删除一条记忆：不对真值表态，仅不再使用。
+    /// The user deletes a memory: taking no position on its truth, merely no
+    /// longer using it.
     #[must_use]
     pub fn retracted(
         fact_id: Id,
@@ -858,7 +935,8 @@ impl NewFactEvent {
         }
     }
 
-    /// 撤销上一次失效（恢复）。状态机语义：末态由最后一条状态事件决定。
+    /// Revoke the previous invalidation (restore). State machine semantics: the
+    /// final state is determined by the last status event.
     #[must_use]
     pub fn revoke(fact_id: Id, actor: Actor, device_id: impl Into<String>) -> Self {
         Self {
@@ -875,7 +953,8 @@ impl NewFactEvent {
         }
     }
 
-    /// 标记「矛盾待人工确认」。批注，不改变状态。
+    /// Mark it "contradiction awaiting human confirmation". An annotation; it
+    /// does not change the status.
     #[must_use]
     pub fn flag(fact_id: Id, reason: impl Into<String>, device_id: impl Into<String>) -> Self {
         Self {
@@ -894,7 +973,7 @@ impl NewFactEvent {
 }
 
 // ══════════════════════════════════════════════════════════
-//  L2 摘要层
+//  L2 summary layer
 // ══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq, FromRow)]
@@ -922,26 +1001,32 @@ pub struct NewSummary {
     pub embedding_model: String,
     pub covers_from: Option<DateTime<Utc>>,
     pub covers_to: Option<DateTime<Utc>>,
-    /// 这份摘要是从哪些东西摘出来的。**必须非空**
-    /// （[`crate::WriteTxn::insert_summary`] 会拒绝空列表）。
+    /// What this summary was summarized from. **Must be non-empty**
+    /// ([`crate::WriteTxn::insert_summary`] rejects an empty list).
     ///
-    /// 摘要不像事实那样有一列 `source_episode_id NOT NULL` 兜底，没有这份
-    /// 血缘就没有任何办法在源被 redact 之后找到它 —— 而 GDPR Art.17 的
-    /// 擦除义务及于派生数据。一条摘不出源头的摘要是无法追责的僵尸记忆，
-    /// 所以它宁可写不进去（见 docs/memory-content.md §5.3）。
+    /// A summary has no `source_episode_id NOT NULL` column to fall back on the
+    /// way a fact does, and without this provenance there is no way whatsoever
+    /// to find it once its source has been redacted — while GDPR Art. 17's
+    /// erasure obligation extends to derived data. A summary whose source
+    /// cannot be traced is a zombie memory nobody can be held accountable for,
+    /// so we would rather it never be written at all (see
+    /// docs/memory-content.md §5.3).
     pub sources: Vec<ProvenanceRef>,
     pub device_id: String,
 }
 
 // ══════════════════════════════════════════════════════════
-//  回放抽屉 —— 一轮对话「注入了什么、调用了什么」
+//  The replay drawer -- "what was injected, what was called"
+//  on one conversational turn
 //
-//  只在内存里活着的归因等于没有：刷新一次抽屉就空了。
-//  设计取舍（存 id 而非快照、锚在 user episode 上）见
-//  migrations/20260807000005_episode_replay.sql 的表头注释。
+//  Attribution that lives only in memory is no attribution at all: one refresh
+//  and the drawer is empty.
+//  For the design trade-offs (storing ids rather than snapshots, anchoring on
+//  the user episode) see the table header comments of
+//  migrations/20260807000005_episode_replay.sql.
 // ══════════════════════════════════════════════════════════
 
-/// `episode_memories` 的裸表行（同步下发用）。
+/// The raw `episode_memories` table row (for shipping over sync).
 #[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct EpisodeMemory {
     pub id: String,
@@ -957,22 +1042,24 @@ pub struct EpisodeMemory {
 #[derive(Debug, Clone)]
 pub struct NewEpisodeMemory {
     pub id: Id,
-    /// 本轮的锚点 —— **user 那条 episode**（assistant 那条在出错时不落库）
+    /// This turn's anchor — **the user's episode** (the assistant's one is not
+    /// persisted when something goes wrong)
     pub episode_id: Id,
     pub fact_id: Id,
-    /// 注入顺序，0 起
+    /// Injection order, starting at 0
     pub ordinal: i32,
-    /// 命中的召回路（bm25 / vector / graph / episode …）
+    /// The retrieval channels that hit (bm25 / vector / graph / episode …)
     pub channels: Vec<String>,
     pub score: Option<f64>,
     pub device_id: String,
 }
 
-/// 回放一条注入记忆时**当下**看到的样子。
+/// What an injected memory looks like **right now**, when replayed.
 ///
-/// 不是裸表行：`statement` 与失效状态来自 `facts` / `fact_status` 的 JOIN。
-/// 存的是 id、渲染的是现状 —— 于是一条事实被 redact 之后，抽屉里跟着变成
-/// 占位符，不需要再去清一遍这张表。
+/// Not a raw table row: `statement` and the invalidation status come from a
+/// JOIN against `facts` / `fact_status`. Ids are stored and the present state
+/// is rendered — so once a fact is redacted the drawer follows suit and shows a
+/// placeholder, with no need to sweep this table too.
 #[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct InjectedMemory {
     pub episode_id: String,
@@ -980,31 +1067,35 @@ pub struct InjectedMemory {
     pub ordinal: i32,
     pub channels: Option<Vec<String>>,
     pub score: Option<f64>,
-    /// `None` = 这条事实的行已经不在了。理论上不该发生（append-only，
-    /// 且有外键），出现即说明有人绕过本层删了数据 —— 界面应显示
-    /// 「引用了一条已不可见的记忆」而不是把这一行整个藏起来
+    /// `None` = the row for this fact is no longer there. In theory impossible
+    /// (append-only, plus a foreign key); seeing it means somebody bypassed
+    /// this layer and deleted data — the UI should display "references a
+    /// memory that is no longer visible" rather than hiding the whole row
     pub statement: Option<String>,
     pub domain: Option<String>,
     pub source_episode_id: Option<String>,
-    /// 注入之后这条事实**已被失效**。回放要如实说出来：
-    /// 「当时依据的这条，现在已经不成立了」正是审计最想看到的信息
+    /// This fact **has been invalidated** since it was injected. Replay must
+    /// say so honestly: "the thing this was based on no longer holds" is
+    /// exactly the information an audit most wants to see
     pub invalidated: bool,
 }
 
-/// `episode_tool_calls` 的表行。写入侧与读出侧共用形状，
-/// 因此不像别的表那样拆 `New*`——它没有 tsv / embedding 这类只写不读的列。
+/// The `episode_tool_calls` table row. The write side and the read side share
+/// one shape, so unlike other tables there is no separate `New*` — it has no
+/// write-only columns like tsv / embedding.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct EpisodeToolCall {
     pub id: String,
     pub episode_id: String,
     pub ordinal: i32,
     pub name: String,
-    /// 这次调用碰的文件路径；没碰文件的工具为 `None`
+    /// The file path this call touched; `None` for tools that touch no file
     pub path: Option<String>,
     pub summary: String,
     pub ok: bool,
     pub device_id: String,
-    /// 这次写入改了什么（统一 diff，已截断）。`None` = 没有可看的改动。
+    /// What this write changed (unified diff, truncated). `None` = there is no
+    /// change worth looking at.
     pub diff: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -1019,58 +1110,75 @@ pub struct NewEpisodeToolCall {
     pub summary: String,
     pub ok: bool,
     pub device_id: String,
-    /// 这次写入改了什么（统一 diff，**已截断**）。
+    /// What this write changed (unified diff, **truncated**).
     ///
-    /// 截断在 agent 侧（`cortex_agent::diff`）就做完了，那里还能在末尾写明
-    /// 「其余未显示」。这一列会随 `sync_log` 下发到所有设备，
-    /// 所以 migration 上还有一条 8 KiB 的 CHECK 兜底。
+    /// The truncation is already done on the agent side
+    /// (`cortex_agent::diff`), where it can also append a "rest not shown"
+    /// note. This column ships to every device via `sync_log`, so the migration
+    /// carries an 8 KiB CHECK as a backstop as well.
     pub diff: Option<String>,
 }
 
-/// `episode_tool_calls.summary` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `episode_tool_calls.summary`, matching the CHECK in the
+/// migration.
 ///
-/// 常量在这里而不是让上层写字面量：两处漂移的症状是「工具摘要一长，
-/// 整个写事务回滚」——而那个事务里还带着本轮的记忆归因。
+/// The constant lives here rather than leaving layers above to write a literal:
+/// the symptom of drift between the two is "as soon as a tool summary gets long,
+/// the whole write transaction rolls back" — and that transaction also carries
+/// this turn's memory attribution.
 pub const TOOL_SUMMARY_MAX_CHARS: usize = 2048;
 
-/// `episode_tool_calls.diff` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `episode_tool_calls.diff`, matching the CHECK in the
+/// migration.
 ///
-/// 比 summary 大一个量级：一份 diff 本来就是几十行起步。但仍然要有上限 ——
-/// 这一列会随 `sync_log` **下发到所有设备**，一次几百行的重构轻松几十 KB，
-/// 乘以设备数、乘以每轮多个 `write_file`，就是同步通道上一笔谁都没预算过
-/// 的流量。
+/// An order of magnitude larger than summary: a diff starts at dozens of lines
+/// to begin with. But there still has to be a cap — this column **ships to
+/// every device** via `sync_log`, a few-hundred-line refactor easily runs to
+/// tens of KB, and multiplied by the device count and by several `write_file`
+/// calls per turn, that is traffic on the sync channel nobody ever budgeted
+/// for.
 ///
-/// 与 `cortex_agent::diff` 那边的上限**各管各的**：那边管「人读得完」，
-/// 这边管「入库与同步扛得住」。两个数将来完全可能各自变动，
-/// 所以不共用一个常量。
+/// This cap and the one over in `cortex_agent::diff` are **each their own
+/// business**: that one governs "a human can finish reading it", this one
+/// governs "persistence and sync can bear it". The two numbers may well move
+/// independently in future, so they do not share a constant.
 pub const TOOL_DIFF_MAX_CHARS: usize = 8192;
 
-/// `episode_tool_calls.name` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `episode_tool_calls.name`, matching the CHECK in the
+/// migration.
 pub const TOOL_NAME_MAX_CHARS: usize = 128;
 
-/// `episode_tool_calls.path` 与 `session_events.workspace` 共用的路径上限。
+/// The path cap shared by `episode_tool_calls.path` and
+/// `session_events.workspace`.
 pub const TOOL_PATH_MAX_CHARS: usize = 4096;
 
-/// `episode_blobs.filename` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `episode_blobs.filename`, matching the CHECK in the
+/// migration.
 pub const ATTACHMENT_FILENAME_MAX_CHARS: usize = 255;
 
 // ══════════════════════════════════════════════════════════
-//  会话生命周期
+//  Session lifecycle
 // ══════════════════════════════════════════════════════════
 
-/// `session_events.title` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `session_events.title`, matching the CHECK in the
+/// migration.
 ///
-/// 常量放在这里而不是让上层各写一个字面量：两处一旦漂移，症状是
-/// 「客户端以为改名成功，服务端却回 500」——数据库 CHECK 的报错到不了用户眼前。
+/// The constant lives here rather than leaving each layer above to write its
+/// own literal: once the two drift, the symptom is "the client thinks the
+/// rename succeeded but the server returns 500" — and the database CHECK's
+/// error never reaches the user.
 pub const SESSION_TITLE_MAX_CHARS: usize = 200;
 
-/// `session_events.workspace` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `session_events.workspace`, matching the CHECK in the
+/// migration.
 ///
-/// **定义在 [`cortex_core`]**，因为校验这个上限的
-/// [`cortex_agent::workspace::validate`] 跑在两侧：cortexd（服务端目录）与
-/// 本地 agent（用户自己机器上的目录），而后者不该为了一个数字依赖数据库层。
-/// 这里 re-export 保持 `cortex_store::WORKSPACE_PATH_MAX_CHARS` 可用 ——
-/// 它与 migration 的 CHECK 对齐，那件事仍然是存储层的责任。
+/// **Defined in [`cortex_core`]**, because
+/// [`cortex_agent::workspace::validate`], which enforces this cap, runs on both
+/// sides: in cortexd (a server-side directory) and in the local agent (a
+/// directory on the user's own machine), and the latter should not depend on the
+/// database layer just for a number. The re-export here keeps
+/// `cortex_store::WORKSPACE_PATH_MAX_CHARS` usable — keeping it aligned with the
+/// migration's CHECK remains the storage layer's responsibility.
 pub use cortex_core::WORKSPACE_PATH_MAX_CHARS;
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -1078,15 +1186,18 @@ pub struct SessionEvent {
     pub id: String,
     pub session_id: String,
     pub op: SessionOp,
-    /// `op = Rename` 时非空
+    /// Non-null when `op = Rename`
     pub title: Option<String>,
-    /// `op = BindWorkspace` 时非空。**本机绝对路径** ——
-    /// 同步到别的设备上可能根本不存在，客户端应把「不存在」当作未绑定。
+    /// Non-null when `op = BindWorkspace`. **An absolute path on the local
+    /// machine** — once synced to another device it may not exist at all, and a
+    /// client should treat "does not exist" as unbound.
     pub workspace: Option<String>,
-    /// `op = MoveToProject` 时非空。指向的项目**可能已经被删了** ——
-    /// 删项目刻意不级联改写会话事件，末态视图会把悬挂的绑定当作未分组。
+    /// Non-null when `op = MoveToProject`. The project it points at **may
+    /// already have been deleted** — deleting a project deliberately does not
+    /// cascade a rewrite of session events, and the final-state view treats a
+    /// dangling binding as ungrouped.
     pub project_id: Option<String>,
-    /// `op = SetRuntime` 时非空。
+    /// Non-null when `op = SetRuntime`.
     pub runtime: Option<SessionRuntime>,
     pub actor: Actor,
     pub device_id: String,
@@ -1098,13 +1209,17 @@ pub struct NewSessionEvent {
     pub id: Id,
     pub session_id: String,
     pub op: SessionOp,
-    /// `op = Rename` 时必填，其余必须为 `None`（schema CHECK 强制）
+    /// Required when `op = Rename`, and must be `None` otherwise (enforced by a
+    /// schema CHECK)
     pub title: Option<String>,
-    /// `op = BindWorkspace` 时必填，其余必须为 `None`（schema CHECK 强制）
+    /// Required when `op = BindWorkspace`, and must be `None` otherwise
+    /// (enforced by a schema CHECK)
     pub workspace: Option<String>,
-    /// `op = MoveToProject` 时必填，其余必须为 `None`（schema CHECK 强制）
+    /// Required when `op = MoveToProject`, and must be `None` otherwise
+    /// (enforced by a schema CHECK)
     pub project_id: Option<String>,
-    /// `op = SetRuntime` 时必填，其余必须为 `None`（schema CHECK 强制）
+    /// Required when `op = SetRuntime`, and must be `None` otherwise (enforced
+    /// by a schema CHECK)
     pub runtime: Option<SessionRuntime>,
     pub actor: Actor,
     pub device_id: String,
@@ -1125,8 +1240,9 @@ impl NewSessionEvent {
         }
     }
 
-    /// 用户给会话起了个名字。末态由最后一条 `rename` 决定 ——
-    /// 不做「撤销栈」，`[rename A, rename B]` 之后就是 B。
+    /// The user gave the session a name. The final state is determined by the
+    /// last `rename` — there is no "undo stack", so after
+    /// `[rename A, rename B]` the answer is B.
     #[must_use]
     pub fn rename(session_id: &str, title: &str, actor: Actor, device_id: &str) -> Self {
         Self {
@@ -1135,27 +1251,32 @@ impl NewSessionEvent {
         }
     }
 
-    /// 归档 —— 从默认列表隐藏，**不删除任何东西**。
+    /// Archive — hide it from the default list, **deleting nothing**.
     ///
-    /// 用户口中的「删除会话」在 append-only 体系里就是这个操作：消息、附件、
-    /// 已抽取的事实全都原样留着，只是不再出现在列表里。真要销毁内容得走
-    /// `redactions` 的 redact / purge，语义不同、要二次确认（docs/memory.md §十一）。
+    /// What a user calls "deleting a session" is this operation in an
+    /// append-only system: the messages, the attachments, and the extracted
+    /// facts all stay exactly as they were, they simply stop appearing in the
+    /// list. Actually destroying content requires `redactions`' redact / purge,
+    /// which has different semantics and requires a second confirmation
+    /// (docs/memory.md §11).
     #[must_use]
     pub fn archive(session_id: &str, actor: Actor, device_id: &str) -> Self {
         Self::bare(session_id, SessionOp::Archive, actor, device_id)
     }
 
-    /// 撤销归档。
+    /// Undo the archive.
     #[must_use]
     pub fn unarchive(session_id: &str, actor: Actor, device_id: &str) -> Self {
         Self::bare(session_id, SessionOp::Unarchive, actor, device_id)
     }
 
-    /// 把会话绑到一个本机目录上。
+    /// Bind the session to a local directory.
     ///
-    /// `workspace` 必须是**已由服务端校验过**的绝对路径（存在、是目录、
-    /// 不是系统目录）。存储层不做校验：它没有「什么算系统目录」这个概念，
-    /// 那是部署形态的知识，属于 cortexd。
+    /// `workspace` must be an absolute path that the **server has already
+    /// validated** (it exists, it is a directory, it is not a system
+    /// directory). The storage layer does not validate: it has no concept of
+    /// "what counts as a system directory", which is knowledge about the
+    /// deployment shape and belongs to cortexd.
     #[must_use]
     pub fn bind_workspace(
         session_id: &str,
@@ -1169,18 +1290,21 @@ impl NewSessionEvent {
         }
     }
 
-    /// 解绑工作区 —— 会话退回纯聊天，文件工具从模型的工具目录里消失。
+    /// Unbind the workspace — the session falls back to pure chat, and the file
+    /// tools disappear from the model's tool catalog.
     #[must_use]
     pub fn unbind_workspace(session_id: &str, actor: Actor, device_id: &str) -> Self {
         Self::bare(session_id, SessionOp::UnbindWorkspace, actor, device_id)
     }
 
-    /// 声明这个会话在哪儿跑。见 [`SessionRuntime`]。
+    /// Declare where this session runs. See [`SessionRuntime`].
     ///
-    /// **与 `bind_workspace` 是两件事**，虽然它们常常一起发生：前者说的是
-    /// 「哪个目录」，这个说的是「哪一侧的执行环境」。绑本机目录的会话必然是
-    /// `Local`，但反过来不成立 —— 一个 `Local` 会话可以此刻还没绑目录
-    /// （用户刚在这台机器上新建了它，还没选）。
+    /// **A different thing from `bind_workspace`**, even though the two often
+    /// happen together: that one says "which directory", this one says "which
+    /// side's execution environment". A session bound to a local directory is
+    /// necessarily `Local`, but the converse does not hold — a `Local` session
+    /// may not have a directory bound yet (the user just created it on this
+    /// machine and has not picked one).
     #[must_use]
     pub fn set_runtime(
         session_id: &str,
@@ -1194,12 +1318,16 @@ impl NewSessionEvent {
         }
     }
 
-    /// 把会话移进某个项目。再移一次就是换项目 —— 一个会话同时只属于一个项目。
+    /// Move the session into a project. Moving it again switches projects — a
+    /// session belongs to at most one project at a time.
     ///
-    /// 存储层**不校验项目存不存在**：那需要一次读，而写事务持着 advisory lock、
-    /// 纪律要求它短小纯写（见 [`crate::txn`]）。校验属于 cortexd，在进事务前做。
-    /// 即使漏了校验也不会脏掉视图：`session_state` 把指向已删除项目的绑定
-    /// 当作未分组。
+    /// The storage layer **does not check whether the project exists**: that
+    /// would require a read, while the write transaction holds the advisory
+    /// lock and the discipline requires it to be short and write-only (see
+    /// [`crate::txn`]). The check belongs to cortexd and happens before
+    /// entering the transaction. Even a skipped check does not corrupt the
+    /// view: `session_state` treats a binding pointing at a deleted project as
+    /// ungrouped.
     #[must_use]
     pub fn move_to_project(
         session_id: &str,
@@ -1213,9 +1341,10 @@ impl NewSessionEvent {
         }
     }
 
-    /// 把会话移出项目，退回未分组。
+    /// Move the session out of its project, back to ungrouped.
     ///
-    /// 与「删项目」不是一回事：这一条只动这一个会话，而删项目是解散整个分组。
+    /// Not the same thing as "deleting a project": this touches only this one
+    /// session, whereas deleting a project dissolves the whole grouping.
     #[must_use]
     pub fn remove_from_project(session_id: &str, actor: Actor, device_id: &str) -> Self {
         Self::bare(session_id, SessionOp::RemoveFromProject, actor, device_id)
@@ -1223,13 +1352,16 @@ impl NewSessionEvent {
 }
 
 // ══════════════════════════════════════════════════════════
-//  项目生命周期
+//  Project lifecycle
 // ══════════════════════════════════════════════════════════
 
-/// `project_events.name` 的字符数上限，与 migration 里的 CHECK 一致。
+/// The character cap on `project_events.name`, matching the CHECK in the
+/// migration.
 ///
-/// 常量在这里而不是让上层写字面量：两处漂移的症状是「客户端以为改名成功，
-/// 服务端却回 500」—— 数据库 CHECK 的报错到不了用户眼前。
+/// The constant lives here rather than leaving layers above to write a literal:
+/// the symptom of drift between the two is "the client thinks the rename
+/// succeeded but the server returns 500" — and the database CHECK's error never
+/// reaches the user.
 pub const PROJECT_NAME_MAX_CHARS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -1237,7 +1369,7 @@ pub struct ProjectEvent {
     pub id: String,
     pub project_id: String,
     pub op: ProjectOp,
-    /// `op = Create | Rename` 时非空
+    /// Non-null when `op = Create | Rename`
     pub name: Option<String>,
     pub actor: Actor,
     pub device_id: String,
@@ -1249,7 +1381,8 @@ pub struct NewProjectEvent {
     pub id: Id,
     pub project_id: String,
     pub op: ProjectOp,
-    /// `op = Create | Rename` 时必填，`Delete` 必须为 `None`（schema CHECK 强制）
+    /// Required when `op = Create | Rename`; must be `None` for `Delete`
+    /// (enforced by a schema CHECK)
     pub name: Option<String>,
     pub actor: Actor,
     pub device_id: String,
@@ -1267,11 +1400,14 @@ impl NewProjectEvent {
         }
     }
 
-    /// 建一个项目。`project_id` 由调用方生成（通常是一个新 ULID）。
+    /// Create a project. `project_id` is generated by the caller (usually a
+    /// fresh ULID).
     ///
-    /// **同一个 id 再 create 一次是「撤销删除」**，不是错误：末态由最后一条
-    /// 生命周期事件决定，于是重建之后原来那些会话的归属原样回来 ——
-    /// 这正是删项目刻意不级联改写会话事件换来的东西。
+    /// **Creating the same id again is "undo the deletion"**, not an error: the
+    /// final state is determined by the last lifecycle event, so after
+    /// recreating it the original sessions' membership comes back exactly as it
+    /// was — which is precisely what deliberately not cascading a rewrite of
+    /// session events on project deletion buys.
     #[must_use]
     pub fn create(project_id: &str, name: &str, actor: Actor, device_id: &str) -> Self {
         Self {
@@ -1280,7 +1416,8 @@ impl NewProjectEvent {
         }
     }
 
-    /// 改名。末态由最后一条 `rename`（或 `create`）决定，不做撤销栈。
+    /// Rename. The final state is determined by the last `rename` (or
+    /// `create`); there is no undo stack.
     #[must_use]
     pub fn rename(project_id: &str, name: &str, actor: Actor, device_id: &str) -> Self {
         Self {
@@ -1289,11 +1426,12 @@ impl NewProjectEvent {
         }
     }
 
-    /// 删项目 —— **解散分组，不动内容**。
+    /// Delete a project — **dissolve the grouping, leave the content alone**.
     ///
-    /// 里面的会话变成未分组，消息、附件、已抽取的事实一条不少。
-    /// 真要销毁内容得走 `redactions` 的 redact / purge，那是另一条路、
-    /// 要二次确认（docs/memory.md §十一）。
+    /// The sessions inside become ungrouped, and not one message, attachment,
+    /// or extracted fact is lost. Actually destroying content requires
+    /// `redactions`' redact / purge, which is a different path and requires a
+    /// second confirmation (docs/memory.md §11).
     #[must_use]
     pub fn delete(project_id: &str, actor: Actor, device_id: &str) -> Self {
         Self::bare(project_id, ProjectOp::Delete, actor, device_id)
@@ -1301,14 +1439,14 @@ impl NewProjectEvent {
 }
 
 // ══════════════════════════════════════════════════════════
-//  抹除记录
+//  Redaction records
 // ══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct Redaction {
     pub id: String,
     pub target_kind: RedactionTarget,
-    /// episode 时是 ULID，blob 时是 SHA-256
+    /// A ULID for an episode, a SHA-256 for a blob
     pub target_id: String,
     pub mode: RedactionMode,
     pub reason: String,
@@ -1323,17 +1461,18 @@ pub struct NewRedaction {
     pub target_kind: RedactionTarget,
     pub target_id: String,
     pub mode: RedactionMode,
-    /// schema 要求必填 —— 抹除必须留下理由
+    /// Required by the schema — a redaction must leave a reason behind
     pub reason: String,
     pub actor: String,
     pub device_id: String,
 }
 
 // ══════════════════════════════════════════════════════════
-//  视图
+//  Views
 // ══════════════════════════════════════════════════════════
 
-/// `fact_status` 视图：一条事实最近一次**状态**事件（`flag` 不参与）。
+/// The `fact_status` view: a fact's most recent **status** event (`flag` takes
+/// no part).
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct FactStatus {
     pub fact_id: String,
@@ -1345,46 +1484,54 @@ pub struct FactStatus {
     pub decided_at: DateTime<Utc>,
 }
 
-/// `session_state` 视图：一个会话四个维度各自的末态。
+/// The `session_state` view: a session's final state along each of its four
+/// dimensions.
 ///
-/// 四个维度**互相独立**地取各自最后一条事件 —— `[archive, rename]` 之后
-/// 会话既有了新标题，也仍然处于归档中。用「整表最后一条」判定会得出
-/// 「改个名就自动出档了」这种谁也没要求过的行为。
+/// The four dimensions take their own last event **independently of each
+/// other** — after `[archive, rename]` the session both has a new title and is
+/// still archived. Deciding by "the last row in the whole table" would produce
+/// behavior nobody asked for, like "renaming it automatically unarchives it".
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct SessionState {
     pub session_id: String,
-    /// 用户设置的标题。`None` = 从未改过名，上层应回落到「首条用户消息派生」。
+    /// The title the user set. `None` = never renamed, and the layer above
+    /// should fall back to "derived from the first user message".
     pub title: Option<String>,
     pub archived: bool,
-    /// 绑定的本机目录。`None` = 未绑定，该会话是纯聊天（没有文件工具）。
+    /// The bound local directory. `None` = unbound, and the session is pure
+    /// chat (no file tools).
     pub workspace: Option<String>,
-    /// 所属项目。`None` = 未分组。
+    /// The project it belongs to. `None` = ungrouped.
     ///
-    /// **指向已删除项目的绑定在视图里就已经变成 `None`** —— 删项目不级联
-    /// 改写会话事件，悬挂的绑定是常态，判定收敛在 SQL 里一处。
+    /// **A binding pointing at a deleted project has already become `None` in
+    /// the view** — deleting a project does not cascade a rewrite of session
+    /// events, dangling bindings are routine, and the decision is consolidated
+    /// into a single place in SQL.
     pub project_id: Option<String>,
-    /// 这个会话在哪儿跑。**视图里已经把 NULL 折成 `Cloud`** ——
-    /// 缺省定在 SQL 一处，而不是让每个调用方各判一遍「没有事件算什么」。
+    /// Where this session runs. **The view has already folded NULL into
+    /// `Cloud`** — the default is pinned down in one place in SQL rather than
+    /// leaving every caller to decide separately what "no event" means.
     pub runtime: SessionRuntime,
-    /// 五个维度中最近一次事件的时间
+    /// The time of the most recent event across the five dimensions
     pub decided_at: DateTime<Utc>,
 }
 
-/// `project_state` 视图 + 会话计数：项目列表的一行。
+/// The `project_state` view + a session count: one row of the project list.
 ///
-/// `session_count` 不是视图的一部分（视图只回答「这个项目此刻叫什么」），
-/// 而是列表查询顺手聚合出来的 —— 见 [`crate::Store::projects`]。
+/// `session_count` is not part of the view (the view only answers "what is this
+/// project currently called"); it is aggregated in passing by the list query —
+/// see [`crate::Store::projects`].
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct Project {
     pub project_id: String,
     pub name: String,
     pub created_at: DateTime<Utc>,
-    /// 这个项目下有多少个**会显示在列表里**的会话。口径见
-    /// [`crate::Store::projects`] 的文档。
+    /// How many sessions under this project **would appear in the list**. For
+    /// what exactly that counts, see the docs on [`crate::Store::projects`].
     pub session_count: i64,
 }
 
-/// `canonical_entities` 视图：实体经别名合并后的最终归属。
+/// The `canonical_entities` view: an entity's final owner after alias merges.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct CanonicalEntity {
     pub id: String,
@@ -1398,34 +1545,40 @@ mod tests {
     #[test]
     fn text_enum_roundtrips_through_str() {
         for op in [FactOp::Invalidate, FactOp::Revoke, FactOp::Flag] {
-            assert_eq!(op.as_str().parse::<FactOp>().expect("应能解析回来"), op);
+            assert_eq!(
+                op.as_str().parse::<FactOp>().expect("should parse back"),
+                op
+            );
         }
     }
 
     #[test]
     fn unknown_variant_is_rejected() {
-        let err = "nope".parse::<Role>().expect_err("未知取值应当报错");
+        let err = "nope"
+            .parse::<Role>()
+            .expect_err("an unknown value should error");
         assert!(matches!(err, crate::StoreError::UnknownVariant { .. }));
     }
 
     #[test]
     fn session_event_constructors_respect_the_schema_checks() {
-        // schema 的 CHECK 是两侧的：rename 必须有 title，且**只有** rename
-        // 能有 title。构造器写错会在集成测试里变成一句 SQLSTATE 23514，
-        // 这里先用单测把意图钉住
+        // The schema's CHECK cuts both ways: rename must have a title, and
+        // **only** rename may have one. A mistake in a constructor would show
+        // up in the integration tests as a bare SQLSTATE 23514, so this unit
+        // test pins the intent down first
         let r = NewSessionEvent::rename("s", "新标题", Actor::User, "dev");
         assert_eq!(r.title.as_deref(), Some("新标题"));
-        assert!(r.workspace.is_none(), "rename 不该携带 workspace");
+        assert!(r.workspace.is_none(), "rename must not carry a workspace");
 
         let b = NewSessionEvent::bind_workspace("s", "/tmp/x", Actor::User, "dev");
         assert_eq!(b.workspace.as_deref(), Some("/tmp/x"));
-        assert!(b.title.is_none(), "bind_workspace 不该携带 title");
+        assert!(b.title.is_none(), "bind_workspace must not carry a title");
 
         let m = NewSessionEvent::move_to_project("s", "proj", Actor::User, "dev");
         assert_eq!(m.project_id.as_deref(), Some("proj"));
         assert!(
             m.title.is_none() && m.workspace.is_none(),
-            "move_to_project 不该携带 title / workspace"
+            "move_to_project must not carry a title / workspace"
         );
 
         for e in [
@@ -1436,7 +1589,7 @@ mod tests {
         ] {
             assert!(
                 e.title.is_none() && e.workspace.is_none() && e.project_id.is_none(),
-                "{} 是纯状态事件，不该携带任何载荷",
+                "{} is a pure status event and must not carry any payload",
                 e.op
             );
         }
@@ -1444,27 +1597,29 @@ mod tests {
 
     #[test]
     fn project_event_constructors_respect_the_schema_checks() {
-        // 与 session_events 同一套两侧 CHECK：create / rename 必须有 name，
-        // 且**只有**它们能有 name。构造器写错会在集成测试里变成一句
-        // SQLSTATE 23514，这里先用单测把意图钉住
+        // The same two-way CHECK as session_events: create / rename must have a
+        // name, and **only** they may have one. A mistake in a constructor
+        // would show up in the integration tests as a bare SQLSTATE 23514, so
+        // this unit test pins the intent down first
         for e in [
             NewProjectEvent::create("p", "新项目", Actor::User, "dev"),
             NewProjectEvent::rename("p", "改过的名", Actor::User, "dev"),
         ] {
-            assert!(e.name.is_some(), "{} 必须携带 name", e.op);
+            assert!(e.name.is_some(), "{} must carry a name", e.op);
         }
 
         let d = NewProjectEvent::delete("p", Actor::User, "dev");
         assert!(
             d.name.is_none(),
-            "delete 是纯状态事件，带上 name 会让视图表现为「删一下名字就变了」"
+            "delete is a pure status event; carrying a name would make the view behave as though \
+             deleting it also changed its name"
         );
     }
 
     #[test]
     fn episode_blob_record_id_uses_colon() {
         let link = NewEpisodeBlob {
-            episode_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("合法 ULID"),
+            episode_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("a valid ULID"),
             blob_hash: "a".repeat(64),
             kind: None,
             filename: None,

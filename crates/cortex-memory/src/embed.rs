@@ -1,67 +1,78 @@
-//! 向量化 —— [`Embedder`] 抽象与后端选择。
+//! Vectorization — the [`Embedder`] abstraction and backend selection.
 //!
-//! 三个后端，具体实现各在一处：
+//! Three backends, each implemented in exactly one place:
 //!
-//! | 后端 | 在哪 | 何时用 |
+//! | Backend | Where | When to use |
 //! |---|---|---|
-//! | `api`（**默认**） | [`crate::embed_api`] | 调远端 `/v1/embeddings`（自建容器或云服务） |
-//! | `hash` | 本文件 | 离线开发与 CI。**不是语义空间** |
-//! | `fast` | [`crate::embed_local`]，feature `local-embed` | 一个进程搞定，不依赖外部服务 |
+//! | `api` (**default**) | [`crate::embed_api`] | Calls a remote `/v1/embeddings` (self-hosted container or cloud service) |
+//! | `hash` | this file | Offline development and CI. **Not a semantic space** |
+//! | `fast` | [`crate::embed_local`], feature `local-embed` | One process handles everything, no external service |
 //!
-//! # 为什么默认从进程内推理改成了 HTTP
+//! # Why the default moved from in-process inference to HTTP
 //!
-//! 在此之前 `fastembed`（内部 ONNX Runtime）是硬依赖。代价不只是「重」：
-//! Intel Mac 上 `ort-sys` 没有预编译产物、**构建期**就失败；每台机器都要
-//! 能拿到那 590 MB 权重，而生产节点上 Hugging Face 完全不可达时，
-//! cortexd 会**照常启动、`/health` 返回 ok**，只在日志里留一行
-//! 「回落到 mock」—— 记忆检索是假的而没有任何红灯。
-//! 详见 [`crate::embed_api`] 的模块注释。
+//! Before this, `fastembed` (ONNX Runtime inside) was a hard dependency. The
+//! cost was more than just "heavy": on Intel Macs `ort-sys` has no prebuilt
+//! artifacts and fails at **build time**; every machine has to be able to
+//! fetch those 590 MB of weights, and when Hugging Face was completely
+//! unreachable from the production node, cortexd would **start up as usual and
+//! return ok from `/health`**, leaving a single line in the log saying it had
+//! "fallen back to mock" — memory retrieval was fake, with no red light at
+//! all. See the module comment of [`crate::embed_api`] for the full story.
 //!
-//! 「记忆内容不应出网」这条理由**只对一半成立**，得说清楚：抽取本来就
-//! 已经把对话发给 LLM 供应商了。走 API 之后多出网的是**每条事实、
-//! 每个 episode 与每次检索 query**。真在意这一点的部署，把
-//! `CORTEX_EMBED_ENDPOINT` 指向内网那个容器即可 —— 协议是同一个。
+//! The argument "memory content must not leave the network" is **only half
+//! true**, and that has to be stated clearly: extraction already sends the
+//! conversation to an LLM vendor. What additionally leaves the network once we
+//! go through the API is **every fact, every episode and every retrieval
+//! query**. A deployment that genuinely cares about this just points
+//! `CORTEX_EMBED_ENDPOINT` at the container on its own network — the protocol
+//! is the same one.
 //!
-//! # 维度是 schema 的一部分
+//! # The dimension is part of the schema
 //!
-//! 迁移里写死 `VECTOR(1024)`。换模型要么维度一致，要么得加新列迁移
-//! （见 memory.md §七「换模型不停机」）。所有向量表都记 `embedding_model`，
-//! 正是为了支持渐进回填。
+//! The migration hardcodes `VECTOR(1024)`. Switching models means either
+//! matching that dimension, or adding a migration with a new column
+//! (see memory.md §7 "switching models without downtime"). Every vector table
+//! records `embedding_model`, precisely so that progressive backfill is
+//! possible.
 //!
-//! # 环境变量
+//! # Environment variables
 //!
-//! | 变量 | 取值 | 默认 |
+//! | Variable | Values | Default |
 //! |---|---|---|
 //! | `CORTEX_EMBED_BACKEND` | `api` \| `hash` \| `fast` | `api` |
-//! | `CORTEX_EMBED_ENDPOINT` | 服务地址 | `http://embeddings/v1/embeddings` |
-//! | `CORTEX_EMBED_MODEL` | 模型名 | `bge-m3` |
-//! | `CORTEX_EMBED_API_KEY` | 鉴权，自建可不填 | 无 |
-//! | `CORTEX_EMBED_BATCH` | 单请求条数 / 回填批大小 | 10 |
+//! | `CORTEX_EMBED_ENDPOINT` | service address | `http://embeddings/v1/embeddings` |
+//! | `CORTEX_EMBED_MODEL` | model name | `bge-m3` |
+//! | `CORTEX_EMBED_API_KEY` | auth, optional when self-hosted | none |
+//! | `CORTEX_EMBED_BATCH` | items per request / backfill batch size | 10 |
 
 use std::sync::Arc;
 
 use cortex_core::{CortexError, Result};
 
-/// schema 写死的向量维度。变更需配套 migration。
+/// The vector dimension hardcoded in the schema. Changing it requires a
+/// matching migration.
 pub const EMBEDDING_DIM: usize = 1024;
 
-/// 向量化后端。
+/// A vectorization backend.
 ///
-/// 抽象成 trait 有两个实际用途：测试时换成确定性的假实现（不必下载模型），
-/// 以及将来换模型时新旧并存做渐进回填。
+/// Making this a trait buys two concrete things: swapping in a deterministic
+/// fake for tests (no model download needed), and having the old and new model
+/// coexist for progressive backfill when the model is eventually switched.
 #[async_trait::async_trait]
 pub trait Embedder: Send + Sync {
-    /// 模型标识，写入各表的 `embedding_model` 列。
+    /// Model identifier, written into the `embedding_model` column of every
+    /// table.
     fn model_id(&self) -> &str;
 
     fn dim(&self) -> usize {
         EMBEDDING_DIM
     }
 
-    /// 批量向量化。交互路径用 batch=1，后台回填用大 batch。
+    /// Batch vectorization. The interactive path uses batch=1, background
+    /// backfill uses a large batch.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
-    /// 单条便捷方法。
+    /// Single-item convenience method.
     async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut v = self.embed(&[text.to_string()]).await?;
         v.pop()
@@ -69,10 +80,13 @@ pub trait Embedder: Send + Sync {
     }
 }
 
-/// 确定性的哈希向量化器 —— **仅供测试与离线开发**。
+/// A deterministic hash vectorizer — **for tests and offline development
+/// only**.
 ///
-/// 不具备任何语义能力（同义词不会相近），但它无需下载模型、无需网络、
-/// 输出稳定可断言，使得存储层与检索管线的测试不必依赖真实模型。
+/// It has no semantic ability whatsoever (synonyms do not end up close), but
+/// it needs no model download, no network, and its output is stable enough to
+/// assert on, which lets the storage layer and the retrieval pipeline be
+/// tested without depending on a real model.
 pub struct HashEmbedder {
     dim: usize,
 }
@@ -105,12 +119,14 @@ impl Embedder for HashEmbedder {
     }
 }
 
-/// 把文本散列成单位长度向量。相同输入必得相同输出。
+/// Hashes text into a unit-length vector. Identical input must produce
+/// identical output.
 fn hash_vector(text: &str, dim: usize) -> Vec<f32> {
     use std::hash::{Hash, Hasher};
 
     let mut v = vec![0f32; dim];
-    // 按字符 n-gram 散列，让相似字符串的向量也有一定相关性
+    // Hash by character n-gram, so that similar strings also get somewhat
+    // correlated vectors
     let chars: Vec<char> = text.chars().collect();
     for window in chars.windows(2.min(chars.len().max(1))) {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -127,12 +143,14 @@ fn hash_vector(text: &str, dim: usize) -> Vec<f32> {
     v
 }
 
-// ───────────────────────────── 真实语义模型 ─────────────────────────────
+// ───────────────────────── Real semantic models ─────────────────────────
 
-/// 就地归一化到单位长度。
+/// Normalizes to unit length in place.
 ///
-/// 模型是否已归一化取决于导出时的图结构（int8 版与 fp32 版并不一致），
-/// 与其逐模型考据，不如统一在这里兜底——对已归一化的向量这是恒等操作。
+/// Whether a model has already normalized depends on the graph structure it
+/// was exported with (the int8 and fp32 versions do not agree). Rather than
+/// researching this model by model, we backstop it uniformly here — for an
+/// already-normalized vector this is the identity operation.
 pub(crate) fn normalize(v: &mut [f32]) -> std::result::Result<(), String> {
     if v.len() != EMBEDDING_DIM {
         return Err(format!(
@@ -141,8 +159,9 @@ pub(crate) fn normalize(v: &mut [f32]) -> std::result::Result<(), String> {
         ));
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    // 零向量在 pgvector 的 cosine 距离下得到 NaN，会静默污染整个 ORDER BY，
-    // 比在这里报错难查得多
+    // A zero vector yields NaN under pgvector's cosine distance and silently
+    // poisons the entire ORDER BY, which is far harder to track down than an
+    // error raised right here
     if !norm.is_finite() || norm <= f32::EPSILON {
         return Err(format!("模长 {norm} 非法，无法归一化"));
     }
@@ -152,53 +171,59 @@ pub(crate) fn normalize(v: &mut [f32]) -> std::result::Result<(), String> {
     Ok(())
 }
 
-// ───────────────────────────── 后端选择 ─────────────────────────────
+// ────────────────────────── Backend selection ──────────────────────────
 
-/// 便于在配置里切换后端。
+/// Makes it easy to switch backends from configuration.
 pub type SharedEmbedder = Arc<dyn Embedder>;
 
-/// 选哪个后端。
+/// Which backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// 调远端 `/v1/embeddings`。**默认。**
+    /// Calls a remote `/v1/embeddings`. **Default.**
     #[default]
     Api,
-    /// 确定性哈希桩，仅测试与离线开发。
+    /// Deterministic hash stub, for tests and offline development only.
     Hash,
-    /// 进程内 ONNX 推理。需要 feature `local-embed`。
+    /// In-process ONNX inference. Requires feature `local-embed`.
     ///
-    /// 变体本身**不**跟着 feature 一起消失：那样的话没开 feature 时
-    /// `CORTEX_EMBED_BACKEND=fast` 会报「未知取值」，把「这个后端没编进来」
-    /// 说成「你拼错了」。留着变体，让 [`build_embedder`] 给出真正的原因。
+    /// The variant itself does **not** disappear along with the feature: if it
+    /// did, `CORTEX_EMBED_BACKEND=fast` without the feature would report
+    /// "unknown value", turning "this backend was not compiled in" into "you
+    /// made a typo". Keeping the variant lets [`build_embedder`] give the real
+    /// reason.
     Fast,
 }
 
 impl Backend {
-    /// 解析 `CORTEX_EMBED_BACKEND`。
+    /// Parses `CORTEX_EMBED_BACKEND`.
     ///
-    /// **默认是 `api`**。看起来 `hash` 更「安全」（不联网、不依赖任何服务），
-    /// 但那会让语义召回在没人配置时静默失效：检索照常返回结果、
-    /// 没有任何报错，只是召回质量烂得毫无道理 —— 这种错要几周才发现。
-    /// 相比之下连不上 embedding 服务是**响亮**的：第一次写记忆就报错。
+    /// **The default is `api`.** `hash` looks "safer" (no network, no
+    /// dependency on any service), but it would make semantic recall fail
+    /// silently whenever nobody configured anything: retrieval still returns
+    /// results, nothing errors, the recall quality is just inexplicably
+    /// terrible — a bug of that shape takes weeks to notice. Failing to reach
+    /// the embedding service, by contrast, is **loud**: the very first memory
+    /// write errors out.
     ///
-    /// CI 与离线开发显式设 `CORTEX_EMBED_BACKEND=hash`。
+    /// CI and offline development set `CORTEX_EMBED_BACKEND=hash` explicitly.
     ///
     /// # Errors
     ///
-    /// 取值不认识时报错。
+    /// Errors on an unrecognized value.
     pub fn from_env() -> Result<Self> {
-        // 空串按「没设」处理，理由见 cortex_core::config 的 `non_empty`
+        // An empty string is treated as "not set"; see `non_empty` in
+        // cortex_core::config for the reason
         std::env::var("CORTEX_EMBED_BACKEND")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map_or(Ok(Self::Api), |v| Self::parse(&v))
     }
 
-    /// 解析后端名。
+    /// Parses a backend name.
     ///
     /// # Errors
     ///
-    /// 取值不认识时报错。
+    /// Errors on an unrecognized value.
     pub fn parse(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "api" | "http" | "remote" => Ok(Self::Api),
@@ -211,14 +236,15 @@ impl Backend {
     }
 }
 
-/// 新建一个 embedder（**不**复用全局实例）。
+/// Builds a fresh embedder (does **not** reuse the global instance).
 ///
-/// 换模型的渐进回填需要新旧两个实例同时在世（memory.md §七），
-/// 所以这条路必须保留；日常代码应该用 [`shared_embedder`]。
+/// Progressive backfill across a model switch needs the old and the new
+/// instance alive at the same time (memory.md §7), so this path has to stay;
+/// everyday code should use [`shared_embedder`].
 ///
 /// # Errors
 ///
-/// 配置非法或模型加载失败。
+/// Invalid configuration, or the model fails to load.
 pub async fn build_embedder(backend: Backend) -> Result<SharedEmbedder> {
     match backend {
         Backend::Hash => Ok(Arc::new(HashEmbedder::new())),
@@ -229,9 +255,10 @@ pub async fn build_embedder(backend: Backend) -> Result<SharedEmbedder> {
             crate::embed_local::FastEmbedder::from_env().await?,
         )),
 
-        // 没编进来时给出**真正的原因**，而不是让它在 parse 那一步
-        // 表现成「未知取值」——后者会把「这个二进制没带这个后端」
-        // 说成「你把名字拼错了」，而两者的处置完全不同
+        // When it was not compiled in, give the **actual reason** instead of
+        // letting it surface as "unknown value" back in parse — the latter
+        // turns "this binary does not carry this backend" into "you misspelled
+        // the name", and the two call for completely different fixes
         #[cfg(not(feature = "local-embed"))]
         Backend::Fast => Err(CortexError::Config(
             "CORTEX_EMBED_BACKEND=fast 需要 feature `local-embed`，而这个二进制没有编进来。\n\
@@ -243,15 +270,18 @@ pub async fn build_embedder(backend: Backend) -> Result<SharedEmbedder> {
     }
 }
 
-/// 进程内共享的 embedder，按环境变量选择后端。
+/// The process-wide shared embedder, backend chosen by environment variable.
 ///
-/// 用 `OnceCell` 而不是每处各建一个：模型 int8 也有 600 MB，
-/// 「daemon 而非嵌入式」这个架构决策的理由之一就是**模型常驻共享**
-/// （architecture.md）。重复加载会直接吃掉那个收益。
+/// A `OnceCell` rather than one instance per call site: even the int8 model is
+/// 600 MB, and one of the reasons behind the "daemon, not embedded"
+/// architectural decision is precisely that **the model stays resident and
+/// shared** (architecture.md). Loading it repeatedly eats that benefit
+/// outright.
 ///
 /// # Errors
 ///
-/// 首次调用时配置非法或模型加载失败；失败不会被缓存，下次调用会重试。
+/// Invalid configuration or a failed model load on the first call; failures
+/// are not cached, so the next call retries.
 pub async fn shared_embedder() -> Result<SharedEmbedder> {
     static SHARED: tokio::sync::OnceCell<SharedEmbedder> = tokio::sync::OnceCell::const_new();
     SHARED
@@ -260,11 +290,12 @@ pub async fn shared_embedder() -> Result<SharedEmbedder> {
         .cloned()
 }
 
-/// 让 `Arc<dyn Embedder>` 本身也是 `Embedder`。
+/// Makes `Arc<dyn Embedder>` itself an `Embedder`.
 ///
-/// 没有这个的话，凡是持有 embedder 的泛型结构（如 `Retriever<E: Embedder>`）
-/// 都无法用共享句柄实例化，调用方只能到处写 `&*arc` 或改成非泛型 ——
-/// 前者难看，后者丢掉静态分发。
+/// Without this, any generic structure holding an embedder (such as
+/// `Retriever<E: Embedder>`) cannot be instantiated with a shared handle, and
+/// callers are left writing `&*arc` everywhere or dropping the generic —
+/// the former is ugly, the latter gives up static dispatch.
 #[async_trait::async_trait]
 impl<T: Embedder + ?Sized> Embedder for Arc<T> {
     fn model_id(&self) -> &str {
@@ -289,7 +320,10 @@ mod tests {
         let e = HashEmbedder::new();
         let a = e.embed_one("对象存储用 RustFS").await.unwrap();
         let b = e.embed_one("对象存储用 RustFS").await.unwrap();
-        assert_eq!(a, b, "相同输入必须得到相同向量，否则测试无法断言");
+        assert_eq!(
+            a, b,
+            "identical input must give an identical vector, otherwise tests have nothing to assert on"
+        );
     }
 
     #[tokio::test]
@@ -299,7 +333,7 @@ mod tests {
         assert_eq!(
             v.len(),
             EMBEDDING_DIM,
-            "维度必须与 migration 的 VECTOR(1024) 一致"
+            "the dimension must match VECTOR(1024) in the migration"
         );
     }
 
@@ -310,7 +344,7 @@ mod tests {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
             (norm - 1.0).abs() < 1e-4,
-            "余弦距离要求单位向量，实际模长 {norm}"
+            "cosine distance requires unit vectors, actual norm {norm}"
         );
     }
 
@@ -327,13 +361,16 @@ mod tests {
         let mut v = vec![0f32; EMBEDDING_DIM];
         assert!(
             normalize(&mut v).is_err(),
-            "零向量必须报错：pgvector 的 cosine 距离会给出 NaN 并静默污染排序"
+            "a zero vector must error: pgvector's cosine distance yields NaN and silently poisons the ordering"
         );
 
         let mut v = vec![2f32; EMBEDDING_DIM];
         normalize(&mut v).unwrap();
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "归一化后模长应为 1，实际 {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "the norm after normalizing should be 1, actual {norm}"
+        );
     }
 
     #[test]
@@ -341,14 +378,15 @@ mod tests {
         let mut v = vec![1f32; 768];
         assert!(
             normalize(&mut v).is_err(),
-            "非 1024 维必须在写库前被拦下，否则错误会以 Postgres 类型错误的形式出现在很远的地方"
+            "anything other than 1024 dimensions must be caught before the write, otherwise the error surfaces far away in the form of a Postgres type error"
         );
     }
 
     #[tokio::test]
     async fn hash_backend_needs_no_model() {
-        // 这条同时是 CI 的可用性保证：CORTEX_EMBED_BACKEND=hash 必须能在
-        // 无网络、无模型缓存的机器上走通
+        // This also doubles as CI's availability guarantee:
+        // CORTEX_EMBED_BACKEND=hash must work on a machine with no network and
+        // no model cache
         let e = build_embedder(Backend::Hash).await.unwrap();
         assert_eq!(e.model_id(), "hash-stub-v1");
         assert_eq!(e.embed_one("x").await.unwrap().len(), EMBEDDING_DIM);
@@ -360,12 +398,12 @@ mod tests {
         assert_eq!(Backend::parse(" HASH ").unwrap(), Backend::Hash);
         assert!(
             Backend::parse("apii").is_err(),
-            "拼错的后端名必须报错；静默回落会让「CI 用 hash」的意图失效"
+            "a misspelled backend name must error; falling back silently defeats the intent of \"CI uses hash\""
         );
         assert_eq!(
             Backend::default(),
             Backend::Api,
-            "默认必须是真实语义后端：默认成 hash 会让召回在没人配置时静默失效"
+            "the default must be the real semantic backend: defaulting to hash makes recall fail silently whenever nobody configured anything"
         );
     }
 }

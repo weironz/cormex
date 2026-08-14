@@ -1,29 +1,37 @@
-//! 事实抽取管线：一轮对话 → 结构化事实 → 落库。
+//! The fact extraction pipeline: one conversational turn → structured facts →
+//! persisted.
 //!
 //! ```text
-//! episode 文本
+//! episode text
 //!     │
-//!     ├─① 抽取     廉价模型出 JSON 候选事实         ← 唯一一次跨网络
-//!     ├─② 实体消解  精确名 → 向量近似 → 新建
-//!     ├─③ 矛盾消解  确定性逻辑，不再问模型
-//!     └─④ 落库     一个 write_txn 写完 entity + fact + fact_events
+//!     ├─① extract          cheap model emits JSON candidate facts   ← the only network hop
+//!     ├─② entity resolution exact name → vector nearest → create new
+//!     ├─③ conflict resolution deterministic logic, the model is not consulted again
+//!     └─④ persist          one write_txn writes entity + fact + fact_events
 //! ```
 //!
-//! # 三条必须守住的纪律
+//! # Three rules that must hold
 //!
-//! 1. **①②③ 全在事务外。** 持锁事务里跨网络会把 `pg_advisory_xact_lock(4272)`
-//!    的持有时间拉到秒级，全库写入排在后面 —— 见 docs/memory.md §九。
-//!    这也是为什么 [`cortex_store::WriteTxn`] 根本不提供读方法。
-//! 2. **矛盾消解不交给 LLM。** 让模型判断「新旧哪条对」既不稳定也不可复现，
-//!    而失效是 append-only 的不可逆写入。这里只用两个客观量：
-//!    宾语是否相同、事件时间孰先孰后。
-//! 3. **宁可少抽。** 检索是 top-K，噪声会把有用的挤出去。判据只有一条：
-//!    「下次对话如果不知道这条，会不会做错决定？」
+//! 1. **①②③ all happen outside the transaction.** A network round trip inside a
+//!    lock-holding transaction stretches how long `pg_advisory_xact_lock(4272)`
+//!    is held into seconds, and every write in the database queues up behind it
+//!    — see docs/memory.md §9. This is also exactly why
+//!    [`cortex_store::WriteTxn`] offers no read methods at all.
+//! 2. **Conflict resolution is not delegated to the LLM.** Asking a model which
+//!    of the old and new facts is right is neither stable nor reproducible, and
+//!    invalidation is an irreversible append-only write. Only two objective
+//!    quantities are used here: whether the objects are identical, and which
+//!    event time comes first.
+//! 3. **Prefer extracting too little.** Retrieval is top-K, so noise crowds out
+//!    the useful entries. There is exactly one criterion: "if the next
+//!    conversation didn't know this, would it make a wrong decision?"
 //!
-//! # 为什么不做增量 / 流式抽取
+//! # Why there is no incremental / streaming extraction
 //!
-//! 抽取的产物是**整体**的（一条事实要么成立要么不成立），流式吐 JSON 只会
-//! 让容错解析变难，却省不下什么延迟 —— 它本来就跑在异步队列里，不阻塞对话。
+//! What extraction produces is **whole** (a fact either holds or it doesn't).
+//! Streaming out JSON would only make fault-tolerant parsing harder while saving
+//! essentially no latency — extraction already runs on an async queue and never
+//! blocks the conversation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -40,14 +48,15 @@ use crate::tokenize;
 use crate::trace::{self, TraceRules};
 
 // ══════════════════════════════════════════════════════════
-//  候选事实
+//  Candidate facts
 // ══════════════════════════════════════════════════════════
 
-/// 抽取结果里对一个实体的称呼。落库前还要经实体消解拿到真正的 id。
+/// What the extraction result calls an entity. Before it is persisted it still
+/// has to go through entity resolution to obtain a real id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRef {
     pub name: String,
-    /// person / project / tool / org / file / concept …… 开放不枚举
+    /// person / project / tool / org / file / concept … open-ended, not an enum
     pub kind: String,
 }
 
@@ -59,7 +68,8 @@ impl EntityRef {
         }
     }
 
-    /// 消解与去重用的键。大小写与首尾空白不该产生两个实体。
+    /// The key used for resolution and deduplication. Differing case or
+    /// surrounding whitespace should not produce two separate entities.
     fn cache_key(&self) -> (String, String) {
         (
             self.kind.trim().to_lowercase(),
@@ -68,97 +78,114 @@ impl EntityRef {
     }
 }
 
-/// 事实的宾语：字面量，或指向另一个实体（后者即知识图谱中的一条边）。
+/// A fact's object: either a literal, or a pointer to another entity (the latter
+/// being one edge in the knowledge graph).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectRef {
     Literal(String),
     Entity(EntityRef),
 }
 
-/// 一条尚未落库的候选事实。
+/// A candidate fact that has not been persisted yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateFact {
     pub subject: EntityRef,
     pub predicate: String,
     pub object: ObjectRef,
-    /// 自然语言表述。向量化与界面展示都用它，因此必须能独立读懂
+    /// The natural-language phrasing. Both vectorization and the UI use it, so it
+    /// has to be readable standing entirely on its own
     pub statement: String,
     pub domain: Option<String>,
-    /// 【事件时间】何时开始为真。推断不出就是 `None` ——
-    /// 不要用「现在」冒充，那会让认知回放把补录的旧事当成新事
+    /// [Event time] when this started being true. If it can't be inferred, it's
+    /// `None` — do not pass "now" off as the answer, because that makes time
+    /// replay treat a backfilled old fact as a new one
     pub valid_at: Option<DateTime<Utc>>,
     pub confidence: f32,
 }
 
-/// 抽取一轮对话所需的上下文。
+/// The context needed to extract from one conversational turn.
 #[derive(Debug, Clone)]
 pub struct ExtractContext {
-    /// 出处。`facts.source_episode_id NOT NULL` 是可审计的根基
+    /// Provenance. `facts.source_episode_id NOT NULL` is the foundation that
+    /// makes any of this auditable
     pub episode_id: Id,
-    /// 该轮对话的发生时间。两处用到：给模型解析「上周」这类相对表述做基准；
-    /// 事件时间未知时作为矛盾消解的回落值（见 [`Rival::effective_at`]）
+    /// When this turn happened. Used in two places: as the reference point that
+    /// lets the model resolve relative phrasings like "last week", and as the
+    /// fallback for conflict resolution when event time is unknown (see
+    /// [`Rival::effective_at`])
     pub occurred_at: DateTime<Utc>,
     pub domain: Option<String>,
-    /// 已知实体名。提示模型复用既有称呼，从源头压制别名爆炸
+    /// Known entity names. Nudges the model into reusing existing names,
+    /// suppressing the alias explosion at the source
     pub known_entities: Vec<String>,
-    /// 这一轮**是谁写回来的**。决定抽出来的事实落在哪一档信任级。
+    /// **Who wrote this turn back.** Determines which trust tier the extracted
+    /// facts land in.
     pub origin: TurnOrigin,
 }
 
-/// 一轮对话的来源。**这是信任级的唯一入口。**
+/// Where a turn came from. **This is the sole entry point for trust tiers.**
 ///
-/// # 信任级量的是什么
+/// # What a trust tier actually measures
 ///
-/// 不是「这件事发生过没有」，而是**「这段内容有多容易被攻击者操纵」**。
-/// 三档就是这条尺子上的三个位置：
+/// Not "did this really happen", but **"how easy is this content for an attacker
+/// to manipulate"**. The three tiers are three positions on that one ruler:
 ///
-/// | | 谁在说 | 落到 |
+/// | | Who is speaking | Lands in |
 /// |---|---|---|
-/// | [`Self::Trusted`] | 用户自己，经一把完整的用户凭据 | tier 2 `conversation` |
-/// | [`Self::Delegated`] | 持委托凭据的调用方（典型是沙箱容器） | tier 3 `tool_output` |
-/// | [`Self::External`] | 第三方 agent（MCP） | tier 4 `external` |
+/// | [`Self::Trusted`] | The user themselves, via a full user credential | tier 2 `conversation` |
+/// | [`Self::Delegated`] | A caller holding a delegated credential (typically a sandbox container) | tier 3 `tool_output` |
+/// | [`Self::External`] | A third-party agent (MCP) | tier 4 `external` |
 ///
-/// # 为什么被委托的那一档要降一级
+/// # Why the delegated tier gets demoted one level
 ///
-/// 拿委托凭据的那一头跑的是不可信代码：模型的输出、用户装的依赖、被 prompt
-/// 注入的工具调用。它写回来的 `role: user` 文本**不是用户说的**，是那个
-/// 进程说的 —— 而它可能已经被自己读到的东西诱导。这与工具轨迹降到 tier 3
-/// 是同一个论证。
+/// Whatever holds a delegated credential is running untrusted code: model
+/// output, dependencies the user installed, tool calls that got prompt-injected.
+/// The `role: user` text it writes back **is not what the user said** — it is
+/// what that process said, and that process may already have been steered by
+/// something it read. This is the same argument that demotes tool traces to
+/// tier 3.
 ///
-/// # 为什么外部还要再降一档
+/// # Why external gets demoted one level further
 ///
-/// 被委托的那一头至少是**用户自己那把 bearer 换来的**，跑的是用户让它干的
-/// 活，而且作用域绑死在一个会话上。第三方 agent 连这个都不成立：那一头是
-/// 谁、被喂了什么、有没有人在看，我们一概不知道。
+/// The delegated side is at least **something exchanged for the user's own
+/// bearer token**, doing work the user asked for, with its scope pinned to a
+/// single session. For a third-party agent not even that holds: we have no idea
+/// who is on the other end, what was fed to it, or whether anyone is watching.
 ///
-/// # 为什么这一格是我们特有的
+/// # Why this slot is specific to us
 ///
-/// 被投毒的 fact 会在**未来所有会话、所有设备**上被召回并注入 system
-/// prompt，而写它的那个进程 / 那个第三方早就不在了。四家云 agent 没有这条
-/// 通道（它们的沙箱没有可写的长期记忆），所以没人替我们守。
+/// A poisoned fact gets recalled and injected into the system prompt across
+/// **every future session on every device**, long after the process or the third
+/// party that wrote it is gone. The four cloud agents have no such channel
+/// (their sandboxes have no writable long-term memory), so nobody is guarding
+/// this on our behalf.
 ///
-/// # 为什么是枚举而不是几个 bool
+/// # Why an enum rather than a couple of bools
 ///
-/// 它此前是 `from_sandbox: bool`。加第二个来源时如果再加一个 bool，
-/// 「两个都为 true」就成了一个类型上合法、语义上没定义的状态 —— 而它迟早
-/// 会出现，那时落哪一档全看代码里哪个 `if` 在前面。
+/// This used to be `from_sandbox: bool`. If a second bool had been added for the
+/// second origin, "both are true" would become a state that is legal in the type
+/// system and undefined in meaning — and it *would* eventually occur, at which
+/// point which tier it lands in depends on nothing more than which `if` happens
+/// to come first in the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TurnOrigin {
-    /// 用户自己，经一把完整的用户凭据。**默认**。
+    /// The user themselves, via a full user credential. **The default.**
     #[default]
     Trusted,
-    /// 持委托凭据的调用方写回来的。至今唯一的实例是云沙箱容器，
-    /// 但这一档判的是凭据的信任级，不是它跑在哪里。
+    /// Written back by a caller holding a delegated credential. So far the only
+    /// instance is the cloud sandbox container, but what this tier judges is the
+    /// trust level of the credential, not where the code happens to run.
     Delegated,
-    /// 第三方 agent 经 MCP 写进来的。
+    /// Written in by a third-party agent over MCP.
     External,
 }
 
 impl TurnOrigin {
-    /// 这一档的对话文本抽出来的事实落在哪个通道。
+    /// Which channel facts extracted from this tier's conversation text land in.
     ///
-    /// 工具轨迹那一路**不看这个** —— 它恒为 `ToolOutput`，理由见
-    /// `trace_candidates` 调用处那段注释。
+    /// The tool-trace path **does not consult this** — it is always
+    /// `ToolOutput`; the reasoning is in the comment at the `trace_candidates`
+    /// call site.
     #[must_use]
     pub const fn conversation_channel(self) -> FactSource {
         match self {
@@ -181,7 +208,7 @@ impl ExtractContext {
         }
     }
 
-    /// 这一轮是谁写回来的。见 [`TurnOrigin`]。
+    /// Who wrote this turn back. See [`TurnOrigin`].
     #[must_use]
     pub fn from(mut self, origin: TurnOrigin) -> Self {
         self.origin = origin;
@@ -209,13 +236,17 @@ impl ExtractContext {
 //  Prompt
 // ══════════════════════════════════════════════════════════
 
-/// 单轮送进模型的文本上限。
+/// Upper bound on the text sent to the model for a single turn.
 ///
-/// 超长轮次（贴了整个文件）继续送只会线性烧钱，而尾部通常是代码正文 ——
-/// 恰好是明确不抽的东西。截断优于分块：分块会让同一条事实被抽两遍。
+/// Sending oversized turns (someone pasted a whole file) in full just burns money
+/// linearly, and the tail end is usually source code — precisely the thing we
+/// explicitly do not extract. Truncation beats chunking: chunking makes the same
+/// fact get extracted twice.
 const MAX_EPISODE_CHARS: usize = 24_000;
 
-/// 一轮最多接受多少条候选。模型偶尔会「凑数」，硬顶住上限比事后清理便宜。
+/// How many candidates a single turn will accept at most. The model occasionally
+/// pads out its answer, and holding a hard ceiling is cheaper than cleaning up
+/// afterwards.
 const MAX_CANDIDATES: usize = 24;
 
 const EXTRACT_SYSTEM: &str = r#"你是 Cortex 记忆系统的事实抽取器。从一轮对话中提炼**值得长期记住**的结构化事实。
@@ -321,17 +352,21 @@ fn build_user_prompt(episode_text: &str, ctx: &ExtractContext) -> String {
 }
 
 // ══════════════════════════════════════════════════════════
-//  容错解析
+//  Fault-tolerant parsing
 // ══════════════════════════════════════════════════════════
 
-/// 从模型返回的文本里剥出 JSON 主体。
+/// Peel the JSON body out of whatever text the model returned.
 ///
-/// 三种见过的脏输出都要能吃下：```json 围栏、JSON 前后的解释文字、
-/// 顶层直接是数组而非对象。做法是扫描出**第一个配平的** `{…}` 或 `[…]`，
-/// 而不是简单地取首尾字符 —— 后者遇到「解释文字里有个右花括号」就废了。
+/// All three flavours of dirty output we've actually seen have to be digestible:
+/// ```json fences, prose wrapped around the JSON, and a top level that is an
+/// array rather than an object. The approach is to scan for the **first balanced**
+/// `{…}` or `[…]` rather than naively taking the first and last character — the
+/// naive version falls apart the moment the surrounding prose contains a closing
+/// brace.
 ///
-/// `pub(crate)`：[`crate::crosslink`] 的判定结果是同一个模型吐的同一种脏
-/// JSON，抄第二份的下场是只在其中一份里修 bug。
+/// `pub(crate)`: [`crate::crosslink`]'s judgements come back as the same kind of
+/// dirty JSON from the same model, and keeping a second copy just means fixing a
+/// bug in only one of them.
 pub(crate) fn extract_json_blob(raw: &str) -> Option<&str> {
     let bytes = raw.as_bytes();
     let start = bytes.iter().position(|b| *b == b'{' || *b == b'[')?;
@@ -368,10 +403,12 @@ pub(crate) fn extract_json_blob(raw: &str) -> Option<&str> {
     None
 }
 
-/// 解析候选事实。**逐条容错**：某一条字段缺失只丢那一条，不废掉整批。
+/// Parse candidate facts. **Fault-tolerant per entry**: a missing field on one
+/// entry drops only that entry, it does not void the whole batch.
 ///
-/// 模型偶尔会漏 `statement` 或把 `object` 直接写成字符串。为这种小毛病
-/// 丢掉同批次里好的几条，是拿正确率换洁癖。
+/// The model occasionally omits `statement`, or writes `object` as a bare string.
+/// Throwing away the good entries in the same batch over a blemish like that is
+/// trading accuracy for tidiness.
 pub fn parse_candidates(raw: &str) -> Result<Vec<CandidateFact>> {
     let blob = extract_json_blob(raw)
         .ok_or_else(|| CortexError::Memory("抽取结果里找不到 JSON".into()))?;
@@ -379,7 +416,7 @@ pub fn parse_candidates(raw: &str) -> Result<Vec<CandidateFact>> {
     let value: Value = serde_json::from_str(blob)
         .map_err(|e| CortexError::Memory(format!("抽取结果不是合法 JSON：{e}")))?;
 
-    // 顶层可能是 {"facts":[…]}、{"data":[…]}，也可能直接就是 […]
+    // The top level may be {"facts":[…]}, {"data":[…]}, or just […] directly
     let items = match &value {
         Value::Array(items) => items.as_slice(),
         Value::Object(map) => map
@@ -412,7 +449,8 @@ fn candidate_from_json(v: &Value) -> Option<CandidateFact> {
 
     let object = object_ref_from_json(v.get("object")?)?;
 
-    // statement 缺失不该丢掉整条 —— 主谓宾都在，拼一句出来即可
+    // A missing statement should not cost us the whole entry — subject,
+    // predicate and object are all there, so just assemble a sentence
     let statement = v
         .get("statement")
         .and_then(Value::as_str)
@@ -441,7 +479,8 @@ fn candidate_from_json(v: &Value) -> Option<CandidateFact> {
         .and_then(Value::as_str)
         .and_then(parse_event_time);
 
-    // schema 的 CHECK 要求 0..=1；模型给 95 这种百分数也别整条丢掉
+    // The schema's CHECK requires 0..=1; when the model hands back a percentage
+    // like 95, don't throw the whole entry away over it
     let confidence = v
         .get("confidence")
         .and_then(Value::as_f64)
@@ -463,7 +502,7 @@ fn candidate_from_json(v: &Value) -> Option<CandidateFact> {
 
 fn entity_ref_from_json(v: &Value, default_kind: &str) -> Option<EntityRef> {
     match v {
-        // 模型有时把 subject 直接写成字符串
+        // The model sometimes writes subject as a bare string
         Value::String(s) => {
             let name = s.trim();
             (!name.is_empty()).then(|| EntityRef::new(name, default_kind))
@@ -506,17 +545,19 @@ fn object_ref_from_json(v: &Value) -> Option<ObjectRef> {
             {
                 return Some(ObjectRef::Literal(t.to_owned()));
             }
-            // {"name":…,"kind":…} 直接放在 object 下也认
+            // {"name":…,"kind":…} placed directly under object is accepted too
             entity_ref_from_json(v, "concept").map(ObjectRef::Entity)
         }
         _ => None,
     }
 }
 
-/// 谓词归一：小写 + 非字母数字折成单个下划线。
+/// Predicate normalization: lowercase, with runs of non-alphanumerics folded into
+/// a single underscore.
 ///
-/// 同一种关系被写成 `decided on` / `Decided-On` / `decided_on` 是常态，
-/// 不归一的话矛盾检测按 `(subject_id, predicate)` 就永远撞不上。
+/// The same relation showing up as `decided on` / `Decided-On` / `decided_on` is
+/// the norm, and without normalization conflict detection keyed on
+/// `(subject_id, predicate)` would never collide at all.
 #[must_use]
 pub fn normalize_predicate(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -533,7 +574,8 @@ pub fn normalize_predicate(raw: &str) -> String {
     out
 }
 
-/// 解析事件时间。模型给的粒度从年到秒都有，能吃多少吃多少。
+/// Parse an event time. The granularity the model hands back ranges from years to
+/// seconds, so accept as much of that range as possible.
 fn parse_event_time(raw: &str) -> Option<DateTime<Utc>> {
     let s = raw.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("null") || s.eq_ignore_ascii_case("unknown") {
@@ -555,22 +597,29 @@ fn parse_event_time(raw: &str) -> Option<DateTime<Utc>> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  矛盾消解 —— 确定性逻辑
+//  Conflict resolution — deterministic logic
 // ══════════════════════════════════════════════════════════
 
-/// 谓词的基数规则：哪些谓词在同一主语下只能有一个取值。
+/// Cardinality rules for predicates: which predicates can hold only one value per
+/// subject.
 ///
-/// 这是矛盾消解里唯一带「知识」的地方，因此**必须是查表而非模型判断**：
-/// 失效是 append-only 的不可逆写入，判错了没有回头路（只能再追加 revoke）。
+/// This is the only place in conflict resolution that carries "knowledge", which
+/// is exactly why it **must be a lookup table rather than a model judgement**:
+/// invalidation is an irreversible append-only write, and there is no way back
+/// from getting it wrong (all you can do is append a revoke on top).
 ///
-/// 表外的谓词一律当多值处理 —— 即「补充，两条并存」。这个默认方向是刻意的：
-/// 漏判一次矛盾只是多留一条旧事实，误判一次却会把仍然为真的事实打成失效。
+/// Any predicate not in the table is treated as multi-valued — that is, "add it,
+/// both entries coexist". That default direction is deliberate: missing a
+/// conflict merely leaves one extra stale fact around, whereas calling one
+/// wrongly marks a fact that is still true as invalidated.
 #[derive(Debug, Clone)]
 pub struct PredicateRules {
     functional: BTreeSet<String>,
 }
 
-/// 天然单值的谓词。命名取自 schema 注释里举的例子与实际抽取中的高频词。
+/// Predicates that are inherently single-valued. The names are taken from the
+/// examples in the schema comments and from what shows up most often in real
+/// extraction.
 const DEFAULT_FUNCTIONAL: &[&str] = &[
     "decided",
     "decided_on",
@@ -612,7 +661,8 @@ impl Default for PredicateRules {
 }
 
 impl PredicateRules {
-    /// 追加单值谓词。领域专有的谓词由调用方补齐，不写死在这里。
+    /// Add more single-valued predicates. Domain-specific predicates are filled
+    /// in by the caller rather than hard-coded here.
     #[must_use]
     pub fn with_functional<I, S>(mut self, predicates: I) -> Self
     where
@@ -631,50 +681,58 @@ impl PredicateRules {
     }
 }
 
-/// 参与矛盾判定的一条现存（或本批次内已计划）事实。
+/// One existing fact (or one already planned within this batch) that takes part
+/// in the conflict decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rival {
     pub fact_id: Id,
-    /// 归一化的宾语键，判重用
+    /// The normalized object key, used for duplicate detection
     pub object_key: String,
-    /// 判定用的事件时间。
+    /// The event time used for the decision.
     ///
-    /// `facts.valid_at` 允许为 NULL（未知或一直如此），但比较必须有个值，
-    /// 于是回落到该行的系统时间。**不把这个回落值写回 `valid_at`** ——
-    /// 那等于用「我何时知道」冒充「何时为真」，双时间轴就白设计了。
+    /// `facts.valid_at` is allowed to be NULL (unknown, or true all along), but a
+    /// comparison needs *some* value, so it falls back to that row's system
+    /// time. **This fallback value is never written back into `valid_at`** —
+    /// doing so would pass "when I learned it" off as "when it became true", and
+    /// the whole bitemporal design would have been for nothing.
     pub effective_at: DateTime<Utc>,
 }
 
-/// 矛盾消解的判定结果。
+/// The verdict of conflict resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// 同主谓宾的有效事实已经在库里 —— 丢弃，一个字都不写。
+    /// A valid fact with the same subject/predicate/object is already in the
+    /// database — discard, write not a single word.
     ///
-    /// 这是噪声的最大来源：同一件事在连续几轮里被反复提及。
+    /// This is the single largest source of noise: the same thing being brought
+    /// up over and over across consecutive turns.
     Duplicate,
-    /// 写入新事实，并按需给旧事实追加事件。
-    /// `supersede` 与 `flag` 都为空即「补充」，两条并存。
+    /// Write the new fact, and append events to the old ones as needed.
+    /// `supersede` and `flag` both empty means "addition": both entries coexist.
     Write {
-        /// 追加 `invalidate/superseded`，`superseded_by` 指向新事实
+        /// Append `invalidate/superseded`, with `superseded_by` pointing at the
+        /// new fact
         supersede: Vec<Id>,
-        /// 追加 `flag`（批注，不改状态），新旧两侧都要挂
+        /// Append `flag` (an annotation; it does not change status) — it has to
+        /// be attached to both the old and the new side
         flag: Vec<Id>,
-        /// `superseded` 事件的 `invalid_at`
+        /// The `invalid_at` on the `superseded` event
         invalid_at: DateTime<Utc>,
     },
 }
 
-/// 判定新事实与同 `(subject_id, predicate)` 现存事实的关系。
+/// Decide how a new fact relates to the existing facts under the same
+/// `(subject_id, predicate)`.
 ///
-/// 只看两个客观量，没有任何模型参与：
+/// Only two objective quantities are consulted; no model is involved at all:
 ///
-/// | 情形 | 判定 |
+/// | Situation | Verdict |
 /// |---|---|
-/// | 宾语相同 | 重复，丢弃 |
-/// | 谓词是多值的 | 补充，并存 |
-/// | 单值 + 新事实事件时间更晚 | 取代 |
-/// | 单值 + 新事实事件时间更早 | 并存（补录历史，区间不重叠不构成矛盾） |
-/// | 单值 + 事件时间完全相同 | 矛盾且判不出，两条并存 + flag |
+/// | Identical object | Duplicate, discard |
+/// | Predicate is multi-valued | Addition, coexist |
+/// | Single-valued + new fact's event time is later | Supersede |
+/// | Single-valued + new fact's event time is earlier | Coexist (backfilled history; non-overlapping intervals are not a conflict) |
+/// | Single-valued + event times are exactly equal | A conflict we cannot adjudicate: both coexist, plus a flag |
 #[must_use]
 pub fn decide(
     new_object_key: &str,
@@ -693,8 +751,9 @@ pub fn decide(
         for r in rivals {
             match new_effective_at.cmp(&r.effective_at) {
                 std::cmp::Ordering::Greater => supersede.push(r.fact_id),
-                // 新事实描述的是更早的状态：这是补录，旧事实仍然是「当下」。
-                // 时间区间不重叠不构成矛盾（docs/memory.md §五）。
+                // The new fact describes an earlier state: this is a backfill,
+                // and the old fact is still "the present". Non-overlapping time
+                // intervals do not constitute a conflict (docs/memory.md §5).
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => flag.push(r.fact_id),
             }
@@ -708,7 +767,8 @@ pub fn decide(
     }
 }
 
-/// 归一化的宾语键。实体宾语按 id 比，字面量按去空白小写比。
+/// The normalized object key. Entity objects compare by id; literals compare
+/// lowercased with whitespace squeezed out.
 fn object_key(literal: Option<&str>, entity_id: Option<&str>) -> String {
     if let Some(id) = entity_id {
         return format!("e:{id}");
@@ -719,10 +779,10 @@ fn object_key(literal: Option<&str>, entity_id: Option<&str>) -> String {
 }
 
 // ══════════════════════════════════════════════════════════
-//  实体近邻索引
+//  Entity nearest-neighbour index
 // ══════════════════════════════════════════════════════════
 
-/// 一个已知实体的最小画像，供近似匹配使用。
+/// The minimal profile of a known entity, for approximate matching.
 #[derive(Debug, Clone)]
 pub struct EntityRecord {
     pub id: Id,
@@ -731,19 +791,23 @@ pub struct EntityRecord {
     pub embedding: Vec<f32>,
 }
 
-/// 实体向量近邻检索。
+/// Nearest-neighbour lookup over entity vectors.
 ///
-/// 抽成 trait 而不是直接查库，是因为 `cortex-store` 现在只暴露
-/// `(kind, name)` 的精确匹配，没有实体向量的近邻查询方法。默认实现
-/// [`InProcessEntityIndex`] 在进程内做（cortexd 常驻，够覆盖同一进程
-/// 内的别名归并）；等存储层补上 `entities_near` 之后换个实现即可，
-/// 调用方一行不用改。
+/// This is a trait rather than a direct database query because `cortex-store`
+/// currently only exposes exact `(kind, name)` matching — it has no
+/// nearest-neighbour query over entity vectors. The default implementation,
+/// [`InProcessEntityIndex`], does it in-process (cortexd is long-running, which
+/// is enough to cover alias merging within one process); once the storage layer
+/// grows an `entities_near`, swapping in another implementation is all it takes
+/// and no call site changes by a line.
 #[async_trait::async_trait]
 pub trait EntityIndex: Send + Sync {
-    /// 记住一个实体（新建的或刚消解到的），供后续近似匹配。
+    /// Remember an entity (newly created, or just resolved) for later
+    /// approximate matching.
     async fn remember(&self, record: EntityRecord);
 
-    /// 同 kind 下与给定向量最相近的实体，按余弦相似度降序。
+    /// The entities of the same kind closest to the given vector, in descending
+    /// order of cosine similarity.
     async fn nearest(
         &self,
         kind: &str,
@@ -752,7 +816,7 @@ pub trait EntityIndex: Send + Sync {
     ) -> Vec<(EntityRecord, f32)>;
 }
 
-/// 进程内的实体索引。
+/// The in-process entity index.
 #[derive(Default)]
 pub struct InProcessEntityIndex {
     records: RwLock<Vec<EntityRecord>>,
@@ -793,7 +857,9 @@ impl EntityIndex for InProcessEntityIndex {
     }
 }
 
-/// 余弦相似度。向量已由 [`crate::embed`] 归一化，这里仍算模长以防外部塞进未归一的向量。
+/// Cosine similarity. Vectors are already normalized by [`crate::embed`], but the
+/// magnitudes are still computed here in case something outside hands us
+/// un-normalized vectors.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -813,35 +879,40 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ══════════════════════════════════════════════════════════
-//  抽取器
+//  The extractor
 // ══════════════════════════════════════════════════════════
 
-/// 实体近似匹配的余弦阈值。
+/// The cosine threshold for approximate entity matching.
 ///
-/// 取值偏保守：把两个不同实体错并成一个，比多留一个别名难查得多
-/// （`entity_merges` 是 first-writer-wins 且当前不可逆）。
-/// 换成语义更强的 embedding 模型时可以往上调，用
-/// [`Extractor::with_entity_match_threshold`]。
+/// The value leans conservative: wrongly merging two distinct entities into one
+/// is far harder to track down than leaving one extra alias around
+/// (`entity_merges` is first-writer-wins and currently irreversible). It can be
+/// raised when switching to a semantically stronger embedding model, via
+/// [`Extractor::with_entity_match_threshold`].
 pub const DEFAULT_ENTITY_MATCH_THRESHOLD: f32 = 0.82;
 
-/// 一轮落库的结果。
+/// The outcome of persisting one turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestReport {
-    /// 模型给出的候选条数
+    /// How many candidates the model produced
     pub candidates: usize,
-    /// 实际写入的 fact id
+    /// The fact ids actually written
     pub written: Vec<Id>,
-    /// 因与库内已有事实同主谓宾而被丢弃的条数
+    /// How many were discarded for sharing subject/predicate/object with a fact
+    /// already in the database
     pub duplicates: usize,
-    /// 被取代（追加了 superseded 事件）的旧 fact id
+    /// The ids of old facts that were superseded (a superseded event was
+    /// appended to them)
     pub superseded: Vec<Id>,
-    /// 被标记「矛盾待确认」的 fact id（新旧两侧都在内）
+    /// The fact ids marked "conflict, awaiting confirmation" (both the old and
+    /// the new side are included)
     pub flagged: Vec<Id>,
-    /// 新建的实体 id
+    /// The ids of newly created entities
     pub new_entities: Vec<Id>,
 }
 
-/// 事实抽取器。克隆代价低（内部都是 `Arc`），可以塞进异步任务队列。
+/// The fact extractor. Cheap to clone (everything inside is an `Arc`), so it can
+/// be dropped straight into an async task queue.
 #[derive(Clone)]
 pub struct Extractor {
     llm: LlmClient,
@@ -872,7 +943,8 @@ impl Extractor {
         self
     }
 
-    /// 调整工具轨迹的判据参数（惯例阈值、每轮预算等）。
+    /// Adjust the criteria used for tool traces (the habit threshold, the
+    /// per-turn budget, and so on).
     #[must_use]
     pub fn with_trace_rules(mut self, rules: TraceRules) -> Self {
         self.trace_rules = rules;
@@ -891,8 +963,9 @@ impl Extractor {
         self
     }
 
-    /// 写入 `facts.extracted_by`：供应商 + 模型。
-    /// 记到型号是为了将来能按抽取器版本回溯质量问题。
+    /// What gets written to `facts.extracted_by`: provider + model.
+    /// Recording it down to the exact model is what will later let us trace
+    /// quality problems back to a specific extractor version.
     fn extracted_by(&self) -> String {
         format!(
             "{}/{}",
@@ -901,10 +974,11 @@ impl Extractor {
         )
     }
 
-    // ── ① 抽取 ─────────────────────────────────────────────
+    // ── ① Extract ──────────────────────────────────────────
 
-    /// 从一条 episode 抽取候选事实。**用廉价模型** —— 每轮都要跑的东西
-    /// 绝不能用主对话模型（docs/memory.md §十）。
+    /// Extract candidate facts from one episode. **Uses the cheap model** —
+    /// anything that runs on every single turn must never go through the main
+    /// conversation model (docs/memory.md §10).
     pub async fn extract(
         &self,
         episode_text: &str,
@@ -914,17 +988,23 @@ impl Extractor {
             return Ok(Vec::new());
         }
 
-        // ── 写入侧负过滤。**必须在这一行，不能更靠后** ──
+        // ── Write-side negative filter. **It must be on this line, not any
+        // later** ──
         //
-        // 下面紧接着就是一次 LLM 调用：过滤挪到 `write_candidates` 或者
-        // 交给 prompt 里那句「凭据不抽」，原文都已经完整过了一遍网络。
-        // 这正是 Mem0 的反面教训（memory-content.md §七 原则二）。
+        // What follows immediately below is an LLM call: move this filter into
+        // `write_candidates`, or delegate it to the "don't extract credentials"
+        // sentence in the prompt, and the raw text has already crossed the
+        // network in full either way. This is precisely the lesson Mem0 teaches
+        // by counterexample (memory-content.md §7, principle 2).
         //
-        // 阻断的只是**派生层**：episode 早就落盘了，这里放弃的是本轮的
-        // 事实抽取、它的 embedding、以及它进检索索引。L0 不能有洞 ——
-        // 而密钥最常出现的地方恰恰就是对话正文。
+        // What gets blocked is only the **derived layer**: the episode was
+        // persisted long ago, and what is given up here is this turn's fact
+        // extraction, its embedding, and its entry into the retrieval index. L0
+        // is not allowed to have holes — and the conversation body is exactly
+        // where secrets most often appear.
         //
-        // 日志只记规则名。记上下文等于把密钥从对话正文搬进容器日志
+        // The log records only the rule name. Recording the context would move
+        // the secret out of the conversation body and into the container logs
         if let Some(rule) = crate::redaction::scan(episode_text) {
             tracing::warn!(
                 episode = %ctx.episode_id,
@@ -950,9 +1030,10 @@ impl Extractor {
         parse_candidates(&raw)
     }
 
-    // ── ②③④ 消解与落库 ──────────────────────────────────────
+    // ── ②③④ Resolution and persistence ────────────────────
 
-    /// 完整管线：抽取 → 实体消解 → 矛盾消解 → 落库。
+    /// The full pipeline: extract → entity resolution → conflict resolution →
+    /// persist.
     pub async fn ingest(
         &self,
         store: &Store,
@@ -963,30 +1044,37 @@ impl Extractor {
         self.write_candidates(store, candidates, ctx).await
     }
 
-    /// 把候选事实消解并落库，**并把本轮工具轨迹派生的候选一并写进去**。
+    /// Resolve the candidate facts and persist them, **including the candidates
+    /// derived from this turn's tool traces**.
     ///
-    /// 与 [`Self::extract`] 分开，是为了让确定性的那一半能脱离 LLM 单测，
-    /// 也让「重跑落库」不必再花一次模型钱。
+    /// This is separate from [`Self::extract`] so that the deterministic half can
+    /// be unit-tested without an LLM, and so that "re-run the persistence step"
+    /// doesn't cost another model call.
     ///
-    /// # 为什么轨迹这一路挂在这里而不是挂在 [`Self::ingest`] 上
+    /// # Why the trace path hangs off this method rather than [`Self::ingest`]
     ///
-    /// 1. **它不需要模型。** 挂在 `ingest` 上就等于规定「必须先花一次
-    ///    LLM 调用，才轮得到看工具轨迹」，而轨迹抽取是纯确定性计算。
-    /// 2. **挂在 `ingest` 上就测不到。** 评测的 `seed` 模式只经过
-    ///    `write_candidates`（`evals/README.md`「两种模式」那一节），
-    ///    轨迹抽取放在 `ingest` 里，回归门里那一格会永远是零。
+    /// 1. **It needs no model.** Hanging it off `ingest` would amount to
+    ///    declaring "you must first spend an LLM call before tool traces get
+    ///    looked at", when trace extraction is pure deterministic computation.
+    /// 2. **Hanging it off `ingest` would make it untestable.** The eval suite's
+    ///    `seed` mode goes only through `write_candidates` (see the "two modes"
+    ///    section of `evals/README.md`), so with trace extraction sitting inside
+    ///    `ingest`, that cell of the regression gate would read zero forever.
     ///
-    /// 轨迹这一路只做两次**读**查询与一段纯计算，全部在 `write_txn` 之外，
-    /// 不违反约束 2。
+    /// The trace path performs only two **read** queries plus a stretch of pure
+    /// computation, all of it outside `write_txn`, so it does not violate
+    /// constraint 2.
     pub async fn write_candidates(
         &self,
         store: &Store,
         candidates: Vec<CandidateFact>,
         ctx: &ExtractContext,
     ) -> Result<IngestReport> {
-        // 在途任务防护：redact 执行时可能有抽取任务正在飞，
-        // 不查这一句就会把已抹除的内容重新写回来（docs/memory.md §十一）。
-        // 放在最前面：轨迹派生的候选同样出自这条 episode，同样要被它挡住。
+        // In-flight task guard: when a redact runs, extraction tasks may still be
+        // in the air, and without this check they would write the erased content
+        // straight back in (docs/memory.md §11). It goes first because the
+        // trace-derived candidates come from the same episode and must be
+        // blocked by it too.
         let source = ctx.episode_id.to_string();
         if store.is_redacted(RedactionTarget::Episode, &source).await? {
             tracing::warn!(episode = %source, "出处已被抹除，放弃本轮抽取产物");
@@ -996,17 +1084,25 @@ impl Extractor {
             });
         }
 
-        // 来源通道随候选一起走，而不是事后按谓词猜：`CandidateFact` 里
-        // **没有**这个字段，加一个会打断调用方的结构体字面量构造
-        // （评测的题集转换就是那么写的）。内部配对是唯一不外溢的做法。
-        // 沙箱写回来的对话**降一档**到 tier 3，与工具轨迹同级。
+        // The source channel travels alongside each candidate rather than being
+        // guessed after the fact from the predicate: `CandidateFact` has **no**
+        // such field, and adding one would break callers' struct-literal
+        // construction (the eval suite's dataset conversion is written exactly
+        // that way). Pairing them internally is the only approach that doesn't
+        // leak outward. Conversation written back by the sandbox is **demoted one
+        // level** to tier 3, on par with tool traces.
         //
-        // 那一轮的 `role: user` 不是用户说的，是容器说的 —— 而容器里跑着
-        // 不可信代码，可能已经被它自己读到的东西诱导。降级的论证与下面轨迹
-        // 那段逐字相同：信任级量的是「这段内容有多容易被攻击者操纵」。
+        // That turn's `role: user` is not what the user said, it is what the
+        // container said — and the container runs untrusted code that may already
+        // have been steered by something it read itself. The argument for the
+        // demotion is word-for-word the same as the trace passage below: what a
+        // trust tier measures is "how easy is this content for an attacker to
+        // manipulate".
         //
-        // 不是「不写」而是「降级」：沙箱里干的活确实值得记住（它就是用户
-        // 让它干的），只是不该与用户亲口说的话平起平坐。
+        // Note this is "demote", not "don't write": the work done inside the
+        // sandbox genuinely is worth remembering (it is what the user asked for),
+        // it just should not stand on equal footing with what the user said in
+        // their own words.
         let conversation_tier = ctx.origin.conversation_channel();
         let mut candidates: Vec<(CandidateFact, FactSource)> = candidates
             .into_iter()
@@ -1016,14 +1112,19 @@ impl Extractor {
             self.trace_candidates(store, ctx)
                 .await?
                 .into_iter()
-                // tier 3。比 Conversation（tier 2）低是对的：信任级量的不是
-                // 「这件事发生过没有」——退出码当然客观——而是**这段内容有多
-                // 容易被攻击者操纵**。决定跑哪条命令的是模型，而模型可能已经
-                // 被待抽取的内容诱导（MINJA / AgentPoison 都是写侧攻击）；
-                // 工具轨迹是「模型自己造出来又自己读回来」的闭环，正是 §4.4
-                // 点名的那个自我强化入口。客观的那一半我们已经另外兑现了：
-                // 候选**只由硬信号定位**（ok 的真假序列、出现次数），
-                // 那部分压根不经过信任级。
+                // tier 3. Being below Conversation (tier 2) is correct: what a
+                // trust tier measures is not "did this happen" — an exit code is
+                // of course objective — but **how easy this content is for an
+                // attacker to manipulate**. What decides which command gets run
+                // is the model, and the model may already have been steered by
+                // the very content awaiting extraction (MINJA and AgentPoison are
+                // both write-side attacks); a tool trace is a closed loop of "the
+                // model produced it and then read it back itself", exactly the
+                // self-reinforcement entry point §4.4 calls out. The objective
+                // half we have already honoured separately: candidates are
+                // **located by hard signals alone** (the true/false sequence of
+                // `ok`, and occurrence counts), and that part never passes
+                // through trust tiers at all.
                 .map(|c| (c, FactSource::ToolOutput)),
         );
 
@@ -1035,7 +1136,7 @@ impl Extractor {
             return Ok(report);
         }
 
-        // ── ② 实体消解：全部读操作在 write_txn 之外完成 ──
+        // ── ② Entity resolution: every read happens outside write_txn ──
         let mut resolver = EntityResolution::default();
         for (c, _) in &candidates {
             self.resolve_entity(store, &c.subject, &mut resolver)
@@ -1045,7 +1146,8 @@ impl Extractor {
             }
         }
 
-        // ── 向量化：同样必须在事务外算完 ──
+        // ── Vectorization: likewise, it must be finished outside the
+        // transaction ──
         let statements: Vec<String> = candidates
             .iter()
             .map(|(c, _)| c.statement.clone())
@@ -1059,10 +1161,12 @@ impl Extractor {
             )));
         }
 
-        // ── ③ 矛盾消解 ──
+        // ── ③ Conflict resolution ──
         let extracted_by = self.extracted_by();
         let mut plans: Vec<Plan> = Vec::new();
-        // 本批次内已计划的事实也要参与判定，否则同一轮里的两条互斥事实会双双生效
+        // Facts already planned within this batch have to take part in the
+        // decision too, otherwise two mutually exclusive facts from the same turn
+        // would both end up in force
         let mut pending: HashMap<(Id, String), Vec<Rival>> = HashMap::new();
 
         for ((candidate, source), vector) in candidates.into_iter().zip(vectors) {
@@ -1080,8 +1184,9 @@ impl Extractor {
                 object_text.as_deref(),
                 object_entity_id.map(|id| id.to_string()).as_deref(),
             );
-            // 事件时间未知时回落到本轮对话的发生时间：那是这条事实为真的
-            // 最晚下界，也是唯一不需要再查一次库就能拿到的时间。
+            // When event time is unknown, fall back to when this turn happened:
+            // that is the latest lower bound for when this fact became true, and
+            // the only timestamp available without another database round trip.
             let effective_at = candidate.valid_at.unwrap_or(ctx.occurred_at);
 
             let slot = (subject_id, candidate.predicate.clone());
@@ -1104,7 +1209,8 @@ impl Extractor {
             };
 
             let fact_id = Id::new();
-            // 被本批次内的新事实取代掉的，就不该再作为后续候选的对手
+            // Anything superseded by a new fact within this batch should no
+            // longer act as a rival for the candidates that follow
             let survivors: Vec<Rival> = pending
                 .remove(&slot)
                 .unwrap_or_default()
@@ -1133,23 +1239,32 @@ impl Extractor {
                     confidence: candidate.confidence,
                     valid_at: candidate.valid_at,
                     source_episode_id: ctx.episode_id,
-                    // 对话那一路一律 Conversation（tier 2），**不区分「用户亲述」**。
+                    // The conversation path is uniformly Conversation (tier 2);
+                    // it **does not single out "the user said this themselves"**.
                     //
-                    // 不是保守，是这条管线现在真的分辨不出来：送进模型的是
-                    // 「用户：… / 助手：…」拼成的一整块（见 cortexd::live），
-                    // 候选回来时也不带「这句出自哪一侧」。把其中一部分标成
-                    // tier 1 就是凭空拔高，而 tier 1 的用途恰恰是「最可信的
-                    // 那批不该被外部内容盖掉」——标错方向是有害的。
+                    // That isn't conservatism, it's that this pipeline genuinely
+                    // cannot tell right now: what gets sent to the model is one
+                    // block assembled as "user: … / assistant: …" (see
+                    // cortexd::live), and the candidates come back with no
+                    // indication of which side any sentence came from. Marking
+                    // some subset of them tier 1 would be promoting them out of
+                    // thin air — and the whole point of tier 1 is "the most
+                    // trustworthy entries must not be overwritten by external
+                    // content", so an error in that direction does damage.
                     //
-                    // 解锁 tier 1 要改的是抽取器本身：候选 schema 加一个
-                    // 「出自用户 / 出自助手」的字段，由模型逐条标注。
-                    // 这符合 §8.3 的原则「必须由抽取器显式记录每条对应哪个
-                    // 输入片段，不能事后重建」，也正是存量行栽跟头的地方。
+                    // Unlocking tier 1 means changing the extractor itself: add a
+                    // "from the user / from the assistant" field to the candidate
+                    // schema and have the model annotate each entry. That follows
+                    // the §8.3 principle that the extractor must explicitly record
+                    // which input fragment each entry corresponds to, rather than
+                    // reconstructing it after the fact — which is precisely where
+                    // the existing rows came to grief.
                     //
-                    // 工具轨迹那一路是 ToolOutput（tier 3），理由见上面
-                    // 配对的地方。
+                    // The tool-trace path is ToolOutput (tier 3); the reasoning is
+                    // at the matching spot above.
                     source,
-                    // 单源：出处就是 `source_episode_id` 那一条 episode
+                    // Single-source: the provenance is exactly the one episode in
+                    // `source_episode_id`
                     derived_from: Vec::new(),
                     extracted_by: extracted_by.clone(),
                     device_id: self.device_id.clone(),
@@ -1164,7 +1279,7 @@ impl Extractor {
             return Ok(report);
         }
 
-        // ── ④ 落库：一个事务写完 entity + fact + fact_events ──
+        // ── ④ Persist: one transaction writes entity + fact + fact_events ──
         let new_entities = resolver.created.clone();
         let device_id = self.device_id.clone();
         store
@@ -1184,8 +1299,10 @@ impl Extractor {
                         tx.insert_fact_event(&event).await?;
                     }
                     if !plan.flag.is_empty() {
-                        // flag 是批注、不改状态，所以新旧两侧都要挂：
-                        // 界面的「待确认列表」得同时看到互相矛盾的两条
+                        // A flag is an annotation and does not change status, so
+                        // it has to be attached to both the old and the new side:
+                        // the UI's "awaiting confirmation" list needs to show both
+                        // of the mutually contradictory entries at once
                         let reason =
                             format!("与 {} 条同主谓事实冲突，事件时间相同", plan.flag.len());
                         for old in &plan.flag {
@@ -1214,13 +1331,15 @@ impl Extractor {
         Ok(report)
     }
 
-    /// 从本轮的工具轨迹产出候选事实。
+    /// Produce candidate facts from this turn's tool traces.
     ///
-    /// 两次读查询、一段纯计算，没有模型参与 —— 判据在
-    /// [`crate::trace`] 里，全部由 `ok` 的真假序列与出现次数算出来。
+    /// Two read queries and a stretch of pure computation, with no model
+    /// involved — the criteria live in [`crate::trace`] and are derived entirely
+    /// from the true/false sequence of `ok` and from occurrence counts.
     ///
-    /// 本轮没有任何工具调用时**只查一次**就返回：绝大多数对话轮次是纯聊天，
-    /// 让它们白背一次全库扫描不划算。
+    /// When the turn contains no tool calls at all it returns after **a single
+    /// query**: the overwhelming majority of conversational turns are pure chat,
+    /// and making them carry a full-table scan for nothing is not worth it.
     async fn trace_candidates(
         &self,
         store: &Store,
@@ -1233,9 +1352,11 @@ impl Extractor {
             return Ok(Vec::new());
         }
 
-        // 惯例这条判据在单轮内算不出来，必须越过本轮的视野。
-        // 范围是**整个记忆库**而不是当前项目 —— `episode_tool_calls` 上
-        // 没有工作区/项目列，收窄不了。等它有了再收。
+        // The "habit" criterion cannot be computed within a single turn; it has
+        // to see past this turn's horizon. The scope is **the entire memory
+        // store** rather than the current project — `episode_tool_calls` has no
+        // workspace/project column, so there is nothing to narrow by. Narrow it
+        // once that column exists.
         let history = store
             .recent_tool_calls(self.trace_rules.history_limit)
             .await?;
@@ -1258,7 +1379,8 @@ impl Extractor {
         Ok(out)
     }
 
-    /// 查同 `(subject_id, predicate)` 的现存有效事实，转成判定用的对手。
+    /// Look up the existing valid facts under the same
+    /// `(subject_id, predicate)` and turn them into rivals for the decision.
     async fn rivals(&self, store: &Store, subject_id: Id, predicate: &str) -> Result<Vec<Rival>> {
         let existing = store
             .active_facts_by_subject_predicate(&subject_id.to_string(), predicate)
@@ -1266,8 +1388,10 @@ impl Extractor {
 
         let mut out = Vec::with_capacity(existing.len());
         for f in existing {
-            // 库里的 id 是 ulid 域（文本）。解析不了说明有人绕过 Id 直接写了库，
-            // 这时宁可跳过它也不要让整轮抽取失败。
+            // Ids in the database live in the ulid domain (text). Failing to
+            // parse means someone wrote to the database directly, bypassing Id;
+            // in that case it is better to skip the row than to fail the whole
+            // turn's extraction.
             let Ok(fact_id) = f.id.parse::<Id>() else {
                 tracing::warn!(fact = %f.id, "事实 id 不是合法 ULID，矛盾判定跳过它");
                 continue;
@@ -1281,10 +1405,11 @@ impl Extractor {
         Ok(out)
     }
 
-    /// 实体消解：精确名 → 向量近似 → 新建。
+    /// Entity resolution: exact name → vector nearest → create new.
     ///
-    /// 全是读操作，必须在 `write_txn` 之外跑完 —— [`cortex_store::WriteTxn`]
-    /// 干脆不提供读方法，就是为了让这条纪律没法被绕过。
+    /// It is all reads, and it must finish outside `write_txn` —
+    /// [`cortex_store::WriteTxn`] simply offers no read methods at all, precisely
+    /// so this rule cannot be worked around.
     async fn resolve_entity(
         &self,
         store: &Store,
@@ -1299,13 +1424,15 @@ impl Extractor {
         let kind = r.kind.trim().to_lowercase();
         let name = r.name.trim();
 
-        // ① 精确匹配。大小写不同不该造出两个实体，所以小写形式也试一次。
+        // ① Exact match. Differing case should not create two entities, so try
+        // the lowercased form as well.
         let mut hits = store.entities_named(&kind, name).await?;
         if hits.is_empty() && name != name.to_lowercase() {
             hits = store.entities_named(&kind, &name.to_lowercase()).await?;
         }
         if let Some(hit) = hits.first() {
-            // 沿别名合并链走到底 —— 命中的可能已经被并进别人了
+            // Walk the alias-merge chain to its end — whatever we hit may
+            // already have been merged into something else
             let canonical = store
                 .canonical_entity(&hit.id)
                 .await?
@@ -1317,8 +1444,10 @@ impl Extractor {
             return Ok(id);
         }
 
-        // ② 向量近似。名字单独向量化（不拼 kind）：别名之间的差异本就在名字上，
-        // 掺进 kind 只会把所有同类实体的相似度一起抬高，阈值就失去分辨力了。
+        // ② Vector approximation. The name is vectorized on its own (kind is not
+        // concatenated in): what differs between aliases is the name itself, and
+        // mixing kind in would lift the similarity of every entity of that kind
+        // together, leaving the threshold with no discriminating power.
         let embedding = self.embedder.embed_one(&name.to_lowercase()).await?;
         if let Some((record, score)) = self.index.nearest(&kind, &embedding, 1).await.pop()
             && score >= self.entity_match_threshold
@@ -1331,7 +1460,7 @@ impl Extractor {
             return Ok(record.id);
         }
 
-        // ③ 新建
+        // ③ Create new
         let id = Id::new();
         resolver.created.push(NewEntity {
             id,
@@ -1365,7 +1494,8 @@ impl std::fmt::Debug for Extractor {
     }
 }
 
-/// 一轮里对实体的消解结果：已解析的 (kind,name) → id，以及待新建的实体。
+/// The entity resolution results for one turn: the resolved (kind, name) → id
+/// mapping, plus the entities still to be created.
 #[derive(Default)]
 struct EntityResolution {
     resolved: HashMap<(String, String), Id>,
@@ -1381,7 +1511,8 @@ impl EntityResolution {
     }
 }
 
-/// 一条候选事实的落库计划。所有决策在进事务前已经算完。
+/// The persistence plan for one candidate fact. Every decision has already been
+/// computed before the transaction is entered.
 struct Plan {
     fact: NewFact,
     supersede: Vec<Id>,
@@ -1398,15 +1529,15 @@ mod tests {
         Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
     }
 
-    // ── JSON 容错解析 ──────────────────────────────────────
+    // ── Fault-tolerant JSON parsing ────────────────────────
 
     #[test]
     fn parses_plain_json() {
         let raw = r#"{"facts":[{"subject":{"name":"张三","kind":"person"},
             "predicate":"prefers","object":{"text":"Rust"},
             "statement":"张三偏好用 Rust 写服务","confidence":0.9}]}"#;
-        let out = parse_candidates(raw).expect("应能解析");
-        assert_eq!(out.len(), 1, "实际解析出 {} 条", out.len());
+        let out = parse_candidates(raw).expect("should parse");
+        assert_eq!(out.len(), 1, "actually parsed {} entries", out.len());
         assert_eq!(out[0].subject.name, "张三");
         assert_eq!(out[0].object, ObjectRef::Literal("Rust".into()));
     }
@@ -1415,27 +1546,29 @@ mod tests {
     fn tolerates_markdown_fence() {
         let raw = "好的，这是抽取结果：\n```json\n{\"facts\":[{\"subject\":\"cortex\",\
             \"predicate\":\"uses\",\"object\":\"RustFS\",\"statement\":\"cortex 用 RustFS\"}]}\n```\n希望有帮助。";
-        let out = parse_candidates(raw).expect("带围栏与解释文字也应能解析");
-        assert_eq!(out.len(), 1, "实际解析出 {} 条", out.len());
+        let out =
+            parse_candidates(raw).expect("should parse even with a fence and surrounding prose");
+        assert_eq!(out.len(), 1, "actually parsed {} entries", out.len());
         assert_eq!(
             out[0].subject.kind, "concept",
-            "字符串形式的 subject 应回落默认 kind"
+            "a subject given as a bare string should fall back to the default kind"
         );
     }
 
     #[test]
     fn tolerates_trailing_prose_with_braces() {
-        // 尾巴上带右花括号——朴素的「取第一个 { 到最后一个 }」会连解释一起吞掉
+        // A closing brace in the trailing prose — the naive "take the first {
+        // through the last }" would swallow the explanation along with it
         let raw = r#"{"facts":[]}  说明：格式为 {"facts": []}"#;
-        let out = parse_candidates(raw).expect("应只取配平的那段");
-        assert!(out.is_empty(), "实际 {} 条", out.len());
+        let out = parse_candidates(raw).expect("should take only the balanced span");
+        assert!(out.is_empty(), "actually got {} entries", out.len());
     }
 
     #[test]
     fn accepts_bare_array() {
         let raw = r#"[{"subject":{"name":"cortex","kind":"project"},"predicate":"uses",
             "object":{"entity":{"name":"Postgres","kind":"tool"}},"statement":"cortex 用 Postgres"}]"#;
-        let out = parse_candidates(raw).expect("顶层数组也应能解析");
+        let out = parse_candidates(raw).expect("a top-level array should parse too");
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].object, ObjectRef::Entity(_)));
     }
@@ -1446,16 +1579,16 @@ mod tests {
             {"predicate":"uses","object":"x"},
             {"subject":{"name":"cortex","kind":"project"},"predicate":"uses","object":"Postgres"}
         ]}"#;
-        let out = parse_candidates(raw).expect("应能解析");
+        let out = parse_candidates(raw).expect("should parse");
         assert_eq!(
             out.len(),
             1,
-            "缺 subject 的那条该丢，好的那条该留，实际 {} 条",
+            "the entry missing a subject should be dropped and the good one kept, actually got {} entries",
             out.len()
         );
         assert_eq!(
             out[0].statement, "cortex uses Postgres",
-            "缺 statement 时应自动拼一句"
+            "a missing statement should be assembled automatically"
         );
     }
 
@@ -1463,15 +1596,15 @@ mod tests {
     fn clamps_confidence_and_percentages() {
         let raw = r#"{"facts":[{"subject":"a","predicate":"p","object":"o","confidence":95},
                                 {"subject":"b","predicate":"p","object":"o","confidence":-3}]}"#;
-        let out = parse_candidates(raw).expect("应能解析");
+        let out = parse_candidates(raw).expect("should parse");
         assert!(
             (out[0].confidence - 0.95).abs() < 1e-6,
-            "百分数应折算，实际 {}",
+            "a percentage should be rescaled, actually {}",
             out[0].confidence
         );
         assert!(
             (out[1].confidence - 0.0).abs() < 1e-6,
-            "越界值应夹紧，实际 {}",
+            "an out-of-range value should be clamped, actually {}",
             out[1].confidence
         );
     }
@@ -1488,17 +1621,21 @@ mod tests {
         assert_eq!(parse_event_time("2026"), Some(ts(2026, 1, 1)));
         assert!(parse_event_time("2026-08-07T10:30:00Z").is_some());
         assert_eq!(parse_event_time("null"), None);
-        assert_eq!(parse_event_time("上周"), None, "含糊表述不该被猜成某个日期");
+        assert_eq!(
+            parse_event_time("上周"),
+            None,
+            "a vague phrasing must not be guessed into some specific date"
+        );
     }
 
     #[test]
     fn normalizes_predicate_spelling_variants() {
         for raw in ["decided on", "Decided-On", "decided_on", "  DECIDED  ON  "] {
-            assert_eq!(normalize_predicate(raw), "decided_on", "输入：{raw}");
+            assert_eq!(normalize_predicate(raw), "decided_on", "input: {raw}");
         }
     }
 
-    // ── 矛盾消解 ───────────────────────────────────────────
+    // ── Conflict resolution ────────────────────────────────
 
     fn rival(key: &str, at: DateTime<Utc>) -> Rival {
         Rival {
@@ -1514,7 +1651,7 @@ mod tests {
         assert_eq!(
             decide("t:postgres", ts(2026, 6, 1), true, &rivals),
             Verdict::Duplicate,
-            "同主谓宾重复入库会把检索结果挤满同一条事实"
+            "re-persisting the same subject/predicate/object would pack the retrieval results with one and the same fact"
         );
     }
 
@@ -1524,7 +1661,7 @@ mod tests {
         let v = decide("t:go", ts(2026, 6, 1), false, &rivals);
         assert!(
             matches!(&v, Verdict::Write { supersede, flag, .. } if supersede.is_empty() && flag.is_empty()),
-            "多值谓词是补充关系，不该失效任何东西：{v:?}"
+            "a multi-valued predicate is an addition and must not invalidate anything: {v:?}"
         );
     }
 
@@ -1543,14 +1680,18 @@ mod tests {
                 invalid_at,
                 ..
             } => {
-                assert_eq!(supersede, vec![old.fact_id], "更晚的取值应取代更早的");
+                assert_eq!(
+                    supersede,
+                    vec![old.fact_id],
+                    "the later value should supersede the earlier one"
+                );
                 assert_eq!(
                     invalid_at,
                     ts(2026, 6, 1),
-                    "invalid_at 必须是新事实的事件时间"
+                    "invalid_at must be the new fact's event time"
                 );
             }
-            other => panic!("应判为取代，实际 {other:?}"),
+            other => panic!("should have been judged a supersede, actually {other:?}"),
         }
     }
 
@@ -1560,7 +1701,7 @@ mod tests {
         let v = decide("t:mysql", ts(2025, 1, 1), true, &[current]);
         assert!(
             matches!(&v, Verdict::Write { supersede, flag, .. } if supersede.is_empty() && flag.is_empty()),
-            "补录去年的旧事不该把今天仍然为真的事实打成失效：{v:?}"
+            "backfilling last year's history must not mark a fact that is still true today as invalidated: {v:?}"
         );
     }
 
@@ -1577,10 +1718,17 @@ mod tests {
             Verdict::Write {
                 supersede, flag, ..
             } => {
-                assert!(supersede.is_empty(), "判不出先后就不该失效任何一条");
-                assert_eq!(flag, vec![other.fact_id], "应进入待人工确认列表");
+                assert!(
+                    supersede.is_empty(),
+                    "if the ordering cannot be determined, neither entry should be invalidated"
+                );
+                assert_eq!(
+                    flag,
+                    vec![other.fact_id],
+                    "it should land on the list awaiting manual confirmation"
+                );
             }
-            other => panic!("应判为 flag，实际 {other:?}"),
+            other => panic!("should have been judged a flag, actually {other:?}"),
         }
     }
 
@@ -1588,10 +1736,13 @@ mod tests {
     fn default_rules_treat_unknown_predicates_as_multi_valued() {
         let rules = PredicateRules::default();
         assert!(rules.is_functional("uses"));
-        assert!(rules.is_functional("Decided-On"), "判定前应先归一谓词拼写");
+        assert!(
+            rules.is_functional("Decided-On"),
+            "predicate spelling should be normalized before the lookup"
+        );
         assert!(
             !rules.is_functional("mentions"),
-            "表外谓词一律当多值——误判失效比漏判贵得多"
+            "predicates outside the table are always treated as multi-valued — a wrong invalidation costs far more than a missed one"
         );
     }
 
@@ -1610,7 +1761,7 @@ mod tests {
         assert_ne!(object_key(Some("x"), None), object_key(None, Some("x")));
     }
 
-    // ── 实体索引 ───────────────────────────────────────────
+    // ── Entity index ───────────────────────────────────────
 
     #[tokio::test]
     async fn index_returns_nearest_within_kind() {
@@ -1631,9 +1782,17 @@ mod tests {
         index.remember(b).await;
 
         let hits = index.nearest("project", &[1.0, 0.0, 0.0], 5).await;
-        assert_eq!(hits.len(), 1, "kind 不同的实体不该混进候选");
+        assert_eq!(
+            hits.len(),
+            1,
+            "entities of a different kind must not slip into the candidates"
+        );
         assert_eq!(hits[0].0.id, a.id);
-        assert!((hits[0].1 - 1.0).abs() < 1e-6, "实际相似度 {}", hits[0].1);
+        assert!(
+            (hits[0].1 - 1.0).abs() < 1e-6,
+            "actual similarity {}",
+            hits[0].1
+        );
     }
 
     #[tokio::test]
@@ -1656,7 +1815,7 @@ mod tests {
         assert_eq!(
             cosine(&[1.0], &[1.0, 2.0]),
             0.0,
-            "维度不同应返回 0 而非 panic"
+            "mismatched dimensions should return 0 rather than panic"
         );
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
     }
@@ -1667,64 +1826,82 @@ mod tests {
     fn system_prompt_states_the_only_criterion() {
         assert!(
             EXTRACT_SYSTEM.contains("会不会做错决定"),
-            "抽取判据必须写进 prompt，否则模型会把寒暄也抽进来"
+            "the extraction criterion must be written into the prompt, or the model will start extracting small talk too"
         );
     }
 
-    /// 「绝对不抽」这一节挡的不是噪声，是**不能存进 append-only 库的东西**。
+    /// The "never extract" section blocks not noise, but **things that cannot be
+    /// stored in an append-only database at all**.
     ///
-    /// 与「明确不抽」分成两节是有意的：前者是信噪比问题（抽了只是浪费预算），
-    /// 后者抽了就再也拿不出来——`redact` 是唯一的出口，而它要显式触发、
-    /// 二次确认、留墓碑（memory.md §十一）。一条被误抽的健康推断会一路
-    /// 同步到每台设备，然后永久留在那里。
+    /// Splitting it from "explicitly do not extract" into two separate sections
+    /// is deliberate: the latter is a signal-to-noise problem (extracting it only
+    /// wastes budget), whereas anything in this section can never be taken back
+    /// out once extracted — `redact` is the only exit, and it demands an explicit
+    /// trigger, a second confirmation, and a tombstone (memory.md §11). One
+    /// wrongly extracted health inference syncs all the way out to every device
+    /// and then stays there permanently.
     ///
-    /// 情绪那条尤其不能删：在工作场景下推断情绪属于 EU AI Act Art.5(1)(f)
-    /// 的禁止性实践，2025-02-02 已生效、无宽限期，而 Cortex 明确定位含办公。
+    /// The emotion rule especially must not be removed: inferring emotion in a
+    /// workplace setting is a prohibited practice under EU AI Act Art.5(1)(f),
+    /// in force since 2025-02-02 with no grace period — and Cortex is explicitly
+    /// positioned to cover office work.
     #[test]
     fn system_prompt_forbids_what_cannot_be_unstored() {
         for (needle, why) in [
-            ("情绪状态", "工作场景下推断情绪是已生效的禁止性实践"),
+            (
+                "情绪状态",
+                "inferring emotion in a workplace setting is a prohibited practice already in force",
+            ),
             (
                 "性取向",
-                "GDPR Art.9 特殊类别，合法性门槛远高于普通个人数据",
+                "a GDPR Art.9 special category, whose lawfulness bar is far above ordinary personal data",
             ),
-            ("第三方", "用户没有资格替第三方同意"),
+            (
+                "第三方",
+                "the user has no standing to consent on a third party's behalf",
+            ),
             (
                 "凭据与密钥",
-                "append-only 下误抽一次就永久留存并同步到每台设备",
+                "under append-only, extracting one by mistake means it is retained forever and synced to every device",
             ),
         ] {
             assert!(
                 EXTRACT_SYSTEM.contains(needle),
-                "prompt 里缺少「{needle}」这条禁抽规则：{why}"
+                "the prompt is missing the 「{needle}」 do-not-extract rule: {why}"
             );
         }
     }
 
-    /// 「不抽你自己的解释与总结」会顺手把助手的**反驳**也扫掉，
-    /// 而那恰恰是最该留的一类。
+    /// "Do not extract your own explanations and summaries" also sweeps away the
+    /// assistant's **corrections** along the way — and those are exactly the
+    /// class most worth keeping.
     ///
-    /// 失效方式是静默的：模型照规则跳过「不对，实际是 Y」，于是库里只剩
-    /// 「用户认为 X」。下次检索把这条错误认知捞回去当成用户的既定立场，
-    /// 一轮轮强化——外部研究把这条记为记忆诱发谄媚的主要成因。
-    /// 所以例外必须与那条规则**同时**出现在 prompt 里，不能只留一句泛泛的鼓励。
+    /// The failure mode is silent: the model dutifully follows the rule and skips
+    /// "no, it's actually Y", so all that remains in the database is "the user
+    /// believes X". The next retrieval pulls that mistaken belief back as the
+    /// user's settled position and reinforces it turn after turn — outside
+    /// research records this as a primary cause of memory-induced sycophancy.
+    /// The carve-out therefore has to appear in the prompt **alongside** the rule
+    /// itself; a vague sentence of encouragement is not enough.
     #[test]
     fn system_prompt_carves_out_corrections_from_the_no_summary_rule() {
         assert!(
             EXTRACT_SYSTEM.contains("纠正与反驳"),
-            "必须给「不抽解释与总结」开一个反驳例外，否则助手的纠正会被静默丢弃"
+            "the no-explanations-or-summaries rule must have a carve-out for rebuttals, or the assistant's corrections get silently dropped"
         );
         assert!(
             EXTRACT_SYSTEM.contains("用户曾认为"),
-            "反驳必须两侧都记：只记正确答案会丢掉「用户曾经错在哪」这个上下文"
+            "a rebuttal must record both sides: keeping only the correct answer loses the context of what the user was wrong about"
         );
         let deny = EXTRACT_SYSTEM
             .find("你自己的推理过程")
-            .expect("「不抽解释与总结」这条规则本身还在");
-        let carve = EXTRACT_SYSTEM.find("纠正与反驳").expect("例外还在");
+            .expect("the no-explanations-or-summaries rule itself is still present");
+        let carve = EXTRACT_SYSTEM
+            .find("纠正与反驳")
+            .expect("the carve-out is still present");
         assert!(
             deny < carve,
-            "例外必须写在规则之后，否则读到规则时还不知道有例外"
+            "the carve-out must come after the rule, otherwise the rule is read without any knowledge that an exception exists"
         );
     }
 
@@ -1735,7 +1912,7 @@ mod tests {
         let prompt = build_user_prompt(&huge, &ctx);
         assert!(
             prompt.contains("已截断"),
-            "超长轮次必须截断，否则成本线性膨胀"
+            "an oversized turn must be truncated, otherwise cost grows linearly with it"
         );
         assert!(prompt.chars().count() < huge.chars().count());
     }
@@ -1748,7 +1925,7 @@ mod tests {
         let prompt = build_user_prompt("聊了点东西", &ctx);
         assert!(
             prompt.contains("2026-08-07"),
-            "模型需要基准日期才能解析相对时间"
+            "the model needs a reference date before it can resolve relative times"
         );
         assert!(prompt.contains("cortex"));
         assert!(prompt.contains("coding"));

@@ -1,8 +1,8 @@
-//! 报告：机器可读的 JSON（供 CI 比对）与人类可读的文本。
+//! Reports: machine-readable JSON (for CI comparison) and human-readable text.
 //!
-//! 两份都要。JSON 是给回归门用的 —— CI 里把本次与基线的
-//! `by_kind[*].recall["5"]` 比一比，跌了就红。文本是给人看的 ——
-//! 一个只会吐 JSON 的评测工具，没人会去读它。
+//! Both are needed. The JSON serves the regression gate — CI compares this
+//! run's `by_kind[*].recall["5"]` against the baseline's, and a drop goes red.
+//! The text serves people — nobody reads an eval tool that only emits JSON.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -49,7 +49,8 @@ impl SuiteInfo {
     }
 }
 
-/// 跑这一次用的全部旋钮。基线数字离开这些参数就没有意义。
+/// Every knob used for this run. Baseline numbers are meaningless divorced from
+/// these parameters.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunInfo {
     pub mode: String,
@@ -64,19 +65,21 @@ pub struct RunInfo {
     pub recent_days: i64,
     pub context_window: usize,
     pub budget_tokens: usize,
-    /// 是否关掉了域加权（`--ignore-domain`）
+    /// Whether domain weighting was turned off (`--ignore-domain`)
     pub domain_boost_off: bool,
-    /// 弃权阈值。扫描曲线全靠它区分各次运行
+    /// The abstention threshold. Sweeping the curve relies entirely on this to
+    /// tell runs apart
     pub abstain_below: f64,
-    /// 时间近因的形态：`channel` / `decay(强度,半衰期)` / `off`
+    /// The form of temporal recency: `channel` / `decay(strength,half-life)` /
+    /// `off`
     pub recency_mode: String,
-    /// episodes 那一路开没开
+    /// Whether the episodes path is on
     pub episode_channel: bool,
-    /// 单路强命中补偿权重
+    /// Compensation weight for a strong hit on a single path
     pub peak_bonus: f64,
-    /// 语义地板（余弦距离上限）；`None` = 没设
+    /// The semantic floor (an upper bound on cosine distance); `None` = unset
     pub semantic_floor: Option<f64>,
-    /// 回放走排序版还是全貌版
+    /// Whether replay uses the ranked version or the full-picture version
     pub replay_ranked: bool,
     pub schema: String,
 }
@@ -84,17 +87,19 @@ pub struct RunInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct CorpusInfo {
     pub ingest: IngestStats,
-    /// 库里最终有多少条事实
+    /// How many facts ended up in the store
     pub facts_total: usize,
-    /// 其中仍然有效的
+    /// How many of those are still active
     pub facts_active: usize,
     pub entities: i64,
-    /// 落进 `episode_tool_calls` 的行数
+    /// How many rows landed in `episode_tool_calls`
     pub tool_calls: i64,
-    /// 跨域连接扫描的结果。`None` = 这次没跑扫描。
+    /// Results of the cross-domain link scan. `None` = no scan was run this
+    /// time.
     ///
-    /// 边本身要落进报告，不能只留个条数：噪声边的危害是在图遍历里传染，
-    /// 「写了 12 条」这个数字对判断噪声毫无帮助，得把 12 条读一遍。
+    /// The edges themselves go into the report, not just a count: a noisy edge
+    /// does its damage by spreading through graph traversal, and the number
+    /// "wrote 12" is no help at all in judging noise — those 12 have to be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_links: Option<CrossLinkStats>,
 }
@@ -111,7 +116,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// CI 回归门要看的那几个数字。
+    /// The handful of numbers the CI regression gate looks at.
     #[must_use]
     pub fn gate_metrics(&self) -> BTreeMap<String, f64> {
         let mut out = BTreeMap::new();
@@ -137,10 +142,10 @@ impl Report {
 }
 
 // ══════════════════════════════════════════════════════════
-//  文本渲染
+//  Text rendering
 // ══════════════════════════════════════════════════════════
 
-/// 报告里列出多少道最差的题。
+/// How many of the worst questions the report lists.
 const WORST_SAMPLE: usize = 12;
 
 #[must_use]
@@ -181,7 +186,8 @@ pub fn render_text(report: &Report) -> String {
         r.budget_tokens,
         if r.domain_boost_off { "关" } else { "开" }
     );
-    // 这一行是 A/B 的身份证：不打出来，两份报告放在一起就分不清谁是谁
+    // This line is the A/B run's identity card: without printing it, two
+    // reports side by side cannot be told apart
     let _ = writeln!(
         s,
         "旋钮：弃权阈值 {:.4}　语义地板 {}　近因形态 {}　episodes 路 {}　强命中补偿 {}　回放 {}",
@@ -211,11 +217,13 @@ pub fn render_text(report: &Report) -> String {
         c.facts_active
     );
     if c.tool_calls > 0 {
-        // 轨迹落了多少行必须单独打出来。工具经验题全挂时有两种可能 ——
-        // 轨迹没进库，或者进了库但没人读 —— 只有这个数字能把它们分开
+        // How many trace rows landed has to be printed on its own. When the
+        // tool-experience questions all fail there are two possibilities — the
+        // traces never reached the store, or they did and nobody read them —
+        // and only this number tells them apart
         let _ = writeln!(
             s,
-            "工具轨迹：`episode_tool_calls` 落库 {} 行（抽取器读没读它，看下面「工具经验」那一行的 gold 缺失数）",
+            "工具轨迹：`episode_tool_calls` 落库 {} 行（抽取器读没读它，看下面 `tool_experience` 那一行的 gold 缺失数）",
             c.tool_calls
         );
     }
@@ -231,7 +239,8 @@ pub fn render_text(report: &Report) -> String {
     if let Some(cl) = &c.cross_links
         && !cl.links.is_empty()
     {
-        // 边本身必须打出来。「写了 N 条」判断不了噪声，读一遍才行
+        // The edges themselves have to be printed. "Wrote N" cannot decide
+        // whether they are noise; reading them can
         let _ = writeln!(s, "## 本次新增的跨域连接");
         let _ = writeln!(s);
         for l in &cl.links {
@@ -357,12 +366,14 @@ pub fn render_text(report: &Report) -> String {
     s
 }
 
-/// 抽取侧的断言。
+/// Assertions on the extraction side.
 ///
-/// 检索侧的十几项指标里没有一项能回答「这条该不该被抽出来」——
-/// 它们的分母全都是「已经在库里的事实」。抽取 prompt 里
-/// 「绝对不抽」与「纠正必抽」两节改完之后回归门十八项全部持平，
-/// 根本原因就是这套评测当时只有检索侧的尺子。这一段是另一把。
+/// Not one of the dozen-plus retrieval-side metrics can answer "should this
+/// have been extracted at all" — their denominators are all "facts already in
+/// the store". After the "never extract this" and "always extract corrections"
+/// sections of the extraction prompt were rewritten, all eighteen regression
+/// gate numbers stayed flat, and the root cause was that this eval had only a
+/// retrieval-side ruler at the time. This section is the other one.
 fn render_extraction(questions: &[QuestionResult]) -> String {
     let declared: Vec<&QuestionResult> = questions
         .iter()
@@ -432,10 +443,11 @@ fn render_table(rows: &[Aggregate], head: &str) -> String {
     s
 }
 
-/// 表格的读法。写一次，三张表共用 —— 指标不解释就没人看得懂该修哪里。
+/// How to read the tables. Written once, shared by all three — an unexplained
+/// metric leaves nobody able to tell what to fix.
 const TABLE_LEGEND: &str = "> `R@∞` = 不限名次的召回率，与 `R@5` 的差额就是**排序**欠的债；\
 差额大该修融合，差额小该修召回。\n\
-> `平均注入条数` 在「应召不到」那一行不为 0，就说明**检索器无法弃权** —— \
+> `平均注入条数` 在 `unanswerable` 那一行不为 0，就说明**检索器无法弃权** —— \
 没有答案时它照样会塞一整块记忆进 prompt。\n";
 
 fn render_channels(overall: &Aggregate) -> String {
@@ -495,7 +507,8 @@ fn render_channel_matrix(by_kind: &[Aggregate]) -> String {
     s
 }
 
-/// 题型 / 语种的稳定排序，保证两次跑出来的报告能直接 diff。
+/// Stable ordering of question kinds / languages, so two runs' reports can be
+/// diffed directly.
 #[must_use]
 pub fn kind_order() -> [QuestionKind; 7] {
     QuestionKind::all()
@@ -513,16 +526,19 @@ mod tests {
 
     #[test]
     fn empty_aggregate_renders_without_nan() {
-        let table = render_table(&[aggregate("空", &[])], "口径");
+        let table = render_table(&[aggregate("empty", &[])], "口径");
         assert!(
             !table.contains("NaN"),
-            "NaN 会一路渗进 CI 比对，必须在源头挡住：{table}"
+            "a NaN would seep all the way into the CI comparison and must be \
+             stopped at the source: {table}"
         );
     }
 
     #[test]
     fn gate_metrics_cover_every_kind() {
-        // CI 只比总分是不够的：某一题型崩了而总分微跌，回归门就放过去了
+        // Comparing only the overall score in CI is not enough: one question
+        // kind can collapse while the overall score dips slightly, and the
+        // regression gate lets it through
         let report = Report {
             suite: SuiteInfo {
                 name: "t".into(),
@@ -564,13 +580,13 @@ mod tests {
                 tool_calls: 0,
                 cross_links: None,
             },
-            overall: aggregate("全部", &[]),
-            by_kind: vec![aggregate("中文语义", &[])],
+            overall: aggregate("all", &[]),
+            by_kind: vec![aggregate("chinese_semantic", &[])],
             by_lang: vec![],
             questions: vec![],
         };
         let gate = report.gate_metrics();
         assert!(gate.contains_key("overall.recall@5"));
-        assert!(gate.contains_key("kind.中文语义.recall@5"));
+        assert!(gate.contains_key("kind.chinese_semantic.recall@5"));
     }
 }

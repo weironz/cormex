@@ -1,31 +1,40 @@
-//! 走 HTTP 的 embedding 后端 —— OpenAI 兼容的 `/v1/embeddings`。
+//! The embedding backend that goes over HTTP — an OpenAI-compatible
+//! `/v1/embeddings`.
 //!
-//! # 为什么默认是这一条，而不是进程内推理
+//! # Why this is the default rather than in-process inference
 //!
-//! 在此之前 `fastembed`（内部 ONNX Runtime）是 `cortex-memory` 的**硬依赖**，
-//! 没有 feature gate。代价不只是「重」：
+//! Before this, `fastembed` (ONNX Runtime inside) was a **hard dependency** of
+//! `cortex-memory`, with no feature gate. The cost was more than just
+//! "heavy":
 //!
-//! 1. **Intel Mac 根本编不出来** —— `ort-sys: no prebuilt binaries available
-//!    for target x86_64-apple-darwin`。v0.1.0 发版时试了两轮才确认这不是
-//!    「没有现成二进制」而是「编不了」，连 `CORTEX_EMBED_BACKEND=hash`
-//!    也救不了，因为 ort-sys 在**构建期**就失败
-//! 2. **每台跑 cortexd 的机器都得能拿到那 590 MB**。第一次上生产时
-//!    那台节点 Hugging Face 完全不可达（DNS 被污染到 Meta 的段、
-//!    `hf-mirror.com` 也不通），cortexd 于是**照常启动、`/health` 返回 ok**，
-//!    只在日志里留一行「回落到 mock 数据源」—— 记忆检索是假的而没有红灯
-//! 3. 启动加载 12 秒、常驻 1.0 GiB
+//! 1. **Intel Macs simply cannot build it** — `ort-sys: no prebuilt binaries
+//!    available for target x86_64-apple-darwin`. It took two rounds during the
+//!    v0.1.0 release to confirm that this is not "no prebuilt binary handy"
+//!    but "cannot be built", and not even `CORTEX_EMBED_BACKEND=hash` saves
+//!    you, because ort-sys fails at **build time**
+//! 2. **Every machine running cortexd has to be able to fetch those 590 MB.**
+//!    The first time this went to production, Hugging Face was completely
+//!    unreachable from that node (DNS poisoned to Meta's ranges,
+//!    `hf-mirror.com` unreachable too), so cortexd **started up as usual and
+//!    returned ok from `/health`**, leaving a single line in the log saying it
+//!    had "fallen back to the mock data source" — memory retrieval was fake,
+//!    with no red light
+//! 3. 12 seconds of startup loading, 1.0 GiB resident
 //!
-//! 换成 HTTP 之后这三条一起消失，而且**同一个协议同时覆盖两种部署**：
-//! `CORTEX_EMBED_ENDPOINT` 指向 compose 里那个自建容器，或者指向
-//! 任何一家兼容 OpenAI 的云服务，切换只是改一行环境变量。
+//! Switching to HTTP makes all three disappear at once, and **one protocol
+//! covers both deployment shapes**: point `CORTEX_EMBED_ENDPOINT` at the
+//! self-hosted container in compose, or at any OpenAI-compatible cloud
+//! service — switching is a one-line environment variable change.
 //!
-//! # 维度不匹配必须当场炸
+//! # A dimension mismatch has to blow up on the spot
 //!
-//! schema 把向量列写死成 `VECTOR(1024)`。接错一家（OpenAI 的
-//! `text-embedding-3-small` 是 1536）时，最坏的结果不是报错，是
-//! **写入被数据库拒绝、而调用方把它当成一次普通的写失败**，
-//! 或者更糟：某些服务会截断。所以这里在**第一次响应**就校验维度并
-//! 给出指名道姓的错误，而不是把问题推给 Postgres。
+//! The schema hardcodes the vector column as `VECTOR(1024)`. When you wire up
+//! the wrong vendor (OpenAI's `text-embedding-3-small` is 1536), the worst
+//! outcome is not an error, it is **the write being rejected by the database
+//! while the caller treats it as an ordinary write failure** — or worse: some
+//! services truncate. So we validate the dimension on the **very first
+//! response** and give an error that names names, instead of handing the
+//! problem off to Postgres.
 
 use std::time::Duration;
 
@@ -34,61 +43,72 @@ use serde::{Deserialize, Serialize};
 
 use crate::embed::{EMBEDDING_DIM, Embedder, normalize};
 
-/// 单次请求最多送多少条文本。
+/// How many texts at most go into a single request.
 ///
-/// 不是性能调优，是**兼容性下限**：各家对 batch 大小的限制差得很远
-/// （TEI 默认 32，阿里百炼 `text-embedding-v3` 是 10）。取 10 让默认配置
-/// 在所有已知服务上都能跑通；自建服务想要更大的吞吐可以调
-/// `CORTEX_EMBED_BATCH`。
+/// This is not performance tuning, it is a **compatibility floor**: vendors
+/// differ wildly in the batch size they allow (TEI defaults to 32, Alibaba
+/// Bailian's `text-embedding-v3` is 10). Picking 10 lets the default
+/// configuration work against every service we know of; a self-hosted service
+/// that wants more throughput can raise `CORTEX_EMBED_BATCH`.
 const DEFAULT_BATCH: usize = 10;
 
-/// 单次 HTTP 请求的超时。
+/// Timeout for a single HTTP request.
 ///
-/// 给到 60 秒是因为**冷启动**：自建的 TEI 容器第一次收到请求时可能还在
-/// 载入权重。设成常见的 30 秒会让「服务刚起来的头一分钟」表现为
-/// 一串超时失败，而那正是有人在盯着看的时候。
+/// It is 60 seconds because of **cold start**: a self-hosted TEI container may
+/// still be loading weights when it receives its first request. Setting the
+/// usual 30 seconds would make "the first minute after the service comes up"
+/// present as a string of timeout failures — which is exactly the moment
+/// someone is watching.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 失败重试次数（不含首次）。
+/// Number of retries after a failure (not counting the first attempt).
 ///
-/// 只重试**可能是瞬时**的错误：连接失败、超时、5xx、429。
-/// 4xx（模型名不对、鉴权失败、维度不符）重试多少次都是同样的结果，
-/// 重试只会把一条清楚的错误信息延迟三倍才让人看见。
+/// Only errors that **may be transient** are retried: connection failure,
+/// timeout, 5xx, 429. A 4xx (wrong model name, failed auth, dimension
+/// mismatch) gives the same result however many times you retry it; retrying
+/// only delays one clear error message by a factor of three before anyone sees
+/// it.
 const MAX_RETRIES: usize = 2;
 
-/// [`ApiEmbedder`] 的构造参数。
+/// Construction parameters for [`ApiEmbedder`].
 #[derive(Debug, Clone)]
 pub struct ApiEmbedderConfig {
-    /// 完整的请求地址，或者能推导出它的基地址。见 [`resolve_url`]。
+    /// The full request address, or a base address it can be derived from.
+    /// See [`resolve_url`].
     pub endpoint: String,
-    /// 模型名。自建 TEI 忽略这个字段，云服务必填。
+    /// Model name. Self-hosted TEI ignores this field; cloud services require
+    /// it.
     pub model: String,
-    /// `Authorization: Bearer <key>`。自建服务通常不需要，留空即不发这个头。
+    /// `Authorization: Bearer <key>`. Self-hosted services usually do not need
+    /// it; leaving it empty means the header is not sent.
     pub api_key: Option<String>,
-    /// 单次请求最多几条文本。
+    /// How many texts at most go into a single request.
     pub batch: usize,
 }
 
 impl ApiEmbedderConfig {
-    /// 从环境变量读取。
+    /// Reads from environment variables.
     ///
-    /// | 变量 | 含义 | 默认 |
+    /// | Variable | Meaning | Default |
     /// |---|---|---|
-    /// | `CORTEX_EMBED_ENDPOINT` | 服务地址 | `http://embeddings/v1/embeddings` |
-    /// | `CORTEX_EMBED_MODEL` | 模型名 | `bge-m3` |
-    /// | `CORTEX_EMBED_API_KEY` | 鉴权（自建可不填） | 无 |
-    /// | `CORTEX_EMBED_BATCH` | 单请求条数 | 10 |
+    /// | `CORTEX_EMBED_ENDPOINT` | service address | `http://embeddings/v1/embeddings` |
+    /// | `CORTEX_EMBED_MODEL` | model name | `bge-m3` |
+    /// | `CORTEX_EMBED_API_KEY` | auth (optional when self-hosted) | none |
+    /// | `CORTEX_EMBED_BATCH` | items per request | 10 |
     ///
-    /// 默认地址指向 compose 里那个 `embeddings` 服务的容器名 ——
-    /// 「什么都不配就能跑」的那条路是自托管，不是某一家云。
+    /// The default address points at the container name of the `embeddings`
+    /// service in compose — the "works with zero configuration" path is
+    /// self-hosting, not any particular cloud.
     ///
     /// # Errors
     ///
-    /// `CORTEX_EMBED_BATCH` 不是正整数时报错。
+    /// Errors when `CORTEX_EMBED_BATCH` is not a positive integer.
     pub fn from_env() -> Result<Self> {
-        // 空串按「没设」处理：compose 里的 `${VAR:-}` 会把没写在 .env 里的
-        // 变量设成空串而不是不设，直接 `env::var` 会拿到 `Ok("")` 并把
-        // 默认值顶掉。这个坑在 cortex-core 的 `non_empty` 注释里有完整记录
+        // An empty string is treated as "not set": `${VAR:-}` in compose sets
+        // a variable that is absent from .env to the empty string rather than
+        // leaving it unset, and a plain `env::var` then gets `Ok("")` and
+        // overrides the default. This trap is documented in full in the
+        // `non_empty` comment in cortex-core
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 
         let batch = match var("CORTEX_EMBED_BATCH") {
@@ -114,32 +134,34 @@ impl ApiEmbedderConfig {
     }
 }
 
-/// 把用户填的地址补成真正要 POST 的 URL。
+/// Completes the address the user filled in into the URL we actually POST to.
 ///
-/// 存在的理由是各家文档给的「基地址」形状不一样，而让用户去猜要不要
-/// 自己补 `/v1/embeddings` 的结果是**一半的人配错**，症状还是 404 ——
-/// 一个看起来像「服务没起来」的错误。
+/// It exists because vendor docs hand out "base addresses" in different
+/// shapes, and making users guess whether to append `/v1/embeddings`
+/// themselves means **half of them get it wrong**, with a 404 as the symptom
+/// — an error that looks like "the service is not up".
 ///
-/// 三种形状都认：
+/// All three shapes are accepted:
 ///
-/// | 填的 | 实际请求 |
+/// | Filled in | Actually requested |
 /// |---|---|
-/// | `http://embeddings/v1/embeddings` | 原样 |
+/// | `http://embeddings/v1/embeddings` | as-is |
 /// | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `…/v1/embeddings` |
 /// | `http://embeddings` | `http://embeddings/v1/embeddings` |
-/// # 只能看**路径**，不能看整串
+/// # Only the **path** may be inspected, never the whole string
 ///
-/// 第一版写的是 `base.ends_with("/embeddings")`，它对
-/// `http://embeddings` 返回真 —— `//embeddings` 里那个斜杠就够了。
-/// 而 `embeddings` 恰好是 compose 里那个服务的容器名，
-/// 于是**默认配置**会原样 POST 到 `http://embeddings` 并拿到 404，
-/// 症状看起来像「服务没起来」。所以这里先把 authority 剥掉再判断。
+/// The first version wrote `base.ends_with("/embeddings")`, which returns true
+/// for `http://embeddings` — that slash inside `//embeddings` is enough. And
+/// `embeddings` happens to be the container name of that service in compose,
+/// so the **default configuration** would POST to `http://embeddings`
+/// unchanged and get a 404, with a symptom that looks like "the service is not
+/// up". Hence we strip the authority off before deciding.
 #[must_use]
 pub fn resolve_url(raw: &str) -> String {
     let base = raw.trim().trim_end_matches('/');
 
-    // 找到 authority 之后第一个 '/'，它之后才是路径。
-    // 没有 scheme 时（`embeddings:80`）也按同样的方式退化处理
+    // Find the first '/' after the authority; only what follows it is the
+    // path. When there is no scheme (`embeddings:80`) it degrades the same way
     let after_scheme = base.find("://").map_or(0, |i| i + 3);
     let path = base[after_scheme..]
         .find('/')
@@ -156,8 +178,10 @@ pub fn resolve_url(raw: &str) -> String {
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
-    /// 显式要 float。不写的话有些服务默认回 base64（OpenAI 的 SDK 会这么请求），
-    /// 而我们的反序列化只认数组 —— 那会表现为一条看不懂的解析错误
+    /// Ask for float explicitly. Without it some services default to base64
+    /// (OpenAI's SDK requests it that way), while our deserialization only
+    /// accepts an array — that would present as an incomprehensible parse
+    /// error
     encoding_format: &'static str,
 }
 
@@ -168,15 +192,16 @@ struct EmbedResponse {
 
 #[derive(Deserialize)]
 struct EmbedItem {
-    /// 请求里第几条。**必须按它排序**：协议不保证返回顺序与请求一致，
-    /// 而错位不会报错 —— 它表现为「检索质量莫名其妙地差」，
-    /// 是这类 bug 里最难被发现的一种
+    /// Which item of the request this is. **We must sort by it**: the protocol
+    /// makes no guarantee that the response order matches the request order,
+    /// and a misalignment does not error — it presents as "retrieval quality
+    /// is inexplicably bad", the hardest kind of bug of this family to spot
     #[serde(default)]
     index: usize,
     embedding: Vec<f32>,
 }
 
-/// 调远端 `/v1/embeddings` 的 embedder。
+/// The embedder that calls a remote `/v1/embeddings`.
 pub struct ApiEmbedder {
     http: reqwest::Client,
     url: String,
@@ -186,8 +211,9 @@ pub struct ApiEmbedder {
 
 impl std::fmt::Debug for ApiEmbedder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 手写而不是 derive：ApiEmbedderConfig 里有 api_key，
-        // derive 出来的 Debug 会把密钥打进任何一条 `{:?}` 日志
+        // Hand-written rather than derived: ApiEmbedderConfig holds an
+        // api_key, and a derived Debug would print the secret into any `{:?}`
+        // log line
         f.debug_struct("ApiEmbedder")
             .field("url", &self.url)
             .field("model", &self.cfg.model)
@@ -198,22 +224,28 @@ impl std::fmt::Debug for ApiEmbedder {
 }
 
 impl ApiEmbedder {
-    /// 按配置构造。**不**在这里探活：探活要发一次真实请求，
-    /// 而 cortexd 启动时远端可能还没起来（compose 里两个服务同时拉起）。
-    /// 第一次 embed 失败时的错误信息已经足够指明问题。
+    /// Constructs from configuration. Deliberately does **not** health-check
+    /// here: a health check means sending a real request, and the remote may
+    /// not be up yet when cortexd starts (compose brings both services up at
+    /// once). The error message from the first failing embed already points at
+    /// the problem well enough.
     ///
     /// # Errors
     ///
-    /// HTTP 客户端构造失败（基本只可能是 TLS 后端有问题）。
+    /// The HTTP client fails to build (essentially only possible when the TLS
+    /// backend is broken).
     pub fn new(cfg: ApiEmbedderConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| CortexError::Memory(format!("构造 HTTP 客户端失败：{e}")))?;
         let url = resolve_url(&cfg.endpoint);
-        // 写进各表 embedding_model 列的标识。带 `api:` 前缀是为了让
-        // 「同一个模型名、本地跑 vs 远端跑」在库里可分辨 —— 两边的
-        // 归一化与池化实现未必逐位一致，混在一张表里是静默的质量损失
+        // The identifier written into the embedding_model column of every
+        // table. The `api:` prefix exists so that "same model name, run
+        // locally vs. run remotely" stays distinguishable in the database —
+        // the two sides' normalization and pooling implementations are not
+        // necessarily bit-for-bit identical, and mixing them into one table is
+        // a silent quality loss
         let model_id = format!("api:{}", cfg.model);
         Ok(Self {
             http,
@@ -223,44 +255,52 @@ impl ApiEmbedder {
         })
     }
 
-    /// 从环境变量构造。
+    /// Constructs from environment variables.
     ///
     /// # Errors
     ///
-    /// 配置非法。
+    /// Invalid configuration.
     pub fn from_env() -> Result<Self> {
         Self::new(ApiEmbedderConfig::from_env()?)
     }
 
-    /// 从 `CORTEX_EMBED_LEGACY_*` 构造**上一个模型**的 embedder。没配就是 `None`。
+    /// Constructs an embedder for the **previous model** from
+    /// `CORTEX_EMBED_LEGACY_*`. `None` when it is not configured.
     ///
-    /// # 它解决什么
+    /// # What it solves
     ///
-    /// 回填期间旧事实的向量还只在旧空间里。要让它们仍然被检索到，就得把
-    /// **查询**也编到旧空间去 —— 而那需要旧模型本身还在手上。
-    /// 这就是 memory.md §七 第 3 步「检索期间按模型分组，各自召回」的前提。
+    /// During backfill, the vectors of old facts still live only in the old
+    /// space. For them to still be retrievable, the **query** has to be
+    /// encoded into that old space too — and that requires still having the
+    /// old model itself on hand. This is the precondition for step 3 of
+    /// memory.md §7, "during retrieval, group by model and recall each
+    /// separately".
     ///
-    /// # ⚠️ 它救不了「从进程内 fastembed 换到远端 API」这一次
+    /// # ⚠️ It does not save the "in-process fastembed → remote API" migration
     ///
-    /// 那种迁移里的旧模型是 fastembed，而它默认已经不编进二进制
-    /// （feature `local-embed`）。也就是说 docker 镜像里根本没有那个旧模型，
-    /// 配了这几个变量也构造不出它来。
+    /// In that migration the old model is fastembed, which by default is no
+    /// longer compiled into the binary (feature `local-embed`). Which means
+    /// the docker image does not contain that old model at all, and setting
+    /// these variables cannot construct it.
     ///
-    /// 这条路覆盖的是**将来的 api → api 换模型**（换云厂商 / 换模型名）。
-    /// 那一次迁移只能靠回填器把窗口熬过去，期间 BM25 / 图 / 近因三路兜着。
+    /// This path covers the **future api → api model switch** (changing cloud
+    /// vendor / changing model name). That earlier migration can only ride the
+    /// window out on the backfiller, with BM25 / graph / recency covering the
+    /// other three routes in the meantime.
     ///
     /// # Errors
     ///
-    /// 配了 endpoint 但别的取值非法。
+    /// The endpoint is configured but another value is invalid.
     pub fn legacy_from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 
         let Some(endpoint) = var("CORTEX_EMBED_LEGACY_ENDPOINT") else {
             return Ok(None);
         };
-        // 模型名必填：旧空间的 `model_id` 要写进查询的过滤条件，
-        // 猜错等于查了一个空集合 —— 而那与「没配」的表现一模一样，
-        // 分辨不出来。宁可当场报错
+        // The model name is mandatory: the old space's `model_id` goes into
+        // the query's filter condition, and guessing it wrong means querying
+        // an empty set — which behaves exactly like "not configured" and
+        // cannot be told apart. Better to error on the spot
         let model = var("CORTEX_EMBED_LEGACY_MODEL").ok_or_else(|| {
             CortexError::Config(
                 "设了 CORTEX_EMBED_LEGACY_ENDPOINT 就必须设 CORTEX_EMBED_LEGACY_MODEL：\n\
@@ -279,7 +319,7 @@ impl ApiEmbedder {
         .map(Some)
     }
 
-    /// 发一批（已经切好，长度 <= batch）。
+    /// Sends one batch (already chunked, length <= batch).
     async fn embed_chunk(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = EmbedRequest {
             model: &self.cfg.model,
@@ -290,8 +330,9 @@ impl ApiEmbedder {
         let mut last: Option<CortexError> = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                // 线性退避就够：这里重试的是「服务刚起来」与「瞬时 429」，
-                // 不是雪崩场景
+                // Linear backoff is enough: what is being retried here is "the
+                // service just came up" and "a transient 429", not an
+                // avalanche scenario
                 tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
 
@@ -325,8 +366,10 @@ impl ApiEmbedder {
                         detail.trim()
                     ));
                     if !retryable {
-                        // 4xx 直接抛：模型名不对 / 鉴权失败 / 请求形状不对，
-                        // 重试三次只是把同一条错误延后三倍才让人看见
+                        // Throw a 4xx straight through: wrong model name /
+                        // failed auth / wrong request shape. Retrying three
+                        // times only delays the same error by a factor of
+                        // three before anyone sees it
                         return Err(err);
                     }
                     last = Some(err);
@@ -336,7 +379,7 @@ impl ApiEmbedder {
         Err(last.unwrap_or_else(|| CortexError::Memory("embedding 请求失败".into())))
     }
 
-    /// 校验并按 index 排好序。
+    /// Validates and sorts back into `index` order.
     fn collect(mut parsed: EmbedResponse, want: usize, model: &str) -> Result<Vec<Vec<f32>>> {
         if parsed.data.len() != want {
             return Err(CortexError::Memory(format!(
@@ -360,13 +403,18 @@ impl ApiEmbedder {
             }
         }
         let mut out: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
-        // 统一兜底归一化。**不能假设远端已经归一化过**：TEI 默认归一化，
-        // 但这是它的一个可关闭选项，而各家云服务的口径并不一致、
-        // 也很少写在文档里。对已归一化的向量这是恒等操作，代价可忽略。
+        // A uniform normalize as a backstop. **We cannot assume the remote has
+        // already normalized**: TEI normalizes by default, but that is an
+        // option it can turn off, and cloud services do not agree with each
+        // other on this and rarely write it down in their docs. For an
+        // already-normalized vector this is the identity operation, at
+        // negligible cost.
         //
-        // 不做的后果不是「差一点」：`retrieval` 的语义地板（0.50）是按
-        // 单位向量的余弦距离标定的，喂进非单位向量之后那个阈值失去含义 ——
-        // 表现为召回莫名其妙地宽或者莫名其妙地空，而没有任何报错。
+        // Skipping it is not a matter of being "slightly off": `retrieval`'s
+        // semantic floor (0.50) is calibrated against the cosine distance of
+        // unit vectors, and once you feed it non-unit vectors that threshold
+        // loses its meaning — presenting as recall being inexplicably wide or
+        // inexplicably empty, with no error at all.
         for (i, v) in out.iter_mut().enumerate() {
             normalize(v).map_err(|e| {
                 CortexError::Memory(format!("模型 {model} 返回的第 {i} 条向量无法归一化：{e}"))
@@ -404,38 +452,40 @@ mod tests {
 
     #[test]
     fn resolve_url_accepts_all_three_shapes() {
-        // 自建 TEI，文档里给的就是完整路径
+        // Self-hosted TEI; the docs hand you the full path already
         assert_eq!(
             resolve_url("http://embeddings/v1/embeddings"),
             "http://embeddings/v1/embeddings",
-            "已经是完整路径的地址不该被再拼一次"
+            "an address that is already a full path must not be appended to a second time"
         );
-        // 云服务文档给的通常是「基地址到 /v1 为止」
+        // Cloud service docs usually give you "the base address up to /v1"
         assert_eq!(
             resolve_url("https://dashscope.aliyuncs.com/compatible-mode/v1"),
             "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
-            "以 /v1 结尾的基地址只该补 /embeddings，不能补成 /v1/v1/embeddings"
+            "a base address ending in /v1 should only get /embeddings appended, never become /v1/v1/embeddings"
         );
-        // 只给了主机。**这条是回归测试**：第一版用 `ends_with("/embeddings")`
-        // 判断整串，而 `http://embeddings` 里 `//embeddings` 那个斜杠就够它
-        // 返回真 —— 而 `embeddings` 恰恰是 compose 里的服务名，
-        // 于是默认配置直接 POST 到 404
+        // Only the host was given. **This one is a regression test**: the
+        // first version used `ends_with("/embeddings")` against the whole
+        // string, and that slash inside `//embeddings` in `http://embeddings`
+        // is enough to make it return true — and `embeddings` is exactly the
+        // service name in compose, so the default configuration POSTed
+        // straight into a 404
         assert_eq!(
             resolve_url("http://embeddings"),
             "http://embeddings/v1/embeddings",
-            "主机名叫 embeddings 时也必须补全路径 —— 不能把 authority 当成路径"
+            "the path must still be completed when the host is named embeddings —— the authority must not be mistaken for the path"
         );
-        // 带端口的同一个坑
+        // The same trap, with a port
         assert_eq!(
             resolve_url("http://embeddings:80"),
             "http://embeddings:80/v1/embeddings",
-            "带端口时同样要补全"
+            "completion must happen with a port too"
         );
-        // 末尾多一个斜杠是最常见的手滑
+        // A trailing slash is the most common slip of the finger
         assert_eq!(
             resolve_url("https://api.openai.com/v1/"),
             "https://api.openai.com/v1/embeddings",
-            "末尾斜杠不该产生 //"
+            "a trailing slash must not produce //"
         );
     }
 
@@ -447,15 +497,15 @@ mod tests {
             api_key: Some("sk-super-secret-value".into()),
             batch: 4,
         })
-        .expect("构造不该失败");
+        .expect("construction should not fail");
         let s = format!("{e:?}");
         assert!(
             !s.contains("sk-super-secret-value"),
-            "Debug 输出泄漏了 API key —— 它会随任何一条 {{:?}} 日志进日志文件：{s}"
+            "the Debug output leaked the API key —— it would ride any {{:?}} log line into the log file: {s}"
         );
         assert!(
             s.contains("<已设置>"),
-            "Debug 应当能看出 key 有没有配，只是不给出取值：{s}"
+            "Debug should still reveal whether a key is configured, just not its value: {s}"
         );
     }
 
@@ -467,28 +517,31 @@ mod tests {
                 embedding: vec![0.0; 1536], // OpenAI text-embedding-3-small
             }],
         };
-        let err = ApiEmbedder::collect(parsed, 1, "text-embedding-3-small")
-            .expect_err("1536 维必须被拒绝，不能写进 VECTOR(1024) 的列");
+        let err = ApiEmbedder::collect(parsed, 1, "text-embedding-3-small").expect_err(
+            "1536 dimensions must be rejected, they cannot go into a VECTOR(1024) column",
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("1536") && msg.contains("1024"),
-            "错误信息要同时给出实际维度与期望维度，否则排查得去翻 schema：{msg}"
+            "the error message must give both the actual and the expected dimension, otherwise diagnosing it means digging through the schema: {msg}"
         );
         assert!(
             msg.contains("text-embedding-3-small"),
-            "错误信息要点名是哪个模型：{msg}"
+            "the error message must name which model it was: {msg}"
         );
     }
 
     #[test]
     fn collect_sorts_by_index() {
-        // 故意乱序返回：协议不保证顺序，而错位是静默的质量损失。
-        // 两条向量的方向必须不同，否则归一化之后分辨不出谁是谁 ——
-        // 也不能用零向量：那是**合法地**会被归一化拒掉的输入
+        // Deliberately return them out of order: the protocol guarantees no
+        // ordering, and a misalignment is a silent quality loss. The two
+        // vectors must point in different directions, otherwise there is no
+        // telling which is which after normalizing — and a zero vector cannot
+        // be used either: that is an input normalize **legitimately** rejects
         let mut a = vec![0.0f32; EMBEDDING_DIM];
-        a[0] = 1.0; // index=0 那条
+        a[0] = 1.0; // the index=0 one
         let mut b = vec![0.0f32; EMBEDDING_DIM];
-        b[1] = 1.0; // index=1 那条
+        b[1] = 1.0; // the index=1 one
         let parsed = EmbedResponse {
             data: vec![
                 EmbedItem {
@@ -501,27 +554,30 @@ mod tests {
                 },
             ],
         };
-        let got = ApiEmbedder::collect(parsed, 2, "bge-m3").expect("两条都是 1024 维，应当通过");
+        let got = ApiEmbedder::collect(parsed, 2, "bge-m3")
+            .expect("both are 1024-dimensional, this should pass");
         assert_eq!(
             (got[0][0], got[0][1]),
             (1.0, 0.0),
-            "返回顺序必须按 index 归位 —— 错位不会报错，只会让检索莫名其妙地差"
+            "the response order must be put back by index —— a misalignment does not error, it just makes retrieval inexplicably bad"
         );
         assert_eq!(
             (got[1][0], got[1][1]),
             (0.0, 1.0),
-            "第二条应当是 index=1 那条"
+            "the second one should be the index=1 one"
         );
     }
 
     #[test]
     fn collect_normalizes_and_rejects_zero_vectors() {
-        // 远端未必归一化（TEI 默认归一化，但那是可关的；各家云口径不一）。
-        // 语义地板 0.50 是按单位向量的余弦距离标定的，喂进非单位向量之后
-        // 那个阈值失去含义 —— 而且不会报错
+        // The remote does not necessarily normalize (TEI does by default, but
+        // that can be turned off; cloud vendors do not agree). The semantic
+        // floor of 0.50 is calibrated against the cosine distance of unit
+        // vectors, and once you feed it non-unit vectors that threshold loses
+        // its meaning — and nothing errors
         let mut v = vec![0.0f32; EMBEDDING_DIM];
         v[0] = 3.0;
-        v[1] = 4.0; // 模长 5
+        v[1] = 4.0; // norm 5
         let got = ApiEmbedder::collect(
             EmbedResponse {
                 data: vec![EmbedItem {
@@ -532,14 +588,15 @@ mod tests {
             1,
             "bge-m3",
         )
-        .expect("合法向量应当通过");
+        .expect("a legal vector should pass");
         let norm = got[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
             (norm - 1.0).abs() < 1e-5,
-            "返回的向量必须是单位长度，实际模长 {norm}"
+            "the returned vector must be unit length, actual norm {norm}"
         );
 
-        // 零向量在 pgvector 的余弦距离下得到 NaN，会静默污染整个 ORDER BY
+        // A zero vector yields NaN under pgvector's cosine distance and
+        // silently poisons the entire ORDER BY
         let err = ApiEmbedder::collect(
             EmbedResponse {
                 data: vec![EmbedItem {
@@ -550,10 +607,12 @@ mod tests {
             1,
             "bge-m3",
         )
-        .expect_err("零向量必须被拒 —— 它在 pgvector 里会变成 NaN 并污染排序");
+        .expect_err(
+            "a zero vector must be rejected —— in pgvector it turns into NaN and poisons the ordering",
+        );
         assert!(
             err.to_string().contains("归一化"),
-            "错误信息要说清原因：{err}"
+            "the error message must state the reason: {err}"
         );
     }
 
@@ -565,11 +624,12 @@ mod tests {
                 embedding: vec![0.0; EMBEDDING_DIM],
             }],
         };
-        let err = ApiEmbedder::collect(parsed, 3, "bge-m3")
-            .expect_err("少返回了两条必须报错，否则调用方会拿到一个错位的数组");
+        let err = ApiEmbedder::collect(parsed, 3, "bge-m3").expect_err(
+            "returning two fewer items must error, otherwise the caller gets a misaligned array",
+        );
         assert!(
             err.to_string().contains('3'),
-            "错误信息要说清请求了几条：{err}"
+            "the error message must state how many items were requested: {err}"
         );
     }
 }

@@ -1,9 +1,12 @@
-//! 项目：两台状态机、删项目的爆炸半径、按项目过滤、schema 约束、同步下发。
+//! Projects: the two state machines, the blast radius of deleting a project,
+//! filtering by project, the schema constraints, and delivery over sync.
 //!
-//! 与 session_events 那份同源：逻辑全在 SQL 里（`project_state` 的两次
-//! DISTINCT ON、`session_state` 里那句「悬挂归属按未分组处理」的 EXISTS、
-//! `session_digests` 的项目过滤、表上的 CHECK），单测一条都测不到 ——
-//! 只能真连库。数据库不可用时 skip 而非 fail。
+//! Same lineage as the session_events file: the logic lives entirely in SQL
+//! (the two DISTINCT ONs in `project_state`, the EXISTS in `session_state` that
+//! says "treat a dangling membership as ungrouped", the project filter in
+//! `session_digests`, the CHECKs on the tables), and a unit test can reach none
+//! of it — only a real database connection can. Skip rather than fail when the
+//! database is unavailable.
 
 mod common;
 
@@ -34,7 +37,7 @@ async fn write_episode(store: &Store, ep: NewEpisode) -> Id {
     store
         .write_txn(async |t| t.insert_episode(&ep).await)
         .await
-        .expect("写 episode 不该失败");
+        .expect("writing the episode should not fail");
     id
 }
 
@@ -42,17 +45,18 @@ async fn emit_project(store: &Store, e: NewProjectEvent) -> i64 {
     store
         .write_txn(async |t| t.insert_project_event(&e).await)
         .await
-        .expect("写 project_event 不该失败")
+        .expect("writing the project_event should not fail")
 }
 
 async fn emit_session(store: &Store, e: NewSessionEvent) -> i64 {
     store
         .write_txn(async |t| t.insert_session_event(&e).await)
         .await
-        .expect("写 session_event 不该失败")
+        .expect("writing the session_event should not fail")
 }
 
-/// 名字与存在与否各是一台状态机，各取各的末条。
+/// The name and the existence are each a state machine, and each takes its own
+/// last event.
 #[tokio::test]
 async fn the_last_event_of_each_machine_wins() {
     let Some(db) = common::setup().await else {
@@ -60,7 +64,7 @@ async fn the_last_event_of_each_machine_wins() {
     };
     let s = &db.store;
 
-    // 改名两次：末态是最后那个，不做撤销栈
+    // Rename twice: the final state is the last one, with no undo stack
     emit_project(
         s,
         NewProjectEvent::create("renamed", "甲", Actor::User, DEV),
@@ -77,8 +81,9 @@ async fn the_last_event_of_each_machine_wins() {
     )
     .await;
 
-    // 删掉之后再改名：改名不该把它救回来 —— 两台状态机互不干扰，
-    // 「整表最后一条」那种判据会在这里得出「改个名就自动复活了」
+    // Rename after deleting: the rename must not resurrect it -- the two state
+    // machines do not interfere, and a "last row in the whole table" criterion
+    // would conclude here that "renaming it automatically brought it back"
     emit_project(
         s,
         NewProjectEvent::create("gone", "要删的", Actor::User, DEV),
@@ -91,13 +96,19 @@ async fn the_last_event_of_each_machine_wins() {
     )
     .await;
 
-    // 同 id 再 create 一次 = 撤销误删
+    // Creating the same id again = undoing an accidental deletion
     emit_project(s, NewProjectEvent::create("back", "初版", Actor::User, DEV)).await;
     emit_project(s, NewProjectEvent::delete("back", Actor::User, DEV)).await;
     emit_project(s, NewProjectEvent::create("back", "重建", Actor::User, DEV)).await;
 
-    let projects = s.projects().await.expect("查项目列表不该失败");
-    let events = s.project_events("renamed").await.expect("查时间线不该失败");
+    let projects = s
+        .projects()
+        .await
+        .expect("querying the project list should not fail");
+    let events = s
+        .project_events("renamed")
+        .await
+        .expect("querying the timeline should not fail");
 
     db.cleanup().await;
 
@@ -108,29 +119,38 @@ async fn the_last_event_of_each_machine_wins() {
 
     assert!(
         names.contains(&("renamed".into(), "丙".into())),
-        "[create 甲, rename 乙, rename 丙] 之后应当叫「丙」—— 末态由最后一条决定：{names:?}"
+        "after [create 甲, rename 乙, rename 丙] it should be called 丙 -- the final state is \
+         decided by the last event: {names:?}"
     );
     assert!(
         !names.iter().any(|(id, _)| id == "gone"),
-        "删掉之后再改名不该让项目复活 —— 存在与否是独立的一台状态机：{names:?}"
+        "renaming after deleting must not resurrect the project -- existence is an independent \
+         state machine: {names:?}"
     );
     assert!(
         names.contains(&("back".into(), "重建".into())),
-        "同 id 再 create 一次应当把项目恢复（撤销误删），且用最新的名字：{names:?}"
+        "creating the same id again should restore the project (undoing an accidental deletion), \
+         under its newest name: {names:?}"
     );
 
-    assert_eq!(events.len(), 3, "时间线应当有三条：{events:?}");
+    assert_eq!(
+        events.len(),
+        3,
+        "the timeline should hold three entries: {events:?}"
+    );
     assert_eq!(
         events[0].op,
         ProjectOp::Create,
-        "时间线必须按时间升序，第一条是 create：{events:?}"
+        "the timeline must be ascending by time, so the first entry is create: {events:?}"
     );
 }
 
-/// **删项目只解散分组**：会话变未分组，消息与已抽取的记忆一条不少。
+/// **Deleting a project only dissolves the grouping**: the sessions become
+/// ungrouped, and not one message or extracted memory is lost.
 ///
-/// 这是这个功能最容易被实现错的一条 —— 写成级联删会话的话，
-/// 用户点一下「删除项目」就丢掉了几个月的对话，而那不可逆。
+/// This is the easiest part of the feature to implement wrong — written as a
+/// cascading delete of sessions, one click on "delete project" loses months of
+/// conversation, irreversibly.
 #[tokio::test]
 async fn deleting_a_project_ungroups_its_sessions_and_destroys_nothing() {
     let Some(db) = common::setup().await else {
@@ -150,7 +170,8 @@ async fn deleting_a_project_ungroups_its_sessions_and_destroys_nothing() {
     )
     .await;
 
-    // 挂一条派生记忆上去，好断言「删项目不动记忆」
+    // Hang a derived memory off it so we can assert "deleting a project does
+    // not touch memory"
     let entity = common::new_entity("person", "老王");
     let fact = common::new_fact(entity.id, "喜欢", "深色主题", ep);
     let subject = entity.id;
@@ -160,84 +181,97 @@ async fn deleting_a_project_ungroups_its_sessions_and_destroys_nothing() {
         t.insert_fact(&fact).await
     })
     .await
-    .expect("写实体与事实不该失败");
+    .expect("writing the entity and the fact should not fail");
 
     let grouped = s
         .session_state("sess")
         .await
-        .expect("查末态不该失败")
-        .expect("写过事件的会话应当有末态");
+        .expect("querying the final state should not fail")
+        .expect("a session that has had events should have a final state");
     let in_project = s
         .session_digests(10, false, Some("proj"))
         .await
-        .expect("按项目查列表不该失败");
+        .expect("querying the list by project should not fail");
 
     emit_project(s, NewProjectEvent::delete("proj", Actor::User, DEV)).await;
 
     let after_state = s
         .session_state("sess")
         .await
-        .expect("查末态不该失败")
-        .expect("会话的事件还在，末态就还在");
-    let after_projects = s.projects().await.expect("查项目列表不该失败");
+        .expect("querying the final state should not fail")
+        .expect("the session's events are still there, so its final state is too");
+    let after_projects = s
+        .projects()
+        .await
+        .expect("querying the project list should not fail");
     let after_sessions = s
         .session_digests(10, false, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
     let after_facts = s
         .active_facts_by_subject(&subject.to_string(), 10)
         .await
-        .expect("查事实不该失败");
+        .expect("querying the facts should not fail");
     let after_episodes = s
         .episodes_by_session("sess", 10)
         .await
-        .expect("查消息不该失败");
-    // 事件本身是 append-only 的，删项目不该把历史抹掉
-    let session_events = s.session_events("sess").await.expect("查时间线不该失败");
+        .expect("querying the messages should not fail");
+    // The events themselves are append-only, so deleting a project must not
+    // erase the history
+    let session_events = s
+        .session_events("sess")
+        .await
+        .expect("querying the timeline should not fail");
 
     db.cleanup().await;
 
     assert_eq!(
         grouped.project_id.as_deref(),
         Some("proj"),
-        "移进项目之后末态应当指向它：{grouped:?}"
+        "after being moved into the project the final state should point at it: {grouped:?}"
     );
-    assert_eq!(in_project.len(), 1, "项目里应当有一个会话：{in_project:?}");
+    assert_eq!(
+        in_project.len(),
+        1,
+        "the project should contain one session: {in_project:?}"
+    );
 
     assert!(
         after_projects.is_empty(),
-        "删掉之后项目必须从列表消失：{after_projects:?}"
+        "once deleted the project must disappear from the list: {after_projects:?}"
     );
     assert_eq!(
         after_state.project_id, None,
-        "项目没了之后会话必须变成未分组 —— 悬挂的归属会让界面画出一个\
-         点进去空空如也的分组标签：{after_state:?}"
+        "once the project is gone the session must become ungrouped -- a dangling membership \
+         would make the UI draw a group label that leads to an empty view: {after_state:?}"
     );
     assert_eq!(
         after_sessions.len(),
         1,
-        "删项目不该让会话从列表里消失：{after_sessions:?}"
+        "deleting a project must not make the session disappear from the list: {after_sessions:?}"
     );
     assert_eq!(
         after_sessions[0].message_count, 1,
-        "删项目不该动任何一条消息：{after_sessions:?}"
+        "deleting a project must not touch a single message: {after_sessions:?}"
     );
-    assert_eq!(after_episodes.len(), 1, "原始消息必须一条不少");
+    assert_eq!(after_episodes.len(), 1, "not one raw message may be lost");
     assert_eq!(
         after_facts.len(),
         1,
-        "删项目不该动任何一条已抽取的记忆 —— 销毁内容只能走 redact / purge"
+        "deleting a project must not touch a single extracted memory -- destroying content can \
+         only go through redact / purge"
     );
     assert_eq!(after_facts[0].id, fact_id);
     assert_eq!(
         session_events.len(),
         1,
-        "会话的 move_to_project 事件必须原样留着（append-only），\
-         删项目不级联改写它正是「撤销误删」成立的前提：{session_events:?}"
+        "the session's move_to_project event must stay exactly as it was (append-only); not \
+         cascading a rewrite of it on project deletion is precisely the premise on which \
+         \"undo an accidental deletion\" rests: {session_events:?}"
     );
 }
 
-/// 第四个维度与前三个互不干扰。
+/// The fourth dimension does not interfere with the first three.
 #[tokio::test]
 async fn the_project_dimension_does_not_interfere_with_the_others() {
     let Some(db) = common::setup().await else {
@@ -251,41 +285,54 @@ async fn the_project_dimension_does_not_interfere_with_the_others() {
         NewSessionEvent::move_to_project("sess", "proj", Actor::User, DEV),
     )
     .await;
-    // 移进项目之后归档、改名。若视图用「整表最后一条」判定，这两条会把归属冲掉
+    // Archive and rename after moving into the project. If the view decided by
+    // "the last row in the whole table", these two would wash the membership
+    // away
     emit_session(s, NewSessionEvent::archive("sess", Actor::User, DEV)).await;
     emit_session(s, NewSessionEvent::rename("sess", "标题", Actor::User, DEV)).await;
 
-    let grouped = s.session_state("sess").await.expect("查末态不该失败");
+    let grouped = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     emit_session(
         s,
         NewSessionEvent::remove_from_project("sess", Actor::User, DEV),
     )
     .await;
-    let ungrouped = s.session_state("sess").await.expect("查末态不该失败");
+    let ungrouped = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
 
-    let grouped = grouped.expect("写过事件的会话应当有末态");
+    let grouped = grouped.expect("a session that has had events should have a final state");
     assert_eq!(
         grouped.project_id.as_deref(),
         Some("proj"),
-        "归档 / 改名之后归属应当原样保留：{grouped:?}"
+        "membership should survive archiving / renaming untouched: {grouped:?}"
     );
-    assert!(grouped.archived, "归属不该把归档态冲掉：{grouped:?}");
+    assert!(
+        grouped.archived,
+        "membership must not wash the archived state away: {grouped:?}"
+    );
     assert_eq!(grouped.title.as_deref(), Some("标题"));
 
     assert_eq!(
-        ungrouped.expect("会话仍有事件").project_id,
+        ungrouped.expect("the session still has events").project_id,
         None,
-        "移出项目之后必须是 None，而不是留着最后待过的那个项目"
+        "after being moved out it must be None, not the last project it happened to be in"
     );
 }
 
-/// 按项目过滤必须发生在 `LIMIT` 之前。
+/// Filtering by project must happen before the `LIMIT`.
 ///
-/// 「先取 N 条再在内存里筛」是最容易写出的实现，缺陷不报错：别的项目的会话
-/// 把配额吃光，用户点开项目看到的是一个空列表 —— 而他明明刚往里拖过会话。
+/// "Take N rows first and filter in memory" is the easiest implementation to
+/// write, and its defect raises no error: other projects' sessions eat the whole
+/// quota and the user opens their project to an empty list — right after having
+/// dragged sessions into it.
 #[tokio::test]
 async fn filtering_by_project_happens_before_the_limit() {
     let Some(db) = common::setup().await else {
@@ -295,7 +342,7 @@ async fn filtering_by_project_happens_before_the_limit() {
 
     emit_project(s, NewProjectEvent::create("proj", "分组", Actor::User, DEV)).await;
 
-    // 三个不属于该项目的会话都比它新，会排在前面
+    // Three sessions outside the project, all newer than it, so they sort ahead
     for i in 0..3 {
         let id = format!("other-{i}");
         write_episode(s, episode(&id, "别的会话", 1 + i)).await;
@@ -310,15 +357,15 @@ async fn filtering_by_project_happens_before_the_limit() {
     let filtered = s
         .session_digests(1, false, Some("proj"))
         .await
-        .expect("按项目查列表不该失败");
+        .expect("querying the list by project should not fail");
     let unfiltered = s
         .session_digests(10, false, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
     let missing_project = s
         .session_digests(10, false, Some("nope"))
         .await
-        .expect("查一个不存在的项目不该报错");
+        .expect("querying a nonexistent project should not raise an error");
 
     db.cleanup().await;
 
@@ -328,26 +375,31 @@ async fn filtering_by_project_happens_before_the_limit() {
             .map(|d| d.session_id.clone())
             .collect::<Vec<_>>(),
         vec!["mine"],
-        "项目过滤必须发生在 LIMIT 之前，否则别的项目的会话会把配额吃掉"
+        "the project filter must happen before the LIMIT, or other projects' sessions eat the \
+         quota"
     );
     assert_eq!(
         unfiltered.len(),
         4,
-        "不传 project_id 时必须给全部会话（含未分组的）：{unfiltered:?}"
+        "with no project_id passed, every session must be returned (including ungrouped ones): \
+         {unfiltered:?}"
     );
     assert!(
         unfiltered
             .iter()
             .any(|d| d.session_id == "mine" && d.project_id.as_deref() == Some("proj")),
-        "归属要随 digest 一起回来，客户端才画得出分组标签：{unfiltered:?}"
+        "membership must ride along with the digest, or the client cannot draw the group label: \
+         {unfiltered:?}"
     );
     assert!(
         missing_project.is_empty(),
-        "查一个不存在的项目应当是空列表而不是全量：{missing_project:?}"
+        "querying a nonexistent project should give an empty list, not everything: \
+         {missing_project:?}"
     );
 }
 
-/// 每个 op 只能带自己那一个载荷字段，两侧的 CHECK 都要真的生效。
+/// Each op may carry only its own payload field, and the CHECKs on both sides
+/// must genuinely take effect.
 #[tokio::test]
 async fn schema_rejects_mismatched_payloads() {
     let Some(db) = common::setup().await else {
@@ -358,7 +410,8 @@ async fn schema_rejects_mismatched_payloads() {
     let mut create_without_name = NewProjectEvent::create("p", "x", Actor::User, DEV);
     create_without_name.name = None;
 
-    // delete 却带着 name —— 放过它的话，视图里会表现为「删一下名字就变了」
+    // delete carrying a name -- letting it through would make the view behave
+    // as though deleting it also changed its name
     let mut delete_with_name = NewProjectEvent::delete("p", Actor::User, DEV);
     delete_with_name.name = Some("不该有的名字".into());
 
@@ -367,10 +420,10 @@ async fn schema_rejects_mismatched_payloads() {
 
     let mut project_outcome = Vec::new();
     for (label, e) in [
-        ("create 缺 name", create_without_name),
-        ("delete 带 name", delete_with_name),
-        ("空名字", empty_name),
-        ("超长名字", too_long),
+        ("create missing its name", create_without_name),
+        ("delete carrying a name", delete_with_name),
+        ("an empty name", empty_name),
+        ("an over-long name", too_long),
     ] {
         let r = s
             .write_txn(async |t| t.insert_project_event(&e).await)
@@ -381,14 +434,18 @@ async fn schema_rejects_mismatched_payloads() {
     let mut move_without_target = NewSessionEvent::move_to_project("s", "p", Actor::User, DEV);
     move_without_target.project_id = None;
 
-    // 归档却带着 project_id —— 视图里会表现为「归档一下就换了个项目」
+    // archive carrying a project_id -- the view would behave as though
+    // archiving also moved it to a different project
     let mut archive_with_project = NewSessionEvent::archive("s", Actor::User, DEV);
     archive_with_project.project_id = Some("p".into());
 
     let mut session_outcome = Vec::new();
     for (label, e) in [
-        ("move_to_project 缺 project_id", move_without_target),
-        ("archive 带 project_id", archive_with_project),
+        (
+            "move_to_project missing its project_id",
+            move_without_target,
+        ),
+        ("archive carrying a project_id", archive_with_project),
     ] {
         let r = s
             .write_txn(async |t| t.insert_session_event(&e).await)
@@ -399,11 +456,14 @@ async fn schema_rejects_mismatched_payloads() {
     db.cleanup().await;
 
     for (label, rejected) in project_outcome.into_iter().chain(session_outcome) {
-        assert!(rejected, "「{label}」应当被 schema 的 CHECK 拒绝");
+        assert!(
+            rejected,
+            "\"{label}\" should be rejected by the schema's CHECK"
+        );
     }
 }
 
-/// `session_count` 的口径必须与会话列表看到的一致。
+/// What `session_count` counts must match what the session list shows.
 #[tokio::test]
 async fn session_count_matches_what_the_session_list_shows() {
     let Some(db) = common::setup().await else {
@@ -413,12 +473,14 @@ async fn session_count_matches_what_the_session_list_shows() {
 
     emit_project(s, NewProjectEvent::create("proj", "分组", Actor::User, DEV)).await;
 
-    // 会算进去的那一个
+    // The one that counts
     write_episode(s, episode("visible", "看得见的会话", 10)).await;
-    // 归档的：从默认列表消失，也就不该出现在计数里
+    // Archived: it vanishes from the default list, so it must not appear in the
+    // count either
     write_episode(s, episode("archived", "归档的会话", 9)).await;
     emit_session(s, NewSessionEvent::archive("archived", Actor::User, DEV)).await;
-    // 一条消息都没有的：会话列表的起点是 episodes 聚合，它本来就不在列表里
+    // With no messages at all: the session list starts from the episodes
+    // aggregate, so it is not in the list to begin with
     for id in ["visible", "archived", "silent"] {
         emit_session(
             s,
@@ -427,43 +489,62 @@ async fn session_count_matches_what_the_session_list_shows() {
         .await;
     }
 
-    let projects = s.projects().await.expect("查项目列表不该失败");
+    let projects = s
+        .projects()
+        .await
+        .expect("querying the project list should not fail");
     let listed = s
         .session_digests(10, false, Some("proj"))
         .await
-        .expect("按项目查列表不该失败");
-    let single = s.project("proj").await.expect("查单个项目不该失败");
-    let missing = s.project("nope").await.expect("查不存在的项目不该报错");
+        .expect("querying the list by project should not fail");
+    let single = s
+        .project("proj")
+        .await
+        .expect("querying a single project should not fail");
+    let missing = s
+        .project("nope")
+        .await
+        .expect("querying a nonexistent project should not raise an error");
 
     db.cleanup().await;
 
-    assert_eq!(projects.len(), 1, "应当恰好一个项目：{projects:?}");
+    assert_eq!(
+        projects.len(),
+        1,
+        "there should be exactly one project: {projects:?}"
+    );
     assert_eq!(
         projects[0].session_count,
         listed.len() as i64,
-        "计数与 GET /sessions?project_id= 看到的条数必须一致，否则用户会看到\
-         「3 个会话」点进去只有 1 个：计数 {}，列表 {:?}",
+        "the count must agree with what GET /sessions?project_id= shows, or the user sees \
+         \"3 sessions\" and finds only 1 after clicking in: count {}, list {:?}",
         projects[0].session_count,
         listed.iter().map(|d| &d.session_id).collect::<Vec<_>>()
     );
     assert_eq!(
         projects[0].session_count, 1,
-        "归档的与一条消息都没有的都不该算进计数：{projects:?}"
+        "neither the archived one nor the one with no messages may enter the count: {projects:?}"
     );
     assert_eq!(
         single.map(|p| p.name),
         Some("分组".into()),
-        "按 id 查单个项目应当拿得到"
+        "looking a single project up by id should find it"
     );
-    assert!(missing.is_none(), "不存在的项目应当是 None 而不是报错");
+    assert!(
+        missing.is_none(),
+        "a nonexistent project should be None rather than an error"
+    );
 }
 
-/// 新表必须进 `sync_log`，且 `/sync` 拉得回它的业务行。
+/// The new table must enter `sync_log`, and `/sync` must be able to pull its
+/// business row back.
 ///
-/// 漏掉 `load_payloads` 的那一支不是「项目同步不了」，而是**整条 /sync 断掉**：
-/// 一条 project_events 日志会让整批拉取报 UnknownTable，客户端的游标从此
-/// 卡死在它前面。会话那一侧的 `project_id` 同理 —— 不下发的话，别的设备上
-/// 所有会话都是未分组的，而它看起来只像「分组功能没同步过来」。
+/// Missing the arm in `load_payloads` does not mean "projects fail to sync", it
+/// means **the whole of /sync breaks**: one project_events log row makes the
+/// entire batch report UnknownTable, and the client's cursor is stuck in front
+/// of it from then on. The same goes for `project_id` on the session side —
+/// without shipping it, every session on other devices is ungrouped, and that
+/// merely looks like "the grouping feature didn't sync over".
 #[tokio::test]
 async fn project_events_and_the_session_link_flow_through_the_sync_log() {
     let Some(db) = common::setup().await else {
@@ -471,7 +552,10 @@ async fn project_events_and_the_session_link_flow_through_the_sync_log() {
     };
     let s = &db.store;
 
-    let before = s.latest_seq().await.expect("查游标不该失败");
+    let before = s
+        .latest_seq()
+        .await
+        .expect("querying the cursor should not fail");
 
     let created = NewProjectEvent::create("proj", "同步得到吗", Actor::User, DEV);
     let project_event_id = created.id.to_string();
@@ -481,16 +565,19 @@ async fn project_events_and_the_session_link_flow_through_the_sync_log() {
     let session_event_id = moved.id.to_string();
     emit_session(s, moved).await;
 
-    let records = s.fetch_since(before, 100).await.expect("增量拉取不该失败");
+    let records = s
+        .fetch_since(before, 100)
+        .await
+        .expect("the incremental pull should not fail");
 
     db.cleanup().await;
 
-    assert!(seq > before, "project_event 必须推进同步游标");
+    assert!(seq > before, "a project_event must advance the sync cursor");
 
     let project_hit = records
         .iter()
         .find(|r| r.table_name == table::PROJECT_EVENTS)
-        .unwrap_or_else(|| panic!("project_events 没有进 sync_log：{records:?}"));
+        .unwrap_or_else(|| panic!("project_events did not enter sync_log: {records:?}"));
     assert_eq!(project_hit.record_id, project_event_id);
     match project_hit.payload.as_ref() {
         Some(SyncPayload::ProjectEvent(e)) => {
@@ -498,19 +585,20 @@ async fn project_events_and_the_session_link_flow_through_the_sync_log() {
             assert_eq!(e.name.as_deref(), Some("同步得到吗"));
             assert_eq!(e.project_id, "proj");
         }
-        other => panic!("载荷类型不对，/sync 会下发不出去：{other:?}"),
+        other => panic!("wrong payload type, so /sync cannot deliver it: {other:?}"),
     }
 
     let session_hit = records
         .iter()
         .find(|r| r.record_id == session_event_id)
-        .unwrap_or_else(|| panic!("session_events 没有进 sync_log：{records:?}"));
+        .unwrap_or_else(|| panic!("session_events did not enter sync_log: {records:?}"));
     match session_hit.payload.as_ref() {
         Some(SyncPayload::SessionEvent(e)) => assert_eq!(
             e.project_id.as_deref(),
             Some("proj"),
-            "会话事件的 project_id 必须随载荷下发，否则别的设备上所有会话都是未分组的"
+            "a session event's project_id must ship inside the payload, or every session on \
+             other devices is ungrouped"
         ),
-        other => panic!("载荷类型不对：{other:?}"),
+        other => panic!("wrong payload type: {other:?}"),
     }
 }

@@ -1,32 +1,42 @@
-//! 转录回扫器：把预签名直传漏掉的媒体补回记忆。
+//! The transcription rescanner: bring back into memory the media that presigned
+//! direct upload skipped.
 //!
-//! # 为什么需要它
+//! # Why it is needed
 //!
-//! 上传有两条路：
+//! There are two upload paths:
 //!
-//! | 路径 | 服务端见过字节吗 | 转录 |
+//! | Path | Did the server see the bytes | Transcription |
 //! |---|---|---|
-//! | `POST /blobs` 中转（≤ 32 MiB） | 见过 | 上传时顺手排一次 |
-//! | `presign` + `commit`（> 32 MiB） | **从没见过** | 无从触发 |
+//! | relayed via `POST /blobs` (≤ 32 MiB) | yes | queued right there during upload |
+//! | `presign` + `commit` (> 32 MiB) | **never** | nothing to trigger it |
 //!
-//! 也就是说**大文件是纯归档，检索不到**。而大文件恰恰是最值钱的那些
-//! （长截图、扫描件、录屏），用户三个月后想找的正是它们。
+//! In other words **large files are pure archive and cannot be retrieved**. And
+//! large files are precisely the valuable ones (long screenshots, scans, screen
+//! recordings) — exactly what the user goes looking for three months later.
 //!
-//! 本模块以 `blobs` 表为权威清单，周期性地找出「可转录的类型 + 还没有任何
-//! `blob_transcripts` 行」的对象，从对象存储拉回来补跑一遍。它同时也兜住了
-//! 中转路径上转录失败/进程重启丢任务的那部分。
+//! This module treats the `blobs` table as the authoritative inventory,
+//! periodically finding objects that are "a transcribable type + have no
+//! `blob_transcripts` row at all", pulling them back from object storage and
+//! running the pipeline again. It also catches the cases on the relayed path
+//! where transcription failed or a process restart lost the job.
 //!
-//! # 四条必须守住的东西
+//! # Four things that must hold
 //!
-//! 1. **尊重 redaction。** 候选查询里就排掉了有墓碑的 blob（见
-//!    [`cortex_store::Store::blobs_missing_transcript`]），管线里
-//!    [`cortex_memory::transcribe::RedactionGuard`] 再复检一次。
-//!    少了第一道，回扫器会周期性地把已抹除的内容从对象存储拉回内存、
-//!    送上网 —— 即使结果最终被丢弃，秘密也已经出过进程了。
-//! 2. **限速限并发。** 一次把几百个大文件全拉下来会同时打爆内存与 vision
-//!    配额。批量、并发、单个体积三个闸门都在下面的常量里。
-//! 3. **失败可重试，但不能无限重试同一个坏 blob。** 见 [`Ledger`]。
-//! 4. **没配 `CORTEX_VISION_PROVIDER` 就整条关闭**，与上传路径一致。
+//! 1. **Respect redaction.** Blobs carrying a tombstone are excluded by the
+//!    candidate query itself (see
+//!    [`cortex_store::Store::blobs_missing_transcript`]), and
+//!    [`cortex_memory::transcribe::RedactionGuard`] rechecks inside the
+//!    pipeline. Without the first of those, the rescanner would periodically
+//!    pull erased content out of object storage into memory and send it over the
+//!    network — and even if the result is ultimately discarded, the secret has
+//!    already left the process.
+//! 2. **Rate-limit and bound concurrency.** Pulling several hundred large files
+//!    at once blows out memory and the vision quota simultaneously. All three
+//!    gates — batch size, concurrency, per-object size — are constants below.
+//! 3. **Failures may be retried, but one bad blob must not be retried
+//!    forever.** See [`Ledger`].
+//! 4. **With no `CORTEX_VISION_PROVIDER` configured, the whole thing is off**,
+//!    consistent with the upload path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,62 +47,74 @@ use cortex_core::CortexError;
 use crate::blobs::MediaStore;
 use crate::live::{Live, TranscribeOutcome};
 
-/// 两轮回扫之间的间隔。
+/// Interval between rescan rounds.
 ///
-/// 五分钟：直传完成到能被检索到之间的延迟上限。做得更短没有意义 ——
-/// 一次 vision 调用本身就要十几秒，而做得更长会让「刚传的大图搜不到」
-/// 从「等一会儿」变成「是不是坏了」。
+/// Five minutes: the upper bound on the delay between a direct upload finishing
+/// and the object becoming retrievable. Making it shorter is pointless — a
+/// single vision call already takes on the order of ten seconds — while making
+/// it longer turns "the large image I just uploaded is not searchable" from
+/// "wait a moment" into "is this broken?".
 const SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// 启动后等多久跑第一轮。
+/// How long after startup the first round runs.
 ///
-/// 不在启动瞬间就跑：进程刚起来时连接池在预热、embedding 模型可能还在加载，
-/// 此时压一批 vision 调用进去只会让启动更慢，而回扫本来就不急。
+/// Not immediately at startup: right after the process comes up, the connection
+/// pool is warming and the embedding model may still be loading, so pushing a
+/// batch of vision calls in only makes startup slower — and the rescan is not
+/// urgent to begin with.
 const FIRST_SCAN_DELAY: Duration = Duration::from_secs(30);
 
-/// 一轮最多处理多少个 blob。
+/// Maximum number of blobs handled in one round.
 ///
-/// 闸门作用在**每轮**而不是总量：积压一千个时它们会分几十轮消化完，
-/// 而任一时刻内存与配额的占用都是有界的。
+/// The gate applies **per round**, not to the total: a backlog of a thousand is
+/// consumed over a few dozen rounds, while the memory and quota footprint at any
+/// instant stays bounded.
 const BATCH: usize = 8;
 
-/// 同时在跑的转录数。
+/// How many transcriptions run at once.
 ///
-/// 2 而不是 8：每个在跑的任务都把整份字节握在内存里（见 [`MAX_BYTES`]），
-/// 而 vision 供应商那侧通常也有并发限流 —— 打满只会换来一批 429，
-/// 然后这些 blob 全被记成失败。
+/// 2 rather than 8: every running task holds the entire byte payload in memory
+/// (see [`MAX_BYTES`]), and vision providers usually rate-limit concurrency on
+/// their side too — saturating it just earns a batch of 429s, after which all
+/// of these blobs get recorded as failures.
 const CONCURRENCY: usize = 2;
 
-/// 单个 blob 的体积上限。
+/// Per-blob size ceiling.
 ///
-/// 转录要把整份字节读进内存（`BlobStore::get` 没有流式接口），一个 2 GB 的
-/// 录屏能直接把进程打死。超过这个数的**永久跳过**并明说 —— 静默跳过会让
-/// 「为什么这个视频搜不到」查无可查。
+/// Transcription has to read the whole payload into memory (`BlobStore::get` has
+/// no streaming interface), and a 2 GB screen recording can kill the process
+/// outright. Anything larger is **skipped permanently** and said so out loud —
+/// skipping silently leaves "why is this video not searchable" with nothing to
+/// investigate.
 ///
-/// 64 MiB 是直传门槛（32 MiB）的两倍：真正需要回扫的正是那一档。
+/// 64 MiB is twice the direct-upload threshold (32 MiB): that band is exactly
+/// what the rescan exists to rescue.
 const MAX_BYTES: i64 = 64 * 1024 * 1024;
 
-/// 同一个 blob 最多试几次。
+/// Maximum attempts per blob.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// SQL 侧的粗筛。
+/// Coarse filter on the SQL side.
 ///
-/// 只是**粗筛** —— 真正认领与否由转录管线按 MIME 决定。它存在的唯一理由是
-/// 不要把整张 `blobs` 表拉进内存。
+/// It is **only** a coarse filter — whether an object is actually claimed is
+/// decided by the transcription pipeline based on MIME. Its sole reason to exist
+/// is to avoid pulling the entire `blobs` table into memory.
 ///
-/// 眼下只有图片：`cortex-memory` 里没有可用的 ASR 实现（缺口见
-/// [`cortex_memory::transcribe::Transcriber`] 的文档），把 `audio/%` 与
-/// `video/%` 放进来只会让回扫器每五分钟把同一批视频认领一次、
-/// 拿到 `Unsupported`、再记一次日志。ASR 落地时改这里一行即可。
+/// Images only for now: `cortex-memory` has no usable ASR implementation (the
+/// gap is documented on [`cortex_memory::transcribe::Transcriber`]), and adding
+/// `audio/%` and `video/%` here would just make the rescanner claim the same
+/// batch of videos every five minutes, get `Unsupported`, and log it again. When
+/// ASR lands, one line here changes.
 const MIME_PREFIXES: &[&str] = &["image/%"];
 
-/// 起一个后台回扫任务。
+/// Spawn the background rescan task.
 ///
-/// 未配置 vision 模型时**什么都不做**（连任务都不起），与上传路径一致：
-/// 图片照常归档，只是检索不到。
+/// With no vision model configured it does **nothing at all** (the task is not
+/// even spawned), consistent with the upload path: images are still archived,
+/// they simply cannot be retrieved.
 pub fn spawn(st: crate::state::AppState, blobs: MediaStore) {
     let Some(live) = st.live().cloned() else {
-        return; // mock 后端，没有库可回扫
+        return; // mock backend: no database to rescan
     };
     if !live.transcription_enabled() {
         tracing::info!("未配置 vision 模型，转录回扫器不启动");
@@ -100,18 +122,22 @@ pub fn spawn(st: crate::state::AppState, blobs: MediaStore) {
     }
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_SCAN_DELAY).await;
-        // ledger（拉黑坏 blob）**每个租户一份**：hash 是内容寻址的，
-        // 两个租户可能各有一份同样字节的图，而其中一个转不了不代表
-        // 另一个也转不了（对象存储的键带租户前缀，可能只有一边缺文件）
+        // The ledger (which blacklists bad blobs) is **one per tenant**: hashes
+        // are content-addressed, so two tenants may each hold an image with
+        // identical bytes, and one of them being untranscribable does not mean
+        // the other is (object storage keys carry a tenant prefix, so the file
+        // may be missing on only one side)
         let mut ledgers: std::collections::HashMap<String, Ledger> =
             std::collections::HashMap::new();
         let mut tick = tokio::time::interval(SCAN_INTERVAL);
         loop {
             tick.tick().await;
 
-            // 每轮重新列：刚注册的人也要被回扫覆盖到。
-            // 原先这里只有启动时那个连 public 的 store，于是新用户传的图
-            // **永远不会被补转录** —— 而那没有任何症状，只是搜不到
+            // Re-enumerated each round: someone who just registered has to be
+            // covered by the rescan too. This used to hold only the startup
+            // store connected to public, so images uploaded by new users were
+            // **never transcribed** — with no symptom at all, they simply were
+            // not searchable
             let schemas = match st.tenant_schemas().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -128,18 +154,20 @@ pub fn spawn(st: crate::state::AppState, blobs: MediaStore) {
                 let ledger = ledgers.entry(schema.as_str().to_owned()).or_default();
                 scan_once(bound.as_live(), &blobs, ledger).await;
             }
-            // 已经不存在的租户不必再留着黑名单
+            // There is no reason to keep a blacklist for a tenant that no
+            // longer exists
             ledgers.retain(|k, _| schemas.iter().any(|s| s.as_str() == k));
         }
     });
 }
 
-/// 一轮回扫。
+/// One rescan round.
 async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
     let prefixes: Vec<String> = MIME_PREFIXES.iter().map(|s| (*s).to_string()).collect();
 
-    // 多要一些候选：已被 ledger 拉黑的那些还占着查询结果的位置，
-    // 只要 BATCH 条会让一个坏 blob 永久堵住它后面的队列
+    // Ask for more candidates than needed: the ones already blacklisted by the
+    // ledger still occupy slots in the query result, so asking for exactly
+    // BATCH would let one bad blob permanently block the queue behind it
     let want = (BATCH * 4) as i64;
     let candidates = match live.store().blobs_missing_transcript(&prefixes, want).await {
         Ok(v) => v,
@@ -160,9 +188,10 @@ async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
 
     tracing::info!(count = todo.len(), "开始回扫补转录");
 
-    // Semaphore 而不是 `buffer_unordered`：闸门要能被 `MAX_BYTES` 那条
-    // 提前返回的路径无成本地绕过（拿不到许可才等），而组合子会把每个 future
-    // 都排进队列
+    // A Semaphore rather than `buffer_unordered`: the gate has to be bypassable
+    // for free by the early-return path from `MAX_BYTES` (only a task that
+    // cannot get a permit waits), whereas the combinator would queue every
+    // future regardless
     let permits = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
     let mut tasks = Vec::with_capacity(todo.len());
 
@@ -185,17 +214,19 @@ async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
     }
 }
 
-/// 一个 blob 的回扫结局，从 ledger 的角度看。
+/// How one blob's rescan ended, from the ledger's point of view.
 enum Verdict {
-    /// 到此为止，不必再来（成功、被抹除、没人认领、太大）
+    /// Finished here; no need to come back (succeeded, redacted, unclaimed, or
+    /// too large)
     Done,
-    /// 这次没成，可以再试
+    /// Did not work this time, but worth another attempt
     Retry,
 }
 
 async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Blob) -> Verdict {
     if blob.size_bytes > MAX_BYTES {
-        // 明说而不是静默跳过：否则「为什么这个大文件搜不到」查无可查
+        // Say so out loud rather than skipping silently: otherwise "why is this
+        // large file not searchable" has nothing to investigate
         tracing::warn!(
             hash = %blob.hash,
             size_bytes = blob.size_bytes,
@@ -223,16 +254,17 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
                     tracing::info!(hash = %blob.hash, segments, "回扫补上了转录");
                 }
                 TranscribeOutcome::Unsupported { mime } => {
-                    // 粗筛放进来了但没有转录器认领（例如 image/heic）。
-                    // 重试多少次都是同一个结果，拉黑
+                    // The coarse filter let it in but no transcriber claims it
+                    // (image/heic, for instance). Any number of retries yields
+                    // the same result, so blacklist it
                     tracing::info!(hash = %blob.hash, mime, "没有转录器认领，回扫不再重试");
                 }
                 TranscribeOutcome::Redacted | TranscribeOutcome::Disabled => {
                     tracing::debug!(hash = %blob.hash, "回扫无需继续");
                 }
             }
-            // 四种结局都是**确定性**的：同样的字节再跑一遍还是同一个答案。
-            // 只有 Err 才值得重试
+            // All four outcomes are **deterministic**: running the same bytes
+            // again produces the same answer. Only an Err is worth retrying
             Verdict::Done
         }
         Err(e) => {
@@ -242,15 +274,19 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
     }
 }
 
-/// 「这次失败了」还是「这个永远转不了」。
+/// "It failed this time" versus "this can never be transcribed".
 ///
-/// [`CortexError::Invalid`] 是内容本身的问题（字节不是合法图片、转录器产出的
-/// 段落非法）—— 换一次网络重来一遍，结果一模一样。其余（供应商 5xx、限流、
-/// 数据库抖动、对象存储超时）都是环境问题，值得重试。
+/// [`CortexError::Invalid`] is a problem with the content itself (the bytes are
+/// not a valid image, the transcriber produced invalid segments) — running it
+/// again over a different network connection gives exactly the same result.
+/// Everything else (provider 5xx, rate limiting, database jitter, object storage
+/// timeouts) is environmental and worth retrying.
 ///
-/// 分错方向的代价不对称：把永久错误当成可重试，是每五分钟白烧一次模型调用；
-/// 把可重试当成永久，只是这一个 blob 要等到进程重启才再有机会。
-/// 因此拿不准时往「可重试」倒 —— 上面还有 [`MAX_ATTEMPTS`] 兜着。
+/// The cost of guessing wrong is asymmetric: treating a permanent error as
+/// retryable burns one model call every five minutes for nothing; treating a
+/// retryable error as permanent merely means this one blob has to wait for a
+/// process restart to get another chance. So when in doubt, lean towards
+/// "retryable" — [`MAX_ATTEMPTS`] is backing us up above.
 const fn classify(e: &CortexError) -> Verdict {
     match e {
         CortexError::Invalid(_) => Verdict::Done,
@@ -258,22 +294,27 @@ const fn classify(e: &CortexError) -> Verdict {
     }
 }
 
-/// 重试账本 —— **进程内**，不落库。
+/// The retry ledger — **in-process**, never persisted.
 ///
-/// # 为什么不建一张表
+/// # Why there is no table for this
 ///
-/// 落库要么走 [`cortex_store::Store::write_txn`]（那会给每次失败追加一行
-/// `sync_log`，把服务端的运维状态推送给每一台设备），要么绕过它裸写
-/// （那就打穿了「WriteTxn 是唯一写入口」这个结构性保证，而那个保证的全部
-/// 价值就在于没人能绕过）。两个代价都比它要解决的问题大。
+/// Persisting it would either go through
+/// [`cortex_store::Store::write_txn`] (which appends a `sync_log` row for every
+/// failure, pushing the server's operational state out to every device), or
+/// bypass it with a raw write (which punches through the structural guarantee
+/// that WriteTxn is the only write entry point — a guarantee whose entire value
+/// is that nobody can bypass it). Both costs exceed the problem being solved.
 ///
-/// 放弃的是**跨重启的记忆**：进程重启后一个坏 blob 会再被试一次。
-/// 这可以接受 —— 单次尝试的成本有界（一次取字节 + 一次模型调用），
-/// 而永久坏掉的 blob 本来就是稀有事件；重启也不是高频动作。
-/// 真正要防的「每五分钟重试同一个坏 blob 直到天荒地老」被挡住了。
+/// What is given up is **memory across restarts**: after a process restart, one
+/// bad blob gets tried again. That is acceptable — the cost of a single attempt
+/// is bounded (one byte fetch plus one model call), permanently broken blobs are
+/// a rare event to begin with, and restarts are not frequent. The thing actually
+/// worth preventing — retrying the same bad blob every five minutes until the
+/// end of time — is blocked.
 #[derive(Debug, Default)]
 struct Ledger {
-    /// hash → 已经试过几次。到达 [`MAX_ATTEMPTS`] 或拿到确定性结局即拉黑
+    /// hash → how many attempts so far. Blacklisted on reaching
+    /// [`MAX_ATTEMPTS`] or on any deterministic outcome
     attempts: HashMap<String, u32>,
     blocked: std::collections::HashSet<String>,
 }
@@ -286,9 +327,11 @@ impl Ledger {
     fn record(&mut self, hash: &str, verdict: Verdict) {
         match verdict {
             Verdict::Done => {
-                // 成功的那些下一轮本来就查不出来了（有 blob_transcripts 行），
-                // 拉黑是为了 Unsupported / 超大 / 内容坏掉这几类：
-                // 它们永远满足「没有转录行」这个候选条件
+                // The successful ones would not show up in the next round
+                // anyway (they now have a blob_transcripts row); the
+                // blacklisting is for the Unsupported / oversized / corrupt
+                // cases, which satisfy the "no transcript row" candidate
+                // condition forever
                 self.attempts.remove(hash);
                 self.blocked.insert(hash.to_owned());
             }
@@ -314,13 +357,15 @@ mod tests {
 
     #[test]
     fn a_deterministic_outcome_blocks_immediately() {
-        // Unsupported / 超大 / 字节坏掉这几类永远满足「没有转录行」这个候选
-        // 条件。不立刻拉黑的话，回扫器每五分钟就会把它们再认领一遍
+        // The Unsupported / oversized / corrupt-bytes cases satisfy the "no
+        // transcript row" candidate condition forever. Without an immediate
+        // blacklisting, the rescanner claims them again every five minutes
         let mut l = Ledger::default();
         l.record("a", Verdict::Done);
         assert!(
             l.is_blocked("a"),
-            "确定性结局必须立刻拉黑，否则会被无限认领"
+            "a deterministic outcome must be blacklisted immediately, or it will be claimed \
+             forever"
         );
     }
 
@@ -331,20 +376,24 @@ mod tests {
             l.record("b", Verdict::Retry);
             assert!(
                 !l.is_blocked("b"),
-                "第 {i} 次失败就放弃太早了 —— 供应商 5xx 与限流都是会自己好的"
+                "giving up on failure #{i} is far too early —— provider 5xx and rate limiting \
+                 both recover on their own"
             );
         }
         l.record("b", Verdict::Retry);
         assert!(
             l.is_blocked("b"),
-            "连续失败 {MAX_ATTEMPTS} 次后必须停手，否则一个坏 blob 会被无限重试"
+            "after {MAX_ATTEMPTS} consecutive failures it must stop, or one bad blob gets \
+             retried forever"
         );
     }
 
     #[test]
     fn only_content_errors_are_treated_as_permanent() {
-        // 分错方向的代价不对称：把永久错误当可重试是每轮白烧一次模型调用，
-        // 把可重试当永久只是这一个 blob 要等到重启。拿不准往「可重试」倒
+        // The cost of guessing wrong is asymmetric: treating a permanent error
+        // as retryable burns one model call per round for nothing, while
+        // treating a retryable one as permanent only makes this blob wait for a
+        // restart. When in doubt, lean towards "retryable"
         assert!(matches!(
             classify(&CortexError::Invalid("这不是一张合法的图片".into())),
             Verdict::Done
@@ -356,18 +405,21 @@ mod tests {
         ] {
             assert!(
                 matches!(classify(&transient), Verdict::Retry),
-                "{transient} 是环境问题，应当可重试"
+                "{transient} is an environmental problem and should be retryable"
             );
         }
     }
 
     #[test]
     fn the_size_ceiling_is_above_the_direct_upload_threshold() {
-        // 回扫要救的正是「大到必须走直传」的那一档。上限若低于直传门槛，
-        // 这个模块就一个 blob 都救不了，而且不会有任何报错
+        // The band the rescan exists to rescue is exactly "large enough that it
+        // had to go through direct upload". If the ceiling were below the
+        // direct-upload threshold, this module would rescue not a single blob —
+        // and would report nothing at all
         assert!(
             MAX_BYTES > crate::blobs::DIRECT_UPLOAD_LIMIT as i64,
-            "回扫体积上限必须高于直传门槛，否则它救不了任何一个直传上来的对象"
+            "the rescan size ceiling must exceed the direct-upload threshold, or it rescues \
+             none of the objects that arrived by direct upload"
         );
     }
 }

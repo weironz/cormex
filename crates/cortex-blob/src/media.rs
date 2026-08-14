@@ -1,39 +1,52 @@
-//! 媒体元数据探测：从字节流认出 MIME、图片宽高。
+//! Media metadata probing: recognizing the MIME type, and an image's width and
+//! height, from a byte stream.
 //!
-//! # 为什么要在这一层做
+//! # Why this belongs at this layer
 //!
-//! 客户端上报的 `Content-Type` 不可信（浏览器按扩展名猜，移动端常直接给
-//! `application/octet-stream`），而 `blobs.mime` 决定了下游怎么处理这份内容：
-//! 转录 pipeline 靠它分流到 ASR / vision / OCR，前端靠它决定用哪个播放器。
-//! 猜错的代价是这份内容**永久成为检索黑洞** —— 没人会回头重扫。
+//! The `Content-Type` a client reports is untrustworthy (browsers guess from
+//! the extension, mobile clients routinely send `application/octet-stream`
+//! outright), and `blobs.mime` determines how everything downstream handles the
+//! content: the transcription pipeline routes on it to ASR / vision / OCR, and
+//! the front end picks a player by it. The cost of guessing wrong is that this
+//! content becomes a **permanent retrieval black hole** — nobody ever goes back
+//! and rescans.
 //!
-//! 所以：以字节头为准，客户端声明只作后备。
+//! Hence: the bytes decide, and the client's claim is only a fallback.
 //!
-//! # 只读文件头，不解码
+//! # Read the header only; never decode
 //!
-//! 全部探测都只看前几十字节。对一段 200 MB 的视频不解码就是几百纳秒，
-//! 而解码它需要几百 MB 内存 —— 这是把探测放在上传热路径上的前提。
+//! Every probe looks at no more than the first few dozen bytes. For a 200 MB
+//! video, not decoding takes a few hundred nanoseconds, whereas decoding it
+//! would take a few hundred megabytes of memory — which is the premise on which
+//! probing can sit on the upload hot path at all.
 
 use serde::{Deserialize, Serialize};
 
-/// 从字节流探测出的媒体元数据。字段全部可选：探不出来就是探不出来，
-/// 绝不编一个默认值（`0x0` 的宽高会让前端布局算出除零）。
+/// Media metadata probed from a byte stream. Every field is optional: if it
+/// cannot be determined, it cannot be determined, and no default is ever
+/// invented (a `0x0` width and height would make the front end's layout divide
+/// by zero).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaMeta {
-    /// 由字节头判定的 MIME。探不出时为 `None`，调用方回落到客户端声明。
+    /// The MIME decided by the leading bytes. `None` when it cannot be
+    /// determined, in which case the caller falls back to the client's claim.
     pub mime: Option<String>,
-    /// 图片像素宽高。视频尺寸需要解容器，属于「重依赖」那一档，见下。
+    /// Image dimensions in pixels. Video dimensions would require demuxing the
+    /// container, which falls in the "heavy dependency" category; see below.
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// 音视频时长。**当前恒为 `None`**，理由见 [`probe`] 的文档。
+    /// The duration of audio or video. **Currently always `None`**; see the
+    /// documentation of [`probe`] for why.
     pub duration_ms: Option<u64>,
 }
 
 impl MediaMeta {
-    /// 取一个可直接写进 `blobs.mime` 的值：字节头优先，客户端声明兜底。
+    /// Produce a value that can be written straight into `blobs.mime`: the
+    /// leading bytes first, the client's claim as backstop.
     ///
-    /// 二者都缺时给 `application/octet-stream` —— 这是 `blobs.mime NOT NULL`
-    /// 的要求，也是 HTTP 对「不知道是什么」的标准答案。
+    /// When both are missing it gives `application/octet-stream` — which is
+    /// what `blobs.mime NOT NULL` requires, and also HTTP's standard answer for
+    /// "no idea what this is".
     #[must_use]
     pub fn resolve_mime(&self, declared: Option<&str>) -> String {
         self.mime
@@ -42,7 +55,8 @@ impl MediaMeta {
             .unwrap_or_else(|| DEFAULT_MIME.to_owned())
     }
 
-    /// 是否是图片。转录 pipeline 靠它分流到 vision/OCR。
+    /// Whether this is an image. The transcription pipeline routes on it to
+    /// vision/OCR.
     #[must_use]
     pub fn is_image(&self) -> bool {
         self.mime
@@ -50,7 +64,8 @@ impl MediaMeta {
             .is_some_and(|m| m.starts_with("image/"))
     }
 
-    /// 是否是音视频。分流到 ASR，也是将来时长探测唯一需要处理的一类。
+    /// Whether this is audio or video. Routes to ASR, and is also the only
+    /// category future duration probing would ever have to handle.
     #[must_use]
     pub fn is_audio_video(&self) -> bool {
         self.mime
@@ -59,39 +74,48 @@ impl MediaMeta {
     }
 }
 
-/// 不知道是什么时的 MIME。
+/// The MIME for "no idea what this is".
 pub const DEFAULT_MIME: &str = "application/octet-stream";
 
-/// 探测一段字节的媒体元数据。
+/// Probe a stretch of bytes for media metadata.
 ///
-/// # 时长为什么没做
+/// # Why duration was not implemented
 ///
-/// 拿到时长要解容器：MP4 得走 box 树读 `mvhd.duration/timescale`，
-/// Matroska 得读 `Segment/Info/Duration`，MP3 无容器只能扫帧算，
-/// 而 VBR 的 MP3 不扫完全文件就是错的。真做全格式只有两条路：
+/// Getting the duration means demuxing the container: MP4 requires walking the
+/// box tree to read `mvhd.duration/timescale`, Matroska requires reading
+/// `Segment/Info/Duration`, and MP3 has no container at all so the frames have
+/// to be scanned and summed — and for a VBR MP3 anything short of scanning the
+/// whole file is wrong. Doing this properly for every format leaves two routes:
 ///
-/// - 绑 ffmpeg：拖进 C 依赖与 GPL/LGPL 的许可证讨论，六端交叉编译全部受累
-/// - 上 `symphonia`：纯 Rust，但为了一个数字要背整套解复用器
+/// - Bind ffmpeg: which drags in a C dependency and a GPL/LGPL licensing
+///   discussion, and burdens cross-compilation for all six targets.
+/// - Adopt `symphonia`: pure Rust, but carrying an entire demuxer stack for the
+///   sake of one number.
 ///
-/// 而**时长现在没有消费方** —— 播放器自己会从流里读，检索用的是
-/// `blob_transcripts.span_*_ms`（由 ASR 产出，本来就带时间轴）。
-/// 所以留 `duration_ms: Option<u64>` 这个位置，等 ASR pipeline 落地时
-/// 顺手从转录结果里拿——那时它是免费的。
+/// And **duration currently has no consumer** — the player reads it out of the
+/// stream itself, and retrieval uses `blob_transcripts.span_*_ms` (produced by
+/// ASR, which carries a timeline anyway). So the slot `duration_ms:
+/// Option<u64>` is left here, to be filled from the transcription result when
+/// the ASR pipeline lands — at which point it is free.
 ///
-/// 在此之前此字段恒为 `None`，**不要**误以为「探测失败」。
+/// Until then this field is invariably `None`; do **not** mistake that for "the
+/// probe failed".
 #[must_use]
 pub fn probe(bytes: &[u8]) -> MediaMeta {
     let mime = infer::get(bytes).map(|t| t.mime_type().to_owned());
 
-    // 只对确实是图片的字节调 imagesize：它对非图片会做一轮无谓的头部匹配
+    // Only call imagesize on bytes that really are an image: on non-images it
+    // performs a pointless round of header matching.
     let (width, height) = match mime.as_deref() {
         Some(m) if m.starts_with("image/") => match imagesize::blob_size(bytes) {
             Ok(size) => (
                 u32::try_from(size.width).ok(),
                 u32::try_from(size.height).ok(),
             ),
-            // 认得出是图片却读不出尺寸，多半是被截断的上传。
-            // 不升级为错误：内容本身照存不误，尺寸缺失只是前端少一个布局提示。
+            // Recognizable as an image yet with unreadable dimensions is most
+            // likely a truncated upload. Not escalated to an error: the content
+            // itself is stored regardless, and missing dimensions only cost the
+            // front end one layout hint.
             Err(e) => {
                 tracing::debug!(error = %e, mime = m, "认出是图片但读不出尺寸，按未知处理");
                 (None, None)
@@ -112,8 +136,9 @@ pub fn probe(bytes: &[u8]) -> MediaMeta {
 mod tests {
     use super::*;
 
-    /// 最小合法 PNG：1×1 全透明。用真实字节而不是造假的头，
-    /// 才能同时验到 infer 与 imagesize 两条路径。
+    /// The smallest legal PNG: 1×1, fully transparent. Real bytes rather than a
+    /// faked header, so that both the infer and the imagesize paths are
+    /// exercised.
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
@@ -122,7 +147,8 @@ mod tests {
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
-    /// 最小 GIF87a：3×5，尺寸写在第 7..10 字节，用来验「宽高不是写死的」。
+    /// The smallest GIF87a: 3×5, with the dimensions written at bytes 7..10 —
+    /// used to verify that width and height are not hard-coded.
     const GIF_3X5: &[u8] = &[
         0x47, 0x49, 0x46, 0x38, 0x37, 0x61, 0x03, 0x00, 0x05, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
         0x00, 0xFF, 0xFF, 0xFF, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x02,
@@ -135,36 +161,52 @@ mod tests {
         assert_eq!(
             meta.mime.as_deref(),
             Some("image/png"),
-            "PNG 魔数没认出来，转录 pipeline 会把图片当二进制丢掉"
+            "the PNG magic number was not recognized, so the transcription pipeline would throw \
+             the image away as binary"
         );
         assert_eq!(
             (meta.width, meta.height),
             (Some(1), Some(1)),
-            "1×1 PNG 的尺寸读错"
+            "the dimensions of a 1×1 PNG were read wrong"
         );
-        assert!(meta.is_image(), "PNG 应被判定为图片以便分流到 vision/OCR");
-        assert!(!meta.is_audio_video(), "PNG 不该被判定为音视频");
+        assert!(
+            meta.is_image(),
+            "a PNG should be judged an image so it routes to vision/OCR"
+        );
+        assert!(
+            !meta.is_audio_video(),
+            "a PNG should not be judged audio or video"
+        );
     }
 
     #[test]
     fn dimensions_are_read_not_guessed() {
         let meta = probe(GIF_3X5);
-        assert_eq!(meta.mime.as_deref(), Some("image/gif"), "GIF 魔数没认出来");
+        assert_eq!(
+            meta.mime.as_deref(),
+            Some("image/gif"),
+            "the GIF magic number was not recognized"
+        );
         assert_eq!(
             (meta.width, meta.height),
             (Some(3), Some(5)),
-            "宽高应真从文件头读出（3×5 非正方，写死值会在这里露馅）"
+            "width and height should really be read from the file header (3×5 is not square, so \
+             hard-coded values give themselves away here)"
         );
     }
 
     #[test]
     fn unknown_bytes_yield_no_guesses() {
         let meta = probe(b"just some plain text, no magic bytes at all");
-        assert_eq!(meta.mime, None, "认不出就该是 None，绝不编造 MIME");
+        assert_eq!(
+            meta.mime, None,
+            "unrecognized has to mean None; never invent a MIME"
+        );
         assert_eq!(
             (meta.width, meta.height),
             (None, None),
-            "非图片必须留空，编一个 0×0 会让前端布局除零"
+            "non-images must be left empty; inventing a 0×0 makes the front end's layout divide \
+             by zero"
         );
     }
 
@@ -174,35 +216,39 @@ mod tests {
         assert_eq!(
             meta.resolve_mime(Some("application/octet-stream")),
             "image/png",
-            "客户端声明不可信 —— 字节头认出是 PNG 时必须以字节头为准"
+            "the client's claim is untrustworthy — when the leading bytes say PNG, the bytes win"
         );
 
         let unknown = probe(b"...");
         assert_eq!(
             unknown.resolve_mime(Some("text/markdown")),
             "text/markdown",
-            "字节头认不出时才回落到客户端声明"
+            "only when the leading bytes say nothing does it fall back to the client's claim"
         );
         assert_eq!(
             unknown.resolve_mime(None),
             DEFAULT_MIME,
-            "两者都缺时须给出可写进 blobs.mime NOT NULL 的值"
+            "with both missing it must still yield something writable into blobs.mime NOT NULL"
         );
         assert_eq!(
             unknown.resolve_mime(Some("")),
             DEFAULT_MIME,
-            "空字符串的声明等同于没有声明，不能原样写进 blobs.mime"
+            "a claim of the empty string is the same as no claim, and must not be written into \
+             blobs.mime verbatim"
         );
     }
 
     #[test]
     fn duration_is_deliberately_absent() {
-        // 这不是缺陷是取舍：见 probe 的文档。此断言在真做时长探测时会失败，
-        // 那正是提醒去更新文档与调用方的时刻。
+        // Not a defect but a trade-off: see the documentation of probe. This
+        // assertion will fail once duration probing is actually implemented,
+        // which is precisely the moment to go and update the docs and the
+        // callers.
         assert_eq!(
             probe(PNG_1X1).duration_ms,
             None,
-            "时长探测尚未实现（等 ASR pipeline 顺手产出），当前必须恒为 None"
+            "duration probing is not implemented yet (it comes free with the ASR pipeline), so \
+             for now it must invariably be None"
         );
     }
 
@@ -212,7 +258,7 @@ mod tests {
         assert_eq!(
             meta,
             MediaMeta::default(),
-            "空输入应得到全空元数据而不是 panic"
+            "empty input should yield entirely empty metadata rather than a panic"
         );
     }
 }

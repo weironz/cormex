@@ -5,19 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex 的核心业务逻辑：记忆引擎、agent 循环、工具执行"
+description = "The core business logic of Cortex: the memory engine, the agent loop, tool execution"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 chrono.workspace = true
-# Id::derived 的确定性哈希。
+# The deterministic hash behind Id::derived.
 #
-# **不能用 std 的 DefaultHasher** —— 它明确不保证跨 Rust 版本稳定，
-# 而这里算出来的 id 是导入幂等性的全部依据：换个工具链编译一次，
-# 同一条消息就会得到不同的 id，于是整份历史被重新导入一遍。
-# sha2 已经在 cortex-blob 与 cortexd 的依赖树里，不新增编译量。
+# **std's DefaultHasher must not be used** -- it explicitly makes no promise of stability
+# across Rust versions, while the id computed here is the entire basis of import
+# idempotency: compile once with a different toolchain and the same message gets a different
+# id, so the whole history is imported all over again.
+# sha2 is already in the dependency trees of cortex-blob and cortexd, so it adds nothing to
+# the compile.
 sha2 = "0.10"
 thiserror.workspace = true
 anyhow.workspace = true

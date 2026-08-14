@@ -14,17 +14,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── 格式与静态检查 ──────────────────────────────────────
+  # ── Formatting and static checks ────────────────────────
   lint:
-    name: 格式与 Clippy
+    name: Formatting and Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      # 装的是 stable，真正跑的是 rust-toolchain.toml 里钉的 1.97.1 ——
-      # rustup 的代理看到工具链文件会自己把它拉下来（连同文件里声明的
-      # rustfmt / clippy）。这里**刻意不把版本号再写一遍**：写死在 YAML 里
-      # 的那份迟早与工具链文件漂移，而漂移的症状是「CI 过了本机没过」
+      # What gets installed is stable; what actually runs is the 1.97.1 pinned in
+      # rust-toolchain.toml -- rustup's proxy sees the toolchain file and fetches that
+      # itself (together with the rustfmt / clippy the file declares). The version is
+      # **deliberately not written out a second time** here: a copy hard-coded into YAML
+      # will drift from the toolchain file sooner or later, and the symptom of that drift
+      # is "CI passes, the local machine does not"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -34,21 +36,24 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      # `-D warnings` 走命令行而不是 `RUSTFLAGS` 环境变量：RUSTFLAGS 会进入
-      # 编译指纹，于是 lint 与 test 两个 job 各自编一套依赖、Swatinem 的缓存
-      # 互相命中不了；而且它对整棵依赖树生效，第三方 crate 的一条警告就能
-      # 把我们的 CI 弄红。命令行的 `--` 之后只作用于本 workspace 的 crate。
+      # `-D warnings` goes on the command line rather than through the `RUSTFLAGS`
+      # environment variable: RUSTFLAGS becomes part of the compilation fingerprint, so the
+      # lint and test jobs would each build their own copy of the dependencies and
+      # Swatinem's cache would never hit across them; and it applies to the whole
+      # dependency tree, so a single warning in a third-party crate could turn our CI red.
+      # After `--` on the command line it only applies to this workspace's crates.
       #
-      # `--locked`：Cargo.lock 在仓库里就得当真。pgvector 的 sqlx 依赖范围
-      # 跨 semver 组，放开会把 sqlx 拉回 0.8 并造成两份 sqlx-core 共存
-      # （51 个编译错误，见 CLAUDE.md）。不加这个标志，锁文件可以被静默改写，
-      # 而改写发生在 CI 的临时目录里，没人会看见
+      # `--locked`: a Cargo.lock that is in the repository has to be taken at its word.
+      # pgvector's sqlx dependency range spans a semver group, and letting it float pulls
+      # sqlx back to 0.8 and leaves two copies of sqlx-core coexisting (51 compile errors,
+      # see CLAUDE.md). Without this flag the lock file can be silently rewritten, and the
+      # rewrite happens in CI's temporary directory where nobody will ever see it
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # ── 测试 ───────────────────────────────────────────────
+  # ── Tests ──────────────────────────────────────────────
   test:
-    name: 测试
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -57,34 +62,38 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # 用固定版本而不是 `cargo install sqlx-cli`：后者每次 CI 都要现编
-      # 几分钟，而这里只需要一个能跑 migrate 的二进制
-      - name: 安装 sqlx-cli
+      # A pinned version rather than `cargo install sqlx-cli`: the latter has to be
+      # compiled from scratch on every CI run, costing minutes, while all that is needed
+      # here is a binary that can run migrate
+      - name: Install sqlx-cli
         run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
 
-      # ★ 两份 migration **必须分两次跑，且各自的版本表在各自的 schema 里**。
-      #   混成一套的症状不是「报错」，是在建号中途炸 —— 一半的表建好了、
-      #   `_sqlx_migrations` 记着另一半，之后每次跑都从中间接着来。
-      #   本机等价物是 `just db-migrate`，那边也是分开的两条。
-      - name: 应用 migration
+      # ★ The two migration sets **have to be run separately, each with its version table
+      #   in its own schema**. The symptom of merging them is not "an error" but blowing up
+      #   halfway through account creation -- half the tables built, `_sqlx_migrations`
+      #   recording the other half, and every later run resuming from the middle.
+      #   The local equivalent is `just db-migrate`, where they are two separate lines too.
+      - name: Apply migrations
         run: |
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations-global
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
 
-      # ★ `--include-ignored` 不能省。要数据库的测试全都标了 `#[ignore]`，
-      #   默认跑法会跳过它们 —— 而在 CI 的输出里 **「ignored」与「ok」看上去
-      #   一样绿**。没有这个标志时这道门覆盖的只有纯逻辑那一半，
-      #   召回 / 事务 / migration 那一半（也就是这个产品的核心）没有被覆盖。
+      # ★ `--include-ignored` cannot be left out. Every test that needs a database is marked
+      #   `#[ignore]`, and the default invocation skips them -- while in CI's output
+      #   **"ignored" and "ok" look equally green**. Without this flag the gate covers only
+      #   the pure-logic half, leaving the retrieval / transaction / migration half (which
+      #   is to say the core of this product) uncovered.
       - name: cargo test
         run: cargo test --workspace --locked -- --include-ignored
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
 
-    # pgvector 而不是官方 postgres 镜像：召回那一路要 `vector` 扩展，
-    # 缺了它 migration 第一条就炸。版本跟着 deploy 的 compose 走（pg17），
-    # 让「CI 绿了但生产上炸」少一个来源
+    # pgvector rather than the official postgres image: the retrieval leg needs the
+    # `vector` extension, and without it the very first migration blows up. The version
+    # follows deploy's compose (pg17), removing one more source of "CI went green but
+    # production exploded"
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -92,8 +101,9 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: cormex_test
         ports: ["5432:5432"]
-        # 没有这个 health-cmd 的话，job 会在 Postgres 还没接受连接时就开始跑
-        # migration —— 失败是间歇性的，而间歇性的 CI 失败没人会去查
+        # Without this health-cmd the job would start running migrations while Postgres is
+        # not yet accepting connections -- the failure is intermittent, and nobody ever
+        # goes and investigates an intermittent CI failure
         options: >-
           --health-cmd pg_isready
           --health-interval 10s

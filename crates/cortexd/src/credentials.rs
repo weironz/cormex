@@ -1,56 +1,73 @@
-//! 账号凭据 —— 密码怎么存、refresh token 怎么校验、什么时候要把整条链子作废。
+//! Account credentials — how passwords are stored, how refresh tokens are
+//! verified, and when the entire chain must be revoked.
 //!
-//! 这个模块只有**纯逻辑**：不碰数据库、不碰 HTTP、不做租户隔离。
-//! 它回答三个问题，每一个的错误答案都不会在测试里显形，只会在事后显形。
+//! This module contains **pure logic** only: it touches neither the database nor
+//! HTTP, and does no tenant isolation. It answers three questions, and a wrong
+//! answer to any of them does not show up in tests — only afterwards.
 //!
-//! # 一、为什么密码不能沿用 [`crate::auth`] 那套 SHA-256
+//! # 1. Why passwords cannot reuse [`crate::auth`]'s SHA-256
 //!
-//! `auth.rs` 论证过「预共享 token 用 SHA-256 摘要就够，不需要慢 KDF」，
-//! 那段论证是对的，但它**明写了一个前提**：token 是 256 位内核随机数。
-//! 慢 KDF 防的是「低熵秘密被离线爆破」，而对高熵随机串来说，把每次尝试
-//! 慢一百万倍，爆破时间只是从「宇宙年龄」变成「宇宙年龄」—— 白付一份依赖
-//! 和每请求几十毫秒的 CPU。
+//! `auth.rs` argued that "a SHA-256 digest is enough for a pre-shared token, no
+//! slow KDF needed", and that argument is correct — but it **states a premise
+//! explicitly**: the token is 256 bits of kernel randomness. A slow KDF defends
+//! against "offline brute-forcing of a low-entropy secret", and for a
+//! high-entropy random string, making each attempt a million times slower moves
+//! the brute-force time from "the age of the universe" to "the age of the
+//! universe" — paying for a dependency and tens of milliseconds of CPU per
+//! request in exchange for nothing.
 //!
-//! **人选的密码不满足那个前提。** 它的真实熵在二三十位量级，而且分布高度
-//! 集中在几百万个已知串上。对这种秘密，单次尝试的成本**就是**唯一的防线：
-//! 库被拖走之后，SHA-256 让攻击者一秒试几十亿个，argon2id 让他一秒试几千个。
-//! 同一条判据（秘密是否高熵），两侧结论相反。
+//! **A human-chosen password does not satisfy that premise.** Its real entropy
+//! is on the order of twenty or thirty bits, and its distribution is heavily
+//! concentrated on a few million known strings. For a secret like that, the cost
+//! of a single attempt **is** the only defence: after the database is stolen,
+//! SHA-256 lets the attacker try billions per second while argon2id lets them
+//! try thousands. One criterion (is the secret high-entropy), opposite
+//! conclusions on either side of it.
 //!
-//! 所以这个文件里会出现一个看起来自相矛盾的组合：
+//! Which is why this file contains a combination that looks self-contradictory:
 //!
-//! | 秘密 | 谁选的 | 熵 | 存法 |
+//! | Secret | Chosen by | Entropy | Stored as |
 //! |---|---|---|---|
-//! | 密码 | 人 | 低 | **argon2id**（慢，抗离线爆破） |
-//! | refresh token | 内核 CSPRNG | 256 位 | **SHA-256**（快，够用） |
+//! | password | a human | low | **argon2id** (slow, resists offline brute force) |
+//! | refresh token | kernel CSPRNG | 256 bits | **SHA-256** (fast, sufficient) |
 //!
-//! 它不是不一致，是同一条判据的两侧。谁要是「顺手统一一下」，
-//! 无论统一到哪边都是错的：统一到 SHA-256 是把密码库送人，
-//! 统一到 argon2 是让每次刷新令牌都烧掉几十毫秒 CPU（而刷新比登录频繁得多）。
+//! This is not an inconsistency, it is the two sides of one criterion. Anyone
+//! who "unifies them while they are in here" is wrong whichever way they unify:
+//! unifying on SHA-256 gives away the password database, and unifying on argon2
+//! burns tens of milliseconds of CPU on every token refresh (and refreshes are
+//! far more frequent than logins).
 //!
-//! # 二、refresh token 轮转与 family
+//! # 2. Refresh token rotation and families
 //!
-//! 每次用 refresh token 换新的 access token，这条 token 就作废并轮转出一个
-//! 后继。一条轮转链叫一个 **family**。
+//! Every time a refresh token is exchanged for a new access token, that token is
+//! retired and rotates out a successor. One rotation chain is called a
+//! **family**.
 //!
-//! 这样做的意义全在于：**被轮转过的旧 token 再次出现 = 它泄露了**。
-//! 正常客户端拿到后继之后不会再用旧的那条；会用旧的那条的只有两种人 ——
-//! 拿到副本的攻击者，或者被攻击者抢先用掉后继的真用户。**分不清是哪一种，
-//! 也不需要分清**：两种情形下正确的动作都是把整条 family 作废，让双方
-//! 一起重新登录。见 [`judge_refresh`]。
+//! The entire point of doing it this way: **an already-rotated old token showing
+//! up again = it leaked**. A normal client never reuses the old one after
+//! receiving its successor; only two kinds of party would — an attacker holding
+//! a copy, or the real user whose successor the attacker consumed first. **We
+//! cannot tell which, and we do not need to**: in both cases the correct action
+//! is to revoke the entire family and make both sides log in again. See
+//! [`judge_refresh`].
 
-// 本模块是账号体系的**纯逻辑那一半**，调用它的路由与仓储还没落地。
-// cortexd 是 bin crate，`pub` 在这里不豁免 dead_code，于是在被接上之前
-// 每一个导出项都是一条 `-D warnings` 下的编译错误。
+// This module is the **pure-logic half** of the accounts system, and the routes
+// and repositories that call it have not landed yet. cortexd is a bin crate, so
+// `pub` does not exempt anything from dead_code here, and until it is wired up
+// every exported item is a compile error under `-D warnings`.
 //
-// 这与 CLAUDE.md 里「优先让代码真的用起来，而不是加 allow」的要求相抵触，
-// 而这里的实情是「马上就会用起来」—— 所以这条 allow 是**脚手架**：
-// 路由一接上就该删掉它，删掉之后如果还有东西报 dead_code，
-// 那就是真的没人用，该按那条规则处理。
+// That conflicts with CLAUDE.md's requirement to "make the code genuinely used
+// rather than adding an allow", and the truth here is "it is about to be used"
+// — so this allow is **scaffolding**: it should be deleted the moment the
+// routes are wired in, and if anything still reports dead_code afterwards, then
+// it genuinely has no callers and should be handled by that rule.
 //
-// 没用 `#[expect(dead_code)]`（它会在不再需要时自动报警、自己催自己删除，
-// 本该是更好的选择）：测试里这些项**全都被用到**，于是 `--all-targets`
-// 编译测试目标时这条 expect 是「未兑现」的，反过来触发
-// `unfulfilled_lint_expectations`。两个目标各要一种写法，只有 allow 两边都过。
+// `#[expect(dead_code)]` was not used (it warns automatically once no longer
+// needed and thus nags for its own removal, which would have been the better
+// choice): these items are **all used** inside the tests, so when
+// `--all-targets` compiles the test target that expectation is "unfulfilled",
+// which in turn triggers `unfulfilled_lint_expectations`. The two targets each
+// demand a different spelling, and only allow passes both.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use cortex_core::Id;
@@ -58,113 +75,148 @@ use password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, Sa
 use sha2::{Digest as _, Sha256};
 
 // ══════════════════════════════════════════════════════════════
-//  一、密码
+//  1. Passwords
 // ══════════════════════════════════════════════════════════════
 
-/// 密码最短长度。
+/// Minimum password length.
 ///
-/// 12 而不是 8：argon2id 把离线爆破从「每秒几十亿」压到「每秒几千」，
-/// 这个倍率对 8 位密码不够 —— 常见的 8 位口令基本都在几亿条的字典里，
-/// 每秒几千也就是几天。12 位把字典空间推到需要真正的算力预算。
+/// 12 rather than 8: argon2id compresses offline brute force from "billions per
+/// second" to "thousands per second", and that factor is not enough for an
+/// 8-character password — common 8-character passphrases essentially all sit in
+/// dictionaries of a few hundred million entries, and at thousands per second
+/// that is a matter of days. 12 pushes the dictionary space up to where a real
+/// compute budget is required.
 ///
-/// **刻意没有任何组合规则**（必须含大写 / 数字 / 符号）。那类规则的实测效果是
-/// 把人推向 `Password1!` 这种形状 —— 它满足全部规则，而且就在字典的最前面。
-/// 长度是唯一一个「照做就真的多出熵」的要求，所以这里只要长度。
+/// **There are deliberately no composition rules** (must contain uppercase /
+/// digits / symbols). The measured effect of such rules is to push people
+/// towards the shape `Password1!` — which satisfies every rule and sits right
+/// at the front of the dictionary. Length is the only requirement where
+/// complying genuinely adds entropy, so length is all that is asked for here.
 pub const MIN_PASSWORD_LEN: usize = 12;
 
-/// 密码最长长度。
+/// Maximum password length.
 ///
-/// argon2 的开销与输入长度几乎无关，所以长密码本身不是 DoS —— 加这个上界
-/// 是为了让「密码」这个字段的形状有限，不至于因为上游某处漏了 body 限制，
-/// 就有一条把 100 MB 塞进哈希函数的路径。1 KiB 对任何 passphrase 都绰绰有余。
+/// argon2's cost is almost independent of input length, so a long password is
+/// not itself a DoS — this bound exists to keep the shape of the "password"
+/// field finite, so that a missing body limit somewhere upstream does not create
+/// a path that feeds 100 MB into a hash function. 1 KiB is far more than enough
+/// for any passphrase.
 pub const MAX_PASSWORD_LEN: usize = 1024;
 
-/// 盐的字节数。16 字节是 PHC 的推荐值，也是 [`SaltString`] 的 `RECOMMENDED_LENGTH`。
+/// Salt length in bytes. 16 is PHC's recommended value and also
+/// [`SaltString`]'s `RECOMMENDED_LENGTH`.
 const SALT_BYTES: usize = 16;
 
-/// 内存开销，单位 KiB —— 19 MiB。
+/// Memory cost in KiB — 19 MiB.
 ///
-/// # 为什么是 19 MiB，而不是「越大越安全」
+/// # Why 19 MiB, rather than "bigger is safer"
 ///
-/// 这是 OWASP 对 argon2id 给出的第一档推荐（m=19 MiB, t=2, p=1）。选它不是
-/// 因为它是默认值，是因为**生产机器是 2 核 3.5 GB，上面已经跑着 19 个容器**。
+/// This is OWASP's first-tier recommendation for argon2id (m=19 MiB, t=2, p=1).
+/// It was chosen not because it is the default, but because **the production
+/// machine is 2 cores and 3.5 GB, already running 19 containers**.
 ///
-/// 内存这一项其实是最便宜的：19 MiB 是**每次哈希瞬时**占用，几个并发登录
-/// 也就几十 MB，用完即还。真正会出事的是 CPU —— 见 [`T_COST`]。
+/// Memory is actually the cheapest of the three: 19 MiB is an **instantaneous
+/// per-hash** allocation, so a handful of concurrent logins is tens of MB,
+/// returned as soon as it is done. What actually goes wrong is CPU — see
+/// [`T_COST`].
 ///
-/// 往上调（比如 64 MiB）在这台机器上买到的抗 GPU 能力有限，却让「几个并发
-/// 登录」变成「几百 MB 瞬时峰值」，而这台机器的内存本来就是被 19 个容器分完的。
+/// Raising it (to 64 MiB, say) buys limited GPU resistance on this machine while
+/// turning "a handful of concurrent logins" into a several-hundred-MB
+/// instantaneous peak — on a machine whose memory is already divided among 19
+/// containers.
 const M_COST_KIB: u32 = 19 * 1024;
 
-/// 迭代次数。
+/// Iteration count.
 ///
-/// 与 `M_COST_KIB` 配套的 OWASP 推荐值。**实测**（release，开发机单核空闲）：
+/// OWASP's recommended value paired with `M_COST_KIB`. **Measured** (release
+/// build, single idle core on a development machine):
 ///
-/// | 参数 | 单次 |
+/// | Parameters | Per hash |
 /// |---|---|
-/// | m=19 MiB, t=2, p=1（本模块） | 16.5 ms |
+/// | m=19 MiB, t=2, p=1 (this module) | 16.5 ms |
 /// | m=19 MiB, t=3, p=1 | 22.7 ms |
-/// | m=64 MiB, t=3, p=1（OWASP 另一档） | 89.6 ms |
+/// | m=64 MiB, t=3, p=1 (OWASP's other tier) | 89.6 ms |
 ///
-/// 生产那台 2 核、CPU 被 19 个容器分掉的机器上按 2–4 倍算，即 35–70 ms。
+/// On the production machine — 2 cores, CPU divided among 19 containers —
+/// reckon 2–4x that, i.e. 35–70 ms.
 ///
-/// 所以这里其实**有余量**，t 调到 3 也还在可接受范围。没调，是因为多出来的
-/// 那 6 ms 换到的抗爆破倍率只有 1.5 倍，而它会等比例放大下面这件事：
+/// So there is in fact **headroom** here, and raising t to 3 would still be
+/// within the acceptable range. It was not raised, because the extra 6 ms buys
+/// only a 1.5x brute-force resistance factor while scaling the following problem
+/// proportionally:
 ///
-/// **登录本身就是最好的 DoS 放大器**。一个不需要任何凭据的攻击者，只要往
-/// `/login` 灌错误密码，每条请求就白烧掉服务端一份 argon2 —— 在这台机器上
-/// 每秒二三十条请求就能吃掉一个核（总共两个）。参数翻倍等于把他的放大倍率
-/// 翻倍，而抗爆破只线性变好。
+/// **The login endpoint is itself the best DoS amplifier available.** An
+/// attacker needing no credentials at all merely pours wrong passwords into
+/// `/login`, and each request burns one argon2 on the server for nothing — on
+/// this machine, twenty or thirty requests per second consumes one core (out of
+/// two). Doubling the parameters doubles their amplification factor while
+/// brute-force resistance improves only linearly.
 ///
-/// 真正该防这件事的是登录端点上的限流，不是把 KDF 调软（调软的代价由全体
-/// 用户在拖库那天付）。**限流落地之后，这个常量才值得重新讨论。**
+/// The thing that should actually defend against this is rate limiting on the
+/// login endpoint, not softening the KDF (whose cost is paid by every user on
+/// the day the database is stolen). **This constant is worth revisiting once
+/// rate limiting lands.**
 ///
-/// 注意 debug build 下这套参数要 400 ms 以上 —— 那是未优化的 argon2，
-/// 不是参数选狠了。别照着开发机上跑测试的手感去调它。
+/// Note that under a debug build these parameters take over 400 ms — that is
+/// unoptimized argon2, not parameters chosen too aggressively. Do not tune this
+/// by how it feels while running tests on a development machine.
 const T_COST: u32 = 2;
 
-/// 并行度。
+/// Parallelism.
 ///
-/// **必须是 1，而且这一条比看上去要紧。** `argon2` crate 在没有开 `parallel`
-/// feature 时，p>1 的那些 lane 是**顺序**算的 —— 也就是说把 p 调到 2 只会让
-/// 单次哈希的墙钟时间翻倍，一点并行收益都没有，纯粹是自己给自己加了一倍
-/// 的 DoS 放大倍率。
+/// **It must be 1, and this matters more than it looks.** With the `argon2`
+/// crate's `parallel` feature off, the lanes for p>1 are computed
+/// **sequentially** — meaning that raising p to 2 merely doubles the wall-clock
+/// time of a single hash with no parallel benefit whatsoever, purely doubling
+/// your own DoS amplification factor.
 ///
-/// 就算真开了并行：这台机器只有 2 核。让一次登录吃掉两个核，意味着一个人
-/// 登录期间整台机器（连同那 19 个容器）都在等。
+/// Even with parallelism genuinely enabled: this machine has 2 cores. Letting one
+/// login consume both means that for the duration of one person's login, the
+/// whole machine (along with those 19 containers) is waiting.
 const P_COST: u32 = 1;
 
-/// 本部署的 argon2id 实例。
+/// This deployment's argon2id instance.
 ///
-/// 每次调用现构造：`Argon2::new` 只是填几个 u32，没有预计算，
-/// 缓存它换不到任何东西，却要引入一个 `OnceLock` 和「参数是什么时候定的」
-/// 这个问题。
+/// Constructed fresh on every call: `Argon2::new` only fills in a few u32s and
+/// precomputes nothing, so caching it buys nothing while introducing a
+/// `OnceLock` and the question "when were these parameters fixed".
 fn hasher() -> Argon2<'static> {
-    // 参数是常量且已在上面逐条论证过合法性（m ≥ 8p、t ≥ 1、p ≥ 1），
-    // 构造不出错。真出错说明有人改坏了上面的常量，此时崩在启动路径上
-    // 远好过悄悄退化成弱参数
-    let params = Params::new(M_COST_KIB, T_COST, P_COST, None)
-        .expect("argon2 参数是编译期常量，构造失败说明本模块的常量被改坏了");
+    // The parameters are constants whose validity has been argued point by point
+    // above (m ≥ 8p, t ≥ 1, p ≥ 1), so construction cannot fail. If it does
+    // fail, somebody broke the constants above, and crashing on the startup path
+    // is far better than silently degrading to weak parameters
+    let params = Params::new(M_COST_KIB, T_COST, P_COST, None).expect(
+        "the argon2 parameters are compile-time constants; a failed construction means this \
+         module's constants were broken",
+    );
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// 把明文密码哈希成 PHC 字符串（`$argon2id$v=19$m=19456,t=2,p=1$<盐>$<摘要>`）。
+/// Hash a plaintext password into a PHC string
+/// (`$argon2id$v=19$m=19456,t=2,p=1$<salt>$<digest>`).
 ///
-/// 产出的是**自描述**的 PHC 串：参数和盐都编在里面。所以 [`verify_password`]
-/// 不读上面那几个常量，只读这个串 —— 这意味着以后调高参数时，老密码照样能验，
-/// 用户下次登录时再按新参数重算即可，不需要一次性迁移，也不需要在库里
-/// 存一列「这行是用哪代参数算的」。
+/// What it produces is a **self-describing** PHC string: the parameters and salt
+/// are encoded inside it. Which is why [`verify_password`] does not read the
+/// constants above and reads only this string — meaning that when the
+/// parameters are raised later, old passwords still verify, and the user's next
+/// login recomputes under the new parameters. No one-shot migration, and no
+/// column in the database recording "which generation of parameters this row
+/// used".
 pub fn hash_password(plain: &str) -> cortex_core::Result<String> {
     check_password_shape(plain)?;
 
-    // 盐直接取自内核 CSPRNG，而不是走 `SaltString::generate(&mut OsRng)`。
+    // The salt comes straight from the kernel CSPRNG rather than going through
+    // `SaltString::generate(&mut OsRng)`.
     //
-    // 后者要 `password-hash` 打开 `rand_core/getrandom`，于是「盐是不是真随机」
-    // 就取决于一条**跨 crate 的 feature 传递**能不能一直传对 —— 而 feature
-    // 被谁关掉了这件事不会报错，只会让盐变弱，且没有任何症状。
-    // `getrandom` 本来就是本 crate 的直接依赖（见 auth.rs 的同类理由）。
+    // The latter requires `password-hash` to enable `rand_core/getrandom`, so
+    // "is the salt genuinely random" comes to depend on a **feature propagating
+    // correctly across crates** — and somebody turning that feature off raises
+    // no error, it merely weakens the salt, with no symptom at all. `getrandom`
+    // is a direct dependency of this crate anyway (same reasoning as in
+    // auth.rs).
     let mut salt_bytes = [0u8; SALT_BYTES];
-    getrandom::fill(&mut salt_bytes).expect("内核熵源不可用，拒绝用可预测的盐哈希密码");
+    getrandom::fill(&mut salt_bytes)
+        .expect("the kernel entropy source is unavailable; refusing to hash a password with a predictable salt");
     let salt = SaltString::encode_b64(&salt_bytes)
         .map_err(|e| cortex_core::CortexError::Other(anyhow::anyhow!("盐编码失败：{e}")))?;
 
@@ -174,58 +226,74 @@ pub fn hash_password(plain: &str) -> cortex_core::Result<String> {
         .map_err(|e| cortex_core::CortexError::Other(anyhow::anyhow!("密码哈希失败：{e}")))
 }
 
-/// 校验明文密码。
+/// Verify a plaintext password.
 ///
-/// # 为什么返回 `bool` 而不是 `Result`
+/// # Why this returns `bool` rather than `Result`
 ///
-/// 这里有三种失败：密码不对、PHC 串是坏的（截断 / 手改过 / 算法列不认识）、
-/// 参数解析不了。**调用方对这三种的正确反应完全一样：拒绝登录。**
+/// There are three failures here: the password is wrong, the PHC string is
+/// corrupt (truncated / hand-edited / an unrecognised algorithm field), or the
+/// parameters cannot be parsed. **The caller's correct response to all three is
+/// identical: refuse the login.**
 ///
-/// 而把它们分开报会造成两件事，都是坏的：
+/// And reporting them separately causes two things, both bad:
 ///
-/// 1. 差别顺着 HTTP 响应漏出去。「密码错」与「这个账号的哈希串是坏的」
-///    是两条不同的信息，后者等于告诉攻击者「这个账号存在，而且它的记录有问题」。
-/// 2. 调用点上多一条 `?`，于是一条**损坏的哈希串会变成 500 而不是 401**。
-///    500 会被重试、会进告警、会被人当成服务故障去查，而它实际上是一次
-///    应当被静静拒绝的登录。
+/// 1. The difference leaks out through the HTTP response. "Wrong password" and
+///    "this account's hash string is corrupt" are two different pieces of
+///    information, and the latter tells an attacker "this account exists, and
+///    there is something wrong with its record".
+/// 2. One more `?` at the call site, so **a corrupt hash string becomes a 500
+///    instead of a 401**. A 500 gets retried, raises alerts, and gets
+///    investigated as a service outage — while it is in fact a login that
+///    should have been quietly refused.
 ///
-/// 所以差别在这里就地咽掉，只往日志里留一行（`debug` 级，不带任何密码材料）。
-/// 绝不 panic —— 这个函数的输入有一半来自数据库，另一半来自公网。
+/// So the difference is swallowed right here, leaving only one log line
+/// (`debug` level, carrying no password material). It never panics — half of
+/// this function's input comes from the database and the other half from the
+/// public internet.
 #[must_use]
 pub fn verify_password(plain: &str, phc: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc) else {
-        // 这条不是「密码错了」，是这一行数据坏了。运维需要知道，用户不需要
+        // This is not "the password is wrong", it is "this row of data is
+        // broken". Ops needs to know; the user does not
         tracing::debug!("PHC 串无法解析 —— 该账号的密码哈希已损坏");
         return false;
     };
 
-    // **算法必须由我们说了算，不能由被验的那个串说了算。**
+    // **We decide the algorithm; the string being verified does not.**
     //
-    // `PasswordVerifier` 的默认实现会照着 PHC 串里写的 `$argon2i$` / `$argon2d$`
-    // 去重算并放行 —— 也就是说这个串自己指定用哪个算法验自己。本系统只产出
-    // argon2id，所以出现别的算法只有两种可能：数据被人写过，或者哪天有人加了
-    // 一条「兼容老哈希」的路径而没人复查。两种都该在这里当场停住。
+    // `PasswordVerifier`'s default implementation follows whatever the PHC
+    // string says — `$argon2i$` / `$argon2d$` — recomputing under that and
+    // admitting the result, meaning the string specifies which algorithm
+    // verifies itself. This system only ever produces argon2id, so any other
+    // algorithm appearing has exactly two explanations: the data was written by
+    // somebody, or someone added a "compatible with legacy hashes" path that
+    // nobody reviewed. Both should stop dead right here.
     //
-    // argon2i 抗 GPU 弱、argon2d 抗侧信道弱，id 是二者的混合 ——
-    // 「验的时候顺着串走」等于把选择权交给攻击面那一侧。
+    // argon2i is weak against GPUs and argon2d is weak against side channels;
+    // id is the hybrid of the two — "follow the string while verifying" hands
+    // the choice to the attack surface.
     if argon2::Algorithm::try_from(parsed.algorithm) != Ok(argon2::Algorithm::Argon2id) {
         tracing::debug!(algorithm = %parsed.algorithm, "拒绝非 argon2id 的密码哈希");
         return false;
     }
 
-    // 摘要与参数照样从串里读（那正是 PHC 自描述的意义，也是以后调高
-    // M_COST_KIB 还能验老密码的原因）—— 被钉死的只有「用哪个算法」这一项
+    // The digest and the parameters are still read from the string (that is the
+    // whole point of PHC being self-describing, and the reason old passwords
+    // still verify after M_COST_KIB is raised) — the only thing pinned down is
+    // which algorithm is used
     hasher().verify_password(plain.as_bytes(), &parsed).is_ok()
 }
 
-/// 长度校验。
+/// Length validation.
 ///
-/// 单独一个函数是为了让注册路径能在**不做哈希**的情况下先拒掉 ——
-/// 否则一个 4 字符的密码也要先烧掉 100 ms argon2 才被告知太短。
+/// A separate function so that the registration path can reject **without
+/// hashing** — otherwise a 4-character password would still burn 100 ms of
+/// argon2 before being told it is too short.
 fn check_password_shape(plain: &str) -> cortex_core::Result<()> {
-    // 按**字节**数而不是字符数。理由不是省事：熵是按信息量算的，而
-    // `plain.chars().count()` 会把一个 emoji 算成 1，于是 12 个 emoji
-    // （在真实键盘上是从一张面板里点 12 下）就满足了要求
+    // Measured in **bytes**, not characters. The reason is not convenience:
+    // entropy is measured in information, and `plain.chars().count()` counts one
+    // emoji as 1, so 12 emoji (which on a real keyboard means 12 taps on a
+    // picker panel) would satisfy the requirement
     let len = plain.len();
     if len < MIN_PASSWORD_LEN {
         return Err(cortex_core::CortexError::Invalid(format!(
@@ -242,127 +310,153 @@ fn check_password_shape(plain: &str) -> cortex_core::Result<()> {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  二、refresh token
+//  2. Refresh tokens
 // ══════════════════════════════════════════════════════════════
 
-/// refresh token 的熵，单位字节。
+/// Entropy of a refresh token, in bytes.
 ///
-/// 32 字节 = 256 位，与 `auth.rs::generate` 同一个数量级，理由也一样：
-/// 这是整个「不用慢 KDF」论证的**前提**，不是一个可以为了短一点而调的旋钮。
+/// 32 bytes = 256 bits, the same order of magnitude as `auth.rs::generate`, for
+/// the same reason: this is the **premise** of the entire "no slow KDF needed"
+/// argument, not a knob to be turned down for the sake of a shorter string.
 pub const REFRESH_BYTES: usize = 32;
 
-/// 签发一条 refresh token：`(明文, SHA-256 摘要的十六进制)`。
+/// Issue one refresh token: `(plaintext, hex of the SHA-256 digest)`.
 ///
-/// 明文只在这一刻存在，发给客户端；**落库的只有摘要**。所以数据库被拖走
-/// 之后，里面的 refresh token 一条都不能直接拿来换 access token —— 服务端
-/// 会先对收到的东西做一次 SHA-256，再按摘要去索引里查（见 [`refresh_digest`]）。
+/// The plaintext exists only at this instant and is sent to the client; **only
+/// the digest is persisted**. So after the database is stolen, not one refresh
+/// token in it can be exchanged for an access token directly — the server runs
+/// SHA-256 over whatever it receives and looks the row up by digest (see
+/// [`refresh_digest`]).
 ///
-/// 摘要用 SHA-256 而不是 argon2：见模块文档第一节那张表。这一条与上面
-/// [`hash_password`] 的选择相反，而它们出自同一条判据。
+/// The digest is SHA-256 rather than argon2: see the table in section 1 of the
+/// module docs. This choice is the opposite of [`hash_password`]'s above, and
+/// both follow from the same criterion.
 #[must_use]
 pub fn generate_refresh() -> (String, String) {
     let mut buf = [0u8; REFRESH_BYTES];
-    getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝签发可预测的 refresh token");
+    getrandom::fill(&mut buf).expect(
+        "the kernel entropy source is unavailable; refusing to issue a predictable refresh token",
+    );
     let plain = hex::encode(buf);
     let digest = refresh_digest(&plain);
     (plain, digest)
 }
 
-/// 明文 refresh token 的落库形态。
+/// The persisted form of a plaintext refresh token.
 #[must_use]
-/// # 为什么这里没有 `verify_refresh` / 常数时间比较
+/// # Why there is no `verify_refresh` / constant-time comparison here
 ///
-/// 一度有过，写得也对，但接线时发现**用不上**：`auth_tokens.token_sha256`
-/// 是唯一索引，服务端拿明文算出摘要之后是**按摘要查行**，而不是「取一行
-/// 出来再逐字节比」。比较发生在 B 树里，攻击者对着它测时间学不到东西 ——
-/// 而「这个 token 存不存在」本来就写在响应码上。
+/// There was one once, correctly written, but wiring it up revealed it was
+/// **unused**: `auth_tokens.token_sha256` is a unique index, so after computing
+/// the digest from the plaintext the server **looks the row up by digest**
+/// rather than "fetching a row and comparing it byte by byte". The comparison
+/// happens inside a B-tree, where an attacker timing it learns nothing — and
+/// "does this token exist" is already written on the response code anyway.
 ///
-/// 删掉而不是留着加 `#[allow(dead_code)]`：一段没人调用的安全代码会让
-/// 下一个读它的人以为那条路径被保护着。
+/// Deleted rather than kept with `#[allow(dead_code)]`: a piece of security code
+/// with no callers leaves the next person who reads it believing that path is
+/// protected.
 pub fn refresh_digest(plain: &str) -> String {
     hex::encode(Sha256::digest(plain.as_bytes()))
 }
 
 // ══════════════════════════════════════════════════════════════
-//  三、重放判定
+//  3. Replay adjudication
 // ══════════════════════════════════════════════════════════════
 
-/// 一条 refresh token 在库里的状态 —— [`judge_refresh`] 需要知道的全部。
+/// One refresh token's state in the database — everything [`judge_refresh`]
+/// needs to know.
 ///
-/// 刻意**不含摘要、不含明文、不含用户**：判定与「这条 token 是不是真的」
-/// 无关，后者靠按摘要查行完成，且必须先于判定发生。把两件事塞进
-/// 一个函数，就会出现「摘要对不上也去作废 family」这种可以被任何人白嫖的
-/// 拒绝服务 —— 攻击者只要瞎猜一个 token，就能把别人的会话踢下线。
+/// It deliberately **contains no digest, no plaintext and no user**: the
+/// adjudication has nothing to do with "is this token genuine", which is settled
+/// by looking the row up by digest and must happen before the adjudication.
+/// Cramming both into one function produces the failure "revoke the family even
+/// though the digest did not match" — a denial of service anyone can help
+/// themselves to, where an attacker merely guesses a token at random and kicks
+/// somebody else's session offline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshRecord {
-    /// 这条轮转链的 id。作废时要作废的是**它**，不是这一条。
+    /// Id of this rotation chain. What gets revoked is **it**, not this single
+    /// token.
     pub family: Id,
-    /// 已经被用过一次，并且轮转出了后继。
+    /// Already used once, and rotated out a successor.
     pub rotated: bool,
-    /// 整条 family 已经被作废（本条或它的兄弟触发过一次重放检测）。
+    /// The entire family has been revoked (this token or one of its siblings
+    /// triggered a replay detection at some point).
     pub revoked: bool,
-    /// 绝对过期时刻已过。
+    /// The absolute expiry instant has passed.
     ///
-    /// 是个**已经算好的布尔**而不是一个时间戳：判定是纯函数，
-    /// 让它去读 `Utc::now()` 就等于让它不可测。
+    /// A **pre-computed boolean** rather than a timestamp: the adjudication is a
+    /// pure function, and letting it read `Utc::now()` would make it untestable.
     pub expired: bool,
 }
 
-/// 为什么被拒 —— 只进日志与指标，**绝不进 HTTP 响应体**。
+/// Why it was rejected — for logs and metrics only, **never for the HTTP
+/// response body**.
 ///
-/// 对客户端来说三种拒绝没有区别，都是「重新登录」。分开告诉它，
-/// 等于告诉攻击者「你手上这条是过期了，还是被人抢先用掉了」。
+/// To the client the three rejections are indistinguishable; all of them mean
+/// "log in again". Telling it the difference tells an attacker whether the token
+/// they hold expired or was consumed by somebody else first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// 整条 family 早就死了。
+    /// The whole family died long ago.
     FamilyRevoked,
-    /// 过了绝对有效期。
+    /// The absolute lifetime has elapsed.
     Expired,
 }
 
-/// 判定结果。**三态，不能塌成布尔。**
+/// The verdict. **Three states; it must not collapse into a boolean.**
 ///
-/// 把 [`Self::Reject`] 与 [`Self::RevokeFamily`] 合并成一个「拒绝」，
-/// 意味着检测到重放之后，攻击者手上那条**还没被轮转过的**后继 token
-/// 依然有效 —— 也就是说泄露被检测到了，却什么也没发生。
-/// 重放检测的全部价值就在于第三态。
+/// Merging [`Self::Reject`] and [`Self::RevokeFamily`] into one "reject" means
+/// that after a replay is detected, the **not yet rotated** successor token in
+/// the attacker's hands remains valid — i.e. the leak was detected and nothing
+/// happened. The entire value of replay detection lives in the third state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshVerdict {
-    /// 接受：发新的 access token，把这条标记为已轮转并签出后继。
+    /// Accept: issue a new access token, mark this one rotated, and sign a
+    /// successor.
     Rotate,
-    /// 拒绝这一次，family 不动。
+    /// Refuse this attempt; leave the family alone.
     Reject(RejectReason),
-    /// 拒绝，并且把整条 family 作废 —— 检测到重放。
+    /// Refuse, and revoke the entire family — a replay was detected.
     RevokeFamily { family: Id },
 }
 
-/// 判定一次 refresh 请求。**纯函数**：调用方已经确认过摘要对得上。
+/// Adjudicate one refresh request. **A pure function**: the caller has already
+/// confirmed that the digest matches.
 ///
-/// # 检查顺序是这个函数唯一的内容，且它不是任意的
+/// # The check order is the entire content of this function, and it is not
+/// # arbitrary
 ///
 /// ```text
-/// revoked  ─► Reject(FamilyRevoked)   ← family 已死，不重复作废
-/// rotated  ─► RevokeFamily            ← 重放！必须在 expired 之前判
+/// revoked  ─► Reject(FamilyRevoked)   ← family already dead, do not re-revoke
+/// rotated  ─► RevokeFamily            ← replay! must be checked before expired
 /// expired  ─► Reject(Expired)
-/// 否则     ─► Rotate
+/// else     ─► Rotate
 /// ```
 ///
-/// ## 为什么 `rotated` 必须排在 `expired` 前面
+/// ## Why `rotated` must come before `expired`
 ///
-/// 这是最容易写反的一处，而写反之后测试大概率照样绿。
+/// This is the easiest thing here to get backwards, and once it is backwards the
+/// tests will most likely still be green.
 ///
-/// 直觉会说「都过期了还查什么重放」。但轮转链上**每一次轮转都会签出一条
-/// 有新有效期的后继**：一条 2020 年就该过期的旧 token，它的 family 现在
-/// 完全可能还活着、还在被真用户用。此时有人拿着这条老掉牙的 token 来换 ——
-/// 那正是「他有一份历史副本」的铁证，也正是必须把整条链子掐掉的时刻。
-/// 先判 `expired` 就会把这个信号降级成一次平平无奇的「过期了，重新登录吧」，
-/// 于是攻击者手上那条**没过期的**后继继续可用。
+/// Intuition says "it has expired anyway, why bother checking for a replay". But
+/// **every rotation on the chain signs a successor with a fresh lifetime**: an
+/// old token that should have expired back in 2020 may well belong to a family
+/// that is alive right now and being used by the real user. Somebody presenting
+/// that ancient token for exchange — that is conclusive proof they hold a
+/// historical copy, and precisely the moment the whole chain must be cut.
+/// Checking `expired` first downgrades that signal into an unremarkable "it
+/// expired, please log in again", leaving the attacker's **unexpired** successor
+/// perfectly usable.
 ///
-/// ## 为什么 `revoked` 排在最前，而且只是 Reject
+/// ## Why `revoked` comes first, and is only a Reject
 ///
-/// family 已经作废了，再作废一次不会更安全，只会往一个 append-only 的库里
-/// 多写一条毫无信息量的记录；更糟的是它会把「**新**检测到一次泄露」这个
-/// 本该稀有的信号淹没在噪声里 —— 而这个信号是要用来给人报警的。
+/// The family has already been revoked, and revoking it again makes nothing
+/// safer; it merely writes another entirely uninformative record into an
+/// append-only database. Worse, it drowns the signal "a **new** leak was just
+/// detected" — which should be rare, and which is what raises the alert — in
+/// noise.
 #[must_use]
 pub fn judge_refresh(record: &RefreshRecord) -> RefreshVerdict {
     if record.revoked {
@@ -383,142 +477,174 @@ pub fn judge_refresh(record: &RefreshRecord) -> RefreshVerdict {
 mod tests {
     use super::*;
 
-    // ───────────────────────── 密码 ─────────────────────────
+    // ───────────────────────── Passwords ─────────────────────
 
     #[test]
     fn a_password_hash_is_phc_with_the_parameters_we_chose() {
-        let phc = hash_password("correct horse battery staple").expect("合法密码应当能哈希");
+        let phc =
+            hash_password("correct horse battery staple").expect("a valid password should hash");
         assert!(
             phc.starts_with("$argon2id$"),
-            "必须是 argon2id（不是 argon2i / argon2d），实际拿到：{phc}"
+            "must be argon2id (not argon2i / argon2d); actually got: {phc}"
         );
         assert!(
             phc.contains("v=19"),
-            "必须是 argon2 v1.3（0x13）；老版本有已知弱点。实际：{phc}"
+            "must be argon2 v1.3 (0x13); older versions have known weaknesses. Actual: {phc}"
         );
         assert!(
             phc.contains(&format!("m={M_COST_KIB},t={T_COST},p={P_COST}")),
-            "PHC 串里的参数必须与本模块论证过的常量一致，否则「以后能平滑调参」\
-             这个性质不成立。实际：{phc}"
+            "the parameters inside the PHC string must match the constants argued for in this \
+             module, or the property \"parameters can be raised smoothly later\" does not hold. \
+             Actual: {phc}"
         );
     }
 
     #[test]
     fn the_same_password_never_hashes_to_the_same_string() {
-        let a = hash_password("correct horse battery staple").expect("合法密码应当能哈希");
-        let b = hash_password("correct horse battery staple").expect("合法密码应当能哈希");
+        let a =
+            hash_password("correct horse battery staple").expect("a valid password should hash");
+        let b =
+            hash_password("correct horse battery staple").expect("a valid password should hash");
         assert_ne!(
             a, b,
-            "两次哈希同一个密码得到了相同的串 —— 说明盐不是随机的，\
-             于是拖库之后可以直接按摘要分组找出「谁和谁用了同一个密码」"
+            "hashing the same password twice produced the same string —— which means the salt is \
+             not random, so after the database is stolen one can group by digest and find out \
+             who shares a password with whom"
         );
-        // 但两条都能验回同一个密码
+        // But both verify the same password
         assert!(verify_password("correct horse battery staple", &a));
         assert!(verify_password("correct horse battery staple", &b));
     }
 
     #[test]
     fn the_plaintext_password_never_appears_in_the_hash() {
-        let phc = hash_password("hunter2-hunter2-hunter2").expect("合法密码应当能哈希");
-        assert!(!phc.contains("hunter2"), "明文密码出现在了 PHC 串里：{phc}");
+        let phc = hash_password("hunter2-hunter2-hunter2").expect("a valid password should hash");
+        assert!(
+            !phc.contains("hunter2"),
+            "the plaintext password appeared inside the PHC string: {phc}"
+        );
     }
 
     #[test]
     fn only_the_right_password_verifies() {
-        let phc = hash_password("correct horse battery staple").expect("合法密码应当能哈希");
+        let phc =
+            hash_password("correct horse battery staple").expect("a valid password should hash");
         assert!(
             verify_password("correct horse battery staple", &phc),
-            "正确的密码必须通过"
+            "the correct password must verify"
         );
         assert!(
             !verify_password("correct horse battery stapl", &phc),
-            "少一个字符的密码不能通过"
+            "a password one character short must not verify"
         );
-        assert!(!verify_password("", &phc), "空密码不能通过");
+        assert!(
+            !verify_password("", &phc),
+            "an empty password must not verify"
+        );
         assert!(
             !verify_password("Correct horse battery staple", &phc),
-            "只差大小写的密码不能通过 —— 校验必须是大小写敏感的"
+            "a password differing only in case must not verify —— verification has to be \
+             case-sensitive"
         );
     }
 
-    /// 坏掉的 PHC 串一律 `false`，一条都不许 panic。
+    /// A corrupt PHC string is always `false`, and never panics.
     ///
-    /// 这个函数的第二个参数来自数据库，第一个来自公网。任何一条 panic
-    /// 都是一个「往登录接口发个特定请求就能把 worker 打挂」的洞。
+    /// This function's second argument comes from the database and its first
+    /// from the public internet. Any panic here is a hole where one specific
+    /// request to the login endpoint kills a worker.
     #[test]
     fn a_corrupt_hash_is_a_quiet_false_never_a_panic() {
-        let good = hash_password("correct horse battery staple").expect("合法密码应当能哈希");
+        let good =
+            hash_password("correct horse battery staple").expect("a valid password should hash");
         let corrupt = [
-            ("", "空串"),
-            ("not a phc string at all", "根本不是 PHC 形状"),
-            ("$argon2id$", "只有算法段"),
-            ("$argon2id$v=19$m=19456,t=2,p=1$", "缺盐与摘要"),
-            ("$bcrypt$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA", "不认识的算法"),
+            ("", "empty string"),
+            ("not a phc string at all", "not PHC-shaped at all"),
+            ("$argon2id$", "only the algorithm segment"),
+            ("$argon2id$v=19$m=19456,t=2,p=1$", "missing salt and digest"),
+            (
+                "$bcrypt$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA",
+                "unrecognised algorithm",
+            ),
             (
                 "$argon2id$v=19$m=19456,t=2,p=1$!!!!$!!!!",
-                "盐与摘要不是 b64",
+                "salt and digest are not b64",
             ),
-            (&good[..good.len() - 5], "被截断的合法串"),
+            (&good[..good.len() - 5], "a truncated valid string"),
         ];
         for (phc, what) in corrupt {
             assert!(
                 !verify_password("correct horse battery staple", phc),
-                "损坏的 PHC 串（{what}）必须判否而不是通过：{phc:?}"
+                "a corrupt PHC string ({what}) must compare false rather than verify: {phc:?}"
             );
         }
     }
 
-    /// 用 argon2i / argon2d 算出来的串不能被当成 argon2id 放行。
+    /// A string computed with argon2i / argon2d must not be admitted as
+    /// argon2id.
     ///
-    /// `PasswordVerifier` 的默认实现会照着串里写的算法去验，而我们只该接受
-    /// argon2id —— argon2i 抗 GPU 弱，argon2d 抗侧信道弱。
+    /// `PasswordVerifier`'s default implementation verifies using whatever
+    /// algorithm the string names, and we should only accept argon2id —
+    /// argon2i is weak against GPUs and argon2d is weak against side channels.
     #[test]
     fn only_argon2id_is_accepted() {
-        let salt = SaltString::encode_b64(&[7u8; SALT_BYTES]).expect("固定盐应当能编码");
-        let params = Params::new(M_COST_KIB, T_COST, P_COST, None).expect("参数合法");
+        let salt = SaltString::encode_b64(&[7u8; SALT_BYTES]).expect("a fixed salt should encode");
+        let params =
+            Params::new(M_COST_KIB, T_COST, P_COST, None).expect("the parameters are valid");
         let weak = Argon2::new(Algorithm::Argon2i, Version::V0x13, params)
             .hash_password(b"correct horse battery staple", &salt)
-            .expect("argon2i 哈希应当能算出来")
+            .expect("the argon2i hash should compute")
             .to_string();
-        assert!(weak.starts_with("$argon2i$"), "构造的样本应当是 argon2i");
+        assert!(
+            weak.starts_with("$argon2i$"),
+            "the constructed sample should be argon2i"
+        );
         assert!(
             !verify_password("correct horse battery staple", &weak),
-            "argon2i 的哈希串竟然被放行了 —— 算法降级攻击的入口"
+            "an argon2i hash string was admitted —— that is the entry point for an algorithm \
+             downgrade attack"
         );
     }
 
     #[test]
     fn a_too_short_password_is_rejected_before_any_hashing() {
         let err = hash_password(&"a".repeat(MIN_PASSWORD_LEN - 1))
-            .expect_err("比下限短一个字节的密码必须被拒");
+            .expect_err("a password one byte below the minimum must be rejected");
         assert!(
             matches!(err, cortex_core::CortexError::Invalid(_)),
-            "太短应当是「非法输入」而不是别的类别，实际：{err:?}"
+            "too short should be classified as invalid input, not something else; actual: {err:?}"
         );
         assert!(
             hash_password(&"a".repeat(MIN_PASSWORD_LEN)).is_ok(),
-            "刚好达到下限的密码必须被接受 —— 边界不能差一"
+            "a password exactly at the minimum must be accepted —— the boundary must not be off \
+             by one"
         );
         assert!(
             hash_password(&"a".repeat(MAX_PASSWORD_LEN + 1)).is_err(),
-            "超过上限的密码必须被拒"
+            "a password above the maximum must be rejected"
         );
     }
 
-    /// 12 个 emoji 不算 12 个字节意义上的「长」，但按字节数它远超下限。
-    /// 这条锁住的是「按字节而不是按 char 计长」这个选择本身。
+    /// 12 emoji do not count as "long" in the sense of 12 bytes, but by byte
+    /// count they are far above the minimum. What this test pins down is the
+    /// choice to measure in bytes rather than chars.
     #[test]
     fn length_is_measured_in_bytes() {
-        // 3 个汉字 = 9 字节 < 12，按 char 数（3）和按字节数（9）都该拒
-        assert!(hash_password("密码短").is_err(), "9 字节的密码必须被拒");
-        // 4 个汉字 = 12 字节：按字节够了，按 char 数只有 4
+        // 3 Chinese characters = 9 bytes < 12, so it is rejected both by char
+        // count (3) and by byte count (9)
+        assert!(
+            hash_password("密码短").is_err(),
+            "a 9-byte password must be rejected"
+        );
+        // 5 Chinese characters = 15 bytes: enough by byte count, only 5 by char
+        // count
         assert!(
             hash_password("密码够长了").is_ok(),
-            "15 字节的密码按字节计长应当通过"
+            "a 15-byte password must pass when length is measured in bytes"
         );
     }
 
-    // ─────────────────────── refresh token ───────────────────────
+    // ─────────────────────── Refresh tokens ──────────────────────
 
     #[test]
     fn a_refresh_token_is_high_entropy_and_only_its_digest_is_stored() {
@@ -526,19 +652,25 @@ mod tests {
         assert_eq!(
             plain.len(),
             REFRESH_BYTES * 2,
-            "明文应当是 {REFRESH_BYTES} 字节的十六进制"
+            "the plaintext should be {REFRESH_BYTES} bytes of hex"
         );
-        assert_ne!(plain, digest, "落库的必须是摘要，不能是明文");
+        assert_ne!(
+            plain, digest,
+            "what is persisted must be the digest, never the plaintext"
+        );
         assert_eq!(
             digest,
             refresh_digest(&plain),
-            "摘要必须真的是明文的 SHA-256"
+            "the digest must genuinely be the SHA-256 of the plaintext"
         );
         let (other, _) = generate_refresh();
-        assert_ne!(plain, other, "两次签发不能撞上 —— 熵源坏了才会这样");
+        assert_ne!(
+            plain, other,
+            "two issuances must not collide —— only a broken entropy source does that"
+        );
     }
 
-    // ─────────────────────── 重放判定 ───────────────────────
+    // ───────────────────── Replay adjudication ───────────────────
 
     fn fresh() -> RefreshRecord {
         RefreshRecord {
@@ -554,7 +686,7 @@ mod tests {
         assert_eq!(
             judge_refresh(&fresh()),
             RefreshVerdict::Rotate,
-            "没轮转过、没作废、没过期的 token 必须被接受并轮转"
+            "a token that has not been rotated, revoked or expired must be accepted and rotated"
         );
     }
 
@@ -567,15 +699,17 @@ mod tests {
         assert_eq!(
             judge_refresh(&rec),
             RefreshVerdict::RevokeFamily { family: rec.family },
-            "一条已经轮转过的 token 再次出现 = 它泄露了。此时只「拒绝」是不够的：\
-             攻击者手上那条没轮转过的后继依然有效，检测到了泄露却什么也没发生"
+            "an already-rotated token showing up again = it leaked. Merely refusing is not \
+             enough here: the not-yet-rotated successor in the attacker's hands stays valid, so \
+             the leak was detected and nothing happened"
         );
     }
 
-    /// 判定必须落在**这一条**的 family 上。
+    /// The verdict must land on **this record's** family.
     ///
-    /// 返回一个新造的 / 错的 family 就等于把别人的会话踢掉，而把真正泄露的
-    /// 那条留着 —— 两个方向的错都发生了。
+    /// Returning a freshly minted or wrong family kicks somebody else's session
+    /// offline while leaving the genuinely leaked one alive — both directions of
+    /// error happening at once.
     #[test]
     fn the_revoked_family_is_the_one_from_the_record() {
         let mine = Id::new();
@@ -586,18 +720,26 @@ mod tests {
             ..fresh()
         };
         let RefreshVerdict::RevokeFamily { family } = judge_refresh(&rec) else {
-            panic!("重放必须判 RevokeFamily");
+            panic!("a replay must be adjudicated as RevokeFamily");
         };
-        assert_eq!(family, mine, "要作废的必须是这条 token 自己的 family");
-        assert_ne!(family, someone_else, "绝不能作废到别人的 family 上");
+        assert_eq!(
+            family, mine,
+            "what gets revoked must be this token's own family"
+        );
+        assert_ne!(
+            family, someone_else,
+            "it must never revoke somebody else's family"
+        );
     }
 
-    /// **这条测试守的是检查顺序**，是本模块最容易写反的一处。
+    /// **This test guards the check order**, the thing in this module most
+    /// easily written backwards.
     ///
-    /// 一条又过期又被轮转过的 token 出现，说明有人手上有历史副本；
-    /// 而这条链上**现在**那条后继完全可能还没过期、还在被真用户用。
-    /// 先判 `expired` 会把这个信号降级成一次平平无奇的「过期了」，
-    /// 于是攻击者手上那条没过期的后继继续可用。
+    /// A token that is both expired and already rotated showing up means
+    /// somebody holds a historical copy — while the successor that is on that
+    /// chain **right now** may well be unexpired and in use by the real user.
+    /// Checking `expired` first downgrades that signal into an unremarkable "it
+    /// expired", leaving the attacker's unexpired successor perfectly usable.
     #[test]
     fn an_expired_token_that_was_also_rotated_still_takes_down_the_family() {
         let rec = RefreshRecord {
@@ -608,8 +750,9 @@ mod tests {
         assert_eq!(
             judge_refresh(&rec),
             RefreshVerdict::RevokeFamily { family: rec.family },
-            "又过期又被轮转过 —— 过期不能掩盖重放。轮转链上每次轮转都会签出\
-             一条有新有效期的后继，所以「旧的过期了」完全不意味着「这条链死了」"
+            "both expired and rotated —— expiry must not mask a replay. Every rotation on the \
+             chain signs a successor with a fresh lifetime, so \"the old one expired\" says \
+             nothing whatsoever about \"this chain is dead\""
         );
     }
 
@@ -622,15 +765,17 @@ mod tests {
         assert_eq!(
             judge_refresh(&rec),
             RefreshVerdict::Reject(RejectReason::Expired),
-            "只是过期（没被轮转过）说明用户单纯离开太久，不是泄露信号；\
-             作废整条 family 只会让正常的「太久没用」变成一次莫名其妙的全端登出"
+            "merely expired (never rotated) means the user simply stayed away too long, not a \
+             leak signal; revoking the whole family would turn a normal \"unused for too long\" \
+             into an inexplicable logout on every device"
         );
     }
 
-    /// 已死的 family 只 `Reject`，不再作废一次。
+    /// An already-dead family only gets a `Reject`, never a second revocation.
     ///
-    /// 重复作废在 append-only 的库里就是永久噪声，而且会把「**新**检测到一次
-    /// 泄露」这个本该稀有、本该报警的信号淹掉。
+    /// Repeated revocation is permanent noise in an append-only database, and it
+    /// drowns the signal "a **new** leak was detected" — which should be rare
+    /// and which should raise an alert.
     #[test]
     fn an_already_revoked_family_is_not_revoked_again() {
         let rec = RefreshRecord {
@@ -642,12 +787,13 @@ mod tests {
         assert_eq!(
             judge_refresh(&rec),
             RefreshVerdict::Reject(RejectReason::FamilyRevoked),
-            "family 已经死了，再作废一次不会更安全，只会往 append-only 的库里\
-             写噪声，并把新的泄露告警淹没"
+            "the family is already dead; revoking it again makes nothing safer, it only writes \
+             noise into an append-only database and drowns new leak alerts"
         );
     }
 
-    /// 三态不能塌成布尔 —— 这条把「合并 Reject 与 RevokeFamily」直接钉死。
+    /// The three states must not collapse into a boolean — this test pins down
+    /// "do not merge Reject and RevokeFamily" directly.
     #[test]
     fn reject_and_revoke_family_are_not_the_same_verdict() {
         let replayed = RefreshRecord {
@@ -661,15 +807,16 @@ mod tests {
         assert_ne!(
             judge_refresh(&replayed),
             judge_refresh(&expired),
-            "「拒绝」与「拒绝并作废整个 family」必须是两个不同的结果。\
-             合并成一个等于：检测到泄露之后，攻击者还能继续用这条链上的其他 token"
+            "\"refuse\" and \"refuse and revoke the whole family\" must be two different \
+             outcomes. Merging them amounts to: after a leak is detected, the attacker can keep \
+             using the other tokens on that chain"
         );
         assert!(
             matches!(
                 judge_refresh(&replayed),
                 RefreshVerdict::RevokeFamily { .. }
             ),
-            "重放必须落到第三态上"
+            "a replay must land on the third state"
         );
     }
 }

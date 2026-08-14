@@ -1,19 +1,21 @@
 name: Release
 
 # ══════════════════════════════════════════════════════════
-#  发布流水线 —— 构建并推送 cormex 的 docker 镜像。
+#  Release pipeline -- builds and pushes cormex's docker image.
 #
-#  触发：推 `v*` tag，或手动 workflow_dispatch（要填 tag）。
+#  Triggers: pushing a `v*` tag, or a manual workflow_dispatch (which requires a tag).
 #
-#  ── 只有镜像，没有裸二进制 ────────────────────────────────
-#  这是记忆服务：它要 Postgres + pgvector 才跑得起来，实际部署形态
-#  只有 compose 一种。发一份「下载即用」的二进制会给出一个用不了的
-#  安装路径。想不用 docker 的人走 `cargo install --git`。
+#  ── Images only, no bare binaries ─────────────────────────
+#  This is a memory service: it needs Postgres + pgvector to run at all, and compose is
+#  the only shape it is actually deployed in. Shipping a "download and go" binary would
+#  offer an installation path that does not work. Anyone who does not want docker goes
+#  through `cargo install --git`.
 #
-#  ── 版本线独立于 Cortex ──────────────────────────────────
-#  这是拆分的重点：Cormex 与 Cortex 各发各的版本，不共享 tag、
-#  不互相对齐。下面核对的是**本仓库** Cargo.toml 里的
-#  `[workspace.package] version`，与 Cortex 的版本号无关。
+#  ── The version line is independent of Cortex ─────────────
+#  This is the whole point of the split: Cormex and Cortex release their own versions,
+#  sharing no tags and not aligning with each other. What is checked below is the
+#  `[workspace.package] version` in **this repository's** Cargo.toml, which has nothing
+#  to do with Cortex's version number.
 # ══════════════════════════════════════════════════════════
 
 on:
@@ -22,11 +24,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 手动发布时使用的标签（形如 v0.1.0）
+        description: The tag to use for a manual release (of the form v0.1.0)
         required: true
 
-# 只读。这条流水线不建 release、不改仓库内容，
-# 唯一的写操作发生在两个 registry 上（靠 secrets，不是靠 GITHUB_TOKEN）
+# Read-only. This pipeline creates no release and changes nothing in the repository; its
+# only write operations happen on two registries (through secrets, not GITHUB_TOKEN)
 permissions:
   contents: read
 
@@ -35,24 +37,25 @@ env:
 
 jobs:
   # ══════════════════════════════════════════════════════════
-  #  前置闸门 —— 在编译任何东西之前
+  #  The preflight gate -- before anything gets compiled
   #
-  #  镜像要编一整棵 Rust 依赖树，冷缓存按十几分钟计。版本号对不上
-  #  这种一秒能查出来的事，不该等到那之后才发现。
+  #  The image has to compile an entire Rust dependency tree, which on a cold cache runs
+  #  to a quarter of an hour. Something like a mismatched version number, which takes a
+  #  second to check, has no business being discovered after all that.
   # ══════════════════════════════════════════════════════════
   preflight:
-    name: 前置检查
+    name: Preflight checks
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
-      # tag 只在这里解析一次。刻意不写 `github.ref_name || inputs.tag`：
-      # ref_name 在 workflow_dispatch 上是**分支名**、永远为真，
-      # `||` 右边那一侧于是永远取不到，手动发布会打出一堆
-      # `cormex:vmain` 之类的东西
-      - name: 解析 tag
+      # The tag is resolved once, here. `github.ref_name || inputs.tag` is deliberately not
+      # used: on a workflow_dispatch, ref_name is the **branch name** and therefore always
+      # truthy, so the right-hand side of `||` can never be reached, and a manual release
+      # would push things like `cormex:vmain`
+      - name: Resolve the tag
         id: resolve
         run: |
           set -euo pipefail
@@ -62,57 +65,62 @@ jobs:
             tag="${{ inputs.tag }}"
           fi
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "::error::tag '$tag' 不合法，必须是 vX.Y.Z"; exit 1; }
+            || { echo "::error::tag '$tag' is not valid, it must be vX.Y.Z"; exit 1; }
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      # 用 tomllib 解析而不是 grep：`version = ` 在 Cargo.toml 里出现十几次
-      # （每个 workspace 依赖都有），grep 抓到的是哪一行取决于文件顺序，
-      # 而它抓错时不会报错，只会安静地比对一个不相干的数
-      - name: 版本号与 tag 一致
+      # Parsed with tomllib rather than grep: `version = ` appears a dozen times in
+      # Cargo.toml (once per workspace dependency), which line grep catches depends on the
+      # order of the file, and when it catches the wrong one it does not complain -- it
+      # quietly compares an unrelated number
+      - name: Version number matches the tag
         run: |
           python3 - <<'PY'
           import sys, tomllib
           want = "${{ steps.resolve.outputs.version }}"
           got = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
           if got != want:
-              print(f"::error::tag 是 v{want}，但 Cargo.toml 的 workspace 版本是 {got}")
-              print("镜像 tag 与 `cortexd --version` 会各说一个数，而两边都编译得过。")
+              print(f"::error::the tag is v{want}, but Cargo.toml's workspace version is {got}")
+              print("The image tag and `cortexd --version` would each state a different number, and both would compile.")
               sys.exit(1)
-          print(f"✓ 版本一致：{got}")
+          print(f"OK, versions agree: {got}")
           PY
 
-      # ── 锁文件闸门 ────────────────────────────────────────
+      # ── The lock-file gate ────────────────────────────────
       #
-      # Dockerfile 里那句 `cargo build --release` **没有 `--locked`**，
-      # 而这条流水线只被允许改 .github/workflows/ 下的文件 —— 也就是说
-      # 「构建时用锁文件」这件事没法从 build-push-action 那一侧传进去
-      # （Dockerfile 不接任何 ARG，cargo 也没有等价的环境变量）。
+      # The `cargo build --release` inside the Dockerfile has **no `--locked`**, and this
+      # pipeline is only allowed to change files under .github/workflows/ -- which means
+      # "use the lock file when building" cannot be passed in from the build-push-action
+      # side (the Dockerfile takes no ARG, and cargo has no equivalent environment variable).
       #
-      # 于是把保证前移到这里：`--locked` 让 cargo 在「解析结果与 Cargo.lock
-      # 不一致」时直接失败，不做解析也不改文件。要防的正是 pgvector 那条雷 ——
-      # 它的 sqlx 依赖范围跨 semver 组，一旦允许重新解析就会把 sqlx 拉回 0.8，
-      # 造成两份 sqlx-core 共存（见 CLAUDE.md）。锁文件在这里被确认是自洽的，
-      # 镜像里那次不带标志的构建也就只会照它来。
+      # So the guarantee is moved forward to here: `--locked` makes cargo fail outright when
+      # "what resolution produces" disagrees with Cargo.lock, without resolving and without
+      # touching the file. What this guards against is precisely the pgvector landmine --
+      # its sqlx dependency range spans a semver group, and allowing re-resolution pulls
+      # sqlx back to 0.8 and leaves two copies of sqlx-core coexisting (see CLAUDE.md).
+      # Once the lock file has been confirmed self-consistent here, the flagless build
+      # inside the image can only follow it.
       #
-      # 真正的修法是给 Dockerfile 的 cargo build 加上 `--locked`，
-      # 这道闸门只是它的替身。
+      # The real fix is to add `--locked` to the Dockerfile's cargo build; this gate is
+      # only its stand-in.
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cargo.lock 与清单自洽
+      - name: Cargo.lock is consistent with the manifests
         run: cargo metadata --locked --format-version 1 > /dev/null
 
   # ══════════════════════════════════════════════════════════
-  #  docker 镜像 —— 一个镜像，推两个 registry
+  #  The docker image -- one image, pushed to two registries
   #
-  #  ACR 是生产实际拉取的那个（节点在国内，Docker Hub 在那里要么慢、
-  #  要么得经第三方镜像站，而那类站点缓存 tag→digest，是「拉到旧镜像
-  #  还看不出来」的陷阱）。Docker Hub 那份是异地副本。
+  #  ACR is the one production actually pulls from (the nodes are in China, where Docker
+  #  Hub is either slow or has to go through a third-party mirror -- and mirrors of that
+  #  kind cache tag→digest, which is the trap of "you pulled an old image and cannot even
+  #  tell"). The Docker Hub copy is the off-site replica.
   #
-  #  只做 linux/amd64。arm64 得靠 QEMU 模拟构建，编一整棵 Rust 依赖树
-  #  按小时计，而且没人在 arm64 上验证过这个镜像 —— 发一个从没被启动过
-  #  的 arm64 镜像，正是这条流水线要避免的事。
+  #  linux/amd64 only. arm64 would have to be built under QEMU emulation, and compiling a
+  #  whole Rust dependency tree that way runs into hours -- besides which nobody has
+  #  verified this image on arm64, and shipping an arm64 image that has never once been
+  #  started is exactly what this pipeline exists to avoid.
   # ══════════════════════════════════════════════════════════
   image:
-    name: 镜像 cormex
+    name: Image cormex
     needs: preflight
     runs-on: ubuntu-latest
     steps:
@@ -130,60 +138,65 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: 构建并推送
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          # 构建上下文是仓库根：Dockerfile 要 COPY crates/、evals/、
-          # migrations/ 与 migrations-global/，其中后两个是
-          # `sqlx::migrate!` 这个**编译期**宏要读的目录 ——
-          # 漏进上下文的话在编译期就炸，而本机构建照样是绿的
+          # The build context is the repository root: the Dockerfile has to COPY crates/,
+          # evals/, migrations/ and migrations-global/, and the last two are the
+          # directories the **compile-time** macro `sqlx::migrate!` reads -- leave them out
+          # of the context and it blows up at compile time, while a local build stays green
           context: .
           file: scripts/docker/Dockerfile.cortexd
           platforms: linux/amd64
           push: true
-          # ★ **必须关掉。** buildx 默认给镜像挂一份 provenance 证明，
-          # 那会把结果变成一个 OCI index，里面带一个
-          # `application/vnd.oci.empty.v1+json` 的空描述符 ——
-          # 而阿里云 ACR 不认这个 media type，push 时直接
-          # `denied: unknown manifest class`。
+          # ★ **Must be turned off.** buildx by default attaches a provenance attestation to
+          # the image, which turns the result into an OCI index containing an empty
+          # descriptor of type `application/vnd.oci.empty.v1+json` -- and Aliyun ACR does
+          # not recognize that media type, so the push fails outright with
+          # `denied: unknown manifest class`.
           #
-          # 本地 `docker build` 一路绿灯也说明不了什么：它根本不 push
+          # A local `docker build` going green all the way proves nothing: it never pushes
           provenance: false
-          # 只打具体版本，**不打 latest**。生产钉死版本，重启之后
-          # 必须回到同一个；一个会漂移的 tag 会让「线上跑的是哪一版」
-          # 变成一个查不清的问题。
+          # Only the specific version is tagged, **never latest**. Production pins a
+          # version and has to come back to the same one after a restart; a tag that drifts
+          # turns "which version is running in production" into a question nobody can
+          # settle.
           #
-          # 镜像叫 cormex（不是 cortexd）—— 那是产品名，
-          # 里头的二进制仍叫 cortexd
+          # The image is called cormex (not cortexd) -- that is the product name, while the
+          # binary inside is still called cortexd
           tags: |
             willdockerhub/cormex:v${{ needs.preflight.outputs.version }}
             registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v${{ needs.preflight.outputs.version }}
           cache-from: type=gha,scope=cormex
           cache-to: type=gha,mode=max,scope=cormex
 
-      # 镜像必须被真的启动一次。推上去之后才发现起不来，就只能靠发下一版
-      # 来修 —— 而那时它已经在 registry 里了。
+      # The image has to be genuinely started once. Discovering after the push that it does
+      # not come up leaves no fix but releasing the next version -- and by then it is
+      # already sitting in the registry.
       #
-      # 拉的是 ACR 那份而不是本地 build 出来的那份：本地那份没经过
-      # push/pull 一个来回，manifest 层面的问题（就是上面 provenance
-      # 那一类）在它身上看不出来
-      - name: 冒烟
+      # What gets pulled is the ACR copy rather than the one built locally: the local one
+      # has never made the push/pull round trip, so manifest-level problems (exactly the
+      # provenance kind above) are invisible on it
+      - name: Smoke test
         run: |
           set -euo pipefail
           v="${{ needs.preflight.outputs.version }}"
           img="registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v$v"
           docker pull "$img"
-          # `--version` 是唯一能在 CI 里无依赖执行的真实代码路径：
-          # clap 在连数据库之前就把它答完了，所以不需要 Postgres。
-          # 它证明的是**动态链接通的** —— glibc 版本对不上那一类问题
-          # （构建底座与运行底座代号不一致）会在这里当场炸，
-          # 而不是等到线上起容器时报一句 `GLIBC_2.xx not found`
+          # `--version` is the only real code path that can be executed in CI with no
+          # dependencies: clap answers it before anything connects to a database, so no
+          # Postgres is required.
+          # What it proves is that **dynamic linking works** -- problems of the mismatched
+          # glibc version kind (the build base and the runtime base being different
+          # releases) blow up right here, instead of waiting to report
+          # `GLIBC_2.xx not found` when the container starts in production
           docker run --rm "$img" --version | tee /tmp/v.txt
           grep -qF "$v" /tmp/v.txt \
-            || { echo "::error::镜像里的版本不是 $v"; exit 1; }
-          # migration 随镜像走（部署机上不装 Rust 工具链，
-          # `just prod-migrate` 直接在容器里跑）。两份都要在，
-          # 少了全局那份的症状是新租户建号建到一半失败
+            || { echo "::error::the version inside the image is not $v"; exit 1; }
+          # The migrations travel with the image (the deployment machine has no Rust
+          # toolchain, and `just prod-migrate` runs them inside the container). Both sets
+          # have to be present; the symptom of the global one missing is a new tenant
+          # failing halfway through account creation
           docker run --rm --entrypoint /bin/sh "$img" -c \
             'test -d /opt/cortex/migrations && test -d /opt/cortex/migrations-global' \
-            || { echo "::error::镜像里缺 migration 目录"; exit 1; }
+            || { echo "::error::the migration directories are missing from the image"; exit 1; }

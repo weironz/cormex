@@ -1,15 +1,19 @@
-//! 账号相关的线上形状。
+//! The on-the-wire shapes for accounts.
 //!
-//! # 为什么是两种令牌而不是一种
+//! # Why two kinds of token rather than one
 //!
-//! 一种令牌只能在两个坏结果里选：要么短命（用户每十几分钟被踢一次），
-//! 要么长命（泄露之后攻击者能用很久）。
+//! A single token only lets you pick between two bad outcomes: either it is
+//! short-lived (the user gets kicked out every fifteen minutes), or it is
+//! long-lived (an attacker who leaks it can use it for a long time).
 //!
-//! 分成两种就都要得到：`access_token` 15 分钟、每次请求都带、泄露窗口很短；
-//! `refresh_token` 30 天、只在换 access 时用一次、平时躺在系统凭据库里。
+//! Splitting it in two gets you both: `access_token` lives 15 minutes, rides
+//! on every request, and has a very short leak window; `refresh_token` lives
+//! 30 days, is used once per access exchange, and otherwise sits in the
+//! system credential store.
 //!
-//! **「关掉应用再打开不用重新登录」靠的就是后者。** 服务端发了它而客户端
-//! 不存下来，等于这一整套没做 —— 见 `app/lib/auth/`。
+//! **"Close the app, reopen it, no need to log in again" rests entirely on the
+//! latter.** If the server issues it and the client does not store it, this
+//! whole arrangement was for nothing — see `app/lib/auth/`.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,9 +21,10 @@ use serde::{Deserialize, Serialize};
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
-    /// 这台设备叫什么，纯诊断用。
+    /// What this device is called. Purely diagnostic.
     ///
-    /// 同一个账号在三台机器上登录时，「哪一台的凭据泄露了」只有它答得上来。
+    /// When one account is logged in on three machines, this is the only thing
+    /// that can answer "whose credential leaked".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_label: Option<String>,
 }
@@ -28,16 +33,16 @@ pub struct LoginRequest {
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
-    /// 邀请码。开放注册关着时它是唯一的进门方式。
+    /// Invite code. While open registration is closed, this is the only way in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshRequest {
-    /// **放请求体不放 URL。** 它是长期凭据，而 URL 会进 access log、
-    /// 进反代日志、进浏览器历史 —— 与 `ConfirmReceipt` 里那个 token
-    /// 同一条理由。
+    /// **In the body, not the URL.** It is a long-lived credential, and URLs
+    /// end up in access logs, in reverse-proxy logs, in browser history — the
+    /// same reason as the token in `ConfirmReceipt`.
     pub refresh_token: String,
 }
 
@@ -45,9 +50,11 @@ pub struct RefreshRequest {
 pub struct AuthTokens {
     pub access_token: String,
     pub access_expires_in_secs: u64,
-    /// **只在这里出现一次。** 服务端只存它的摘要，丢了就只能重新登录。
+    /// **Appears here exactly once.** The server stores only its digest; lose
+    /// it and the only way back is logging in again.
     pub refresh_token: String,
-    /// 多久不用就要重新输密码。客户端可以拿它决定要不要提前提醒。
+    /// How long the account can go unused before the password is needed again.
+    /// A client can use this to decide whether to warn the user ahead of time.
     pub refresh_expires_in_secs: u64,
     pub user_id: String,
 }
@@ -56,9 +63,10 @@ pub struct AuthTokens {
 pub struct WhoAmI {
     pub user_id: String,
     pub username: String,
-    /// 这个人的记忆住在哪个 schema。
+    /// Which schema this person's memory lives in.
     ///
-    /// 下发出来是为了让排障时能一眼对上：「我看到的是不是我自己的库」
-    /// 在多租户里是个会被真的问出口的问题。
+    /// It is handed down so that troubleshooting can line things up at a
+    /// glance: "is what I am looking at actually my own database" is a question
+    /// people really do ask out loud in a multi-tenant system.
     pub schema_name: String,
 }

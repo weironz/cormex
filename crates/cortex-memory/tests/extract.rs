@@ -1,8 +1,10 @@
-//! 抽取管线的集成测试：真连数据库，验证消解与落库的最终状态。
+//! Integration tests for the extraction pipeline: a real database, checking
+//! the final state left by resolution and persistence.
 //!
-//! 判断标准一律是**库里的最终状态**（`active_facts` / `fact_events`），
-//! 不是函数返回值 —— 返回值对了但没写进去，或写进去了但视图算错，
-//! 都是这一层才能发现的问题。
+//! The yardstick is always **the final state in the database** (`active_facts`
+//! / `fact_events`), never a function's return value — a return value that is
+//! correct but never written, or written but miscomputed by the view, are both
+//! problems only this layer can catch.
 
 mod common;
 
@@ -14,12 +16,13 @@ use cortex_store::{FactOp, InvalidationKind, NewRedaction, RedactionMode, Redact
 
 use common::{DEVICE, candidate, ctx, offline_extractor, seed_episode, setup, ts};
 
-/// 取某 (主语, 谓词) 下当前有效的事实的宾语集合。
+/// Collects the objects of every fact currently active under a given
+/// (subject, predicate).
 async fn active_objects(store: &cortex_store::Store, subject: Id, predicate: &str) -> Vec<String> {
     store
         .active_facts_by_subject_predicate(&subject.to_string(), predicate)
         .await
-        .expect("查有效事实不该失败")
+        .expect("querying active facts should not fail")
         .into_iter()
         .filter_map(|f| f.object_text)
         .collect()
@@ -45,8 +48,8 @@ async fn superseding_fact_invalidates_the_old_one() {
             &ctx(ep1, ts(2026, 1, 1)),
         )
         .await
-        .expect("首条事实应能落库");
-    assert_eq!(first.written.len(), 1, "首条事实应被写入");
+        .expect("the first fact should be persisted");
+    assert_eq!(first.written.len(), 1, "the first fact should be written");
     let old_fact = first.written[0];
     let subject = first.new_entities[0];
 
@@ -64,56 +67,56 @@ async fn superseding_fact_invalidates_the_old_one() {
             &ctx(ep2, ts(2026, 6, 1)),
         )
         .await
-        .expect("取代性事实应能落库");
+        .expect("the superseding fact should be persisted");
 
     assert_eq!(
         second.superseded,
         vec![old_fact],
-        "uses 是单值谓词，更晚的取值必须取代更早的"
+        "uses is a functional predicate: the later value must supersede the earlier one"
     );
 
-    // ── 旧事实退出检索，新事实留下 ──
+    // ── the old fact drops out of retrieval, the new one stays ──
     let active = active_objects(&store, subject, "uses").await;
     assert_eq!(
         active,
         vec!["Postgres".to_string()],
-        "active_facts 应当只剩新事实，实际 {active:?}"
+        "active_facts should hold nothing but the new fact, actually {active:?}"
     );
 
-    // ── 失效以追加事件表达，不是就地改行 ──
+    // ── invalidation is expressed by an appended event, not an in-place edit ──
     let events = store
         .fact_events(&old_fact.to_string())
         .await
-        .expect("查生命周期事件不该失败");
+        .expect("querying lifecycle events should not fail");
     assert_eq!(
         events.len(),
         1,
-        "旧事实应恰好有一条失效事件，实际 {events:?}"
+        "the old fact should have exactly one invalidation event, actually {events:?}"
     );
     let ev = &events[0];
     assert_eq!(ev.op, FactOp::Invalidate);
     assert_eq!(
         ev.kind,
         Some(InvalidationKind::Superseded),
-        "世界变了属于 superseded，不是 corrected"
+        "the world changed, which is superseded, not corrected"
     );
     assert_eq!(
         ev.superseded_by.as_deref(),
         Some(second.written[0].to_string().as_str()),
-        "superseded_by 必须指向新事实，否则事实演化链断裂"
+        "superseded_by must point at the new fact, or the chain of fact evolution snaps"
     );
     assert_eq!(
         ev.invalid_at,
         Some(ts(2026, 6, 1)),
-        "invalid_at 应取新事实的事件时间，而不是入库时刻"
+        "invalid_at should take the new fact's event time, not the moment it was persisted"
     );
 
-    // 旧事实本身没被改动，审计视图仍看得见
+    // the old fact itself is untouched; the audit view can still see it
     let row = store
         .fact(&old_fact.to_string())
         .await
-        .expect("查事实不该失败")
-        .expect("旧事实必须仍在表里 —— append-only 不做删除");
+        .expect("querying a fact should not fail")
+        .expect("the old fact must still be in the table — append-only does not delete");
     assert_eq!(row.object_text.as_deref(), Some("MySQL"));
 
     db.cleanup().await;
@@ -136,12 +139,13 @@ async fn supplementary_fact_coexists() {
             &ctx(ep, ts(2026, 6, 1)),
         )
         .await
-        .expect("补充性事实应能落库");
+        .expect("supplementary facts should be persisted");
 
-    assert_eq!(report.written.len(), 2, "两条都该写入");
+    assert_eq!(report.written.len(), 2, "both should be written");
     assert!(
         report.superseded.is_empty(),
-        "likes 不在单值谓词表里，两条是补充关系，不该失效任何一条：{:?}",
+        "likes is not in the functional-predicate table; the two supplement each other, \
+         so neither should be invalidated: {:?}",
         report.superseded
     );
 
@@ -151,7 +155,7 @@ async fn supplementary_fact_coexists() {
     assert_eq!(
         active,
         vec!["Go".to_string(), "Rust".to_string()],
-        "两条应当并存"
+        "the two should coexist"
     );
 
     db.cleanup().await;
@@ -171,11 +175,15 @@ async fn entity_aliases_merge_via_vector_similarity() {
             &ctx(ep1, ts(2026, 6, 1)),
         )
         .await
-        .expect("首条应能落库");
-    assert_eq!(first.new_entities.len(), 1, "首次出现应新建实体");
+        .expect("the first should be persisted");
+    assert_eq!(
+        first.new_entities.len(),
+        1,
+        "a first appearance should create a new entity"
+    );
     let entity = first.new_entities[0];
 
-    // 名字不同（精确匹配必然落空），只能靠向量近似归并
+    // the names differ (exact match is bound to miss), so only vector similarity can merge them
     let ep2 = seed_episode(&store, "Cortex 项目的对象存储用 RustFS").await;
     let second = extractor
         .write_candidates(
@@ -190,26 +198,26 @@ async fn entity_aliases_merge_via_vector_similarity() {
             &ctx(ep2, ts(2026, 6, 2)),
         )
         .await
-        .expect("第二条应能落库");
+        .expect("the second should be persisted");
 
     assert!(
         second.new_entities.is_empty(),
-        "「Cortex 项目」应归并到已有实体，不该再造一个：{:?}",
+        "\"Cortex 项目\" should merge into the existing entity, not spawn another one: {:?}",
         second.new_entities
     );
 
     let fact = store
         .fact(&second.written[0].to_string())
         .await
-        .expect("查事实不该失败")
-        .expect("第二条事实应已落库");
+        .expect("querying a fact should not fail")
+        .expect("the second fact should already be persisted");
     assert_eq!(
         fact.subject_id,
         entity.to_string(),
-        "两条事实必须挂在同一个实体上，否则图谱会被别名撕成两半"
+        "both facts must hang off the same entity, or aliases tear the graph in half"
     );
 
-    // 精确同名的那条路也要走通
+    // the exact-same-name path has to work as well
     let ep3 = seed_episode(&store, "cortex 的部署目标是 fly.io").await;
     let third = extractor
         .write_candidates(
@@ -224,8 +232,11 @@ async fn entity_aliases_merge_via_vector_similarity() {
             &ctx(ep3, ts(2026, 6, 3)),
         )
         .await
-        .expect("第三条应能落库");
-    assert!(third.new_entities.is_empty(), "同名实体应走精确匹配复用");
+        .expect("the third should be persisted");
+    assert!(
+        third.new_entities.is_empty(),
+        "an identically named entity should be reused through the exact-match path"
+    );
 
     db.cleanup().await;
 }
@@ -244,9 +255,9 @@ async fn duplicate_candidate_is_dropped() {
             &ctx(ep1, ts(2026, 6, 1)),
         )
         .await
-        .expect("首条应能落库");
+        .expect("the first should be persisted");
 
-    // 同一件事在下一轮被再次提及，只是大小写和空白不同
+    // the same thing is mentioned again next turn, differing only in case and whitespace
     let ep2 = seed_episode(&store, "对，我们用的是 postgres").await;
     let again = extractor
         .write_candidates(
@@ -255,11 +266,12 @@ async fn duplicate_candidate_is_dropped() {
             &ctx(ep2, ts(2026, 6, 2)),
         )
         .await
-        .expect("重复候选也应正常返回");
+        .expect("a duplicate candidate should still return normally");
 
     assert!(
         again.written.is_empty(),
-        "同主谓宾的重复事实必须丢弃 —— 检索是 top-K，重复会把别的挤出去"
+        "a repeat of the same subject/predicate/object must be dropped — \
+         retrieval is top-K, and duplicates squeeze other facts out"
     );
     assert_eq!(again.duplicates, 1);
 
@@ -281,11 +293,12 @@ async fn same_instant_conflict_flags_both_sides() {
             &ctx(ep1, at),
         )
         .await
-        .expect("首条应能落库");
+        .expect("the first should be persisted");
     let old_fact = first.written[0];
     let subject = first.new_entities[0];
 
-    // 同一时刻、同一单值谓词、不同取值 —— 确定性逻辑判不出谁对
+    // same instant, same functional predicate, different values — deterministic
+    // logic cannot tell which one is right
     let ep2 = seed_episode(&store, "任务 A 归李四").await;
     let second = extractor
         .write_candidates(
@@ -294,38 +307,39 @@ async fn same_instant_conflict_flags_both_sides() {
             &ctx(ep2, at),
         )
         .await
-        .expect("冲突候选应能落库");
+        .expect("the conflicting candidate should be persisted");
 
     assert!(
         second.superseded.is_empty(),
-        "判不出先后就不该失效任何一条：{:?}",
+        "if the order cannot be told apart, neither should be invalidated: {:?}",
         second.superseded
     );
     assert_eq!(
         second.flagged.len(),
         2,
-        "新旧两侧都要挂 flag，待确认列表才看得到矛盾的两条：{:?}",
+        "both the old and the new side must be flagged, or the pending-confirmation \
+         list only shows one half of the contradiction: {:?}",
         second.flagged
     );
 
-    // flag 是批注，不改变状态：两条仍然有效
+    // a flag is an annotation, it changes no state: both remain active
     let mut active = active_objects(&store, subject, "assigned_to").await;
     active.sort();
     assert_eq!(
         active,
         vec!["张三".to_string(), "李四".to_string()],
-        "flag 不该改变 active_facts"
+        "a flag should not change active_facts"
     );
 
     let events = store
         .fact_events(&old_fact.to_string())
         .await
-        .expect("查事件不该失败");
+        .expect("querying events should not fail");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].op, FactOp::Flag);
     assert!(
         events[0].kind.is_none() && events[0].invalid_at.is_none(),
-        "flag 不得携带 invalidate 专属字段（schema CHECK 也会拦）"
+        "a flag must not carry invalidate-only fields (the schema CHECK stops it too)"
     );
 
     db.cleanup().await;
@@ -350,9 +364,9 @@ async fn redacted_source_blocks_derived_writes() {
     store
         .write_txn(async |tx| tx.insert_redaction(&tombstone).await)
         .await
-        .expect("墓碑应能落库");
+        .expect("the tombstone should be persisted");
 
-    // 抽取任务是异步的，很可能在 redact 执行时还在飞
+    // extraction is asynchronous and may well still be in flight when the redact runs
     let report = extractor
         .write_candidates(
             &store,
@@ -360,11 +374,11 @@ async fn redacted_source_blocks_derived_writes() {
             &ctx(ep, ts(2026, 6, 1)),
         )
         .await
-        .expect("被抹除的出处不该导致报错，只是什么都不写");
+        .expect("a redacted source should not raise an error, it just writes nothing");
 
     assert!(
         report.written.is_empty() && report.new_entities.is_empty(),
-        "在途抽取任务绝不能把已抹除的内容回填：{report:?}"
+        "an in-flight extraction must never write already-redacted content back: {report:?}"
     );
 
     db.cleanup().await;
@@ -393,18 +407,22 @@ async fn intra_batch_conflict_is_resolved_too() {
             &ctx(ep, ts(2026, 6, 1)),
         )
         .await
-        .expect("同批次冲突应能落库");
+        .expect("an intra-batch conflict should be persisted");
 
-    assert_eq!(report.written.len(), 2, "两条都写入，失效靠追加事件表达");
+    assert_eq!(
+        report.written.len(),
+        2,
+        "both are written; invalidation is expressed by an appended event"
+    );
     assert_eq!(
         report.superseded.len(),
         1,
-        "同一批次内的互斥事实也要判定，否则两条会双双生效"
+        "mutually exclusive facts inside one batch must be resolved too, or both stay active"
     );
 
     let subject = report.new_entities[0];
     let active = active_objects(&store, subject, "uses").await;
-    assert_eq!(active, vec!["Postgres".to_string()], "实际 {active:?}");
+    assert_eq!(active, vec!["Postgres".to_string()], "actually {active:?}");
 
     db.cleanup().await;
 }
@@ -423,35 +441,45 @@ async fn entity_object_becomes_a_graph_edge() {
     let report = extractor
         .write_candidates(&store, vec![c], &ctx(ep, ts(2026, 6, 1)))
         .await
-        .expect("实体宾语应能落库");
+        .expect("an entity object should be persisted");
 
-    assert_eq!(report.new_entities.len(), 2, "主语与宾语都是新实体");
+    assert_eq!(
+        report.new_entities.len(),
+        2,
+        "subject and object are both new entities"
+    );
     let fact = store
         .fact(&report.written[0].to_string())
         .await
-        .expect("查事实不该失败")
-        .expect("事实应已落库");
+        .expect("querying a fact should not fail")
+        .expect("the fact should already be persisted");
     assert!(
         fact.object_entity_id.is_some() && fact.object_text.is_none(),
-        "指向实体的事实应写 object_entity_id 而非 object_text，它是图谱里的一条边"
+        "a fact pointing at an entity should write object_entity_id rather than object_text — \
+         it is an edge in the graph"
     );
 
     let inbound = store
         .active_facts_by_object(fact.object_entity_id.as_deref().unwrap(), 10)
         .await
-        .expect("反向一跳不该失败");
-    assert_eq!(inbound.len(), 1, "图遍历的反向一跳应能找到这条边");
+        .expect("a reverse one-hop should not fail");
+    assert_eq!(
+        inbound.len(),
+        1,
+        "the reverse one-hop of a graph traversal should find this edge"
+    );
 
     db.cleanup().await;
 }
 
-/// 真实模型的抽取质量。CI 没有 key，默认跳过；本地
-/// `cargo test -p cortex-memory --test extract -- --ignored --nocapture` 手跑。
+/// Extraction quality with a real model. CI has no key, so this is skipped by
+/// default; run it by hand locally with
+/// `cargo test -p cortex-memory --test extract -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "需要 DEEPSEEK_API_KEY，会产生真实 API 调用"]
 async fn real_llm_extraction_quality() {
     let _ = dotenvy::dotenv();
-    let llm = cortex_llm::LlmClient::from_env().expect("应能从环境构造 LlmClient");
+    let llm = cortex_llm::LlmClient::from_env().expect("should build an LlmClient from the env");
     let extractor = cortex_memory::extract::Extractor::new(
         llm,
         Arc::new(cortex_memory::embed::HashEmbedder::new()),
@@ -473,7 +501,7 @@ async fn real_llm_extraction_quality() {
     let facts = extractor
         .extract(episode, &ctx)
         .await
-        .expect("真实抽取不该失败");
+        .expect("a real extraction should not fail");
 
     println!("\n=== 抽出 {} 条事实 ===", facts.len());
     for f in &facts {
@@ -489,25 +517,30 @@ async fn real_llm_extraction_quality() {
         );
     }
 
-    assert!(!facts.is_empty(), "这段对话里明显有该记的事实");
+    assert!(
+        !facts.is_empty(),
+        "this conversation plainly contains facts worth recording"
+    );
     assert!(
         facts.len() <= 8,
-        "抽出 {} 条，太多了 —— 寒暄、代码片段、一次性查询都不该抽",
+        "extracted {}, far too many — small talk, code snippets and one-off questions \
+         should none of them be extracted",
         facts.len()
     );
     let joined: String = facts.iter().map(|f| f.statement.as_str()).collect();
     assert!(
         joined.contains("RustFS"),
-        "「决定用 RustFS」是典型的该抽项：{joined}"
+        "\"decided on RustFS\" is a textbook thing to extract: {joined}"
     );
     assert!(
         !joined.contains("println"),
-        "代码片段本身不该进 L1：{joined}"
+        "the code snippet itself has no business in L1: {joined}"
     );
 }
 
-/// 真实模型 + 真实数据库跑完整条管线，验证 `extract → 消解 → 落库` 的接线。
-/// 需要 `DEEPSEEK_API_KEY` 与 `DATABASE_URL`。
+/// Runs the whole pipeline against a real model plus a real database, checking
+/// the wiring of `extract → resolution → persistence`.
+/// Requires `DEEPSEEK_API_KEY` and `DATABASE_URL`.
 #[tokio::test]
 #[ignore = "需要 DEEPSEEK_API_KEY 与数据库，会产生真实 API 调用"]
 async fn real_llm_end_to_end_ingest() {
@@ -515,7 +548,7 @@ async fn real_llm_end_to_end_ingest() {
     let Some(db) = setup().await else { return };
     let store = db.store.clone();
 
-    let llm = cortex_llm::LlmClient::from_env().expect("应能从环境构造 LlmClient");
+    let llm = cortex_llm::LlmClient::from_env().expect("should build an LlmClient from the env");
     let extractor = cortex_memory::extract::Extractor::new(
         llm,
         Arc::new(cortex_memory::embed::HashEmbedder::new()),
@@ -527,43 +560,56 @@ async fn real_llm_end_to_end_ingest() {
     let report = extractor
         .ingest(&store, text, &ctx(ep, ts(2026, 8, 7)))
         .await
-        .expect("完整管线不该失败");
+        .expect("the full pipeline should not fail");
 
     println!("\n=== ingest 报告 ===\n{report:#?}");
-    assert!(!report.written.is_empty(), "应至少落库一条事实");
+    assert!(
+        !report.written.is_empty(),
+        "at least one fact should have been persisted"
+    );
 
     for id in &report.written {
         let fact = store
             .fact(&id.to_string())
             .await
-            .expect("查事实不该失败")
-            .expect("刚写的事实应当查得到");
+            .expect("querying a fact should not fail")
+            .expect("a fact just written should be findable");
         println!("落库：{} | {}", fact.predicate, fact.statement);
         assert!(
             fact.embedding.is_some(),
-            "embedding 必须与主行同事务写入，否则向量召回永远漏这条"
+            "the embedding must be written in the same transaction as the main row, \
+             or vector recall misses this one forever"
         );
-        assert_eq!(fact.source_episode_id, ep.to_string(), "出处必须可追溯");
+        assert_eq!(
+            fact.source_episode_id,
+            ep.to_string(),
+            "provenance must stay traceable"
+        );
     }
 
     db.cleanup().await;
 }
 
-/// 沙箱写回来的那一轮，抽出的事实**降一档**到 tier 3。
+/// Facts extracted from a turn written back by a sandbox get **demoted one
+/// notch**, to tier 3.
 ///
-/// # 这一条守的是什么
+/// # What this one guards
 ///
-/// 沙箱里跑的是不可信代码。它写回来的 `role: user` 不是用户说的，是那个
-/// 容器说的 —— 而容器可能已经被它自己读到的东西诱导（MINJA / AgentPoison
-/// 都是写侧攻击）。不降级的话，一条被注入的「事实」会以**用户亲口说的**
-/// 同等信任级，在未来所有会话、所有设备上被召回并注入 system prompt，
-/// 而那个容器早就销毁了。
+/// What runs inside a sandbox is untrusted code. The `role: user` it writes
+/// back was not said by the user, it was said by that container — and the
+/// container may already have been steered by something it read itself (MINJA
+/// and AgentPoison are both write-side attacks). Without the demotion, a single
+/// injected "fact" would be recalled and injected into the system prompt at the
+/// **same trust tier as words the user said out loud**, in every future session
+/// on every device, long after that container was destroyed.
 ///
-/// 四家云 agent 没有这条通道（它们的沙箱没有可写的长期记忆），所以这一格
-/// 是 Cortex 特有的 —— 没有先例可抄，只能自己守。
+/// None of the four cloud agents has this channel (their sandboxes have no
+/// writable long-term memory), so this cell is Cortex-specific — there is no
+/// precedent to copy, we have to guard it ourselves.
 ///
-/// **不是「不写」而是「降级」**：沙箱里干的活确实值得记住（那本来就是用户
-/// 让它干的），只是不该与用户亲口说的话平起平坐。
+/// **Not "don't write" but "demote"**: the work done inside the sandbox really
+/// is worth remembering (the user asked for it in the first place), it just
+/// should not stand on equal footing with what the user said out loud.
 #[tokio::test]
 async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
     let Some(db) = setup().await else { return };
@@ -580,7 +626,7 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
             &ctx(ep_user, ts(2026, 1, 1)),
         )
         .await
-        .expect("普通那轮应能落库");
+        .expect("the ordinary turn should be persisted");
     let sandboxed = extractor
         .write_candidates(
             &store,
@@ -588,7 +634,7 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
             &ctx(ep_sbx, ts(2026, 1, 2)).from(cortex_memory::extract::TurnOrigin::Delegated),
         )
         .await
-        .expect("沙箱那轮同样应能落库");
+        .expect("the sandboxed turn should be persisted just the same");
 
     let tier_of = |id: cortex_core::Id| {
         let store = store.clone();
@@ -596,8 +642,8 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
             store
                 .fact(&id.to_string())
                 .await
-                .expect("查事实不该失败")
-                .expect("刚写进去的事实应当查得到")
+                .expect("querying a fact should not fail")
+                .expect("a fact just written should be findable")
         }
     };
     let normal_fact = tier_of(normal.written[0]).await;
@@ -606,16 +652,20 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
     assert_eq!(
         normal_fact.source_channel.as_str(),
         "conversation",
-        "普通对话抽出来的仍是 conversation（tier 2），这一条不该被改动"
+        "what ordinary conversation extracts is still conversation (tier 2); \
+         that must not be disturbed"
     );
     assert_eq!(
         sandbox_fact.source_channel.as_str(),
         "tool_output",
-        "沙箱写回来的必须降到 tool_output（tier 3）—— 与工具轨迹同级，         因为它们同属「模型自己造出来又自己读回来」的闭环"
+        "what a sandbox writes back must drop to tool_output (tier 3) — the same level as a \
+         tool trace, because both belong to the loop where the model produces something \
+         and then reads it back itself"
     );
     assert!(
         sandbox_fact.trust_tier > normal_fact.trust_tier,
-        "数字越大越不可信：沙箱那条的 tier（{:?}）必须严格高于普通那条（{:?}）",
+        "a bigger number means less trusted: the sandboxed fact's tier ({:?}) must be \
+         strictly higher than the ordinary one's ({:?})",
         sandbox_fact.trust_tier,
         normal_fact.trust_tier
     );

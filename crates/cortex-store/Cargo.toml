@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex 存储层：sqlx repository 与 sync_log 写入器"
+description = "The Cortex storage layer: sqlx repositories and the sync_log writer"
 
 [dependencies]
 cortex-core.workspace = true

@@ -1,6 +1,8 @@
-//! 供应商层冒烟测试：向配置好的模型问一句话，把流式增量逐块打印出来。
+//! A provider-layer smoke test: ask the configured model one question and print
+//! the streamed deltas chunk by chunk.
 //!
-//! 跑之前把密钥写进项目根的 `.env`（该文件已被 .gitignore 排除）：
+//! Before running, put the key in the `.env` at the project root (that file is
+//! excluded by .gitignore):
 //!
 //! ```text
 //! DEEPSEEK_API_KEY=sk-...
@@ -8,9 +10,10 @@
 //! CORTEX_LLM_CHEAP_MODEL=deepseek-v4-flash
 //! ```
 //!
-//! 然后：`cargo run -p cortex-llm --example chat`
+//! Then: `cargo run -p cortex-llm --example chat`
 //!
-//! 每块增量之间打一个 `|`，肉眼就能确认是真流式而不是收完再吐。
+//! A `|` is printed between chunks, so you can confirm by eye that this is real
+//! streaming rather than collecting everything and dumping it at the end.
 
 use std::io::Write;
 
@@ -19,7 +22,8 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 从项目根往上找 .env；example 的工作目录就是 workspace 根，直接找得到。
+    // Search upward from the project root for .env; an example's working
+    // directory is the workspace root, so it is found directly.
     if let Err(e) = dotenvy::dotenv() {
         eprintln!("提示：未加载 .env（{e}），改用进程环境变量");
     }
@@ -31,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let client = LlmClient::from_env()?;
-    // 冒烟测试用廉价模型，别烧主模型的额度。
+    // The smoke test uses the cheap model; do not burn the main model's quota.
     let model = client.cheap_model();
     println!(
         "供应商 {} / 模型 {}（上下文上限 {}）",
@@ -49,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
     let mut chunks = 0usize;
     while let Some(chunk) = stream.next().await {
         print!("{}|", chunk?);
-        // 不 flush 的话终端会攒到换行才显示，看不出流式效果。
+        // Without a flush the terminal buffers until a newline, and the
+        // streaming effect is invisible.
         std::io::stdout().flush()?;
         chunks += 1;
     }

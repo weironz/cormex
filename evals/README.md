@@ -1,414 +1,481 @@
-# cortex-evals —— 检索质量评测
+# cortex-evals —— retrieval quality evaluation
 
-在这个 crate 之前，RRF 的 k 值、各路召回宽度、域加权系数、预算截断
-**全部只能凭感觉调**。它做的事只有一件：让每一次「优化」都有数字可以对照。
+Before this crate existed, the k of RRF, the width of each retrieval leg, the domain
+weighting coefficients and the budget truncation **could only be tuned by feel**. It does
+exactly one thing: give every "optimization" a number to be checked against.
 
-题集是**自建**的中英双语私有集。公开基准（LoCoMo / LongMemEval）全是英文，
-且没有任何一家覆盖 Cortex 的差异化能力：jieba + tsvector 的中文 BM25、
-双时间轴回放、跨 domain 检索、以及「应当召回不到」。不自建就无法证明卖点成立。
+The question set is a **home-grown** private Chinese-English bilingual one. The public
+benchmarks (LoCoMo / LongMemEval) are all English, and not one of them covers what makes
+Cortex different: Chinese BM25 built on jieba + tsvector, bitemporal replay, cross-domain
+retrieval, and "ought to retrieve nothing". Without building our own there is no way to
+show the selling points hold up.
 
 ---
 
-## 怎么跑
+## How to run it
 
 ```bash
-# 只校验题集，不连数据库 —— CI 的第一道门，秒级
+# Validate the question set only, no database -- CI's first gate, takes seconds
 cargo run -p cortex-evals -- validate
 
-# 跑一遍，出基线数字（需要 Postgres：先 just up）
+# One run, producing the baseline figures (needs Postgres: run just up first)
 cargo run -p cortex-evals -- run
 
-# 落盘两份报告
+# Write out two reports
 cargo run -p cortex-evals -- run --json baseline.json --md baseline.md
 
-# 只跑某几道题，调 bad case
+# Run only a few questions, to work on a bad case
 cargo run -p cortex-evals -- run --only q05 --keep-schema
 
-# A/B：关掉域加权看差多少
+# A/B: turn domain weighting off and see how much it matters
 cargo run -p cortex-evals -- run --ignore-domain
 
-# CI 回归门：跌破门槛就以非零码退出
+# CI regression gate: exit non-zero on falling below the threshold
 cargo run -p cortex-evals -- run --min-recall5 0.75
 ```
 
-`DATABASE_URL` 从仓库根的 `.env` 读。`--mode llm` 会真调抽取模型
-（需要 `DEEPSEEK_API_KEY`），把抽取质量也一起测进来。
+`DATABASE_URL` is read from the `.env` at the repository root. `--mode llm` really calls the
+extraction model (needs `DEEPSEEK_API_KEY`), folding extraction quality into the
+measurement as well.
 
-**向量后端跟生产同一条选择逻辑**（`CORTEX_EMBED_BACKEND`，默认 `fast`）。
-早期版本在这里写死 `HashEmbedder`，代价是第一份基线全部建立在
-「向量那一路只是第二条词法通道」的前提上 —— 换成真实语义模型后
-逐路结论整体推翻，白调了一轮参数。无网环境显式设 `=hash`。
+**The vector backend follows the same selection logic as production**
+(`CORTEX_EMBED_BACKEND`, default `fast`). An early version hard-coded `HashEmbedder` here,
+and the price was that the whole first baseline rested on the premise that "the vector leg
+is merely a second lexical channel" -- swapping in a real semantic model overturned the
+per-leg conclusions wholesale, and a round of tuning had been wasted. On a machine with no
+network, set `=hash` explicitly.
 
-### A/B 与参数扫描
+### A/B and parameter sweeps
 
-检索侧的每个旋钮都有对应的开关，用来回答「这个默认值凭什么」：
+Every knob on the retrieval side has a switch of its own, there to answer "what justifies
+this default":
 
-| 旋钮 | flag |
+| knob | flag |
 |---|---|
-| 弃权阈值 | `--abstain-below 0.02` |
-| 语义地板 | `--semantic-floor 0.45` / `--no-semantic-floor` |
-| 时间近因形态 | `--recency channel\|decay\|off`（+ `--recency-strength/-half-life`） |
-| episodes 一路 | `--episodes` / `--no-episodes` |
-| 单路强命中补偿 | `--peak-bonus 0.04` |
-| 时间回放排序 | `--replay-chronological`（退回改造前的全貌版） |
-| 跨域连接扫描 | `--cross-link`（默认关）+ `--cross-link-judge prefilter\|cheap` |
-| 跨域桥的旋钮 | `--cross-link-min/max-distance` · `--cross-link-degree-cap` · `--cross-link-indexed` |
-| 跨域桥的域惩罚豁免 | `--no-bridge-exemption` |
+| abstain threshold | `--abstain-below 0.02` |
+| semantic floor | `--semantic-floor 0.45` / `--no-semantic-floor` |
+| shape of time recency | `--recency channel\|decay\|off` (+ `--recency-strength/-half-life`) |
+| the episodes leg | `--episodes` / `--no-episodes` |
+| single-leg strong-hit bonus | `--peak-bonus 0.04` |
+| ordering of time replay | `--replay-chronological` (falls back to the whole-picture version from before the rework) |
+| cross-domain link scan | `--cross-link` (off by default) + `--cross-link-judge prefilter\|cheap` |
+| knobs of the cross-domain bridge | `--cross-link-min/max-distance` · `--cross-link-degree-cap` · `--cross-link-indexed` |
+| domain-penalty exemption for bridges | `--no-bridge-exemption` |
 
-不给这些 flag 时**跑的就是生产默认值**，所以 `run` 出来的永远是基线。
+With none of these flags given, **what runs is the production default**, so `run` always
+produces the baseline.
 
-批量扫描用 `evals/sweep.py`（一次跑一组、把关键数字拉平成一张表）：
+Bulk sweeps go through `evals/sweep.py` (one group per invocation, flattening the key
+figures into a single table):
 
 ```bash
-python evals/sweep.py recency          # 近因形态 A/B
-python evals/sweep.py episodes         # episodes 一路 A/B
-python evals/sweep.py floor:0.4,0.45,0.5,0.55   # 临时扫一段
+python evals/sweep.py recency          # A/B of the recency shape
+python evals/sweep.py episodes         # A/B of the episodes leg
+python evals/sweep.py floor:0.4,0.45,0.5,0.55   # sweep a range ad hoc
 ```
 
-它刻意不在 Rust 里：`cortex-evals` 的产物是**一次**运行的报告，把
-「跑 N 次再对比」塞进去会让 CI 那条路径也背上一堆用不到的旋钮。
+It is deliberately not written in Rust: what `cortex-evals` produces is the report of
+**one** run, and pushing "run it N times and compare" inside would saddle the CI path with
+a pile of knobs it has no use for.
 
-### 不会污染开发库
+### It does not pollute the development database
 
-每次运行建一个**临时 schema**（`cortex_eval_<时间戳>_<pid>`），在里面跑一遍
-migration，结束 `DROP SCHEMA ... CASCADE`。做法与
-`crates/cortex-store/tests/common/mod.rs` 同款。崩溃残留的 schema 由下次运行
-按岁数（30 分钟）清扫 —— 不做无差别清扫，那会删掉兄弟进程正在用的。
+Every run creates a **temporary schema** (`cortex_eval_<timestamp>_<pid>`), runs the
+migrations inside it, and ends with `DROP SCHEMA ... CASCADE`. The same approach as
+`crates/cortex-store/tests/common/mod.rs`. Schemas left behind by a crash are swept up by
+the next run according to age (30 minutes) -- not swept indiscriminately, which would
+delete the one a sibling process is using.
 
-`--keep-schema` 保留现场供手工排查（报告结尾会打出 schema 名）。
-
----
-
-## 两种模式
-
-| `--mode` | 候选事实从哪来 | 用途 |
-|---|---|---|
-| `seed`（默认） | 题集里手写的候选，走 `Extractor::write_candidates` | 语料确定，跑一百遍结果一致，**能进 CI** |
-| `llm` | 真调廉价模型，走 `Extractor::ingest` | 连抽取质量一起测，但随模型漂移，不适合做回归门 |
-
-两种模式**共用**实体消解、矛盾消解、jieba 分词、向量化与 `write_txn` 落库 ——
-差别只在候选事实从哪来。评的是整条链路，不是四条 SQL。
-
-### 为什么没有第三种模式（录制 / 回放）
-
-「把一次真实抽取的模型输出录下来，之后确定性回放」这个想法讨论过，**否掉了**。
-
-它解决不了它想解决的那个问题。回归门测不出抽取 prompt 的改动，是因为
-seed 模式绕过了模型；而**磁带把模型的输出冻住了**，改 prompt 之后回放
-出来的还是那盘旧磁带，门照样持平。要看见 prompt 的改动就必须重录，
-重录就是一次真实模型调用 —— 非确定性原样回来。
-
-它买到的那一半也已经有了：磁带比 seed 多走的只有 `parse_candidates`
-一个纯函数（脏 JSON 的容错解析），后面的消解 / 向量化 / 落库 seed 走的
-是**同一个** `write_candidates`。为一个纯函数搭一套磁带管理，不如给它
-写单测。
-
-代价还不止：磁带的键是「episode 文本 + prompt + 模型版本」的函数，
-改题集里任何一个字都会让它失效，而失效的样子是**绿灯**（回放到的是
-没人再用的旧语料）。多一个会静默说谎的确定性来源，比少一个测不到
-prompt 的门更糟。
-
-**真正缺的不是第三种模式，是第三条坐标轴**：抽取侧的断言。
-Recall 这一族指标的分母全是「已经在库里的事实」，它们**结构上**回答不了
-「这条该不该被抽出来」。所以另开了两列，两种模式下都算：
-
-| 抽取侧的读数 | 落在哪 | 判定什么 |
-|---|---|---|
-| `gold 缺失` | 报告表格最后一列 / `by_kind[*].gold_missing` | 该抽的没抽出来（「纠正必抽」那一节的落点） |
-| `never_extracted` 泄漏 | 报告「抽取侧」一节 / `questions[*].leaked` | 不该抽的抽出来了（「绝对不抽」那一节的落点） |
-
-在 seed 模式下，这两列对**对话**语料是恒真的（seed 写什么库里就有什么），
-没有信息量；但对**工具轨迹**是真判据 —— seed 从不为工具轨迹写任何事实。
-工具经验题因此成为 seed 模式下唯一能反映抽取侧状态的一格。
+`--keep-schema` preserves the scene for manual investigation (the schema name is printed at
+the end of the report).
 
 ---
 
-## 题集格式
+## Two modes
 
-题集是一个 JSON 文件（`suites/cortex-zh-en-v1.json`）。
-不用 YAML 是因为工作区没有任何 YAML crate，为一个文件引入依赖不划算
-（且 `serde_yaml` 已停止维护）。
+| `--mode` | where candidate facts come from | what it is for |
+|---|---|---|
+| `seed` (default) | candidates hand-written in the question set, through `Extractor::write_candidates` | the corpus is fixed, a hundred runs give the same result, **fit for CI** |
+| `llm` | really calls the cheap model, through `Extractor::ingest` | measures extraction quality too, but drifts with the model, unfit as a regression gate |
+
+Both modes **share** entity resolution, contradiction resolution, jieba tokenization,
+embedding and persistence through `write_txn` -- the only difference is where the candidate
+facts come from. What is being evaluated is the whole chain, not four SQL queries.
+
+### Why there is no third mode (record / replay)
+
+The idea of "record the model output of one real extraction, then replay it
+deterministically" was discussed, and **rejected**.
+
+It does not solve the problem it means to solve. The reason the regression gate cannot see
+a change to the extraction prompt is that seed mode bypasses the model; and **a tape
+freezes the model's output**, so after the prompt changes what plays back is still that old
+tape and the gate stays just as flat. Seeing the effect of a prompt change requires
+re-recording, and re-recording is a real model call -- the non-determinism comes right back.
+
+The half it does buy is already there anyway: what a tape goes through beyond seed is one
+pure function, `parse_candidates` (fault-tolerant parsing of dirty JSON); everything after
+it -- resolution, embedding, persistence -- goes through the **same** `write_candidates`
+that seed uses. Building a whole tape-management apparatus for one pure function is worse
+than writing that function a unit test.
+
+And the price does not stop there: a tape's key is a function of "episode text + prompt +
+model version", so changing a single character anywhere in the question set invalidates it
+-- and the way it fails is a **green light** (what gets replayed is an old corpus nobody
+uses any more). One more deterministic source that lies silently is worse than one missing
+gate on prompts.
+
+**What is really missing is not a third mode but a third axis**: assertions on the
+extraction side. Every metric of the Recall family has "the facts already in the database"
+as its denominator, so they are **structurally** incapable of answering "should this have
+been extracted at all". Hence two more columns, computed in both modes:
+
+| reading on the extraction side | where it lands | what it decides |
+|---|---|---|
+| `gold missing` | last column of the report table / `by_kind[*].gold_missing` | what should have been extracted was not (where the "must be extracted" clause lands) |
+| `never_extracted` leakage | the "extraction side" section of the report / `questions[*].leaked` | what should never have been extracted was (where the "must never be extracted" clause lands) |
+
+In seed mode these two columns are trivially true for **conversation** corpora (whatever
+seed writes is exactly what the database holds) and carry no information; but for **tool
+traces** they are a real criterion -- seed never writes any fact for a tool trace. The
+tool-experience questions are therefore the one cell in seed mode that reflects the state
+of the extraction side.
+
+---
+
+## Question set format
+
+The question set is a single JSON file (`suites/cortex-zh-en-v1.json`).
+Not YAML, because the workspace has no YAML crate at all and pulling in a dependency for
+one file does not pay (and `serde_yaml` is no longer maintained).
 
 ```jsonc
 {
   "name": "...", "version": "...",
   "scenarios": [{
     "id": "sc-storage",
-    "domain": "coding",              // 落到 episode 与 fact 的 domain 列
+    "domain": "coding",              // lands in the domain column of both episode and fact
     "turns": [{
-      "text": "对话原文……",           // 落成 episode；llm 模式下是抽取器的输入
+      "text": "the conversation text...",  // becomes an episode; in llm mode it is the extractor's input
       "occurred_at": "2026-03-02",
-      "checkpoint": "ckpt_minio",    // 可选：记下本轮提交后的系统时间
+      "checkpoint": "ckpt_minio",    // optional: record the transaction time after this turn commits
       "facts": [{
-        "subject": "对象存储", "subject_kind": "concept",
+        "subject": "object storage", "subject_kind": "concept",
         "predicate": "stores_in",
-        "object_entity": "MinIO",    // 与 "object"（字面量）二选一
+        "object_entity": "MinIO",    // either this or "object" (a literal), not both
         "object_entity_kind": "tool",
-        "statement": "Cortex 的对象存储第一版选用 MinIO。",
-        "valid_at": "2026-03-02",    // 【事件时间】矛盾消解按它判先后
+        "statement": "The first version of Cortex object storage used MinIO.",
+        "valid_at": "2026-03-02",    // [Valid time] contradiction resolution decides order by it
         "confidence": 0.9
       }]
     }]
   }],
   "questions": [{
     "id": "q001",
-    "type": "chinese_semantic",      // 见下表
+    "type": "chinese_semantic",      // see the table below
     "lang": "zh",                    // zh | en | mixed
-    "query": "我们的对象存储最后用的是什么？",
-    "domain": "coding",              // 传给检索器做域加权
-    "as_of": "ckpt_minio",           // 可选：走系统时间回放而非日常召回
-    "gold":      [["对象存储", "RustFS"]],
-    "forbidden": [["第一版选用 MinIO"]],
-    "note": "为什么写这道题"
+    "query": "what did we end up using for object storage?",
+    "domain": "coding",              // handed to the retriever for domain weighting
+    "as_of": "ckpt_minio",           // optional: replay by transaction time instead of everyday retrieval
+    "gold":      [["object storage", "RustFS"]],
+    "forbidden": [["first version used MinIO"]],
+    "note": "why this question exists"
   }]
 }
 ```
 
-### 工具轨迹的 fixture
+### Fixtures for tool traces
 
-轮次上还有三个可选字段，专供 `tool_experience` 那一类题：
+A turn takes three more optional fields, meant for questions of the `tool_experience` kind:
 
 ```jsonc
 "turns": [{
-  "text": "工作区的测试先跑通再说，别的等会儿。",   // 结论一个字都不能出现在这里
+  "text": "Get the workspace tests passing first, the rest can wait.",  // not one word of the conclusion may appear here
   "occurred_at": "2026-02-11",
-  "tool_calls": [                                  // → episode_tool_calls，ordinal 就是下标
+  "tool_calls": [                                  // → episode_tool_calls, ordinal is just the index
     { "name": "bash", "path": "Cargo.toml", "ok": false,
-      "summary": "cargo test --workspace 失败：error: failed to select a version for sqlx-core……" },
+      "summary": "cargo test --workspace failed: error: failed to select a version for sqlx-core..." },
     { "name": "bash", "path": "Cargo.lock", "ok": false,
-      "summary": "cargo update -p sqlx-core --precise 0.9.1 之后重跑，仍然失败……" },
+      "summary": "re-ran after cargo update -p sqlx-core --precise 0.9.1, still failing..." },
     { "name": "bash", "path": "Cargo.lock", "ok": true,
-      "summary": "cargo test --workspace --locked 通过：锁住 Cargo.lock 后本地与 CI 解析一致" }
+      "summary": "cargo test --workspace --locked passes: pinning Cargo.lock makes local and CI resolve alike" }
   ],
-  "tool_expect": ["一个正确的抽取器应当从这段轨迹里得出的陈述"],
+  "tool_expect": ["the statement a correct extractor ought to draw from this trace"],
   "tool_avoid":  ["error: failed to select a version for sqlx-core"]
 }]
 ```
 
-**形状照抄生产的 `episode_tool_calls`**：只有命令、路径、成败、一行结论，
-**没有原始 stdout**。评测里能表达的东西不能比生产多，否则测出来的收益是假的
-（原始字节为什么不存，见 `docs/memory-content.md` §二③）。
+**The shape is copied from production's `episode_tool_calls`**: nothing but the command,
+the path, success or failure, and a one-line conclusion -- **no raw stdout**. The evaluation
+must not be able to express more than production does, or the benefit it measures is fake
+(for why the raw bytes are not stored, see `docs/memory-content.md` §2, item ③).
 
-`tool_calls` 是**语料**不是候选事实：seed 与 llm 两种模式都照样落库，
-与 episode 走**同一个 `write_txn`**。跑完会断言「题集声明几条、库里就有几行」——
-轨迹在写入路径上被吞掉的样子，与「抽取器还没接轨迹」在报告里长得一模一样，
-不断言就永远分不开。
+`tool_calls` are **corpus**, not candidate facts: both seed and llm mode persist them just
+the same, through the **same `write_txn`** the episode goes through. After a run there is an
+assertion that "as many rows exist in the database as the question set declared" -- a trace
+swallowed on the write path looks exactly like "the extractor has not been wired to traces
+yet" in the report, and without the assertion the two can never be told apart.
 
-`tool_expect` / `tool_avoid` **一个字都不会落库**，写进去就成了自问自答。
-它们唯一的用途是给题目的 `gold` / `never_extracted` 当锚点（规程见下）。
+`tool_expect` / `tool_avoid` **never reach the database by a single character**; writing
+them in would be asking and answering your own question. Their sole purpose is to serve as
+anchors for a question's `gold` / `never_extracted` (the procedure is below).
 
-题目侧对应地多了一列：
+The question side gains one matching field:
 
 ```jsonc
 { "id": "qt01", "type": "tool_experience", "lang": "zh", "domain": "coding",
-  "query": "本地跑得过、CI 上跑不过那回，最后是靠加了什么把两边对齐的？",
+  "query": "that time it passed locally but not in CI -- what was added in the end to line the two up?",
   "gold": [["--locked"]],
   "never_extracted": [["failed to select a version"]] }
 ```
 
-`never_extracted` 与 `forbidden` **不是一回事**，别混：
+`never_extracted` and `forbidden` are **not the same thing**, do not conflate them:
 
-- `forbidden` 判「检索有没有把它排进前 k」，前提是**它已经在库里**
-- `never_extracted` 判「它根本就不该在库里」，比对的是**语料快照**
+- `forbidden` judges "did retrieval rank it into the top k", on the premise that
+  **it is already in the database**
+- `never_extracted` judges "it should not be in the database at all", and is compared
+  against **the corpus snapshot**
 
-比对的是全部事实而不是有效事实：失效只是加了个墓碑，行还在、向量还在
-（`docs/memory-content.md` §八.5 的 Ghost Vectors）。抽出来又失效掉，
-不等于没抽。
+The comparison is against all facts, not the valid ones: invalidation only adds a tombstone,
+the row is still there and so is the vector (the Ghost Vectors of
+`docs/memory-content.md` §8.5). Extracted and then invalidated is not the same as never
+extracted.
 
-### gold / forbidden 为什么按子串写
+### Why gold / forbidden are written as substrings
 
-事实的 id 是落库时现生成的 ULID，题集里写不出来；`llm` 模式下连 statement
-的措辞都由模型决定。**「这几个关键词都得出现在同一条事实的 `statement` 里」**
-是唯一在两种模式下都成立的标识方式。
+A fact's id is a ULID generated at the moment it is stored, which cannot be written into the
+question set; and in `llm` mode even the wording of the statement is decided by the model.
+**"All of these keywords have to appear in the `statement` of one and the same fact"** is
+the only way of identifying a fact that holds in both modes.
 
-- 一个 `gold` 元素 = 一组子串，**全部**出现才算命中（AND）
-- 多个 `gold` 元素 = 多条应召回的事实，Recall 是它们的比例
-- `forbidden` 同样的规则，但**出现即扣分**：已被取代的旧值、话题相邻的干扰项
-- 匹配大小写不敏感；只匹配 `statement`（predicate / object 不参与 —— gold 越松，分数越虚高）
+- one `gold` element = one group of substrings, a hit requires **all** of them (AND)
+- several `gold` elements = several facts that ought to be retrieved, and Recall is their ratio
+- `forbidden` follows the same rule, but **appearing costs points**: superseded old values,
+  distractors from a neighbouring topic
+- matching is case-insensitive, and matches `statement` only (predicate / object take no
+  part -- the looser gold is, the more inflated the score)
 
-### 题型
+### Question types
 
-| `type` | 含义 |
+| `type` | meaning |
 |---|---|
-| `chinese_semantic` | 换个说法问同一件事（语义换说法，绝大多数是中文题） |
-| `exact_term` | 型号、端口、标识符、人名、邮箱 —— BM25 的主场 |
-| `temporal_replay` | 「三个月前我以为什么」，必须带 `as_of` |
-| `relational` | 从一个实体跳到它关联的事实 —— 图遍历的主场 |
-| `cross_domain` | 在 coding 语境问 office 的事（或反之） |
-| `tool_experience` | **答案只在工具轨迹里**，对话原文一个字都没说 —— 见下 |
-| `unanswerable` | **库里根本没有答案**，`gold` 必须为空、`forbidden` 必须非空 |
+| `chinese_semantic` | asking the same thing in different words (semantic rephrasing; the vast majority are Chinese questions) |
+| `exact_term` | model numbers, ports, identifiers, personal names, email addresses -- BM25's home ground |
+| `temporal_replay` | "what did I believe three months ago", must carry `as_of` |
+| `relational` | hopping from one entity to the facts related to it -- graph traversal's home ground |
+| `cross_domain` | asking about office matters in a coding context (or the reverse) |
+| `tool_experience` | **the answer exists only in the tool trace**, the conversation text says not a word of it -- see below |
+| `unanswerable` | **there is no answer in the database at all**; `gold` must be empty and `forbidden` must not be |
 
-`tool_experience` 与上面五类不是同一个量纲：**前五类考检索**（事实已经在库里，
-问排不排得上去），**这一类考抽取**（那条事实压根还不存在，问抽取器能不能从
-「命令 + 路径 + 成败」里把它造出来）。因此它在 `mode=seed` 下**必然全挂**，
-挂法是 `GoldMissing` 而不是「排太后」。这不是坏消息，是这把尺子的零点。
+`tool_experience` is not on the same scale as the five above it: **the first five test
+retrieval** (the fact is already in the database, the question is whether it gets ranked up),
+while **this one tests extraction** (the fact does not exist at all, the question is whether
+the extractor can construct it out of "command + path + success or failure"). It therefore
+**necessarily fails outright** under `mode=seed`, and the way it fails is `GoldMissing`
+rather than "ranked too low". That is not bad news; it is the zero point of this ruler.
 
-`unanswerable` 这一类不是补充，是刚需：**只测召回率会奖励「什么都召回」的退化策略**
-——把召回宽度调到无穷大，Recall@k 恒为 1。
+The `unanswerable` type is not a supplement but a necessity: **measuring recall alone
+rewards the degenerate strategy of "retrieve everything"** -- turn the retrieval width up to
+infinity and Recall@k is identically 1.
 
 ---
 
-## 怎么加新题
+## How to add a question
 
-1. 需要新语料就加 `scenarios`，不需要就直接在 `questions` 里追加。
-   新事实的 `predicate` 若想让它**取代**旧值，必须用
-   `cortex_memory::extract::DEFAULT_FUNCTIONAL` 里的单值谓词
-   （`decided_on` / `assigned_to` / `deadline` / `stores_in` …），
-   并且两条的 `valid_at` 分得出先后 —— 否则只会被打成 `flag`，两条并存。
-2. `cargo run -p cortex-evals -- validate` 过静态校验。
-3. `cargo test -p cortex-evals` 过题集完整性检查。它会挡住：
-   - gold / forbidden 匹配不到任何铺垫事实（死题 / 恒真断言）
-   - gold 与 forbidden 命中同一条事实（这道题永远判不对）
-   - 某个题型题量掉到 8 以下（单题抖动会淹没信号）
-   - 工具经验题的七条准入（见「怎么加工具经验题」）
-4. `cargo run -p cortex-evals -- run --only <新题 id>` 看单题结果。
+1. Add to `scenarios` if new corpus is needed, otherwise just append to `questions`.
+   If a new fact's `predicate` is meant to **supersede** an old value, it has to be one of
+   the single-valued predicates in `cortex_memory::extract::DEFAULT_FUNCTIONAL`
+   (`decided_on` / `assigned_to` / `deadline` / `stores_in` ...), and the two `valid_at`
+   values have to be distinguishable in order -- otherwise it is merely marked `flag` and
+   both coexist.
+2. Pass static validation with `cargo run -p cortex-evals -- validate`.
+3. Pass the question-set integrity checks with `cargo test -p cortex-evals`. They stop:
+   - gold / forbidden matching no seeded fact at all (a dead question / a trivially true assertion)
+   - gold and forbidden hitting the same fact (a question that can never be judged correctly)
+   - the count for some question type dropping below 8 (single-question jitter drowning the signal)
+   - the seven admission rules for tool-experience questions (see "How to add a tool-experience question")
+4. Look at the single-question result with
+   `cargo run -p cortex-evals -- run --only <the new question id>`.
 
-题目 id 保持字典序，报告与基线 JSON 才能直接 diff。
+Keep question ids in lexicographic order, so that reports and baseline JSON can be diffed
+directly.
 
-### 怎么加「需要跨域桥」的题（q112–q116 就是这么来的）
+### How to add a question that "needs a cross-domain bridge" (q112-q116 came about this way)
 
-这类题测的是 `cortex-memory::crosslink` 写出来的 `relates_to` 边有没有真的
-让图遍历走通两个领域。**自己造题又自己判分是循环论证**，所以有一套固定规程：
+Questions of this kind test whether the `relates_to` edges written by
+`cortex-memory::crosslink` really do let graph traversal get from one domain to the other.
+**Writing your own question and grading it yourself is circular reasoning**, so there is a
+fixed procedure:
 
-1. **先定形状再写字。** 查询点住桥**这一侧**的实体名（用户本来就会这么问），
-   但**一个词都不能和 gold 的 statement 重合** —— 有重合，BM25 或向量
-   自己就够到了，这道题测的就不是桥。
-2. **gold 必须是语料里原有的事实**，绝不能是 `relates_to` 边自己的 statement。
-   边的 statement 里两个实体名都在，拿它当 gold 等于让这道题自证。
-3. **证伪先行**：不开 `--cross-link` 跑一遍，这道题**必须挂**。挂不掉就说明
-   现有四路本来就能答，题目作废。这一步是**准入**条件。
-4. **不许反向筛**：开了桥之后仍然挂的题**留在题集里**。只保留「开了桥就过」
-   的题，就是把答案倒着写进题目 —— 那才是循环论证真正发生的地方。
-5. **回归面单独看**：新题会拉低 `跨域检索` 那一格的分母。判断桥有没有副作用，
-   要看**原有 111 题**那一组的数字，而不是总分。
+1. **Settle the shape before writing any words.** The query names the entity on **this**
+   side of the bridge (which is how a user would ask anyway), but **not one word of it may
+   overlap with gold's statement** -- with an overlap, BM25 or the vector leg would reach it
+   on their own, and the question would not be testing the bridge.
+2. **gold must be a fact that already exists in the corpus**, and never the statement of the
+   `relates_to` edge itself. Both entity names appear inside the edge's statement, so using
+   it as gold means letting the question prove itself.
+3. **Falsification first**: run once without `--cross-link`, and the question **must fail**.
+   If it does not, the existing four legs can already answer it and the question is void.
+   This step is an **admission** condition.
+4. **No filtering in reverse**: questions that still fail with the bridge on **stay in the
+   question set**. Keeping only the ones that "pass once the bridge is on" is writing the
+   answer backwards into the question -- that is where circular reasoning would really happen.
+5. **Look at the regression surface separately**: new questions drag down the denominator of
+   the `cross-domain` cell. Judging whether the bridge has side effects means looking at the
+   figures for the group of **the original 111 questions**, not at the total.
 
-第 3 步的证据留在下面「跨域连接的基线」那张表的 `A 不建桥` 那一行：
-五道题的 R@∞ 只有 0.400，也就是其中三道**一条都召不回来**。
+The evidence for step 3 is preserved in the `A no bridge` row of the "Baseline for
+cross-domain links" table below: R@∞ for the five questions is only 0.400, meaning three of
+them **retrieve nothing at all**.
 
-### 怎么加「工具经验」题（qt01–qt08 就是这么来的）
+### How to add a "tool experience" question (qt01-qt08 came about this way)
 
-这一类题**最容易变成自证**：自己写一条「应当抽出来的陈述」，再自己写一条
-匹配它的 gold，然后宣布评测覆盖了工具轨迹抽取。规程沿用上面那一套，
-但因为 gold 指向的事实**还不存在**，锚点得换个地方扎：
+This kind of question is **the easiest to turn into self-proof**: write a "statement that
+ought to be extracted" yourself, then write a gold that matches it yourself, then declare
+that the evaluation covers tool-trace extraction. The procedure follows the one above, but
+because the fact gold points at **does not exist yet**, the anchor has to be driven in
+somewhere else:
 
-1. **gold 必须命中某条 `tool_expect`**，不许凭空发明答案。
-   （`tool_experience_gold_is_anchored_in_a_declared_expectation`）
-2. **gold 不得命中任何铺垫事实。** 命中了，这道题在 seed 模式下就已经能答对 ——
-   它量的是「一条手写事实能不能被召回」，不是「轨迹能不能被抽成事实」。
-   **这是这一类题最隐蔽的失效方式：它会安安静静地过，看起来像个好消息。**
-   （`tool_experience_gold_is_absent_from_the_seeded_corpus`）
-3. **gold 不得能从任何一轮的 `text` 里读出来。** 结论写进对话原文，llm 模式下
-   抽取器读 text 就够了，轨迹一眼都不用看 —— 这一格的全部价值就在于
-   「对话里一个字都没说」。（`..._is_absent_from_every_conversation_turn`）
-4. **gold 的每个片段必须逐字出现在某段轨迹里。** 抽取器只看得见
-   name / path / summary 三样，要一个它无从得知的词，这道题永远挂，
-   而那是**题目的错不是实现的错**。推论：gold 一律压在命令、参数、
-   环境变量、路径这类标识符上 —— statement 的措辞由模型决定，只有标识符是稳的。
-   （`tool_experience_gold_is_copyable_from_the_trace`）
-5. **查询里不许出现 gold 的任何片段**（同跨域桥那条第 1 步）。
-6. **`never_extracted` 三面夹住**：必须命中某条 `tool_avoid`（否则凭空写的）、
-   不得命中任何铺垫事实（否则恒定判为泄漏）、不得命中任何 `tool_expect`
-   （否则「必须抽」与「绝对不抽」自相矛盾）。而 `tool_avoid` 自己也必须
-   **逐字引用轨迹**，否则那是一张永远通过的许可证。
-7. **证伪先行**：抽取器还没接工具轨迹的现状下，这些题**必须全挂**。
-   不开关就能过，说明它们量到的是别的东西 —— 见第 2、3 条。
+1. **gold must hit some `tool_expect`**; inventing an answer out of nothing is not allowed.
+   (`tool_experience_gold_is_anchored_in_a_declared_expectation`)
+2. **gold must not hit any seeded fact.** If it does, the question can already be answered
+   in seed mode -- it is measuring "can a hand-written fact be retrieved", not "can a trace
+   be turned into a fact".
+   **This is the most insidious failure mode of this kind of question: it passes quietly,
+   and looks like good news.**
+   (`tool_experience_gold_is_absent_from_the_seeded_corpus`)
+3. **gold must not be readable out of the `text` of any turn.** Write the conclusion into
+   the conversation text and in llm mode the extractor only has to read text, never glancing
+   at the trace -- and the entire value of this cell lies in "the conversation says not a
+   word of it". (`..._is_absent_from_every_conversation_turn`)
+4. **Every fragment of gold has to appear verbatim in some trace.** The extractor sees only
+   three things -- name / path / summary -- so demanding a word it has no way of knowing
+   makes the question fail forever, and that is **the question's fault, not the
+   implementation's**. Corollary: gold is always pinned to identifiers such as commands,
+   arguments, environment variables and paths -- the wording of a statement is decided by
+   the model, and only identifiers are stable.
+   (`tool_experience_gold_is_copyable_from_the_trace`)
+5. **No fragment of gold may appear in the query** (as in step 1 for the cross-domain bridge).
+6. **`never_extracted` is boxed in from three sides**: it must hit some `tool_avoid`
+   (otherwise it was invented), must not hit any seeded fact (otherwise it is judged a leak
+   unconditionally), and must not hit any `tool_expect` (otherwise "must be extracted" and
+   "must never be extracted" contradict each other). And `tool_avoid` itself must
+   **quote the trace verbatim**, or it is a licence to pass forever.
+7. **Falsification first**: as things stand, with the extractor not yet wired to tool traces,
+   these questions **must all fail**. Passing without any switch being flipped means they are
+   measuring something else -- see rules 2 and 3.
 
-第 7 步的证据（2026-08-07，`mode=seed`，`hash` 后端，`--only qt`）：
+The evidence for step 7 (2026-08-07, `mode=seed`, the `hash` backend, `--only qt`):
 
 ```
-工具轨迹：`episode_tool_calls` 落库 17 行
+Tool traces: 17 rows of `episode_tool_calls` persisted
 
-| 题型     | 题数 | 计分 | R@5 | … | gold 缺失 |
-| 工具经验 |    8 |    0 | 0.000 | … |         8 |
+| type            | count | scored | R@5 | ... | gold missing |
+| tool_experience |     8 |      0 | 0.000 | ... |            8 |
 
-## 题目问题（不计入检索指标）
-- `qt01` [工具经验] GoldMissing　gold：--locked
-- `qt02` [工具经验] GoldMissing　gold：cargo update
-- `qt03` [工具经验] GoldMissing　gold：PGOPTIONS
-- `qt04` [工具经验] GoldMissing　gold：PYTHONIOENCODING
-- `qt05` [工具经验] GoldMissing　gold：just ci
-- `qt06` [工具经验] GoldMissing　gold：DROP SCHEMA
-- `qt07` [工具经验] GoldMissing　gold：--remove-orphans
-- `qt08` [工具经验] GoldMissing　gold：--locked
+## Question problems (not counted in the retrieval metrics)
+- `qt01` [tool_experience] GoldMissing  gold: --locked
+- `qt02` [tool_experience] GoldMissing  gold: cargo update
+- `qt03` [tool_experience] GoldMissing  gold: PGOPTIONS
+- `qt04` [tool_experience] GoldMissing  gold: PYTHONIOENCODING
+- `qt05` [tool_experience] GoldMissing  gold: just ci
+- `qt06` [tool_experience] GoldMissing  gold: DROP SCHEMA
+- `qt07` [tool_experience] GoldMissing  gold: --remove-orphans
+- `qt08` [tool_experience] GoldMissing  gold: --locked
 ```
 
-「落库 17 行」这一行是必须一起读的：它证明挂的原因是**没人读那张表**，
-而不是语料压根没进去。两者在指标上完全同形。
+The "17 rows persisted" line has to be read together with the rest: it proves the reason
+they fail is that **nobody reads that table**, and not that the corpus never got in. The two
+are indistinguishable in the metrics.
 
-**正对照**在静态那一侧：第 1 与第 4 条合起来就是
-「若抽取器产出了 `tool_expect` 里那些陈述，这 8 道题按构造即可命中」。
-没有再搭一个「假装抽取器已接好」的开关 —— 那等于在评测里留一个作弊模式，
-而它能证明的东西第 1 条已经证明了。
+**The positive control is on the static side**: rules 1 and 4 together amount to "if the
+extractor did produce the statements in `tool_expect`, these 8 questions would hit by
+construction". No further switch for "pretend the extractor is already wired up" was built
+-- that would be leaving a cheat mode inside the evaluation, and what it could prove is
+already proved by rule 1.
 
-**八道题各考一个角度**（都是 `docs/memory-content.md` §二② 那张判据表里的一条）：
+**The eight questions each test one angle** (each of them one row of the criteria table in
+`docs/memory-content.md` §2, item ②):
 
-| 题 | 角度 | gold |
+| question | angle | gold |
 |---|---|---|
-| qt01 | 差异即知识：三次调用只差一个参数 | `--locked` |
-| qt02 | **失败痕迹本身是知识** —— 问的是已被证伪的那条路 | `cargo update` |
-| qt03 | 差异即知识：差在环境变量 | `PGOPTIONS` |
-| qt04 | 同上，跨平台那一档 | `PYTHONIOENCODING` |
-| qt05 | 同一命令反复出现 = 这是这个项目的惯例（证据散在三段轨迹里） | `just ci` |
-| qt06 | 用户显式确认过的高风险操作 | `DROP SCHEMA` |
-| qt07 | 英文提问 × 中文轨迹 —— 逼着 gold 只能压在语种无关的标识符上 | `--remove-orphans` |
-| qt08 | **跨会话复用**：同一条经验，换 office 词汇提问且 `domain=office`（域加权逆风） | `--locked` |
+| qt01 | difference is knowledge: three calls differing by one argument | `--locked` |
+| qt02 | **a trace of failure is itself knowledge** -- it asks about the road already falsified | `cargo update` |
+| qt03 | difference is knowledge: the difference is an environment variable | `PGOPTIONS` |
+| qt04 | as above, the cross-platform variety | `PYTHONIOENCODING` |
+| qt05 | the same command recurring = this is the convention of this project (the evidence is scattered across three traces) | `just ci` |
+| qt06 | a high-risk operation the user explicitly confirmed | `DROP SCHEMA` |
+| qt07 | English question × Chinese trace -- forcing gold to be pinned to language-independent identifiers | `--remove-orphans` |
+| qt08 | **reuse across sessions**: the same experience, asked with office vocabulary and `domain=office` (domain weighting against it) | `--locked` |
 
-qt02 与 qt06 是一对反例守卫：qt02 挡住「只抽成功路径」的抽取器，
-qt06 与 qt05 的 `never_extracted`（那次单次成功的读操作不该产出事实）合起来
-说明**判据不是「成功就不抽」，是「有没有风险与授权」**。
+qt02 and qt06 are a pair of counterexample guards: qt02 stops an extractor that "only
+extracts the successful path", and qt06 together with qt05's `never_extracted` (that one
+successful read operation should produce no fact) shows that **the criterion is not "do not
+extract on success", it is "was there risk, and was there authorization"**.
 
-qt08 的 gold 与 qt01 相同是有意的：评测没有会话维度，「跨会话」在这里
-操作化为「换一套词汇 + 换一个域」，两道题量的是同一条知识在不同入口下的可达性。
+qt08's gold being the same as qt01's is deliberate: the evaluation has no session dimension,
+so "across sessions" is operationalized here as "a different vocabulary + a different
+domain", and the two questions measure the reachability of one and the same piece of
+knowledge through different entrances.
 
 ---
 
-## 指标怎么读
+## How to read the metrics
 
-| 指标 | 含义 | 怎么用 |
+| metric | meaning | how to use it |
 |---|---|---|
-| `R@1 / R@5 / R@10` | 前 k 名里召回了多少条 gold（宏平均，每题等权） | R@5 对应实际注入窗口，是主指标 |
-| `R@∞` | 不限名次的召回率 | 与 R@5 的**差额就是排序欠的债**：差额大该修融合，差额小该修召回 |
-| `MRR` | 首个命中 gold 的名次倒数 | 对头部排名敏感 |
-| `命中均名次` | gold 命中时的平均名次 | 配合 R@∞ 定位「召回到了但排太后」 |
-| `误召@5` | 有 `forbidden` 的题里，前 5 名混入干扰项的比例 | **越低越好**。它是防止退化策略的那把锁 |
-| `平均注入条数` | 每题最终注入多少条记忆 | 「应召不到」那一行不为 0，就说明检索器**无法弃权** |
-| `gold 缺失` | gold 压根没落进库 | 这是**抽取或题目**的问题，不是检索的问题，已排除在 Recall 之外 |
+| `R@1 / R@5 / R@10` | how many golds were retrieved within the top k (macro average, each question weighted equally) | R@5 corresponds to the actual injection window and is the primary metric |
+| `R@∞` | recall with no rank limit | **the gap from R@5 is the debt owed by ranking**: a large gap means fix the fusion, a small one means fix retrieval |
+| `MRR` | the reciprocal rank of the first gold hit | sensitive to the very top of the ranking |
+| `mean hit rank` | the average rank at which gold is hit | together with R@∞ it locates "retrieved, but ranked too low" |
+| `mis-retrieval@5` | among questions that have `forbidden`, the proportion whose top 5 contains a distractor | **lower is better**. This is the lock against degenerate strategies |
+| `mean injected count` | how many memories each question ends up injecting | if the "ought to retrieve nothing" row is not 0, the retriever **cannot abstain** |
+| `gold missing` | gold never made it into the database at all | this is a problem of **extraction or of the question**, not of retrieval, and is already excluded from Recall |
 
-`gold 缺失` 对前五类题是**报警**（题写错了或抽取坏了），对 `工具经验`
-是**读数**：那一格从 8 变成 0 的那一天，就是抽取器接上工具轨迹的那一天。
-同一列两种读法，看题型。
+For the first five types `gold missing` is an **alarm** (the question is wrong or extraction
+is broken); for `tool experience` it is a **reading**: the day that cell goes from 8 to 0 is
+the day the extractor gets wired to tool traces. One column, two readings, depending on the
+question type.
 
-### 逐路贡献
+### Per-leg contribution
 
-「覆盖」= 这一路在自己的原始召回列表里捞到了 gold 的题数。
-「**独占**」= 只有这一路捞到的题数 —— **它才是某一路该不该保留的依据**。
-覆盖高但独占为 0，说明这一路完全能被别的路替代。
+"Coverage" = the number of questions where this leg caught a gold in its own raw retrieval
+list.
+"**Exclusive**" = the number of questions only this leg caught -- **that, and not coverage,
+is the basis for whether a leg deserves to stay**. High coverage with zero exclusives means
+the leg can be entirely replaced by the others.
 
-「送进 top5 的干扰项」把噪声归因到具体通道，否则误召只能整体怪罪于「融合」。
+"Distractors sent into top 5" attributes noise to a specific channel; without it a
+mis-retrieval can only be blamed on "the fusion" as a whole.
 
-**逐路诊断永远发全部五路**，与融合侧是否启用它们无关 ——「关掉这一路之后
-它本来能捞到什么」正是 A/B 时最想看的那个数字，跟着开关一起关掉就只剩一列零。
+**Per-leg diagnostics always report all five legs**, regardless of whether the fusion side
+has them enabled -- "what this leg would have caught if it were switched off" is precisely
+the number you most want to see during an A/B, and switching it off along with the flag
+leaves nothing but a column of zeros.
 
-时间回放题走的是**快照内**的三路（同一份 as-of 集合上的 bm25 / 向量 / 时间倒序），
-与日常召回查的不是同一批数据，混在一张表里两套口径都读不了，
-所以仍然从逐路分母里剔除；它的排序质量由主指标衡量。
+Time-replay questions go through the three legs **inside the snapshot** (bm25 / vector /
+reverse chronological over one and the same as-of set), which query a different body of data
+than everyday retrieval; mixed into one table neither set of figures can be read, so they
+are still excluded from the per-leg denominator. The quality of their ordering is measured
+by the main metrics.
 
-### 分组不是可选项
+### Grouping is not optional
 
-总分掩盖问题。第一份基线的「整体 R@5 = 0.78」看着还行，但它是
-「专名精确 0.92 + 中文语义 0.69 + 时间回放 0.42」平均出来的 ——
-真正该修的是后两个。所有指标都按题型与语种各出一份。
+A total score hides problems. The first baseline's "overall R@5 = 0.78" looked passable, but
+it was the average of "exact term 0.92 + Chinese semantic 0.69 + temporal replay 0.42" --
+what actually needed fixing was the latter two. Every metric is reported once per question
+type and once per language.
 
 ---
 
-## 进 CI 的建议
+## Suggested CI setup
 
 ```yaml
-# 第一道门：秒级，不需要任何服务
+# The first gate: takes seconds, needs no services at all
 - run: cargo run -p cortex-evals -- validate
 - run: cargo test -p cortex-evals
 
-# 第二道门：需要 Postgres service
+# The second gate: needs a Postgres service
 - run: cargo run -p cortex-evals --
          run --mode seed
              --json evals-report.json
@@ -417,190 +484,230 @@ qt08 的 gold 与 qt01 相同是有意的：评测没有会话维度，「跨会
   with: { name: evals-report, path: evals-report.json }
 ```
 
-`--min-recall5` 是整体门槛。更严的做法是把上一次的 `evals-report.json` 存成
-基线，逐题型比 `by_kind[*].recall["5"]` —— 只比总分的话，某一类崩了而总分微跌，
-门就放过去了。`Report::gate_metrics()` 已经把该比的数字摊平成
-`kind.中文语义.recall@5` 这样的扁平 map，直接拿去 diff 即可。
+`--min-recall5` is an overall threshold. The stricter approach is to store the previous
+`evals-report.json` as a baseline and compare `by_kind[*].recall["5"]` type by type --
+comparing the total alone lets the gate through when one category has collapsed while the
+total barely dipped. `Report::gate_metrics()` already flattens the figures worth comparing
+into a flat map like `kind.chinese_semantic.recall@5`, ready to diff as it is.
 
-**`--mode llm` 不要进回归门。** 它的结果随模型版本漂移，会变成随机红灯。
-它的位置是「定期人工跑一次，看抽取质量」。
+**Do not put `--mode llm` in the regression gate.** Its results drift with the model version
+and would become a random red light. Its place is "run it by hand periodically, to look at
+extraction quality".
 
-**`--cross-link --cross-link-judge cheap` 同理不要进回归门** —— 它每晚接受
-几对完全由模型当场决定（同一份语料四次跑分别接受 3/4/6/7 对）。
-要在 CI 里跑跨域连接，只能用 `--cross-link-judge prefilter`，
-而那一档量的是**预筛**而不是**判定**，读数时别混。
+**`--cross-link --cross-link-judge cheap` likewise does not belong in the regression gate**
+-- how many pairs it accepts each night is decided by the model on the spot (four runs over
+one and the same corpus accepted 3/4/6/7 pairs respectively).
+To run cross-domain linking in CI, the only option is `--cross-link-judge prefilter`, and
+that setting measures the **prefilter** rather than the **judgement** -- do not mix the two
+up when reading the numbers.
 
-> **加题或改融合之后，`scripts/evals-baseline.*.json` 必须重新 bless**
-> （`just evals-bless`）。加了 q112–q116 之后默认配置的
-> `kind.跨域检索.recall@5` 会从 0.900 掉到 0.667 —— 那是新题在默认配置下
-> **本来就该挂**，不是回归，但回归门分不出这两者，只能靠人 bless。
+> **After adding questions or changing the fusion, `scripts/evals-baseline.*.json` has to be
+> blessed again** (`just evals-bless`). After adding q112-q116, the default configuration's
+> `kind.cross_domain.recall@5` drops from 0.900 to 0.667 -- those new questions **were
+> supposed to fail** under the default configuration, so it is not a regression, but the
+> regression gate cannot tell the two apart and only a human blessing can.
 
 ---
 
-## 基线数字
+## Baseline figures
 
-自己跑一遍即可复现（`cargo run -p cortex-evals -- run`，不带任何 flag 就是
-生产默认配置）。2026-08-07，`mode=seed`，
-`embedder=fastembed:gpahal/bge-m3-onnx-int8`，73 条铺垫事实 / 17 条工具轨迹 /
-124 道题：
+Reproducible by running it yourself (`cargo run -p cortex-evals -- run`; with no flags at all
+that is the production default configuration). 2026-08-07, `mode=seed`,
+`embedder=fastembed:gpahal/bge-m3-onnx-int8`, 73 seeded facts / 17 tool traces /
+124 questions:
 
-| 题型 | 题数 | 计分 | R@1 | R@5 | R@10 | R@∞ | MRR | 命中均名次 | 误召@5 | 平均注入 | gold 缺失 |
+| type | count | scored | R@1 | R@5 | R@10 | R@∞ | MRR | mean hit rank | mis-retr.@5 | mean injected | gold missing |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 全部 | 124 | 102 | 0.640 | 0.877 | 0.931 | 0.935 | 0.771 | 2.0 | 0.286 | 12.2 | 8 |
-| 中文语义 | 33 | 33 | 0.727 | 0.909 | 0.970 | 0.970 | 0.809 | 1.8 | — | 14.0 | 0 |
-| 专名精确 | 27 | 27 | 0.741 | 0.926 | 0.926 | 0.926 | 0.824 | 1.4 | 0.500 | 9.0 | 0 |
-| 时间回放 | 12 | 12 | 0.667 | 0.833 | 0.917 | 0.944 | 0.744 | 2.8 | — | 27.2 | 0 |
-| 关系推理 | 15 | 15 | 0.483 | 0.967 | 1.000 | 1.000 | 0.867 | 2.0 | — | 8.9 | 0 |
-| 跨域检索 | 15 | 15 | 0.400 | 0.667 | 0.800 | 0.800 | 0.518 | 2.9 | — | 13.1 | 0 |
-| **工具经验** | 8 | **0** | — | — | — | — | — | — | — | 0.0 | **8** |
-| 应召不到 | 14 | 0 | — | — | — | — | — | — | **0.500** | 10.4 | 0 |
+| all | 124 | 102 | 0.640 | 0.877 | 0.931 | 0.935 | 0.771 | 2.0 | 0.286 | 12.2 | 8 |
+| chinese_semantic | 33 | 33 | 0.727 | 0.909 | 0.970 | 0.970 | 0.809 | 1.8 | — | 14.0 | 0 |
+| exact_term | 27 | 27 | 0.741 | 0.926 | 0.926 | 0.926 | 0.824 | 1.4 | 0.500 | 9.0 | 0 |
+| temporal_replay | 12 | 12 | 0.667 | 0.833 | 0.917 | 0.944 | 0.744 | 2.8 | — | 27.2 | 0 |
+| relational | 15 | 15 | 0.483 | 0.967 | 1.000 | 1.000 | 0.867 | 2.0 | — | 8.9 | 0 |
+| cross_domain | 15 | 15 | 0.400 | 0.667 | 0.800 | 0.800 | 0.518 | 2.9 | — | 13.1 | 0 |
+| **tool experience** | 8 | **0** | — | — | — | — | — | — | — | 0.0 | **8** |
+| unanswerable | 14 | 0 | — | — | — | — | — | — | **0.500** | 10.4 | 0 |
 
-逐路（分母 90）：`vector` 覆盖 89 / 独占 2 / R@5 0.911 · `bm25` 81/1/0.733 ·
-`episode` 76/0/0.700（默认不入融合）· `graph` 42/0/0.444 ·
-`recency` 35/0/0.111（默认不入融合）。
+Per leg (denominator 90): `vector` coverage 89 / exclusive 2 / R@5 0.911 · `bm25` 81/1/0.733 ·
+`episode` 76/0/0.700 (not in the fusion by default) · `graph` 42/0/0.444 ·
+`recency` 35/0/0.111 (not in the fusion by default).
 
-抽取侧：5 道题声明了 5 条「不该被抽出来」的断言，泄漏 **0** 条 ——
-seed 模式下这是恒真的（seed 从不为工具轨迹写任何事实），它的零点意义要等
-抽取器接上轨迹、或者切到 `--mode llm` 之后才成立。
+Extraction side: 5 questions declare 5 assertions about "what should never be extracted",
+and **0** leaked -- in seed mode this is trivially true (seed never writes any fact for a
+tool trace), and its value as a zero point only begins once the extractor is wired to traces,
+or once `--mode llm` is used.
 
-> **加进工具经验题之后，检索侧的十八项指标逐位没动。**
-> 这不是巧合，也不是好消息：`GoldMissing` 的题被排除在 Recall 之外
-> （README 上面那条「抽取的锅不该算在检索头上」），于是这八道题在回归门里
-> **一格都不占**。回归门今天量不到抽取侧，这是当前设计已知且刻意的边界 ——
-> 信号在报告的 `gold 缺失` 那一列和「抽取侧」那一节，不在门里。
-> 抽取器接上轨迹之后，`kind.工具经验.recall@5` 会作为**新指标**出现
-> （`scripts/evals-gate.py` 会打「＋ 基线里没有」），bless 一次之后才开始被守。
+> **After the tool-experience questions were added, all eighteen retrieval-side metrics did
+> not move by a single digit.**
+> That is neither a coincidence nor good news: questions marked `GoldMissing` are excluded
+> from Recall (per the line above in this README, "extraction's fault should not be charged
+> to retrieval"), so these eight questions **occupy not one cell** in the regression gate.
+> The regression gate cannot measure the extraction side today; that is a known and
+> deliberate boundary of the current design -- the signal is in the `gold missing` column of
+> the report and in the "extraction side" section, not in the gate.
+> Once the extractor is wired to traces, `kind.tool_experience.recall@5` will show up as a
+> **new metric** (`scripts/evals-gate.py` will print "+ not in the baseline"), and only after
+> one blessing does it start being guarded.
 
-> **这张表与上一版（116 题）在检索侧可以直接比**（逐位相同）。
-> 新增的只有一行「工具经验」与「全部」那一行的两格：`平均注入` 13.0 → 12.2
-> 与 `gold 缺失` 0 → 8，两者都来自八道注定挂掉的新题。
+> **This table is directly comparable with the previous version (116 questions) on the
+> retrieval side** (identical digit for digit).
+> All that is new is one "tool experience" row and two cells of the "all" row:
+> `mean injected` 13.0 → 12.2 and `gold missing` 0 → 8, both coming from the eight new
+> questions that are doomed to fail.
 >
-> 与更早的 111 题版仍然不可比：① q112–q116 那五道跨域桥题在默认配置下
-> 本来就该挂；② 修了 `fusion::rrf` 的同分定序（见下）。
+> It is still not comparable with the earlier 111-question version: ① the five cross-domain
+> bridge questions q112-q116 were supposed to fail under the default configuration;
+> ② the tie-breaking order in `fusion::rrf` was fixed (see below).
 
-### 这套评测以前分辨不了小于 0.02 的改动
+### This evaluation used to be unable to tell apart changes smaller than 0.02
 
-`fusion::rrf` 过去把结果按 `HashMap::into_values()` 的顺序收上来再按分数排序，
-而排序是稳定的 —— **同分条目的相对次序等于 hash 桶序**，随进程变化。
-同分在 RRF 里是常态，于是同一份语料、同一套参数跑三遍：
+`fusion::rrf` used to collect the results in the order of `HashMap::into_values()` and then
+sort them by score, and the sort is stable -- so **the relative order of tied entries equalled
+the hash bucket order**, which varies from process to process. Ties are the normal case in
+RRF, so three runs over the same corpus with the same parameters gave:
 
 ```
 R@1 = 0.630 / 0.640 / 0.650      MRR = 0.766 / 0.771 / 0.778
 ```
 
-也就是说 README 里凡是 ±0.02 以内的结论，当时都没有证据支持。
-现在同分再按 fact id 定序，噪声大幅收窄 —— **但没有归零，别把它当成「尺子不抖了」。**
+Which is to say that every conclusion in this README within ±0.02 had no evidence behind it
+at the time.
+Ties are now broken by fact id, and the noise has narrowed sharply -- **but it has not gone
+to zero, so do not read this as "the ruler has stopped shaking".**
 
-实测同一套参数连跑六遍（hash 后端，116 题）：
+Six consecutive runs of the same parameters, measured (hash backend, 116 questions):
 
-| 指标 | 极差 | 说明 |
+| metric | range | note |
 |---|---:|---|
-| `recall@5` / `recall@10` | **0.0000** | 逐位相同 |
-| `recall_any` / `avg_returned` / 各计数 | **0.0000** | 逐位相同 |
-| `recall@1` | 0.0098 | 恰好一道题的 top-1 在换人（1/102） |
-| `mrr` | 0.0049 | 同上 |
-| `avg_gold_rank` | 0.0094 | 同上 |
+| `recall@5` / `recall@10` | **0.0000** | identical digit for digit |
+| `recall_any` / `avg_returned` / the various counts | **0.0000** | identical digit for digit |
+| `recall@1` | 0.0098 | exactly one question changing its top-1 (1/102) |
+| `mrr` | 0.0049 | as above |
+| `avg_gold_rank` | 0.0094 | as above |
 
-**残余噪声的根因**：末级定序用的是 fact id，而 fact id 是每次 ingest 现生成的
-ULID —— 高 48 位是毫秒时间戳、低 80 位是随机数。**落在同一毫秒里的两条事实，
-它们之间的先后每次都不一样。** 语料只有 73 条，绝大多数事实分散在不同毫秒上，
-所以只剩一处会翻。
+**The root cause of the residual noise**: the final tie-break is on fact id, and a fact id is
+a ULID generated afresh on every ingest -- the top 48 bits are a millisecond timestamp and
+the low 80 bits are random. **For two facts landing in the same millisecond, which comes
+first differs every time.** The corpus has only 73 facts and most of them fall in different
+milliseconds, so only one place is left that can flip.
 
-**这对结论意味着什么**：
+**What this means for the conclusions**:
 
-- **回归门用的 `recall@5` 逐题型是确定的**，门本身可信。
-- **`recall@1` 与 `MRR` 的小数第三位是噪声**。拿它们判定一个 <0.01 的改动，
-  等于在读尺子的刻度线宽度。要判那个量级，得先让 ingest 确定化
-  （给评测一条可复现的 id 生成路径），或者把语料扩大到让单题权重降下去。
+- **The per-type `recall@5` the regression gate uses is deterministic**, so the gate itself
+  is trustworthy.
+- **The third decimal place of `recall@1` and `MRR` is noise.** Judging a change smaller than
+  0.01 by them amounts to reading the width of the ruler's tick marks. To judge at that
+  magnitude, ingest has to be made deterministic first (a reproducible id-generation path for
+  the evaluation), or the corpus has to grow until the weight of a single question comes down.
 
-**调参之前先确认尺子有多粗**——不是「尺子不抖」，是「知道它抖多少」。
+**Before tuning parameters, establish how coarse the ruler is** -- not "the ruler does not
+shake", but "we know how much it shakes".
 
-**读这张表时必须知道的四件事：**
+**Four things you have to know while reading this table:**
 
-1. **`专名精确` 的 R@∞ 是 0.926 而不是 1.000，这是已知的、故意付出的代价。**
-   语义地板（余弦距离 > 0.50 即整体弃权）会误伤两道极短的专名查询
-   （`赵敏是谁`、`jieba-rs`）—— 两三个字的 query 向量本来就发散。
-   换来的是误召率 0.393 → 0.286。全曲线见 `retrieval::BGE_M3_SEMANTIC_FLOOR`。
-2. **`应召不到` 那一行的误召 0.500 是这套检索当前最大的短板**，也是最难修的：
-   干扰项是 `B302 会议室` 对 `B301`、`Redis 过期策略` 对 `pgvector` 这种
-   语义上确实最近的东西。任何**基于分数**的闸门都分不开它们 ——
-   弃权阈值从 0 扫到 0.030 这一列纹丝不动。见 `retrieval::abstain_below`。
-3. **`R@∞` 几乎全线 1.000 是语料规模的产物**：69 条有效事实全部塞得进
-   6000 token 的注入预算，预算截断从未生效。语料上千条之后这一列才有信息量。
-   同理，**逐路独占数普遍很低不足以据此砍路** —— 每一路的召回宽度都覆盖了
-   大半个库，独占本来就攒不出来。
-4. **`Decay` 形态的近因在本题集上不可判**：全部事实是一次 ingest 里几秒内
-   写完的，`created_at` 没有跨度，衰减系数对每条都一样，排序指标与
-   `Off` 逐位相同。要判它，题集得先长出「跨越数周的语料」这一维。
+1. **`exact term`'s R@∞ is 0.926 and not 1.000; this is a known and deliberately paid price.**
+   The semantic floor (abstaining altogether once the cosine distance is > 0.50) catches two
+   extremely short proper-noun queries by mistake (`who is Zhao Min`, `jieba-rs`) -- the
+   vector of a two-or-three-character query is diffuse to begin with.
+   What it buys is a mis-retrieval rate of 0.393 → 0.286. The full curve is at
+   `retrieval::BGE_M3_SEMANTIC_FLOOR`.
+2. **The 0.500 mis-retrieval on the `unanswerable` row is the largest weakness of this
+   retrieval stack today**, and also the hardest to fix: the distractors are things that
+   really are semantically nearest, such as `meeting room B302` against `B301`, or
+   `Redis expiry policy` against `pgvector`. No **score-based** gate can separate them --
+   that column does not budge as the abstain threshold sweeps from 0 to 0.030. See
+   `retrieval::abstain_below`.
+3. **`R@∞` being 1.000 almost across the board is an artefact of corpus size**: all 69 valid
+   facts fit inside the 6000-token injection budget, so budget truncation has never taken
+   effect. That column only carries information once the corpus is in the thousands.
+   By the same token, **the generally low exclusive counts per leg are not enough grounds for
+   cutting a leg** -- every leg's retrieval width covers most of the database, so exclusives
+   cannot accumulate in the first place.
+4. **The `Decay` shape of recency is undecidable on this question set**: every fact is written
+   within seconds of one ingest, `created_at` has no spread, the decay coefficient is the same
+   for every row, and the ranking metrics are identical to `Off` digit for digit. Deciding it
+   requires the question set to grow a new dimension first: "corpus spanning several weeks".
 
 ---
 
-## 跨域连接（`relates_to`）的基线
+## Baseline for cross-domain links (`relates_to`)
 
-`--cross-link` 会在灌完语料之后跑一遍 `cortex-memory::crosslink` 的夜间扫描：
-向量近邻预筛出跨域候选对，判定器决定连不连，写成两条有向 `relates_to` 边。
-**默认关** —— 它往库里写额外的行，不显式要求就不该动基线。
+`--cross-link` runs one pass of `cortex-memory::crosslink`'s nightly scan after the corpus is
+loaded: vector nearest neighbours prefilter the cross-domain candidate pairs, the judge
+decides whether to link them, and two directed `relates_to` edges are written.
+**Off by default** -- it writes extra rows into the database, and should not disturb the
+baseline unless explicitly asked for.
 
-判定器两档：`prefilter`（预筛过的全收，确定性，可进 CI）与 `cheap`
-（真调廉价模型，**随模型漂移**，同一份语料四次跑分别接受了 3/4/6/7 对）。
+The judge has two settings: `prefilter` (accept everything the prefilter passed;
+deterministic, fit for CI) and `cheap` (really calls the cheap model, **drifts with the
+model**: four runs over one and the same corpus accepted 3/4/6/7 pairs).
 
-### 五道需要桥的题（q112–q116）
+### The five questions that need a bridge (q112-q116)
 
-| 配置 | 边（对/行） | R@5 | R@10 | R@∞ | MRR | gold 名次 |
+| configuration | edges (pairs/rows) | R@5 | R@10 | R@∞ | MRR | gold ranks |
 |---|---|---:|---:|---:|---:|---|
-| **A** 不建桥 | — | 0.200 | 0.400 | 0.400 | 0.069 | ×, 4, 6, ×, × |
-| **B** 桥 · 预筛全收 | 24/34 | 0.200 | 0.600 | 1.000 | 0.148 | 13, 11, 2, 7, 7 |
-| **C** 桥 · 廉价模型判定 | 3/6 | **0.600** | **1.000** | 1.000 | **0.237** | 8, 4, 1, 3, 7 |
-| **D** 桥 · 预筛 + 边进索引 | 24/34 | 0.200 | 0.400 | 1.000 | 0.110 | 15, 17, 4, 6, 10 |
-| **B′** 桥 · 预筛 · 关豁免 | 24/34 | 0.200 | 0.400 | 0.800 | 0.089 | ×, 8, 4, 11, 18 |
+| **A** no bridge | — | 0.200 | 0.400 | 0.400 | 0.069 | ×, 4, 6, ×, × |
+| **B** bridge · accept all prefiltered | 24/34 | 0.200 | 0.600 | 1.000 | 0.148 | 13, 11, 2, 7, 7 |
+| **C** bridge · judged by the cheap model | 3/6 | **0.600** | **1.000** | 1.000 | **0.237** | 8, 4, 1, 3, 7 |
+| **D** bridge · prefilter + edges in the index | 24/34 | 0.200 | 0.400 | 1.000 | 0.110 | 15, 17, 4, 6, 10 |
+| **B′** bridge · prefilter · exemption off | 24/34 | 0.200 | 0.400 | 0.800 | 0.089 | ×, 8, 4, 11, 18 |
 
-### 原有 111 题（回归面 —— 判断副作用只能看这一组）
+### The original 111 questions (the regression surface -- side effects can only be judged on this group)
 
-| 配置 | R@1 | R@5 | R@10 | MRR | 误召@5 | 平均注入 |
+| configuration | R@1 | R@5 | R@10 | MRR | mis-retr.@5 | mean injected |
 |---|---:|---:|---:|---:|---:|---:|
-| **A** 不建桥 | 0.673 | 0.912 | 0.959 | 0.807 | 0.286 | 12.9 |
-| **B** 预筛全收 | 0.688 | 0.918 | 0.948 | 0.818 | **0.357** | 15.1 |
-| **C** 廉价模型判定 | 0.683 | 0.912 | 0.948 | 0.814 | **0.250** | 13.1 |
-| **D** 边进索引 | 0.657 | 0.897 | 0.943 | 0.792 | 0.321 | 14.2 |
-| **B′** 关豁免 | 0.673 | 0.918 | 0.948 | 0.808 | 0.321 | 13.9 |
+| **A** no bridge | 0.673 | 0.912 | 0.959 | 0.807 | 0.286 | 12.9 |
+| **B** accept all prefiltered | 0.688 | 0.918 | 0.948 | 0.818 | **0.357** | 15.1 |
+| **C** judged by the cheap model | 0.683 | 0.912 | 0.948 | 0.814 | **0.250** | 13.1 |
+| **D** edges in the index | 0.657 | 0.897 | 0.943 | 0.792 | 0.321 | 14.2 |
+| **B′** exemption off | 0.673 | 0.918 | 0.948 | 0.808 | 0.321 | 13.9 |
 
-**四条能从这两张表读出来的结论：**
+**Four conclusions can be read out of these two tables:**
 
-1. **桥确实把「召不回来」变成了「召得回来」。** A→B 的 R@∞ 从 0.400 跳到
-   1.000：五道题里原本有三道**一条 gold 都捞不到**，建桥后全部可达。
-   这是本次改动唯一一个数量级上的变化。
-2. **钱要花在判定上，不是花在预筛上。** B 与 C 的边数差了八倍，
-   而 C 在新题上全面更好（R@5 0.200→0.600）**且**原有 111 题的误召反而
-   从 0.286 降到 0.250。B 的误召涨到 0.357 —— 那是噪声边在图遍历里传染的
-   直接读数，`专名精确` 那一格的误召被它从 0.500 顶到 1.000。
-   预筛（跨域 + 未连通 + 距离带）单独用**不够**。
-3. **边不能进 BM25 / 向量索引**（D 那一行）。边的 statement 把两个实体名和
-   一句摘要挤在一句话里，正是 `ts_rank` 最偏爱的形状，于是它在任何提到两端的
-   查询上霸榜：原有 111 题 R@5 掉 0.015、MRR 掉 0.026，新题反而更差。
-   `crosslink::Linker::indexed` 默认 false，理由就是这一行。
-4. **域惩罚豁免值钱**（B′ 那一行）。关掉它，新题的 R@10 从 0.600 掉回 0.400、
-   R@∞ 掉到 0.800、gold 平均排名整体后退。桥架好了却被域加权压回去，
-   等于没架。豁免范围见 `retrieval::bridged_entities`。
+1. **The bridge really does turn "cannot be retrieved" into "can be retrieved".** R@∞ jumps
+   from 0.400 to 1.000 between A and B: of the five questions, three originally **caught not
+   a single gold**, and with the bridge all of them are reachable.
+   This is the only change of an order of magnitude in this piece of work.
+2. **Spend the money on the judgement, not on the prefilter.** B and C differ eightfold in
+   edge count, and C is better across the board on the new questions (R@5 0.200→0.600)
+   **and** the mis-retrieval of the original 111 questions actually falls from 0.286 to 0.250.
+   B's mis-retrieval rises to 0.357 -- that is the direct reading of noisy edges infecting
+   graph traversal, and it pushed the `exact term` cell's mis-retrieval from 0.500 up to 1.000.
+   The prefilter on its own (cross-domain + not yet connected + a distance band) is **not
+   enough**.
+3. **Edges must not go into the BM25 / vector index** (row D). An edge's statement crams two
+   entity names and a one-line summary into a single sentence, which is exactly the shape
+   `ts_rank` loves most, so it dominates the board on any query that mentions either end:
+   R@5 on the original 111 questions drops 0.015, MRR drops 0.026, and the new questions get
+   worse rather than better.
+   `crosslink::Linker::indexed` defaults to false, and this row is the reason.
+4. **The domain-penalty exemption is worth having** (row B′). Turn it off and the new
+   questions' R@10 falls back from 0.600 to 0.400, R@∞ drops to 0.800, and gold's average
+   rank retreats across the board. A bridge that is built and then pressed back down by domain
+   weighting might as well not have been built. For the scope of the exemption see
+   `retrieval::bridged_entities`.
 
-**仍然没有解决的**：C 里五道题的 gold 名次是 8/4/1/3/7 —— 只有一路（图遍历）
-捞到它们，融合分自然低。桥把它们送进了注入窗口（平均注入 13 条），
-但送不进 top-5 的前列。要再往上走，得让图遍历这一路的贡献不再只值
-一个 `1/(60+rank)`，那是融合侧的题目，不是这次改动的范围。
+**Still unsolved**: in C the gold ranks of the five questions are 8/4/1/3/7 -- only one leg
+(graph traversal) catches them, so the fusion score is naturally low. The bridge got them
+into the injection window (13 memories injected on average) but not into the front of the
+top 5. Getting them further up requires the graph traversal leg's contribution to be worth
+more than a single `1/(60+rank)`, and that is a question for the fusion side, outside the
+scope of this change.
 
-### 已定案的旋钮
+### Knobs that have been settled
 
-每个默认值背后都有一条扫描曲线，改之前先把曲线重跑一遍 ——
-它们彼此有交互（弃权阈值就是被强命中补偿抬高的分布重新标定的）。
+Behind every default there is a sweep curve; before changing one, run the curve again --
+they interact with each other (the abstain threshold was recalibrated against the
+distribution that the strong-hit bonus had lifted).
 
-| 旋钮 | 定值 | 依据写在哪 |
+| knob | value | where the reasoning is written |
 |---|---|---|
-| 时间近因 | **关**（既不做召回路也不做 decay） | `retrieval::RecencyMode` |
-| episodes 一路 | **关**（实现与题目留着） | `retrieval::Retriever::episode_channel` |
-| 单路强命中补偿 | 0.04 | `fusion::apply_peak_bonus` + `Retriever::new` |
-| 弃权阈值 | 0.030 | `retrieval::Retriever::abstain_below` |
-| 语义地板 | 0.50（仅真实语义后端） | `retrieval::BGE_M3_SEMANTIC_FLOOR` |
-| 时间回放 | 快照内三路排序 | `retrieval::Retriever::retrieve_as_of_ranked` |
-| 跨域连接扫描 | **默认关**；开则判定器用 `cheap` | `crosslink::Linker` |
-| 边进不进索引 | **不进** | `crosslink::Linker::indexed` |
-| 边的距离带 / 度数上限 | 0.12–0.45 / 4 | `crosslink::DEFAULT_MIN_DISTANCE` 等 |
-| 桥的域惩罚豁免 | **开** | `retrieval::bridged_entities` |
+| time recency | **off** (neither a retrieval leg nor a decay) | `retrieval::RecencyMode` |
+| the episodes leg | **off** (the implementation and the questions are kept) | `retrieval::Retriever::episode_channel` |
+| single-leg strong-hit bonus | 0.04 | `fusion::apply_peak_bonus` + `Retriever::new` |
+| abstain threshold | 0.030 | `retrieval::Retriever::abstain_below` |
+| semantic floor | 0.50 (only for a real semantic backend) | `retrieval::BGE_M3_SEMANTIC_FLOOR` |
+| time replay | three legs ranked inside the snapshot | `retrieval::Retriever::retrieve_as_of_ranked` |
+| cross-domain link scan | **off by default**; when on, the judge is `cheap` | `crosslink::Linker` |
+| whether edges go into the index | **they do not** | `crosslink::Linker::indexed` |
+| distance band / degree cap for edges | 0.12-0.45 / 4 | `crosslink::DEFAULT_MIN_DISTANCE` and friends |
+| domain-penalty exemption for bridges | **on** | `retrieval::bridged_entities` |

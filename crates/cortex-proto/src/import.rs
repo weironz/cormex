@@ -1,113 +1,132 @@
-//! 导入 ChatGPT / Claude 的导出文件 —— 三端共用的线上形状。
+//! Importing ChatGPT / Claude export files — the wire shapes shared by all
+//! three front ends.
 //!
-//! # 两条路，同一份契约
+//! # Two routes, one contract
 //!
-//! - **桌面端**：文件在这台机器上，走本地 agent 的
-//!   `POST /local/import/preview` + `POST /local/import/run`。
-//!   请求体里给的是**路径**，字节一次都不过网络。
-//! - **Web 端**：浏览器读不到磁盘，先 `POST /import/upload` 把文件传给
-//!   cortexd 拿一个句柄，再用句柄走 `/import/preview` + `/import/run`。
+//! - **Desktop**: the file is on this machine, so it goes through the local
+//!   agent's `POST /local/import/preview` + `POST /local/import/run`. The
+//!   request body carries a **path**; not one byte crosses the network.
+//! - **Web**: the browser cannot reach the disk, so it first `POST`s the file
+//!   to cortexd via `/import/upload` to get a handle, then uses that handle
+//!   with `/import/preview` + `/import/run`.
 //!
-//! 两条路的 preview 与 run 回的是**同一批类型**（[`ImportEstimate`] /
-//! [`ImportEvent`]），所以客户端那张导入页只有一份，区别只在「拿到的是
-//! 路径还是句柄」。
+//! Both routes' preview and run return **the same set of types**
+//! ([`ImportEstimate`] / [`ImportEvent`]), so there is only one import page on
+//! the client side; the only difference is whether it got a path or a handle.
 //!
-//! # 为什么 preview 是独立的一步而不是 run 的一个开关
+//! # Why preview is a step of its own rather than a flag on run
 //!
-//! 它对应 CLI 里 `--dry-run` 是默认这件事，而理由在界面上更硬：
-//! 每一对消息触发一次 LLM 调用，三年历史可能几千次，而记忆是 append-only ——
-//! 灌错了要走 redact 才撤得掉，那是个显式、需要二次确认的操作。
+//! It corresponds to `--dry-run` being the default in the CLI, and the
+//! reasoning is even harder in a GUI: every message pair triggers one LLM call,
+//! three years of history may be several thousand of them, and memory is
+//! append-only — importing the wrong thing can only be undone via redact, which
+//! is an explicit operation requiring a second confirmation.
 //!
-//! 做成两个端点（而不是 `run(dry: true)`）是为了让**误调不会花钱**：
-//! 一个只读的端点没有任何路径能写入。
+//! Making it two endpoints (rather than `run(dry: true)`) is so that **calling
+//! the wrong one cannot cost money**: a read-only endpoint has no path to a
+//! write at all.
 
 use serde::{Deserialize, Serialize};
 
-/// 上传一个导出文件之后拿到的句柄。
+/// The handle you get back after uploading an export file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadAck {
-    /// 后续 preview / run 用它指代这份文件。
+    /// Subsequent preview / run calls use this to refer to the file.
     pub handle: String,
-    /// 落盘的字节数 —— 客户端可以拿它与自己那份大小核对。
+    /// Bytes written to disk — the client can reconcile it against its own
+    /// notion of the size.
     pub size_bytes: u64,
-    /// 多少秒后这份临时文件会被清掉。
+    /// How many seconds until this temporary file is cleaned up.
     ///
-    /// **必须报出来**：97MB 的上传不便宜，用户放着不管一小时再回来点
-    /// 「开始」，此时句柄已经失效 —— 界面要有能力提前说清楚。
+    /// **It has to be reported**: a 97MB upload is not cheap, and a user who
+    /// wanders off and comes back an hour later to click "Start" finds the
+    /// handle already expired — the UI needs to be able to say so in advance.
     pub expires_in_secs: u64,
 }
 
-/// preview / run 的输入。**二选一**：本地路径或上传句柄。
+/// The input to preview / run. **One or the other**: a local path or an upload
+/// handle.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportRequest {
-    /// 本机绝对路径。只有本地 agent 认这个字段。
+    /// An absolute path on this machine. Only the local agent honours this
+    /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// [`UploadAck::handle`]。只有 cortexd 认这个字段。
+    /// A [`UploadAck::handle`]. Only cortexd honours this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
-    /// `"chatgpt"` / `"claude"`。缺省按文件内容嗅探。
+    /// `"chatgpt"` / `"claude"`. Sniffed from the file content when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
-    /// 只导入这个日期之后有消息的对话（RFC 3339）。
+    /// Import only conversations with messages after this date (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
-    /// 最多导入几段（**从最近的开始**）。先拿三五段试水。
+    /// Import at most this many conversations (**starting from the most
+    /// recent**). Try three or five first to test the water.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_conversations: Option<usize>,
 }
 
-/// 摊开的账。字段与 `cortex_import::Estimate` 一一对应 ——
-/// 那边算，这边原样下发，界面上的数字与 CLI 打印的出自同一次计算。
+/// The bill, itemized. The fields correspond one to one with
+/// `cortex_import::Estimate` — that side computes, this side passes it through
+/// verbatim, so the numbers in the UI and the ones the CLI prints come out of
+/// the same calculation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportEstimate {
-    /// `"ChatGPT"` / `"Claude"`，给人看的写法
+    /// `"ChatGPT"` / `"Claude"`, the human-readable spelling.
     pub platform: String,
     pub conversations: usize,
     pub messages: usize,
-    /// 会触发多少次抽取 = 多少次 LLM 调用。**这个数字直接就是钱。**
+    /// How many extractions this will trigger = how many LLM calls.
+    /// **This number is money, directly.**
     pub pairs: usize,
     pub tokens: usize,
-    /// RFC 3339；一段对话都没有时为 `None`
+    /// RFC 3339; `None` when there is not a single conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
-    /// 落单的消息数（进原文，但不产生事实）。
+    /// The count of unpaired messages (they go into the raw text, but produce
+    /// no facts).
     ///
-    /// 单独报出来，是因为用户看到「导入了 100 条消息」却只多了 40 条记忆时，
-    /// 需要有个地方解释这个差。
+    /// Reported separately because when a user sees "imported 100 messages" and
+    /// yet only gains 40 memories, there has to be somewhere that explains the
+    /// difference.
     pub unpaired: usize,
-    /// 按客户端限速估算的下限分钟数。
+    /// A lower-bound estimate in minutes, based on the client's rate limit.
     pub minutes: f64,
 }
 
-/// `run` 的 SSE 事件。
+/// The SSE events of `run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImportEvent {
-    /// 开工前先把账重报一遍。
+    /// Restate the bill before starting work.
     ///
-    /// 客户端手上已经有 preview 的结果了，但那可能是十分钟前点的，
-    /// 而 `--max-conversations` 之类的参数可能已经改过。以**这条**为准。
+    /// The client already holds the preview result, but that may have been
+    /// clicked ten minutes ago, and parameters such as `--max-conversations`
+    /// may have changed since. **This** one is authoritative.
     Started { estimate: ImportEstimate },
-    /// 进度。字段与 `cortex_import::Progress` 对应。
+    /// Progress. Fields correspond to `cortex_import::Progress`.
     Progress {
         conversations_done: usize,
         conversations_total: usize,
         pairs_done: usize,
-        /// 服务端认出「早就有了」的条数 —— 没有重复计费
+        /// The number the server recognized as "already there" — nothing was
+        /// billed twice.
         skipped: usize,
         failures: usize,
     },
-    /// 跑完了。
+    /// Finished.
     Done {
         pairs_done: usize,
         skipped: usize,
-        /// 失败数。**不为 0 时界面要说「重跑一次即可」** ——
-        /// 写入幂等，重跑只补没成的那些，不会重复计费
+        /// The failure count. **When it is non-zero the UI should say "just run
+        /// it again"** — writes are idempotent, so a rerun only fills in the
+        /// ones that did not make it, and bills nothing twice.
         failures: usize,
     },
-    /// 出错。仍以 SSE 事件形式返回，避免流中断后客户端无从判断原因。
+    /// Something went wrong. Still returned as an SSE event, so that a client
+    /// is not left with a truncated stream and no way to tell why.
     Error { message: String },
 }

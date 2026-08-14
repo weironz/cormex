@@ -1,25 +1,35 @@
-//! 写事务：把 docs/memory.md §九 的写入纪律做成**拿不到的裸事务**。
+//! Write transactions: turning the write discipline of docs/memory.md §9 into a
+//! **raw transaction nobody can get their hands on**.
 //!
-//! ## 纪律
+//! ## The discipline
 //!
-//! 1. 事务开头 `SELECT pg_advisory_xact_lock(4272)`，把并发写事务串行化，
-//!    保证 `sync_log.seq` 的顺序 == 对读端的可见顺序。
-//!    裸 `BIGSERIAL` 做不到：序列值在 INSERT 时分配，行却按提交顺序可见 ——
-//!    T1 取到 100 未提交、T2 取到 101 先提交，客户端把游标推到 101 之后，
-//!    T1 提交的 100 就永久不可见。静默丢数据，除全量重同步外不可修复。
-//! 2. 每写一行业务数据，同事务追加一行 `sync_log`。
-//! 3. 取号事务必须**短小、纯写**：LLM 调用与 embedding 计算一律在事务外完成。
+//! 1. The transaction opens with `SELECT pg_advisory_xact_lock(4272)`, which
+//!    serializes concurrent write transactions and guarantees that the order of
+//!    `sync_log.seq` == the order in which rows become visible to readers.
+//!    A bare `BIGSERIAL` cannot do this: the sequence value is allocated at
+//!    INSERT time, but rows become visible in commit order — T1 takes 100 and
+//!    has not committed, T2 takes 101 and commits first, the client advances
+//!    its cursor past 101, and the 100 that T1 later commits is permanently
+//!    invisible. Silent data loss, unrecoverable short of a full resync.
+//! 2. For every business row written, append one `sync_log` row in the same
+//!    transaction.
+//! 3. Sequence-allocating transactions must be **short and write-only**: LLM
+//!    calls and embedding computation always happen outside the transaction.
 //!
-//! ## 纪律是怎么被强制的
+//! ## How the discipline is enforced
 //!
-//! 第 2 条不靠调用方自觉。裸 [`sqlx::Transaction`] 被封在私有模块 `guarded`
-//! 里，字段对本文件其余部分都不可见，因此**唯一**能落库的路径是
-//! `Guarded::insert_row` —— 而它把「写业务行」和「追加 sync_log」绑成一个
-//! 不可分割的动作。将来给 [`WriteTxn`] 新增写方法的人，即使完全不知道
-//! sync_log 的存在，也写不出漏追加的代码。
+//! Rule 2 does not rely on callers remembering it. The raw
+//! [`sqlx::Transaction`] is sealed inside the private module `guarded`, its
+//! field invisible to the rest of this file, so the **only** path to the
+//! database is `Guarded::insert_row` — and that binds "write the business row"
+//! and "append to sync_log" into a single indivisible action. Whoever adds a
+//! new write method to [`WriteTxn`] in the future cannot write code that skips
+//! the append, even if they have no idea sync_log exists.
 //!
-//! 第 3 条同样是结构性的：[`WriteTxn`] **不提供任何读方法**。需要先查后写的
-//! 流程（矛盾消解、实体消解、合并环检测）应在事务外读完、算完，再进事务写。
+//! Rule 3 is structural in the same way: [`WriteTxn`] **offers no read methods
+//! at all**. Flows that need to read before writing (contradiction resolution,
+//! entity resolution, merge-cycle detection) should do their reading and
+//! computing outside the transaction, then enter it to write.
 
 use sqlx::{PgPool, Postgres, postgres::PgArguments, query::Query};
 
@@ -32,14 +42,16 @@ use crate::model::{
     NewFactEvent, NewProjectEvent, NewRedaction, NewSessionEvent, NewSummary, ProvenanceRef, table,
 };
 
-/// 同步取号锁的 advisory lock key。
+/// The advisory lock key for sync sequence allocation.
 ///
-/// 取值 4272 无特殊含义，只需全库唯一且不与他人冲突；
-/// 与 `migrations/20260807000001_init.sql` 头部注释保持一致。
+/// The value 4272 means nothing in particular; it only has to be unique
+/// database-wide and not collide with anyone else's. It matches the header
+/// comment in `migrations/20260807000001_init.sql`.
 ///
-/// 多租户之后它是**两参数形式的 classid**，第二个参数由租户 schema 派生
-/// （见 `SchemaName::lock_key`）。类型因此是 `i32` 而不是 `i64`：
-/// `pg_advisory_xact_lock` 的双参数重载收两个 int4。
+/// Since multi-tenancy it serves as the **classid of the two-argument form**,
+/// with the second argument derived from the tenant schema (see
+/// `SchemaName::lock_key`). That is why the type is `i32` and not `i64`: the
+/// two-argument overload of `pg_advisory_xact_lock` takes two int4s.
 pub const SYNC_ADVISORY_LOCK_KEY: i32 = 4272;
 
 mod guarded {
@@ -48,27 +60,33 @@ mod guarded {
     use super::SYNC_ADVISORY_LOCK_KEY;
     use crate::error::Result;
 
-    /// 裸事务的看守。字段私有于本模块 —— 这就是纪律的执行机构。
+    /// The guard around the raw transaction. Its field is private to this
+    /// module — this is the enforcement mechanism for the discipline.
     pub(super) struct Guarded {
         tx: Transaction<'static, Postgres>,
     }
 
     impl Guarded {
-        /// 开启事务并**立即**取 advisory lock。
+        /// Begin the transaction and take the advisory lock **immediately**.
         ///
-        /// 锁必须是事务里的第一条语句：它要早于任何 `nextval`，
-        /// 才能让「取号顺序 == 提交顺序」成立。
+        /// The lock has to be the first statement in the transaction: it must
+        /// precede any `nextval` for "allocation order == commit order" to
+        /// hold.
         pub(super) async fn begin(pool: &PgPool, tenant_key: i32) -> Result<Self> {
             let mut tx = pool.begin().await?;
-            // **两参数形式**，第二个由租户 schema 派生。
+            // The **two-argument form**, with the second derived from the
+            // tenant schema.
             //
-            // 原来是单参数的全局键，那把**所有租户**的写事务串行化了 ——
-            // 一个人导入三年历史，别人一句话都写不进去。而这把锁保证的是
-            // 「`sync_log.seq` 的顺序 == 对读端可见的顺序」，
-            // 那件事本来就是每 schema 各论各的。
+            // This used to be a single-argument global key, which serialized
+            // the write transactions of **every tenant** — one person importing
+            // three years of history and nobody else can write a single
+            // sentence. What this lock guarantees is "the order of
+            // `sync_log.seq` == the order rows become visible to readers", and
+            // that is a per-schema matter to begin with.
             //
-            // classid 仍是 SYNC_ADVISORY_LOCK_KEY，好让 `pg_locks` 里
-            // 一眼认得出这是同步取号锁而不是别的什么
+            // The classid is still SYNC_ADVISORY_LOCK_KEY, so that in
+            // `pg_locks` this is recognizable at a glance as the sync
+            // sequence-allocation lock and not something else
             sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
                 .bind(SYNC_ADVISORY_LOCK_KEY)
                 .bind(tenant_key)
@@ -77,9 +95,10 @@ mod guarded {
             Ok(Self { tx })
         }
 
-        /// 唯一的业务写入通道：执行业务 INSERT，并在同一事务里追加 sync_log。
+        /// The one and only business write channel: run the business INSERT and
+        /// append to sync_log within the same transaction.
         ///
-        /// 返回该行在同步全序中的 `seq`。
+        /// Returns the row's `seq` in the total sync order.
         pub(super) async fn insert_row<'q>(
             &mut self,
             table: &'static str,
@@ -99,28 +118,35 @@ mod guarded {
             Ok(seq)
         }
 
-        /// **派生行**专用通道：执行 INSERT，**不写 sync_log**。
+        /// The channel reserved for **derived rows**: run the INSERT and write
+        /// **no sync_log entry**.
         ///
-        /// # 只有一类东西配走这条路
+        /// # Only one class of thing earns this path
         ///
-        /// 换 embedding 模型时补出来的向量（`fact_embeddings` /
-        /// `entity_embeddings`）。它们同时满足三条，缺一条都不行：
+        /// Vectors backfilled when the embedding model changes
+        /// (`fact_embeddings` / `entity_embeddings`). They satisfy all three of
+        /// the following, and missing any one disqualifies a table:
         ///
-        /// 1. **纯派生**：由 `statement` + 模型唯一决定，丢了能重算
-        /// 2. **客户端根本收不到**：`sync_payload.rs` 明确规定
-        ///    「tsv 与 embedding 是服务端派生列，不进同步 payload」——
-        ///    走 sync_log 只会推出一堆载荷里没有任何有用字段的行
-        /// 3. **量级是全库级的**：十万条事实的一次回填就是十万条 sync_log。
-        ///    `sync_payload.rs` 的注释里那句「换 embedding 模型时会全量变化，
-        ///    **白白撑爆增量同步**」说的正是这件事
+        /// 1. **Purely derived**: uniquely determined by `statement` + the
+        ///    model, and recomputable if lost
+        /// 2. **The client cannot receive them anyway**: `sync_payload.rs`
+        ///    states outright that "tsv and embedding are server-derived
+        ///    columns and do not enter the sync payload" — routing them through
+        ///    sync_log would only push out a pile of rows whose payload carries
+        ///    no useful field at all
+        /// 3. **The volume is database-wide**: one backfill over a hundred
+        ///    thousand facts is a hundred thousand sync_log rows. That is
+        ///    exactly what the comment in `sync_payload.rs` means by "changes
+        ///    wholesale when the embedding model changes, **blowing up
+        ///    incremental sync for nothing**"
         ///
-        /// # 加新表之前先想清楚
+        /// # Think it through before adding a new table here
         ///
-        /// 业务行走 [`Self::insert_row`]。把业务行放到这条路上，
-        /// 后果是**其它设备永远看不到它**，而且没有任何症状 ——
-        /// 那正是 sync_log 强制机制存在的理由。
-        /// 拿不准就用 `insert_row`：多一行 sync_log 是可见的浪费，
-        /// 少一行是不可见的丢失。
+        /// Business rows go through [`Self::insert_row`]. Putting a business
+        /// row on this path means **other devices will never see it**, with no
+        /// symptom whatsoever — which is precisely why the sync_log enforcement
+        /// mechanism exists. When in doubt use `insert_row`: one sync_log row
+        /// too many is visible waste, one too few is invisible loss.
         pub(super) async fn insert_derived_row<'q>(
             &mut self,
             stmt: Query<'q, Postgres, PgArguments>,
@@ -141,10 +167,11 @@ mod guarded {
     }
 }
 
-/// 一个写事务。只能由 [`crate::Store::write_txn`] 交到调用方手里。
+/// A write transaction. It can only reach a caller via
+/// [`crate::Store::write_txn`].
 ///
-/// 每个写方法返回该行在同步全序中的 `seq`（`sync_log.seq`）——
-/// 上行 ingest 的逐条 ack 直接用它。
+/// Every write method returns the row's `seq` in the total sync order
+/// (`sync_log.seq`) — the per-record ack for upstream ingest uses it directly.
 pub struct WriteTxn {
     inner: guarded::Guarded,
 }
@@ -173,9 +200,10 @@ impl WriteTxn {
         self.inner.insert_row(table, record_id, stmt).await
     }
 
-    // ── L0 原始层 ──────────────────────────────────────────
+    // ── L0 raw layer ───────────────────────────────────────
 
-    /// 落一条原始消息。`tsv_source` 与主行同事务写入，永不异步补写。
+    /// Persist one raw message. `tsv_source` is written in the same transaction
+    /// as the main row, never backfilled asynchronously.
     pub async fn insert_episode(&mut self, new: &NewEpisode) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -196,9 +224,10 @@ impl WriteTxn {
         self.insert_row(table::EPISODES, &id, stmt).await
     }
 
-    /// 登记一个内容寻址的二进制对象。
+    /// Register a content-addressed binary object.
     ///
-    /// 三步固定顺序的第二步：对象存储上传 → `blobs` 行 → episode + 关联行。
+    /// Step two of a fixed three-step order: upload to object storage → the
+    /// `blobs` row → the episode plus its link rows.
     pub async fn insert_blob(&mut self, new: &NewBlob) -> Result<i64> {
         let stmt = sqlx::query(
             "INSERT INTO blobs (hash, mime, size_bytes, storage_key) VALUES ($1, $2, $3, $4)",
@@ -211,11 +240,13 @@ impl WriteTxn {
         self.insert_row(table::BLOBS, &new.hash, stmt).await
     }
 
-    /// 把 blob 挂到 episode 上。`sync_log.record_id` 用复合键 `episode_id:blob_hash`。
+    /// Attach a blob to an episode. `sync_log.record_id` uses the composite key
+    /// `episode_id:blob_hash`.
     ///
-    /// `filename` 存在这里而不是 `blobs` 里：内容寻址下同一份字节可以有多个
-    /// 文件名，写进 blobs 就成了「谁先传谁定名」。见
-    /// `migrations/20260807000004_attachment_filename.sql`。
+    /// `filename` lives here rather than in `blobs`: under content addressing
+    /// the same bytes can carry several filenames, and putting it in blobs
+    /// would mean "whoever uploads first names it". See
+    /// `migrations/20260807000004_attachment_filename.sql`.
     pub async fn link_episode_blob(&mut self, new: &NewEpisodeBlob) -> Result<i64> {
         let record_id = new.record_id();
         let stmt = sqlx::query(
@@ -231,12 +262,14 @@ impl WriteTxn {
             .await
     }
 
-    // ── 回放抽屉 ───────────────────────────────────────────
+    // ── the replay drawer ──────────────────────────────────
 
-    /// 记下本轮注入了哪一条记忆。
+    /// Record which memory was injected on this turn.
     ///
-    /// 只存 `fact_id`，不存注入当时的原文快照 —— 快照里的原文抹不掉，
-    /// 会让 redact 的销毁承诺变成假的（见 migration 20260807000005 的表头）。
+    /// Only the `fact_id` is stored, never a snapshot of the text as it was
+    /// injected — text inside a snapshot cannot be wiped, which would turn
+    /// redact's promise of destruction into a lie (see the table header of
+    /// migration 20260807000005).
     pub async fn insert_episode_memory(&mut self, new: &NewEpisodeMemory) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -255,10 +288,12 @@ impl WriteTxn {
         self.insert_row(table::EPISODE_MEMORIES, &id, stmt).await
     }
 
-    /// 记下本轮的一次工具调用。
+    /// Record one tool call from this turn.
     ///
-    /// `path` 是独立一列而不是塞在 `summary` 里：summary 是给人看的自然语言，
-    /// 措辞随时会改，客户端一旦用正则从里面抠路径，改一次措辞就是静默显示错文件。
+    /// `path` gets its own column instead of being stuffed into `summary`:
+    /// summary is natural language written for humans and its wording can
+    /// change at any time, so once a client starts regexing the path out of it,
+    /// a single rewording silently shows the wrong file.
     pub async fn insert_episode_tool_call(&mut self, new: &NewEpisodeToolCall) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -279,10 +314,12 @@ impl WriteTxn {
         self.insert_row(table::EPISODE_TOOL_CALLS, &id, stmt).await
     }
 
-    /// 写入媒体转录。
+    /// Write a media transcript.
     ///
-    /// 调用方在写入前必须查过 [`crate::Store::is_redacted`] ——
-    /// 防止 redact 执行时在途的异步任务事后把已抹除内容回填（docs/memory.md §十一）。
+    /// The caller must have checked [`crate::Store::is_redacted`] before
+    /// writing — this keeps an async task that was already in flight when
+    /// redact ran from backfilling erased content after the fact
+    /// (docs/memory.md §11).
     pub async fn insert_blob_transcript(&mut self, new: &NewBlobTranscript) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -305,7 +342,7 @@ impl WriteTxn {
         self.insert_row(table::BLOB_TRANSCRIPTS, &id, stmt).await
     }
 
-    // ── L1 事实层 ──────────────────────────────────────────
+    // ── L1 fact layer ──────────────────────────────────────
 
     pub async fn insert_entity(&mut self, new: &NewEntity) -> Result<i64> {
         let id = new.id.to_string();
@@ -324,14 +361,17 @@ impl WriteTxn {
         self.insert_row(table::ENTITIES, &id, stmt).await
     }
 
-    /// 追加一条别名合并。
+    /// Append one alias merge.
     ///
-    /// `UNIQUE(from_entity)` 使并发分叉在物理层就是 first-writer-wins：
-    /// 后到者会拿到唯一约束冲突（`sqlx::Error::Database`，SQLSTATE 23505），
-    /// 调用方据此转 no-op 并回执客户端。
+    /// `UNIQUE(from_entity)` makes concurrent forks first-writer-wins at the
+    /// physical level: whoever arrives second gets a unique-constraint conflict
+    /// (`sqlx::Error::Database`, SQLSTATE 23505), on which the caller turns the
+    /// operation into a no-op and acks the client.
     ///
-    /// 环（A→B 与 B→A）不由数据库拦截，须由调用方在**事务外**沿 `into_entity`
-    /// 链走到底做成环检测（`canonical_entity` 即为此提供）。
+    /// Cycles (A→B together with B→A) are not caught by the database; the
+    /// caller must detect them **outside the transaction** by walking the
+    /// `into_entity` chain to its end (`canonical_entity` exists for exactly
+    /// this).
     pub async fn insert_entity_merge(&mut self, new: &NewEntityMerge) -> Result<i64> {
         let id = new.id.to_string();
         let source_episode_id = new.source_episode_id.map(|v| v.to_string());
@@ -350,16 +390,20 @@ impl WriteTxn {
         self.insert_row(table::ENTITY_MERGES, &id, stmt).await
     }
 
-    /// 落一条事实。
+    /// Persist one fact.
     ///
-    /// `source` 连带写出 `trust_tier`：两列的对应由 schema 的
-    /// `facts_trust_tier_matches_channel` 锁死，这里只是把它算出来 ——
-    /// 让调用方自己填两列，迟早会出现「通道说是网页、档位说是用户亲述」
-    /// 这种自相矛盾的行，而它只在真出安全事件、要按来源批量失效时才暴露。
+    /// `source` also produces `trust_tier`: the correspondence between the two
+    /// columns is nailed down by the schema's
+    /// `facts_trust_tier_matches_channel`, and all we do here is compute it —
+    /// letting callers fill in both columns themselves would sooner or later
+    /// produce self-contradictory rows like "channel says web page, tier says
+    /// the user said it in person", and such a row only surfaces during an
+    /// actual security incident, when you need to invalidate in bulk by source.
     ///
-    /// `derived_from` 里的每一条源都会在**同一事务**里追加一行 `derivations`
-    /// （各自带自己的 sync_log）。单源派生留空即可，`source_episode_id`
-    /// 就是它的血缘。
+    /// Every source in `derived_from` gets one `derivations` row appended in
+    /// the **same transaction** (each with its own sync_log entry). For
+    /// single-source derivation leave it empty; `source_episode_id` is its
+    /// provenance.
     pub async fn insert_fact(&mut self, new: &NewFact) -> Result<i64> {
         let id = new.id.to_string();
         let object_entity_id = new.object_entity_id.map(|v| v.to_string());
@@ -399,26 +443,29 @@ impl WriteTxn {
         Ok(seq)
     }
 
-    /// 换模型时给一条已有事实补一个向量。
+    /// Add one vector to an existing fact when switching models.
     ///
-    /// # 为什么不是 `UPDATE facts SET embedding = …`
+    /// # Why not `UPDATE facts SET embedding = …`
     ///
-    /// 两条理由，第二条是硬的：
+    /// Two reasons; the second is the hard one:
     ///
-    /// 1. CLAUDE.md：「任何表都不做 UPDATE / DELETE」。这个 crate 里
-    ///    到目前为止零处 UPDATE，既有先例是 `blob_transcripts` ——
-    ///    派生数据往独立表插新行
-    /// 2. 「回填期间双模型召回」（memory.md §七 第 3 步）要求同一条事实
-    ///    **同时**持有两个空间的向量。一个列装不下两个
+    /// 1. CLAUDE.md: "no table does UPDATE / DELETE". This crate contains zero
+    ///    UPDATEs to date, and the existing precedent is `blob_transcripts` —
+    ///    derived data gets new rows in a separate table
+    /// 2. "Dual-model retrieval during backfill" (memory.md §7, step 3)
+    ///    requires one fact to hold vectors from two spaces **at the same
+    ///    time**. One column cannot hold two
     ///
-    /// # 幂等
+    /// # Idempotency
     ///
-    /// `ON CONFLICT DO NOTHING`：进程重启、两轮回填撞到同一条、
-    /// 两台设备同时回填，都会走到这里。让唯一约束兜底，
-    /// 而不是让回填器自己记账 —— 后者要么漏要么重，且错了没有报错。
+    /// `ON CONFLICT DO NOTHING`: a process restart, two backfill passes hitting
+    /// the same row, or two devices backfilling simultaneously all end up here.
+    /// Let the unique constraint be the backstop rather than making the
+    /// backfiller keep its own books — bookkeeping either misses rows or
+    /// duplicates them, and when it goes wrong it raises no error.
     ///
-    /// **不进 sync_log**（走 `insert_derived_row`）。理由见
-    /// `model.rs` 里 `table::FACT_EMBEDDINGS` 那段注释。
+    /// **Does not enter sync_log** (it goes through `insert_derived_row`). For
+    /// the reasoning see the comment on `table::FACT_EMBEDDINGS` in `model.rs`.
     pub async fn insert_fact_embedding(&mut self, new: &NewFactEmbedding) -> Result<()> {
         let stmt = sqlx::query(
             "INSERT INTO fact_embeddings (fact_id, embedding_model, embedding)
@@ -432,12 +479,15 @@ impl WriteTxn {
         self.inner.insert_derived_row(stmt).await
     }
 
-    /// 同上，实体侧。
+    /// The same, on the entity side.
     ///
-    /// 实体向量不参与四路召回，只用于**抽取期的实体消解**。它失效的方式
-    /// 比事实更隐蔽：消解不上就会给同一个人建出第二个实体，
-    /// 从此他的事实分裂在两个节点上，图遍历再也走不通 ——
-    /// 而这一切在界面上只表现为「它好像忘了我说过的一些事」。
+    /// Entity vectors take no part in four-way retrieval; they are used only
+    /// for **entity resolution during extraction**. The way they fail is more
+    /// insidious than for facts: a failed resolution creates a second entity
+    /// for the same person, that person's facts are split across two nodes from
+    /// then on, and graph traversal can no longer get through — while all of
+    /// this shows up in the UI merely as "it seems to have forgotten some
+    /// things I told it".
     pub async fn insert_entity_embedding(&mut self, new: &NewEntityEmbedding) -> Result<()> {
         let stmt = sqlx::query(
             "INSERT INTO entity_embeddings (entity_id, embedding_model, embedding)
@@ -451,9 +501,11 @@ impl WriteTxn {
         self.inner.insert_derived_row(stmt).await
     }
 
-    /// 追加一条生命周期事件（失效 / 恢复 / 标记）。
+    /// Append one lifecycle event (invalidate / restore / mark).
     ///
-    /// 失效以追加表达，而非就地 UPDATE —— 这是 append-only 与多端无冲突的前提。
+    /// Invalidation is expressed by appending rather than by an in-place UPDATE
+    /// — that is the premise of both append-only storage and conflict-free
+    /// multi-device operation.
     pub async fn insert_fact_event(&mut self, new: &NewFactEvent) -> Result<i64> {
         let id = new.id.to_string();
         let superseded_by = new.superseded_by.map(|v| v.to_string());
@@ -478,23 +530,30 @@ impl WriteTxn {
         self.insert_row(table::FACT_EVENTS, &id, stmt).await
     }
 
-    // ── L2 摘要层 ──────────────────────────────────────────
+    // ── L2 summary layer ───────────────────────────────────
 
-    /// 写一份摘要**连同它的血缘**。
+    /// Write a summary **together with its provenance**.
     ///
-    /// # 为什么两件事绑在一个方法里
+    /// # Why the two are bound into one method
     ///
-    /// 与 [`Guarded::insert_row`](guarded) 把「业务行 + sync_log」绑死是同一个手法。
-    /// 摘要没有 `source_episode_id NOT NULL` 那样的兜底列，血缘全在
-    /// `derivations` 里；分成两次调用就意味着「先写摘要、再写边」中间可以断，
-    /// 而断掉的表现是一条**永远找不到源头**的摘要 —— 它在源被 redact 之后
-    /// 会继续泄露内容，且事后补不出来（谁摘的、摘了什么，只有生成它的那步知道）。
+    /// The same technique by which [`Guarded::insert_row`](guarded) welds
+    /// "business row + sync_log" together. A summary has no fallback column
+    /// like `source_episode_id NOT NULL`; its provenance lives entirely in
+    /// `derivations`. Splitting this into two calls would mean the gap between
+    /// "write the summary" and "write the edges" can be interrupted, and the
+    /// symptom of an interruption is a summary whose source **can never be
+    /// found** — one that keeps leaking content after its source is redacted,
+    /// and that cannot be repaired after the fact (who summarized it, and from
+    /// what, is known only to the step that produced it).
     ///
-    /// 返回的是**摘要行**的 seq；它的血缘边紧随其后，seq 更大。
-    /// 客户端按 sync_log 序回放时先看到摘要再看到边，正好是 FK 方向。
+    /// The returned seq is the **summary row's**; its provenance edges follow
+    /// immediately after with larger seqs. A client replaying in sync_log order
+    /// therefore sees the summary before the edges, which is exactly the FK
+    /// direction.
     ///
     /// # Errors
-    /// `new.sources` 为空时返回 [`StoreError::MissingProvenance`]，且**不写任何行**。
+    /// Returns [`StoreError::MissingProvenance`] when `new.sources` is empty,
+    /// and **writes no rows at all**.
     pub async fn insert_summary(&mut self, new: &NewSummary) -> Result<i64> {
         if new.sources.is_empty() {
             return Err(StoreError::MissingProvenance {
@@ -531,13 +590,15 @@ impl WriteTxn {
         Ok(seq)
     }
 
-    // ── 派生血缘 ───────────────────────────────────────────
+    // ── derivation provenance ──────────────────────────────
 
-    /// 追加一条「派生物 ← 源」的血缘边。
+    /// Append one "derived record ← source" provenance edge.
     ///
-    /// 私有：血缘边只应与它描述的那条派生行在同一个方法里写出去
-    /// （见 [`Self::insert_summary`]）。开成 public 就等于允许「先写派生物、
-    /// 回头再补边」，而那正是 §5.3 说的「事后补是不可能的」那种补法。
+    /// Private: a provenance edge should only be written from the same method
+    /// that writes the derived row it describes (see [`Self::insert_summary`]).
+    /// Making it public would amount to permitting "write the derived record
+    /// first, come back and add the edges later" — which is precisely the kind
+    /// of repair §5.3 calls impossible after the fact.
     async fn insert_derivation(
         &mut self,
         derived_kind: DerivedKind,
@@ -561,15 +622,19 @@ impl WriteTxn {
         self.insert_row(table::DERIVATIONS, &id, stmt).await
     }
 
-    // ── 会话生命周期 ───────────────────────────────────────
+    // ── session lifecycle ──────────────────────────────────
 
-    /// 追加一条会话生命周期事件（改名 / 归档 / 绑定工作区）。
+    /// Append one session lifecycle event (rename / archive / bind workspace).
     ///
-    /// 和 [`Self::insert_fact_event`] 一样是追加而非就地改：会话的末态由
-    /// 每个维度最后一条事件决定（`session_state` 视图）。这不只是为了守
-    /// append-only —— 它让多端并发改名有确定结果：按 `sync_log` 全序回放，
-    /// 每台设备算出的标题都一样，而 UPDATE 语义下后到的写会盖掉先到的，
-    /// 两台设备各自「后到」，最终收敛到哪个取决于网络抖动。
+    /// Like [`Self::insert_fact_event`], this appends rather than modifying in
+    /// place: a session's final state is determined by the last event along
+    /// each dimension (the `session_state` view). This is not only about
+    /// upholding append-only — it makes concurrent renames from several devices
+    /// deterministic: replaying in `sync_log` total order, every device
+    /// computes the same title, whereas under UPDATE semantics the later write
+    /// overwrites the earlier one, each of two devices is "the later one" from
+    /// its own vantage point, and which value it finally converges on comes
+    /// down to network jitter.
     pub async fn insert_session_event(&mut self, new: &NewSessionEvent) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -590,14 +655,16 @@ impl WriteTxn {
         self.insert_row(table::SESSION_EVENTS, &id, stmt).await
     }
 
-    // ── 项目生命周期 ───────────────────────────────────────
+    // ── project lifecycle ──────────────────────────────────
 
-    /// 追加一条项目生命周期事件（建 / 改名 / 删）。
+    /// Append one project lifecycle event (create / rename / delete).
     ///
-    /// 与 [`Self::insert_session_event`] 同款：末态由每台状态机最后一条事件
-    /// 决定（`project_state` 视图），而不是就地改一张 projects 表。
-    /// 删项目在这里只是**追加一条 delete**，里面的会话一条都不动 ——
-    /// 级联改写会让「撤销误删」变成不可能。
+    /// Same shape as [`Self::insert_session_event`]: the final state is
+    /// determined by the last event of each state machine (the `project_state`
+    /// view) rather than by modifying a projects table in place. Deleting a
+    /// project here merely **appends a delete**, touching none of the sessions
+    /// inside it — a cascading rewrite would make "undo an accidental deletion"
+    /// impossible.
     pub async fn insert_project_event(&mut self, new: &NewProjectEvent) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(
@@ -614,14 +681,16 @@ impl WriteTxn {
         self.insert_row(table::PROJECT_EVENTS, &id, stmt).await
     }
 
-    // ── 抹除墓碑 ───────────────────────────────────────────
+    // ── redaction tombstones ───────────────────────────────
 
-    /// 写下一块抹除墓碑。
+    /// Write one redaction tombstone.
     ///
-    /// 只是墓碑：真正的级联清除（清 episode 正文、派生 fact 的 statement /
-    /// tsv / embedding、blob_transcripts、重生成 summaries）是 redact 执行器
-    /// 的工作，且是全系统唯一允许 UPDATE 的地方。墓碑本身走 sync_log 下发，
-    /// 客户端收到后必须幂等执行同等本地清除。
+    /// Just the tombstone: the actual cascading purge (clearing episode bodies,
+    /// the statement / tsv / embedding of derived facts, blob_transcripts, and
+    /// regenerating summaries) is the redact executor's job, and it is the only
+    /// place in the entire system where UPDATE is permitted. The tombstone
+    /// itself ships through sync_log, and on receiving it a client must
+    /// idempotently perform the equivalent local purge.
     pub async fn insert_redaction(&mut self, new: &NewRedaction) -> Result<i64> {
         let id = new.id.to_string();
         let stmt = sqlx::query(

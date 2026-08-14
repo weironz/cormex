@@ -1,4 +1,4 @@
-//! 连接池与写事务入口。
+//! The connection pool and the entry point for write transactions.
 
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
@@ -9,39 +9,48 @@ use crate::error::Result;
 use crate::model::{EpisodeAttachment, Project, ProjectEvent, SessionEvent, SessionState};
 use crate::txn::WriteTxn;
 
-/// 编译期嵌入的 migration 集合。
+/// The migration set embedded at compile time.
 ///
-/// 用 `migrate!` 而非运行时读目录：二进制自带 schema，部署时不必带上 `migrations/`。
-/// 注意它只是**读**文件，不需要编译期数据库连接（`query!` 宏才需要，本 crate
-/// 刻意不用 —— 见 crate 级文档）。
+/// `migrate!` rather than reading the directory at runtime: the binary carries
+/// its own schema, so deployments do not have to ship `migrations/` alongside
+/// it. Note that this only **reads** files — it needs no compile-time database
+/// connection (only the `query!` macros do, and this crate deliberately avoids
+/// them; see the crate-level docs).
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
-/// **整个部署只跑一遍**的那一套：账号、令牌、邀请、用量。
+/// The set that runs **exactly once per deployment**: accounts, tokens,
+/// invitations, usage.
 ///
-/// 与 [`MIGRATOR`] 分开是多租户逼出来的：那一套每个租户各跑一遍，
-/// 而这一套是跨租户的。混在一起时，新租户建号会跑到 `cortex_auth.users`
-/// 那条上撞 `relation already exists` —— 而失败点在建号中途。
+/// Multi-tenancy forced the split from [`MIGRATOR`]: that set runs once per
+/// tenant, while this one spans tenants. Mixed together, provisioning a new
+/// tenant would run into `relation already exists` on the `cortex_auth.users`
+/// migration — and the failure point is halfway through account creation.
 static GLOBAL_MIGRATOR: Migrator = sqlx::migrate!("../../migrations-global");
 
-/// 默认连接池上限。写事务被 advisory lock 串行化，池子不需要很大；
-/// 富余的连接留给读路径（四路召回会并发发多条查询）。
+/// The default connection pool ceiling. Write transactions are serialized by
+/// the advisory lock, so the pool does not need to be large; the surplus
+/// connections are left for the read path (four-way retrieval fires several
+/// queries concurrently).
 const DEFAULT_MAX_CONNECTIONS: u32 = 16;
 
-/// 存储层句柄。内部是 `Arc` 语义的连接池，克隆代价极低。
+/// The storage-layer handle. Internally an `Arc`-semantics connection pool, so
+/// cloning is nearly free.
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
-    /// 这个池连到哪个租户的 schema。
+    /// Which tenant's schema this pool is connected to.
     ///
-    /// 带着它是为了两样**原来是全局单例**的东西：写事务的 advisory lock 键，
-    /// 与 sync 的 NOTIFY 通道名。放在 `Store` 上而不是每次传参 ——
-    /// 传参意味着每个调用点都可能传错，而传错的后果是「两个租户共用一把锁」
-    /// 或者「订阅了别人的通道」。
+    /// It is carried along for two things that **used to be global
+    /// singletons**: the advisory lock key for write transactions, and the
+    /// NOTIFY channel name for sync. It lives on `Store` rather than being
+    /// passed at each call — passing it means every call site could pass the
+    /// wrong one, and the consequence of a wrong one is "two tenants sharing a
+    /// single lock" or "subscribed to somebody else's channel".
     schema: crate::tenant::SchemaName,
 }
 
 impl Store {
-    /// 按默认参数连接。
+    /// Connect with the default parameters.
     pub async fn connect(database_url: &str) -> Result<Self> {
         Self::connect_with(
             PgPoolOptions::new().max_connections(DEFAULT_MAX_CONNECTIONS),
@@ -50,15 +59,17 @@ impl Store {
         .await
     }
 
-    /// 按自定义池参数连接。
+    /// Connect with custom pool parameters.
     pub async fn connect_with(options: PgPoolOptions, database_url: &str) -> Result<Self> {
         Ok(Self::from_pool(options.connect(database_url).await?))
     }
 
-    /// 接管一个已建好的连接池。测试用独立 schema 时走这条路。
+    /// Take over an already-built connection pool. Tests that use a dedicated
+    /// schema come through here.
     ///
-    /// schema 按 `public` 算 —— 单用户部署与测试 harness 都落在那儿。
-    /// 多租户走 [`Self::from_pool_in`]。
+    /// The schema is taken to be `public` — that is where both single-user
+    /// deployments and the test harness land. For multi-tenancy use
+    /// [`Self::from_pool_in`].
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
@@ -67,47 +78,54 @@ impl Store {
         }
     }
 
-    /// 接管一个**已经把 `search_path` 焊好**的池，并记住它是谁的。
+    /// Take over a pool whose **`search_path` is already welded in place**, and
+    /// remember whose it is.
     #[must_use]
     pub fn from_pool_in(pool: PgPool, schema: crate::tenant::SchemaName) -> Self {
         Self { pool, schema }
     }
 
-    /// 这个池服务的租户。
+    /// The tenant this pool serves.
     #[must_use]
     pub fn schema(&self) -> &crate::tenant::SchemaName {
         &self.schema
     }
 
-    /// 把这个租户的 schema 迁到最新。
+    /// Migrate this tenant's schema up to date.
     ///
-    /// 只跑 [`MIGRATOR`]（`migrations/`，每租户一份的记忆表）。
-    /// 全局那套见 [`Self::migrate_global`]。
+    /// Runs [`MIGRATOR`] only (`migrations/`, the memory tables of which each
+    /// tenant gets a copy). For the global set see [`Self::migrate_global`].
     ///
     /// # Errors
-    /// 哪条 migration 跑不过。
+    /// Whichever migration failed to run.
     pub async fn migrate(&self) -> Result<()> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
     }
 
-    /// 跑全局那一套（`cortex_auth`）。整个部署一次，不是每租户一次。
+    /// Run the global set (`cortex_auth`). Once per deployment, not once per
+    /// tenant.
     ///
-    /// # 为什么要单独连一次而不是用现成的池
+    /// # Why this opens its own connection instead of using the existing pool
     ///
-    /// 它的 `_sqlx_migrations` 必须落在 `cortex_auth` 里，否则会与租户那套
-    /// 在 `public` 里的版本表撞在一起 —— 两套各有各的版本号，混在一张表里
-    /// 的表现是「某一套被认为已经应用过」，也就是**表没建但以为建了**。
+    /// Its `_sqlx_migrations` must land inside `cortex_auth`, or it collides
+    /// with the tenant set's version table in `public` — the two sets have
+    /// their own version numbers, and mixing them into one table shows up as
+    /// "one of the sets is believed to have already been applied", i.e. **the
+    /// tables were never created but are assumed to be**.
     ///
-    /// 而 `search_path` 是连接级属性，改不了现成的池。
+    /// And `search_path` is a connection-level property, so it cannot be
+    /// changed on an existing pool.
     ///
     /// # Errors
-    /// 连不上、建不出 `cortex_auth`，或者哪条 migration 跑不过。
+    /// Cannot connect, cannot create `cortex_auth`, or some migration fails to
+    /// run.
     pub async fn migrate_global(database_url: &str) -> Result<()> {
         use std::str::FromStr as _;
 
-        // 先把 schema 建出来：`_sqlx_migrations` 要落在里面，而那发生在
-        // 第一条 migration 之前 —— 让 migration 自己建就晚了一步
+        // Create the schema first: `_sqlx_migrations` has to land inside it,
+        // and that happens before the first migration — letting a migration
+        // create it would be one step too late
         let boot = PgPoolOptions::new()
             .max_connections(1)
             .connect(database_url)
@@ -119,7 +137,8 @@ impl Store {
 
         let options = sqlx::postgres::PgConnectOptions::from_str(database_url)
             .map_err(|e| crate::error::StoreError::Invalid(format!("DATABASE_URL 不合法：{e}")))?
-            // public 留在尾部：`ulid` / `sha256` 两个 DOMAIN 装在那儿
+            // public stays at the tail: the `ulid` and `sha256` DOMAINs live
+            // there
             .options([("search_path", "cortex_auth,public")]);
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -131,13 +150,13 @@ impl Store {
         Ok(())
     }
 
-    /// 探活。
+    /// Liveness probe.
     pub async fn ping(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 
-    /// 关闭连接池，等待在途查询结束。
+    /// Close the connection pool, waiting for in-flight queries to finish.
     pub async fn close(&self) {
         self.pool.close().await;
     }
@@ -147,29 +166,36 @@ impl Store {
         &self.pool
     }
 
-    /// 底层连接池。
+    /// The underlying connection pool.
     ///
-    /// 给**这个 crate 之外**、但仍然属于同一个租户的表用（当前是 cortexd
-    /// 的 `llm_keys`）。那张表与记忆无关，不值得为它在 repository 层加
-    /// 一组方法，但它必须落在**同一个 schema** 里 —— 而这个池的
-    /// `search_path` 已经焊死在连接选项上了，拿它就对了。
+    /// For tables that live **outside this crate** but still belong to the same
+    /// tenant (currently cortexd's `llm_keys`). That table has nothing to do
+    /// with memory and does not warrant a set of repository-layer methods of
+    /// its own, but it must land in the **same schema** — and this pool's
+    /// `search_path` is already welded into its connection options, so this is
+    /// the right thing to reach for.
     ///
-    /// 不要拿它去写记忆表：那条路必须走 [`Self::write_txn`]
-    /// （advisory lock + 同事务 sync_log）。
+    /// Do not use it to write memory tables: that path must go through
+    /// [`Self::write_txn`] (advisory lock + sync_log in the same transaction).
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// 在一个**受纪律约束**的写事务里执行 `f`。
+    /// Execute `f` inside a **discipline-bound** write transaction.
     ///
-    /// 事务开头即取 `pg_advisory_xact_lock(4272)`，把并发写事务串行化 ——
-    /// 这保证 `sync_log.seq` 的顺序等于对读端的可见顺序，游标推进永不漏行。
-    /// 详见 [`crate::txn`] 的模块文档。
+    /// The transaction takes `pg_advisory_xact_lock(4272)` right at its start,
+    /// serializing concurrent write transactions — this guarantees that the
+    /// order of `sync_log.seq` equals the order in which rows become visible to
+    /// readers, so advancing the cursor never skips a row. See the module docs
+    /// of [`crate::txn`].
     ///
-    /// `f` 返回 `Ok` 则提交，返回 `Err` 则回滚。`f` 拿到的
-    /// [`WriteTxn`] **只有写方法**：需要先查后写的流程（矛盾消解、实体消解、
-    /// 合并环检测）应在进事务前读完算完 —— 取号事务必须短小、纯写。
+    /// If `f` returns `Ok` the transaction commits; on `Err` it rolls back. The
+    /// [`WriteTxn`] that `f` receives has **write methods only**: flows that
+    /// need to read before writing (contradiction resolution, entity
+    /// resolution, merge-cycle detection) should finish reading and computing
+    /// before entering the transaction — sequence-allocating transactions must
+    /// be short and write-only.
     ///
     /// ```no_run
     /// # use cortex_store::{Store, NewEpisode};
@@ -202,74 +228,98 @@ impl Store {
     }
 }
 
-/// 一个会话的概览。
+/// An overview of one session.
 ///
-/// **两个来源拼起来**：能从消息本身算出来的（起止时间、条数、首条用户消息）
-/// 从 `episodes` 聚合；需要独立存一份的（用户自定义标题、归档、工作区）
-/// 来自 `session_events` 的末态视图 `session_state`。
+/// **Stitched from two sources**: everything derivable from the messages
+/// themselves (start and end times, message count, first user message) is
+/// aggregated from `episodes`; everything that needs storing separately
+/// (user-defined title, archived flag, workspace) comes from `session_state`,
+/// the final-state view over `session_events`.
 ///
-/// 后半部分曾经不存在 —— 那时会话不是一等公民，改名与删除都做不了。
-/// 补上它的**不是**往 `episodes` 里塞控制记录（那等于在 L0 原始层开一条
-/// 控制通道，代价是抽取、召回、同步、三端 UI 每一处都要学会跳过它），
-/// 而是一张独立的事件表。见 `migrations/20260807000002_session_events.sql`。
+/// The second half did not always exist — back then sessions were not
+/// first-class, and neither renaming nor deleting was possible. What filled the
+/// gap was **not** stuffing control records into `episodes` (that would open a
+/// control channel inside the L0 raw layer, at the cost of teaching extraction,
+/// retrieval, sync, and all three UI clients to skip them), but a separate
+/// event table. See `migrations/20260807000002_session_events.sql`.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct SessionDigest {
     pub session_id: String,
     pub message_count: i64,
-    /// 会话第一条消息的发生时间
+    /// When the session's first message occurred
     pub started_at: DateTime<Utc>,
-    /// 最后一条消息的发生时间 —— 列表排序用它
+    /// When the last message occurred — the list sorts on this
     pub updated_at: DateTime<Utc>,
-    /// 首条**用户**消息的正文。派生标题由它来，截断长度是展示决策，留给上层。
+    /// The body of the first **user** message. The derived title comes from it;
+    /// how far to truncate is a presentation decision, left to layers above.
     pub first_user_text: Option<String>,
-    /// 最后一条有正文的消息，供列表做预览。
+    /// The last message that had a body, for the list preview.
     pub last_text: Option<String>,
-    /// 用户设置的标题。`None` = 从未改名，上层回落到从 `first_user_text` 派生。
+    /// The title the user set. `None` = never renamed, and the layer above
+    /// falls back to deriving one from `first_user_text`.
     pub title: Option<String>,
-    /// 已归档 —— 从默认列表隐藏，但消息与派生记忆一概没动。
+    /// Archived — hidden from the default list, but neither the messages nor
+    /// the derived memory are touched.
     pub archived: bool,
-    /// 绑定的本机目录。`None` = 纯聊天会话，文件工具不进模型的工具目录。
+    /// The bound local directory. `None` = a pure chat session, and the file
+    /// tools do not enter the model's tool catalog.
     pub workspace: Option<String>,
-    /// 所属项目。`None` = 未分组，**也包括「原来那个项目已经被删了」** ——
-    /// 视图已经把悬挂的绑定收敛成 `None`，这里读到的就是最终口径。
+    /// The project it belongs to. `None` = ungrouped, **which also covers "the
+    /// project it used to be in has been deleted"** — the view has already
+    /// collapsed dangling bindings to `None`, so what is read here is the final
+    /// word.
     pub project_id: Option<String>,
-    /// 这个会话在哪儿跑。**没有 session_state 行时（纯新会话）也要有值** ——
-    /// 视图里 coalesce 成 'cloud'，LEFT JOIN 出来的 NULL 在这里再兜一次。
+    /// Where this session runs. **It must have a value even when there is no
+    /// session_state row (a brand-new session)** — the view coalesces it to
+    /// 'cloud', and the NULL produced by the LEFT JOIN is caught once more
+    /// here.
     pub runtime: crate::model::SessionRuntime,
 }
 
 impl Store {
-    /// 会话列表：按最后活动时间倒序。
+    /// The session list: most recently active first.
     ///
-    /// # 为什么是一句 SQL 聚合，而不是拉最近 N 条 episode 在内存里归纳
+    /// # Why one SQL aggregate instead of pulling the last N episodes and
+    /// summarizing them in memory
     ///
-    /// 后者（曾经的实现）有个不会报错的缺陷：窗口之外的会话**直接消失**。
-    /// 拉 200 条最近消息，一个话痨会话就能把它占满，于是昨天的会话在列表里
-    /// 不见了 —— 用户看到的是「我的历史丢了」，而日志里一切正常。
-    /// 归纳交给数据库，`limit` 才真正作用在**会话**上而不是消息上。
+    /// The latter (which is what this used to do) has a defect that raises no
+    /// error: sessions outside the window **simply vanish**. Pull the 200 most
+    /// recent messages and one talkative session can fill the whole window, so
+    /// yesterday's sessions disappear from the list — the user sees "my history
+    /// is gone" while the logs look perfectly fine. Handing the summarizing to
+    /// the database is what makes `limit` actually apply to **sessions** rather
+    /// than to messages.
     ///
-    /// # 为什么归档过滤在 SQL 里而不是取回来再 filter
+    /// # Why the archived filter is in SQL instead of filtering after fetching
     ///
-    /// 和上面是同一个坑的另一面：先取 `limit` 条再在内存里丢掉归档的，
-    /// 归档会话就会**占用配额**——归档二十个会话，列表里能看见的就少二十个。
-    /// 过滤必须发生在 `LIMIT` 之前。
+    /// The other face of the same trap: take `limit` rows first and drop the
+    /// archived ones in memory, and archived sessions **consume the quota** —
+    /// archive twenty sessions and the list shows twenty fewer. The filter has
+    /// to happen before the `LIMIT`.
     ///
-    /// # 只列出有消息的会话
+    /// # Only sessions that have messages are listed
     ///
-    /// 聚合的起点是 `episodes`，所以一个「只写过 session_events、还没发过
-    /// 消息」的会话不会出现在这里。这是有意的：它没有时间、没有条数、没有预览，
-    /// 列出来只是一行空白。用户新建会话后先选工作区再发第一句，这段时间里
-    /// 那个会话由客户端本地持有 —— 第一条消息一落库它就自动出现，
-    /// 而此前写下的改名 / 绑定事件会原样生效（末态与写入顺序无关）。
+    /// The aggregate starts from `episodes`, so a session that has only written
+    /// session_events and not yet sent a message does not appear here. That is
+    /// deliberate: it has no timestamps, no count, and no preview, so listing
+    /// it produces one blank row. After a user creates a session they pick a
+    /// workspace before sending their first sentence, and during that window
+    /// the session is held locally by the client — it appears automatically the
+    /// moment the first message lands, and the rename / binding events written
+    /// beforehand take effect exactly as written (the final state does not
+    /// depend on write order).
     ///
-    /// # 按项目过滤
+    /// # Filtering by project
     ///
-    /// `project_id` 为 `None` 时**不过滤**，给全部会话（含未分组的）。
-    /// 与归档一样，过滤发生在 `LIMIT` 之前 —— 否则别的项目的会话会把配额
-    /// 吃掉，症状是「这个项目里明明有会话，列表却是空的」。
+    /// When `project_id` is `None` **no filter is applied** and all sessions
+    /// are returned (including ungrouped ones). As with archiving, the filter
+    /// happens before the `LIMIT` — otherwise other projects' sessions eat the
+    /// quota, and the symptom is "this project clearly has sessions, but the
+    /// list is empty".
     ///
-    /// 传一个**已删除项目**的 id 会得到空列表：视图已经把指向它的绑定
-    /// 收敛成 NULL。这正是想要的 —— 删掉的项目不该还能被翻出来。
+    /// Passing the id of a **deleted project** yields an empty list: the view
+    /// has already collapsed bindings pointing at it to NULL. That is exactly
+    /// what we want — a deleted project should not still be diggable.
     pub async fn session_digests(
         &self,
         limit: i64,
@@ -277,17 +327,19 @@ impl Store {
         project_id: Option<&str>,
     ) -> Result<Vec<SessionDigest>> {
         let rows = sqlx::query_as::<_, SessionDigest>(
-            // 先聚合再 JOIN 视图：反过来的话 session_state 会被每一条 episode
-            // 拖着算一遍，而它自己内部已经有四次 DISTINCT ON 了
+            // Aggregate first, then JOIN the view: the other way around,
+            // session_state gets recomputed once per episode dragging it
+            // along, and it already contains four DISTINCT ONs internally
             "SELECT d.session_id, d.message_count, d.started_at, d.updated_at,
                     d.first_user_text, d.last_text,
                     s.title,
                     coalesce(s.archived, false) AS archived,
                     s.workspace,
                     s.project_id,
-                    -- LEFT JOIN 可能整行为空（会话还没有任何生命周期事件），
-                    -- 那时 runtime 也是 NULL。视图里已经 coalesce 过一次，
-                    -- 这里兜的是「压根没 join 上」那一种
+                    -- The LEFT JOIN may produce an all-NULL row (the session
+                    -- has no lifecycle events yet), and then runtime is NULL
+                    -- too. The view already coalesces once; what is caught
+                    -- here is the 'never joined at all' case
                     coalesce(s.runtime, 'cloud') AS runtime
                FROM (
                     SELECT e.session_id,
@@ -318,10 +370,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// 单个会话的概览。**不过滤归档** —— 调用方是按 id 明确要这一个，
-    /// 归档与否是它要看的信息之一，而不是该被藏起来的理由。
+    /// An overview of a single session. **No archived filter** — the caller
+    /// asked for this specific one by id, and whether it is archived is one of
+    /// the facts they want to see, not a reason to hide it.
     ///
-    /// 返回 `None` 表示这个会话一条消息都没有（可能只写过生命周期事件）。
+    /// Returning `None` means this session has no messages at all (it may have
+    /// written only lifecycle events).
     pub async fn session_digest(&self, session_id: &str) -> Result<Option<SessionDigest>> {
         let row = sqlx::query_as::<_, SessionDigest>(
             "SELECT d.session_id, d.message_count, d.started_at, d.updated_at,
@@ -330,9 +384,10 @@ impl Store {
                     coalesce(s.archived, false) AS archived,
                     s.workspace,
                     s.project_id,
-                    -- LEFT JOIN 可能整行为空（会话还没有任何生命周期事件），
-                    -- 那时 runtime 也是 NULL。视图里已经 coalesce 过一次，
-                    -- 这里兜的是「压根没 join 上」那一种
+                    -- The LEFT JOIN may produce an all-NULL row (the session
+                    -- has no lifecycle events yet), and then runtime is NULL
+                    -- too. The view already coalesces once; what is caught
+                    -- here is the 'never joined at all' case
                     coalesce(s.runtime, 'cloud') AS runtime
                FROM (
                     SELECT e.session_id,
@@ -358,10 +413,12 @@ impl Store {
         Ok(row)
     }
 
-    /// 一个会话四个维度各自的末态。
+    /// The final state of a session along each of its four dimensions.
     ///
-    /// 返回 `None` 表示这个会话从未有过任何生命周期事件 —— 没改过名、
-    /// 没归档、没绑工作区、没进过项目。调用方按「全默认」处理即可，不是错误。
+    /// Returning `None` means this session has never had a lifecycle event at
+    /// all — never renamed, never archived, never bound to a workspace, never
+    /// put in a project. The caller should treat it as "all defaults"; this is
+    /// not an error.
     pub async fn session_state(&self, session_id: &str) -> Result<Option<SessionState>> {
         let row = sqlx::query_as::<_, SessionState>(
             "SELECT session_id, title, archived, workspace, project_id, runtime, decided_at
@@ -373,7 +430,8 @@ impl Store {
         Ok(row)
     }
 
-    /// 一个会话的全部生命周期事件，升序。界面的「它是怎么变的」。
+    /// Every lifecycle event of one session, ascending. The UI's "how did this
+    /// change over time".
     pub async fn session_events(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
         let rows = sqlx::query_as::<_, SessionEvent>(
             "SELECT id, session_id, op, title, workspace, project_id, runtime,
@@ -387,21 +445,26 @@ impl Store {
         Ok(rows)
     }
 
-    // ── 项目 ───────────────────────────────────────────────
+    // ── projects ───────────────────────────────────────────
 
-    /// 现存的项目，新建的在前。
+    /// The projects that exist, newest first.
     ///
-    /// # `session_count` 的口径
+    /// # What `session_count` counts
     ///
-    /// 数的是「这个项目下**会出现在会话列表里**的会话」，所以两条过滤都要有：
+    /// It counts "sessions under this project that **would appear in the
+    /// session list**", so both filters are required:
     ///
-    /// - 排除已归档：归档的产品语义就是从默认列表消失，计数里还算着它，
-    ///   用户会看到「3 个会话」点进去只有 2 个
-    /// - 要求至少有一条消息：会话列表的起点是 `episodes` 聚合，一个「建了
-    ///   但还没发过话」的会话本来就不在列表里（见 [`Self::session_digests`]）
+    /// - Exclude archived ones: the product meaning of archiving is
+    ///   disappearing from the default list, so if the count still includes
+    ///   them the user sees "3 sessions" and finds only 2 after clicking in
+    /// - Require at least one message: the session list starts from the
+    ///   `episodes` aggregate, so a session that was created but has never said
+    ///   anything is not in the list to begin with (see
+    ///   [`Self::session_digests`])
     ///
-    /// 两条都对齐 `GET /sessions?project_id=` 的默认口径 —— 计数与列表长度
-    /// 对不上是那种「看着就不对、但查起来毫无线索」的问题。
+    /// Both align with the default semantics of `GET /sessions?project_id=` —
+    /// a count that disagrees with the list length is the kind of problem that
+    /// looks obviously wrong yet offers no lead when you go looking for it.
     pub async fn projects(&self) -> Result<Vec<Project>> {
         let rows = sqlx::query_as::<_, Project>(
             "SELECT p.project_id, p.name, p.created_at,
@@ -423,7 +486,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 单个项目。返回 `None` 表示它不存在或已被删 —— 两者对调用方是同一件事。
+    /// A single project. Returning `None` means it does not exist or has been
+    /// deleted — to the caller those are the same thing.
     pub async fn project(&self, project_id: &str) -> Result<Option<Project>> {
         let row = sqlx::query_as::<_, Project>(
             "SELECT p.project_id, p.name, p.created_at,
@@ -446,7 +510,8 @@ impl Store {
         Ok(row)
     }
 
-    /// 一个项目的全部生命周期事件，升序。界面的「它是怎么变的」。
+    /// Every lifecycle event of one project, ascending. The UI's "how did this
+    /// change over time".
     pub async fn project_events(&self, project_id: &str) -> Result<Vec<ProjectEvent>> {
         let rows = sqlx::query_as::<_, ProjectEvent>(
             "SELECT id, project_id, op, name, actor, device_id, created_at
@@ -459,14 +524,18 @@ impl Store {
         Ok(rows)
     }
 
-    /// 批量取一批 episode 的附件，**连同 mime 与大小**。
+    /// Fetch the attachments of a batch of episodes, **along with their mime
+    /// type and size**.
     ///
-    /// 会话详情要给每条消息挂上附件，逐条查就是 N+1 —— 一个两百条的会话
-    /// 变成两百次往返，而这条路正是「打开一个带图的会话」的热路径。
+    /// Session detail has to hang attachments off every message, and querying
+    /// one at a time is N+1 — a two-hundred-message session becomes two hundred
+    /// round trips, and this path is exactly the hot path of "open a session
+    /// containing images".
     ///
-    /// 元信息随行返回而不是让客户端拿着 hash 再去 `GET /blobs/{hash}` 问一遍：
-    /// 那是每个附件一次往返，且在此之前客户端**没有任何东西可以显示** ——
-    /// 一个 PDF 只能画成「文档 · a1b2c3d4」。
+    /// The metadata rides along instead of making the client take the hash and
+    /// ask again via `GET /blobs/{hash}`: that would be one round trip per
+    /// attachment, and until it returns the client has **nothing at all to
+    /// display** — a PDF could only be drawn as "document · a1b2c3d4".
     pub async fn episode_attachments_bulk(
         &self,
         episode_ids: &[String],

@@ -1,8 +1,10 @@
-//! S3 兼容后端：RustFS / MinIO / Cloudflare R2 / AWS S3 通用。
+//! The S3-compatible backend: works with RustFS / MinIO / Cloudflare R2 / AWS
+//! S3 alike.
 //!
-//! 只用标准 S3 API，不碰任何一家的私有扩展 —— RustFS 处于 alpha
-//! （社区已有 disk-full 元数据损坏不可恢复的实录），换掉它的那天
-//! 应该只是改一行 endpoint。
+//! It uses only the standard S3 API and touches nobody's proprietary extensions
+//! — RustFS is alpha (the community has documented unrecoverable metadata
+//! corruption on a full disk), and the day it gets replaced should be a
+//! one-line endpoint change.
 
 use std::{ops::Range, time::Duration};
 
@@ -25,68 +27,86 @@ use crate::{
     validate_ttl,
 };
 
-/// 走 multipart 的体积门槛。
+/// The size threshold above which multipart is used.
 ///
-/// 取 16 MiB 的理由：multipart 至少要三次往返（create / upload / complete），
-/// 单次 `PutObject` 只要一次。小对象上 multipart 是纯亏。
-/// 门槛之上才值得，换来的是**按分片重试**——一段 500 MB 的视频
-/// 传到 480 MB 时网络抖一下，单次 PUT 要从头再来，multipart 只重传 8 MiB。
+/// Why 16 MiB: multipart takes at least three round trips (create / upload /
+/// complete), whereas a single `PutObject` takes one. For small objects
+/// multipart is a pure loss. Above the threshold it becomes worth it, and what
+/// it buys is **per-part retry** — when a 500 MB video hits network jitter at
+/// 480 MB, a single PUT starts over from the beginning while multipart
+/// retransmits only 8 MiB.
 pub const MULTIPART_THRESHOLD: usize = 16 * 1024 * 1024;
 
-/// 分片大小。8 MiB 与 AWS CLI 的 `multipart_chunksize` 默认值一致 ——
-/// 不是拍脑袋，是一个被大量生产流量验证过的数字。
+/// The part size. 8 MiB matches the AWS CLI's `multipart_chunksize` default —
+/// not a number pulled out of the air, but one validated by a great deal of
+/// production traffic.
 ///
-/// 下限由 S3 规定：除最后一片外每片不得小于 5 MiB。取 8 MiB 留了余量，
-/// 同时把 10000 片的上限换算成单对象 ~78 GiB，远超任何要进记忆的媒体。
+/// The lower bound is imposed by S3: every part except the last must be at
+/// least 5 MiB. 8 MiB leaves margin, and at the same time turns the 10000-part
+/// limit into roughly 78 GiB per object, far beyond any media that would ever
+/// enter memory.
 pub const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 
-// S3 的硬性约束在编译期兜住 —— 调这两个常数时若破了规矩，
-// 不该等到某段视频传到一半才被服务端拒绝。
+// S3's hard constraints are caught at compile time — if these two constants get
+// adjusted in a way that breaks the rules, that should not wait until some
+// video is halfway uploaded to be refused by the server.
 const _: () = {
     assert!(
         MULTIPART_PART_SIZE >= 5 * 1024 * 1024,
-        "S3 规定除末片外每片不得小于 5 MiB，小于此值 CompleteMultipartUpload 会被拒"
+        "S3 requires every part but the last to be at least 5 MiB; below that, \
+         CompleteMultipartUpload is refused"
     );
     assert!(
         MULTIPART_THRESHOLD >= MULTIPART_PART_SIZE,
-        "门槛低于分片大小会产出只有一片的 multipart —— 三次往返做一次 PUT 的事"
+        "a threshold below the part size produces a one-part multipart — three round trips to do \
+         the job of one PUT"
     );
     assert!(
         MULTIPART_PART_SIZE * 10_000 > 64 * 1024 * 1024 * 1024,
-        "分片数上限是 10000；此分片大小换算出的单对象容量不足 64 GiB，长视频会传不上去"
+        "the part count limit is 10000; this part size works out to less than 64 GiB per object, \
+         so long videos would fail to upload"
     );
 };
 
-/// 建 [`S3BlobStore`] 所需的参数。
+/// The parameters needed to build an [`S3BlobStore`].
 #[derive(Debug, Clone)]
 pub struct S3Options {
-    /// 形如 `http://localhost:9010`。留空表示走 AWS 官方 endpoint。
+    /// Of the form `http://localhost:9010`. Leave it empty to use the official
+    /// AWS endpoint.
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
-    /// path-style 寻址（`host/bucket/key`）而非 virtual-host
-    /// （`bucket.host/key`）。
+    /// Path-style addressing (`host/bucket/key`) rather than virtual-host
+    /// (`bucket.host/key`).
     ///
-    /// **对 RustFS / MinIO 必须为 `true`**，理由见 [`S3BlobStore::new`]。
+    /// **Must be `true` for RustFS / MinIO**; see [`S3BlobStore::new`] for why.
     pub force_path_style: bool,
-    /// 本实例服务的租户，会成为 object key 的首段。
+    /// The tenant this instance serves, which becomes the leading segment of
+    /// the object key.
     ///
-    /// 与 endpoint / bucket 并列放进 `S3Options`，而不是给 [`S3BlobStore::new`]
-    /// 单开一个参数：这几样东西的生命周期是一样的（一个 store 实例一份，
-    /// 建完就不再变），拆成两处只会让「建 store 需要哪些东西」这件事有两个答案。
+    /// It sits in `S3Options` alongside endpoint and bucket rather than being a
+    /// separate parameter of [`S3BlobStore::new`]: these things all have the
+    /// same lifetime (one per store instance, fixed once constructed), and
+    /// splitting them across two places would give "what does building a store
+    /// need" two answers.
     pub tenant: TenantPrefix,
 }
 
 impl S3Options {
-    /// 由 [`cortex_core::config::S3Config`] 与租户构造。默认开 path-style ——
-    /// 自建对象存储是本项目的默认部署形态，而它们清一色只认 path-style。
+    /// Construct from a [`cortex_core::config::S3Config`] and a tenant.
+    /// Path-style is on by default — self-hosted object storage is this
+    /// project's default deployment shape, and those implementations uniformly
+    /// speak only path-style.
     ///
-    /// 租户是独立参数而非取自 `S3Config`：endpoint / bucket / 密钥是**整个进程
-    /// 一份**的部署配置，租户却是**每用户一份**的运行期身份。塞进同一个配置
-    /// 结构体，就等于暗示它也能从环境变量里读一个全局值出来——而那恰好是
-    /// 多租户下最不该发生的事。
+    /// The tenant is a separate parameter rather than being taken from
+    /// `S3Config`: endpoint, bucket and keys are deployment configuration
+    /// held **once per process**, whereas the tenant is a runtime identity held
+    /// **once per user**. Stuffing it into the same config struct would imply it
+    /// too could be read as a global value out of an environment variable —
+    /// which is precisely the thing that must never happen under
+    /// multi-tenancy.
     #[must_use]
     pub fn from_config(cfg: &cortex_core::config::S3Config, tenant: TenantPrefix) -> Self {
         Self {
@@ -101,7 +121,7 @@ impl S3Options {
     }
 }
 
-/// S3 兼容的对象存储后端。
+/// The S3-compatible object storage backend.
 #[derive(Clone)]
 pub struct S3BlobStore {
     client: Client,
@@ -109,9 +129,11 @@ pub struct S3BlobStore {
     tenant: TenantPrefix,
 }
 
-/// 手写而非 derive：`Client` 的 `Debug` 会把整份 SDK 配置
-/// （全部 partition 的 endpoint 正则、拦截器链、重试策略）铺开成几十 KB。
-/// 那东西一旦进了 `tracing` 的错误上下文或某条断言消息，日志就没法看了。
+/// Hand-written rather than derived: `Client`'s `Debug` unrolls the entire SDK
+/// configuration (the endpoint regexes of every partition, the interceptor
+/// chain, the retry policy) into tens of kilobytes. Once that lands in
+/// `tracing`'s error context or in some assertion message, the logs become
+/// unreadable.
 impl std::fmt::Debug for S3BlobStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3BlobStore")
@@ -122,32 +144,40 @@ impl std::fmt::Debug for S3BlobStore {
 }
 
 impl S3BlobStore {
-    /// 建客户端。不做任何网络调用 —— 桶的存在性由
-    /// [`ensure_bucket`](Self::ensure_bucket) 单独负责，
-    /// 好让「构造」保持同步、无副作用、可在配置解析阶段完成。
+    /// Build the client. Makes no network call at all — the bucket's existence
+    /// is the separate responsibility of [`ensure_bucket`](Self::ensure_bucket),
+    /// so that "construction" stays synchronous, side-effect free, and doable
+    /// during configuration parsing.
     ///
-    /// # `force_path_style` 为什么是死规定
+    /// # Why `force_path_style` is non-negotiable
     ///
-    /// 关掉它，SDK 会把桶名拼成子域名，去请求 `cortex-blobs.localhost:9010`
-    /// 而不是 `localhost:9010/cortex-blobs`。RustFS **只实现了 path-style**，
-    /// 于是必然失败 —— 但失败形态取决于本机 DNS 怎么处理那个子域名，
-    /// 两种都实测见过：
+    /// Turn it off and the SDK folds the bucket name into a subdomain,
+    /// requesting `cortex-blobs.localhost:9010` instead of
+    /// `localhost:9010/cortex-blobs`. RustFS **only implements path-style**, so
+    /// this fails without exception — but the shape of the failure depends on
+    /// how the local DNS handles that subdomain, and both have been observed in
+    /// practice:
     ///
-    /// - 子域名解析不了：`dispatch failure: io error: failed to lookup
-    ///   address information`
-    /// - 子域名被解析到 127.0.0.1（`*.localhost` 在不少系统上如此，
-    ///   本机即是）：连接建立后 RustFS 认不得这个 Host，直接断开，
-    ///   报 `connection closed before message completed`
+    /// - The subdomain does not resolve: `dispatch failure: io error: failed to
+    ///   lookup address information`.
+    /// - The subdomain resolves to 127.0.0.1 (which `*.localhost` does on quite
+    ///   a few systems, this machine included): the connection is established,
+    ///   RustFS does not recognize the Host and simply disconnects, reporting
+    ///   `connection closed before message completed`.
     ///
-    /// 两条错误信息里**都不含桶名、也不含「addressing style」字样**，
-    /// 看上去纯粹像网络不通，足以把人往防火墙、容器网络、endpoint 拼写上
-    /// 引一整天。所以不给关的机会：`from_config` 恒为 `true`。
-    /// （AWS 官方 endpoint 两种寻址都支持，开着也不影响。）
+    /// **Neither error message contains the bucket name, nor the words
+    /// "addressing style".** They look like plain network trouble, which is
+    /// enough to send somebody chasing firewalls, container networking and
+    /// endpoint typos for a whole day. So there is no opportunity to turn it
+    /// off: `from_config` sets it to `true` unconditionally. (The official AWS
+    /// endpoint supports both addressing styles, so leaving it on costs
+    /// nothing.)
     ///
-    /// 效果本身由 `path_style_flag_decides_where_the_bucket_name_goes` 钉住。
+    /// The effect itself is pinned down by
+    /// `path_style_flag_decides_where_the_bucket_name_goes`.
     ///
     /// # Errors
-    /// endpoint 不是合法 URL 时返回 [`BlobError::Backend`]。
+    /// Returns [`BlobError::Backend`] when the endpoint is not a legal URL.
     pub fn new(opts: &S3Options) -> Result<Self> {
         let creds = Credentials::new(
             &opts.access_key,
@@ -158,21 +188,25 @@ impl S3BlobStore {
         );
 
         let mut builder = aws_sdk_s3::config::Builder::new()
-            // 不锁行为版本：锁了以后每次升 SDK 都要手工对一遍变更清单，
-            // 而我们只用最基础的六个 API，行为变更面几乎为零。
+            // The behavior version is not pinned: pinning it would mean
+            // manually reviewing a change list on every SDK upgrade, whereas we
+            // use only the six most basic APIs, whose surface for behavioural
+            // change is close to zero.
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(opts.region.clone()))
             .credentials_provider(creds)
             .force_path_style(opts.force_path_style);
 
         if !opts.endpoint.is_empty() {
-            // 提前校验一次：endpoint 拼错若留到第一次请求才炸，
-            // 错误会混在网络失败里难以分辨。
+            // Validate up front: if a mistyped endpoint waited until the first
+            // request to blow up, the error would blend into network failures
+            // and be hard to tell apart.
             //
-            // 光靠 `Url::parse` 成功是不够的 —— 它会把 `localhost:9010`
-            // 解析成「scheme = localhost，path = 9010」并欣然返回 Ok，
-            // 于是最常见的那个错（漏写 http://）恰恰是它漏掉的一个。
-            // 所以显式要求 http/https 且带 host。
+            // A successful `Url::parse` is not enough on its own — it parses
+            // `localhost:9010` as "scheme = localhost, path = 9010" and happily
+            // returns Ok, so the single most common mistake (forgetting
+            // http://) is precisely the one it misses. Hence the explicit
+            // demand for http/https plus a host.
             let url = Url::parse(&opts.endpoint).map_err(|e| {
                 BlobError::Backend(format!("S3 endpoint {:?} 非法：{e}", opts.endpoint))
             })?;
@@ -197,7 +231,8 @@ impl S3BlobStore {
         &self.bucket
     }
 
-    /// 本实例服务的租户。对象都落在 `<tenant>/` 这一前缀之下。
+    /// The tenant this instance serves. Objects all land beneath the `<tenant>/`
+    /// prefix.
     #[must_use]
     pub fn tenant(&self) -> &TenantPrefix {
         &self.tenant
@@ -207,13 +242,17 @@ impl S3BlobStore {
         hash::storage_key(&self.tenant, hash)
     }
 
-    /// 桶不存在则创建。幂等，可在每次启动时无条件调用。
+    /// Create the bucket if it does not exist. Idempotent, and safe to call
+    /// unconditionally on every startup.
     ///
-    /// 不用 `HeadBucket` 先探再建：那是 TOCTOU，两个实例同时启动会撞。
-    /// 直接建，然后把「已存在」这两个错误码当成功 —— 这才是幂等的正确写法。
+    /// It does not `HeadBucket` first and create second: that is a TOCTOU, and
+    /// two instances starting at once collide. Create directly, then treat those
+    /// two "already exists" error codes as success — that is the correct way to
+    /// write idempotence.
     ///
     /// # Errors
-    /// 建桶失败且并非「已存在」时返回 [`BlobError::Backend`]。
+    /// Returns [`BlobError::Backend`] when creation fails for a reason other
+    /// than "already exists".
     pub async fn ensure_bucket(&self) -> Result<()> {
         match self
             .client
@@ -243,8 +282,10 @@ impl S3BlobStore {
             .map_err(|e| BlobError::Backend(format!("构造 presigning 配置失败：{e}")))
     }
 
-    /// 大对象走 multipart。失败时**必须** abort，否则已上传的分片会
-    /// 永久占着桶的空间且不在 `ListObjects` 里可见 —— 是最难发现的那种泄漏。
+    /// Large objects go through multipart. On failure it **must** abort,
+    /// otherwise the parts already uploaded permanently occupy space in the
+    /// bucket while being invisible to `ListObjects` — the hardest kind of leak
+    /// to notice.
     async fn put_multipart(&self, key: &str, bytes: &Bytes, mime: &str) -> Result<()> {
         let created = self
             .client
@@ -277,8 +318,9 @@ impl S3BlobStore {
                 Ok(())
             }
             Err(e) => {
-                // abort 本身也可能失败（网络已断），但那时再报它只会盖住真正的病因。
-                // 记日志而不是替换错误。
+                // The abort itself can also fail (the network may already be
+                // down), but reporting that instead would bury the real cause.
+                // Log it rather than replacing the error.
                 if let Err(abort_err) = self
                     .client
                     .abort_multipart_upload()
@@ -306,11 +348,14 @@ impl S3BlobStore {
     ) -> Result<Vec<CompletedPart>> {
         let mut parts = Vec::with_capacity(bytes.len().div_ceil(MULTIPART_PART_SIZE));
 
-        // 顺序上传而非并发：字节已经全在内存里，瓶颈是上行带宽，
-        // 并发分片并不会让它变宽，只会让内存里同时多出几份切片的引用。
-        // 真要提速应该先把 put 改成流式接口，那是另一件事。
+        // Sequential rather than concurrent uploads: the bytes are already
+        // entirely in memory, the bottleneck is upstream bandwidth, and
+        // concurrent parts do not widen it — they only put several more slice
+        // references in memory at once. Genuinely speeding this up would mean
+        // first turning put into a streaming interface, which is a different
+        // matter.
         for (i, chunk) in bytes.chunks(MULTIPART_PART_SIZE).enumerate() {
-            // S3 的分片编号从 1 开始，不是 0
+            // S3 part numbers start at 1, not 0.
             let part_number =
                 i32::try_from(i + 1).map_err(|_| BlobError::Backend("分片数超出 i32".into()))?;
 
@@ -353,15 +398,19 @@ impl BlobStore for S3BlobStore {
             deduplicated: true,
         };
 
-        // 先探后传：命中就省掉整段上行带宽。
+        // Probe first, upload second: a hit saves the entire upstream
+        // bandwidth.
         //
-        // 这里有一个众所周知的竞态 —— 两个请求同时探到「不存在」，
-        // 于是都传一遍。**故意不管**：内容寻址下二者的 key 与字节完全相同，
-        // S3 的 PutObject 又是原子的，谁后到结果都一样。
-        // 为省一次重复上传去引入分布式锁，是拿可用性换带宽，赔本。
+        // There is a well-known race here — two requests both probe "not
+        // present" and so both upload. **Deliberately ignored**: under content
+        // addressing their keys and their bytes are identical, and S3's
+        // PutObject is atomic, so whichever arrives second the result is the
+        // same. Introducing a distributed lock to save one duplicate upload
+        // trades availability for bandwidth, which is a losing trade.
         //
-        // 唯一的实际影响是 `deduplicated` 这个观测字段偶尔偏低，
-        // 而它本就注明了只作观测用。
+        // The only practical effect is that the observational field
+        // `deduplicated` occasionally reads low, and it is already documented as
+        // being for observation only.
         if self.exists(&blob.hash).await? {
             return Ok(blob);
         }
@@ -404,8 +453,10 @@ impl BlobStore for S3BlobStore {
         validate_range(&range)?;
         let key = self.key_of(hash)?;
 
-        // HTTP Range 的两端都是闭的，Rust 的 Range 是左闭右开 —— 差一位错在这里
-        // 最容易发生，而症状是「视频每段少最后一帧」这种没人会归因到存储层的问题。
+        // Both ends of an HTTP Range are inclusive, while Rust's Range is
+        // half-open — this is where an off-by-one is easiest to make, and the
+        // symptom is "every video segment is missing its last frame", which
+        // nobody would ever attribute to the storage layer.
         let header = format!("bytes={}-{}", range.start, range.end - 1);
 
         let out = self
@@ -425,10 +476,12 @@ impl BlobStore for S3BlobStore {
         let key = self.key_of(hash)?;
         let cfg = Self::presign_cfg(ttl)?;
 
-        // 刻意不设 content_type / content_length：presign 会把请求头一并签进
-        // SignedHeaders，客户端届时发的头只要有一个字节对不上，签名就验不过
-        // （报 SignatureDoesNotMatch，而真因是「你多设了一个头」）。
-        // MIME 由服务端在写 `blobs` 行时定，本就不必让客户端参与。
+        // Deliberately no content_type / content_length: presigning signs the
+        // request headers into SignedHeaders as well, and if a single byte of
+        // what the client actually sends fails to match, the signature does not
+        // verify (reported as SignatureDoesNotMatch, while the real cause is
+        // "you set one header too many"). The MIME is decided by the server when
+        // it writes the `blobs` row, so the client need not be involved at all.
         let req = self
             .client
             .put_object()
@@ -471,8 +524,10 @@ impl BlobStore for S3BlobStore {
             Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
                 Ok(false)
             }
-            // 桶还没建出来时 HeadObject 报 NoSuchBucket，语义上等同于「对象不存在」。
-            // 不特判会让首次启动的 put 直接失败在探测这一步。
+            // While the bucket has yet to be created, HeadObject reports
+            // NoSuchBucket, which is semantically the same as "the object does
+            // not exist". Without this special case, the first put after
+            // startup would fail right at the probing step.
             Err(e) if is_no_such_bucket(&e) => Ok(false),
             Err(e) => Err(backend_err("HeadObject", e)),
         }
@@ -480,8 +535,9 @@ impl BlobStore for S3BlobStore {
 
     async fn delete(&self, hash: &str) -> Result<()> {
         let key = self.key_of(hash)?;
-        // S3 的 DeleteObject 对不存在的 key 也返回 204，天然幂等 ——
-        // 正合 purge 级联清除任务「可重跑」的要求。
+        // S3's DeleteObject returns 204 even for a key that does not exist, so
+        // it is idempotent by nature — exactly what purge's cascading cleanup
+        // job needs in order to be rerunnable.
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -493,12 +549,14 @@ impl BlobStore for S3BlobStore {
     }
 }
 
-/// 把 SDK 错误压成一行可读的字符串。
+/// Flatten an SDK error into one readable line.
 ///
-/// 直接 `{e}` 只会得到 "service error" 这种毫无信息量的顶层描述 ——
-/// 真正的原因埋在 source 链的第二三层。这里显式取 `code`/`message`，
-/// 并在连不上（根本没有服务端响应）时一路下钻到最深一层，
-/// 省下的是每次排查时手工展开错误链的功夫。
+/// A plain `{e}` yields nothing but an utterly uninformative top-level
+/// description like "service error" — the real cause is buried two or three
+/// levels down the source chain. This explicitly takes `code`/`message`, and
+/// when the connection could not be made at all (so there is no server response
+/// whatsoever) drills all the way down to the deepest level. What that saves is
+/// manually unrolling the error chain on every investigation.
 fn backend_err<E>(op: &str, e: SdkError<E>) -> BlobError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
@@ -518,11 +576,15 @@ where
 
 fn map_get_err(hash: &str, e: SdkError<GetObjectError>) -> BlobError {
     match http_status(&e) {
-        // 416：range 落在对象之外。归到 InvalidRange 而不是 Backend，
-        // 才能在 HTTP 层映射成 400 而非 500。
+        // 416: the range falls outside the object. Classified as InvalidRange
+        // rather than Backend, so that the HTTP layer maps it to 400 and not
+        // 500.
         Some(416) => BlobError::InvalidRange(format!("请求的区间完全落在 {hash} 之外")),
-        // 走状态码而不是只认 `GetObjectError::NoSuchKey`：RustFS 等兼容实现
-        // 对缺失对象回 404 却不一定带上那个结构体，只认类型化错误会把 404 错报成 500。
+        // Go by status code rather than only recognizing
+        // `GetObjectError::NoSuchKey`: compatible implementations such as
+        // RustFS answer a missing object with 404 but do not necessarily attach
+        // that struct, and recognizing only the typed error would misreport a
+        // 404 as a 500.
         Some(404) => BlobError::NotFound(hash.to_owned()),
         _ if matches!(&e, SdkError::ServiceError(se) if matches!(se.err(), GetObjectError::NoSuchKey(_))) => {
             BlobError::NotFound(hash.to_owned())
@@ -531,7 +593,8 @@ fn map_get_err(hash: &str, e: SdkError<GetObjectError>) -> BlobError {
     }
 }
 
-/// 取服务端返回的 HTTP 状态码。连不上时无响应可取，返回 `None`。
+/// Take the HTTP status code the server returned. When the connection could not
+/// be made there is no response to take one from, so this returns `None`.
 fn http_status<E>(e: &SdkError<E>) -> Option<u16> {
     match e {
         SdkError::ServiceError(se) => Some(se.raw().status().as_u16()),
@@ -569,31 +632,36 @@ mod tests {
             access_key: "k".into(),
             secret_key: "s".into(),
             force_path_style: true,
-            tenant: TenantPrefix::new(TEST_TENANT).expect("测试租户前缀本身应合法"),
+            tenant: TenantPrefix::new(TEST_TENANT)
+                .expect("the test tenant prefix should itself be legal"),
         }
     }
 
     #[test]
     fn construction_makes_no_network_call() {
-        // 指向一个必然不通的地址：若构造里藏了网络调用，这里会挂住或报错
+        // Point at an address that is guaranteed unreachable: if construction
+        // hid a network call, this would hang or error.
         let mut o = opts();
         o.endpoint = "http://127.0.0.1:1".into();
         assert!(
             S3BlobStore::new(&o).is_ok(),
-            "构造不该访问网络 —— 它要能在配置解析阶段完成"
+            "construction must not touch the network — it has to be doable during configuration \
+             parsing"
         );
     }
 
     #[test]
     fn malformed_endpoint_fails_fast() {
-        // "localhost:9010" 是最常见的那个错（漏写 http://），而它恰恰能被
-        // Url::parse 解析成功（scheme = localhost）。只靠 parse 会放它过去。
+        // "localhost:9010" is the single most common mistake (forgetting
+        // http://), and it happens to parse successfully with Url::parse
+        // (scheme = localhost). Relying on parse alone would let it through.
         for bad in ["localhost:9010", "9010", "ftp://localhost:9010", "http://"] {
             let mut o = opts();
             o.endpoint = bad.into();
             assert!(
                 matches!(S3BlobStore::new(&o), Err(BlobError::Backend(_))),
-                "endpoint {bad:?} 应在构造期被拒 —— 留到首次请求才炸会混进网络失败里难以分辨"
+                "the endpoint {bad:?} should be refused at construction — left to blow up on the \
+                 first request it blends into network failures and is hard to tell apart"
             );
         }
     }
@@ -604,14 +672,17 @@ mod tests {
         o.endpoint = String::new();
         assert!(
             S3BlobStore::new(&o).is_ok(),
-            "空 endpoint 表示走 AWS 官方地址，不该被当成非法输入"
+            "an empty endpoint means the official AWS address and must not be treated as illegal \
+             input"
         );
     }
 
     #[tokio::test]
     async fn traversal_hash_never_reaches_the_network() {
-        // endpoint 指向必然不通的端口：只要请求真的发出去就会是 Backend 错误。
-        // 断言拿到的是 InvalidHash，即证明校验发生在任何网络动作之前。
+        // The endpoint points at a port that is guaranteed unreachable: if a
+        // request really went out, the result would be a Backend error.
+        // Asserting InvalidHash proves the validation happens before any network
+        // action.
         let mut o = opts();
         o.endpoint = "http://127.0.0.1:1".into();
         let s = S3BlobStore::new(&o).unwrap();
@@ -620,38 +691,43 @@ mod tests {
         for evil in ["../../../etc/passwd", "..", "a/../b", "NOTAHASH"] {
             assert!(
                 matches!(s.get(evil).await, Err(BlobError::InvalidHash(_))),
-                "get 的哈希校验没有先于网络调用：{evil:?}"
+                "get's hash validation did not come before the network call: {evil:?}"
             );
             assert!(
                 matches!(s.exists(evil).await, Err(BlobError::InvalidHash(_))),
-                "exists 的哈希校验没有先于网络调用：{evil:?}"
+                "exists's hash validation did not come before the network call: {evil:?}"
             );
             assert!(
                 matches!(s.delete(evil).await, Err(BlobError::InvalidHash(_))),
-                "delete 的哈希校验没有先于网络调用：{evil:?}"
+                "delete's hash validation did not come before the network call: {evil:?}"
             );
             assert!(
                 matches!(
                     s.presign_get(evil, ttl).await,
                     Err(BlobError::InvalidHash(_))
                 ),
-                "presign_get 会把 key 直接签进 URL，校验必须在最前面：{evil:?}"
+                "presign_get signs the key straight into a URL, so validation has to come first: \
+                 {evil:?}"
             );
             assert!(
                 matches!(
                     s.presign_put(evil, ttl).await,
                     Err(BlobError::InvalidHash(_))
                 ),
-                "presign_put 会把 key 直接签进 URL，校验必须在最前面：{evil:?}"
+                "presign_put signs the key straight into a URL, so validation has to come first: \
+                 {evil:?}"
             );
         }
     }
 
-    /// `force_path_style` 的效果是什么 —— 签名不走网络，可以在单测里直接看。
+    /// What `force_path_style` actually does — signing makes no network call, so
+    /// it can be inspected directly in a unit test.
     ///
-    /// 这条测试的价值在于：把「关掉它会怎样」变成一行可读的断言。
-    /// 否则那个后果（DNS 解析 `cortex-blobs.localhost`）只有在真跑起来
-    /// 并读懂一条不含桶名的 io error 时才会显形。
+    /// The value of this test is turning "what happens if you switch it off"
+    /// into one readable assertion. Otherwise that consequence (DNS resolution
+    /// of `cortex-blobs.localhost`) only reveals itself when things are actually
+    /// running and somebody manages to read an io error that does not mention
+    /// the bucket name.
     #[tokio::test]
     async fn path_style_flag_decides_where_the_bucket_name_goes() {
         let h = hash::sha256_hex(b"probe");
@@ -662,11 +738,11 @@ mod tests {
         assert_eq!(
             url.host_str(),
             Some("localhost"),
-            "开启 path-style 后 host 应保持为 endpoint 原样"
+            "with path-style on, the host should stay exactly as the endpoint gave it"
         );
         assert!(
             url.path().starts_with("/cortex-blobs/public/blobs/"),
-            "开启 path-style 后路径应是「桶名 / 租户 / blobs」，实际是 {}",
+            "with path-style on, the path should be \"bucket / tenant / blobs\", got {}",
             url.path()
         );
 
@@ -677,16 +753,20 @@ mod tests {
         assert_eq!(
             url.host_str(),
             Some("cortex-blobs.localhost"),
-            "关掉 path-style 后桶名会被拼成子域名 —— 这正是 RustFS 上 DNS 解析失败的成因，\
-             报出来的错误里既没有桶名也没有 addressing style 字样，极难归因"
+            "with path-style off, the bucket name gets folded into a subdomain — which is exactly \
+             the cause of the DNS resolution failure on RustFS, and the error reported contains \
+             neither the bucket name nor the words \"addressing style\", making it extremely hard \
+             to attribute"
         );
     }
 
-    /// 租户前缀必须真的进到**签名后的 URL** 里。
+    /// The tenant prefix has to genuinely reach the **signed URL**.
     ///
-    /// 单独验这一处，是因为 presign 是唯一一条不经 `put`/`get` 就能把 key 送出去的
-    /// 路径：若哪天它绕开了 `key_of`，客户端就会拿着一个不带租户的 URL 直传，
-    /// 而那份字节会落在别人的前缀下 —— 服务端这边全程无错可报。
+    /// This is verified on its own because presigning is the only path that can
+    /// send a key out without going through `put`/`get`: if it ever bypassed
+    /// `key_of`, clients would upload directly with a URL carrying no tenant,
+    /// and those bytes would land under somebody else's prefix — with the
+    /// server having nothing at all to report throughout.
     #[tokio::test]
     async fn tenant_prefix_reaches_the_signed_url() {
         let h = hash::sha256_hex(b"tenant in url");
@@ -703,20 +783,25 @@ mod tests {
 
         assert!(
             ua.path().contains("/public/blobs/"),
-            "签出的 URL 里没有租户前缀，客户端直传会落到无租户的 key 上：{}",
+            "the signed URL carries no tenant prefix, so a direct client upload would land on a \
+             tenantless key: {}",
             ua.path()
         );
         assert_ne!(
             ua.path(),
             ub.path(),
-            "两个租户对同一份内容签出了同一个 key —— 直传会互相覆盖"
+            "the two tenants signed the same key for the same content — direct uploads would \
+             overwrite each other"
         );
     }
 
     #[test]
     fn part_boundaries_cover_the_last_partial_chunk() {
-        // multipart 最易错的一处是「末片被漏掉」：分片数按整除算就会丢掉尾巴，
-        // 而症状是取回的视频比原文件短一点点 —— 播放器多半还能放，无人察觉。
+        // The easiest thing to get wrong in multipart is "the last part gets
+        // dropped": computing the part count by plain division loses the tail,
+        // and the symptom is that the video fetched back is a little shorter
+        // than the original — which most players will still play, so nobody
+        // notices.
         for (size, want_parts) in [
             (MULTIPART_PART_SIZE, 1),
             (MULTIPART_PART_SIZE + 1, 2),
@@ -726,7 +811,8 @@ mod tests {
             assert_eq!(
                 size.div_ceil(MULTIPART_PART_SIZE),
                 want_parts,
-                "{size} 字节应切成 {want_parts} 片；按整除算会丢掉不足一片的尾巴"
+                "{size} bytes should split into {want_parts} parts; plain division loses the tail \
+                 that is shorter than one part"
             );
         }
     }

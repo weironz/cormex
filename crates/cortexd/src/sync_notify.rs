@@ -1,48 +1,59 @@
-//! 实时同步的扇出总线。
+//! The fan-out bus for realtime sync.
 //!
-//! 事件源是 [`cortex_store::Store::listen_sync`]（`sync_log` 上的
-//! `LISTEN`/`NOTIFY`，连同触发器 DDL 的幂等安装、断线重连与退避，全在存储层
-//! 内部；「为什么走数据库触发器」也写在那儿）。本模块只做一件事：
-//! 把存储层吐出的信号转成 [`SyncEvent`]，广播给每一条 `/ws` 连接。
+//! The event source is [`cortex_store::Store::listen_sync`]
+//! (`LISTEN`/`NOTIFY` on `sync_log`; the idempotent installation of the trigger
+//! DDL, reconnection and backoff all live inside the storage layer, and so does
+//! the reasoning for "why a database trigger"). This module does one thing only:
+//! turn the signals the storage layer emits into [`SyncEvent`]s and broadcast
+//! them to every `/ws` connection.
 //!
-//! # 为什么这一层还要存在
+//! # Why this layer needs to exist at all
 //!
-//! 存储层的订阅句柄是**单消费者**的（一条 `LISTEN` 连接、一个 `recv`），
-//! 而 `/ws` 是多连接的。中间这个 broadcast 把「一个事件源」变成
-//! 「N 个订阅者」，并顺带承担了「订阅者太慢」的降级：落后的连接收到
-//! `Lagged`，处理方式与断线重连完全一样 —— 按自己的游标补拉。
+//! The storage layer's subscription handle is **single-consumer** (one `LISTEN`
+//! connection, one `recv`), while `/ws` has many connections. The broadcast in
+//! between turns "one event source" into "N subscribers", and along the way it
+//! absorbs the "subscriber is too slow" degradation: a connection that falls
+//! behind receives `Lagged`, which it handles exactly the way it handles a
+//! reconnect — backfill from its own cursor.
 
 use cortex_store::{Store, SyncSignal};
 use tokio::sync::broadcast;
 
 use crate::dto::SyncEvent;
 
-/// 广播缓冲。
+/// Broadcast buffer.
 ///
-/// 事件只是「有新数据」的信号，客户端落后了直接补拉即可，因此这里不需要大。
-/// 满了会让最慢的订阅者收到 `Lagged`，处理方式与断线重连完全一样。
+/// An event is only the signal "there is new data"; a client that falls behind
+/// simply backfills, so this does not need to be large. When it fills up, the
+/// slowest subscriber receives `Lagged`, which it handles exactly the way it
+/// handles a reconnect.
 const BUS_CAPACITY: usize = 256;
 
-/// 实时同步信号的发布总线。
+/// The publish bus for realtime sync signals.
 #[derive(Clone)]
 pub struct SyncBus {
     tx: broadcast::Sender<SyncEvent>,
 }
 
 impl SyncBus {
-    /// 订阅存储层的推进通知并起转发任务。
+    /// Subscribe to the storage layer's advance notifications and spawn the
+    /// forwarding task.
     ///
-    /// 不会失败：存储层的订阅内部自愈（重连、退避），装不上触发器也只是
-    /// 「推送静默失效」而非启动失败 —— `GET /sync` 轮询这条底线路径不依赖它。
+    /// Cannot fail: the storage layer's subscription heals itself (reconnect,
+    /// backoff), and failing to install the trigger only means "push goes
+    /// silently dead" rather than a failed startup — the `GET /sync` polling
+    /// path, which is the floor everything falls back to, does not depend on it.
     pub fn spawn(store: Store) -> Self {
         let (tx, _) = broadcast::channel(BUS_CAPACITY);
 
         let bus_tx = tx.clone();
         tokio::spawn(async move {
             let mut notifications = store.listen_sync().await;
-            // recv 返回 None 只有一个原因：存储层连接池已关闭，即进程在退出
+            // recv returns None for exactly one reason: the storage layer's
+            // connection pool has closed, i.e. the process is shutting down
             while let Some(signal) = notifications.recv().await {
-                // 没有订阅者时 send 返回 Err，这不是错误
+                // With no subscribers, send returns Err; that is not an error
+                // here
                 let _ = bus_tx.send(to_event(signal));
             }
             tracing::info!("存储层已关闭，同步信号转发任务收工");
@@ -51,10 +62,12 @@ impl SyncBus {
         Self { tx }
     }
 
-    /// 不接数据库时的空总线：接受订阅，但永远不发事件。
+    /// The inert bus used when no database is attached: it accepts subscribers
+    /// but never emits an event.
     ///
-    /// 让 `/ws` 在 mock 后端下也是一个**行为正确**的端点（握手成功、
-    /// 能收到 hello、能优雅关闭），客户端的连接与重连逻辑照样可测。
+    /// This keeps `/ws` a **behaviourally correct** endpoint under the mock
+    /// backend (the handshake succeeds, hello arrives, it closes gracefully), so
+    /// a client's connection and reconnection logic stays testable.
     #[must_use]
     pub fn inert() -> Self {
         let (tx, _) = broadcast::channel(BUS_CAPACITY);
@@ -66,23 +79,30 @@ impl SyncBus {
         self.tx.subscribe()
     }
 
-    /// 手动推一条信号。mock 后端用它演示推送时序。
+    /// Push one signal by hand. The mock backend uses this to demonstrate push
+    /// timing.
     pub fn publish(&self, event: SyncEvent) {
         let _ = self.tx.send(event);
     }
 }
 
-/// 存储层信号 → 线上事件。两边刻意一一对应，转换里**不做任何判断** ——
-/// 「这次缺不缺口」是事件源才知道的事，中间层擅自归并会把运维信号抹平。
+/// Storage-layer signal → wire event. The two sides correspond one-to-one on
+/// purpose, and the conversion **makes no judgement of its own** — whether a
+/// gap occurred is something only the event source knows, and an intermediate
+/// layer that merges variants on its own initiative flattens away an operational
+/// signal.
 ///
-/// # 为什么是自由函数而不是 `From`
+/// # Why a free function rather than a `From` impl
 ///
-/// `SyncSignal` 属于 `cortex-store`，`SyncEvent` 属于 `cortex-proto`，
-/// cortexd 两个都不拥有 —— 孤儿规则不允许在这里写 impl。而把 impl 塞进
-/// 那两个 crate 里的任何一个，都要给它加一条**反方向**的依赖边：
-/// 协议 crate 依赖数据库驱动，或者存储层依赖 HTTP 契约。两条都不能要。
+/// `SyncSignal` belongs to `cortex-store` and `SyncEvent` belongs to
+/// `cortex-proto`; cortexd owns neither, so the orphan rule forbids writing the
+/// impl here. And putting the impl into either of those crates would require
+/// adding a dependency edge in the **wrong direction**: the protocol crate
+/// depending on a database driver, or the storage layer depending on the HTTP
+/// contract. Neither is acceptable.
 ///
-/// 「谁拥有这个转换」的答案本来就是 cortexd —— 它是唯一同时看得见两侧的地方。
+/// The answer to "who owns this conversion" was cortexd all along — it is the
+/// only place that can see both sides at once.
 #[must_use]
 pub fn to_event(signal: SyncSignal) -> SyncEvent {
     match signal {
@@ -95,10 +115,13 @@ pub fn to_event(signal: SyncSignal) -> SyncEvent {
 mod tests {
     use super::*;
 
-    /// 两个变体必须各自映射，不能都塌成 bump。
+    /// The two variants must map to their own kinds; neither may collapse into
+    /// bump.
     ///
-    /// 塌了以后客户端仍然工作（都是「去拉一次」），但「通知链路断过」这个
-    /// 运维信号就永远观测不到了 —— 而它频繁出现正是数据库连接不稳的唯一线索。
+    /// After such a collapse the client still works (both mean "go fetch"), but
+    /// the operational signal "the notification path broke at some point"
+    /// becomes permanently unobservable — and seeing it appear frequently is
+    /// the only clue that the database connection is unstable.
     #[test]
     fn each_signal_keeps_its_own_kind() {
         assert!(
@@ -106,31 +129,35 @@ mod tests {
                 to_event(SyncSignal::Bump { cursor: 7 }),
                 SyncEvent::Bump { cursor: 7 }
             ),
-            "bump 必须映射为 bump 且保留游标"
+            "a bump must map to a bump and keep its cursor"
         );
         assert!(
             matches!(
                 to_event(SyncSignal::Resync { cursor: 9 }),
                 SyncEvent::Resync { cursor: 9 }
             ),
-            "resync 不能被归并成 bump，否则「可能有缺口」这个信号就丢了"
+            "a resync must not be merged into a bump, or the \"there may be a gap\" signal is lost"
         );
     }
 
-    /// 空总线要能被订阅、被 publish，且不 panic —— mock 后端全靠它。
+    /// The inert bus must accept subscribers and publishes without panicking —
+    /// the mock backend rests entirely on it.
     #[tokio::test]
     async fn an_inert_bus_still_delivers_manual_pushes() {
         let bus = SyncBus::inert();
         let mut rx = bus.subscribe();
         bus.publish(SyncEvent::Bump { cursor: 42 });
 
-        let got = rx.recv().await.expect("刚 publish 的事件应当收得到");
+        let got = rx
+            .recv()
+            .await
+            .expect("an event published a moment ago must be received");
         assert!(
             matches!(got, SyncEvent::Bump { cursor: 42 }),
-            "空总线上的手动推送被改写了：{got:?}"
+            "a manual push on the inert bus was rewritten: {got:?}"
         );
 
-        // 没有订阅者时 publish 不得 panic
+        // publish must not panic when there are no subscribers
         drop(rx);
         bus.publish(SyncEvent::Resync { cursor: 43 });
     }

@@ -1,33 +1,41 @@
-//! 真实后端 —— 把存储层、供应商层、记忆引擎接到 HTTP 契约上。
+//! The live backend — wiring the storage layer, the provider layer and the
+//! memory engine onto the HTTP contract.
 //!
-//! 与 [`crate::state::mock`] 的契约完全一致：路由与 DTO 不因后端切换而变。
+//! Its contract is identical to [`crate::state::mock`]'s: routes and DTOs do not
+//! change when the backend is switched.
 //!
-//! # 这里**没有** agent 循环
+//! # There is **no** agent loop here
 //!
-//! 这是记忆服务，**不跑对话**。agent 一律是另一个进程 —— 它拿一把委托凭据
-//! （见 [`crate::delegated_token`]）经 HTTP 进来：`/llm/stream` 借模型、
-//! `/episodes` 写记忆、`/mcp` 查记忆。那个 agent 是谁、跑在哪台机器上、
-//! 有没有容器，这个进程一概不知道，也不需要知道。
+//! This is a memory service, and it **does not run conversations**. The agent is
+//! always another process — it comes in over HTTP holding a delegated
+//! credential (see [`crate::delegated_token`]): `/llm/stream` to borrow the
+//! model, `/episodes` to write memory, `/mcp` to query memory. Who that agent
+//! is, which machine it runs on, whether there is a container — this process
+//! knows none of it, and does not need to.
 //!
-//! 此前这里还留着一份进程内的循环，只在部署接不上 docker 时走到。删掉它的
-//! 理由不是它有 bug，而是**它是第二份实现**：同一个 `Turn::run` 有两处装配，
-//! 于是每加一个工具、每改一次注入纪律都要记得改两遍，而漏掉的那一遍没有
-//! 任何测试会红——两条路的用户是不同的人群。更要紧的是，把 agent 赶出去
-//! 之后，我们自己的 agent 走的就是第三方走的那条路（`/llm/stream` 借模型、
-//! `/episodes` 写记忆、`/mcp` 查记忆），那个 API 才不会烂。
+//! There used to be an in-process loop here as well, reached only when a
+//! deployment could not attach to docker. The reason for deleting it was not
+//! that it had bugs, but that **it was a second implementation**: the same
+//! `Turn::run` assembled in two places, so every added tool and every change to
+//! injection discipline had to be remembered twice, and the one that was missed
+//! made no test go red — the two paths served different populations of users.
+//! More importantly: with the agent evicted, our own agent takes the same path a
+//! third party takes (`/llm/stream` to borrow the model, `/episodes` to write
+//! memory, `/mcp` to query memory), and only then does that API stay healthy.
 //!
-//! # 一轮对话落到这里是什么
+//! # What one conversational turn amounts to here
 //!
 //! ```text
-//! agent 跑完一轮 → POST /episodes
-//!   ├─ 1. 落 L0：episodes + sync_log 同事务（advisory lock 串行化）
-//!   ├─ 2. 四路召回 + RRF + 预算截断
-//!   ├─ 3. 渲染注入块回给 agent（记忆是数据不是指令）
-//!   └─ 4. 异步抽取事实（不阻塞回执）
+//! agent finishes a turn → POST /episodes
+//!   ├─ 1. land L0: episodes + sync_log in one txn (serialized by advisory lock)
+//!   ├─ 2. four retrieval paths + RRF + budget truncation
+//!   ├─ 3. render the injection block back to the agent (memory is data, not instructions)
+//!   └─ 4. extract facts asynchronously (never blocking the response)
 //! ```
 //!
-//! 第 4 步必须异步：抽取要调一次 LLM，同步做会让每轮对话多等几秒，
-//! 而抽取结果对**本轮**毫无用处——它是给下一轮准备的。
+//! Step 4 has to be asynchronous: extraction makes one LLM call, doing it
+//! synchronously would add seconds to every turn, and the extraction result is
+//! of no use whatsoever to **this** turn — it is preparation for the next one.
 
 use std::sync::Arc;
 
@@ -46,29 +54,36 @@ use crate::dto::*;
 use cortex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
 use cortex_proto::llm::{LlmStreamRequest, ModelTier};
 
-/// `PATCH /sessions` 里那个 `workspace` 字段该怎么处置。
+/// What to do with the `workspace` field in `PATCH /sessions`.
 ///
-/// 返回 `true` = 要解绑；`false` = 这次没提这个字段。绑定一律报错。
+/// Returns `true` = unbind; `false` = the field was not mentioned this time.
+/// Binding always errors.
 ///
-/// # 为什么绑定要**拒绝**而不是静默忽略
+/// # Why binding is **refused** rather than silently ignored
 ///
-/// 这条路曾经是 Web 端绑工作区的回落（本地 agent 不在时），而它绑的是
-/// **服务器上**的一个目录 —— 于是一个远端用户的 `read_file` 动的是生产机的
-/// 文件系统，爆炸半径是整台机器加上所有租户的数据。
+/// This path used to be the web client's fallback for binding a workspace (when
+/// the local agent was absent), and what it bound was a directory **on the
+/// server** — so a remote user's `read_file` touched the production machine's
+/// filesystem, with a blast radius of the whole machine plus every tenant's
+/// data.
 ///
-/// 静默忽略的话，客户端会显示「已绑定 D:\myproject」，然后每个文件操作都
-/// 失败得莫名其妙 —— 而用户明明看到绑定成功了。报错里直接给出两条走得通的路。
+/// Silently ignoring it would leave the client displaying "bound to
+/// D:\myproject" and then failing every file operation inexplicably — while the
+/// user plainly saw the binding succeed. The error message names the two paths
+/// that do work.
 ///
-/// # 为什么解绑照旧放行
+/// # Why unbinding is still permitted
 ///
-/// 老会话上可能还留着一条服务端绑定（这次改动之前存下的）。拒绝解绑等于让
-/// 那条记录永远焊在那儿，而用户唯一能做的就是删掉整个会话。
+/// An older session may still carry a server-side binding (stored before this
+/// change). Refusing to unbind would weld that record in place forever, leaving
+/// the user nothing to do but delete the entire session.
 ///
-/// # 为什么抽成函数
+/// # Why this is factored into a function
 ///
-/// `patch_session` 要一个真数据库才进得去，于是这条判断在那里是测不到的。
-/// 而它恰恰是本次改动里最该有测试的一条 —— 写反了就是**服务端又能绑了**，
-/// 且没有任何症状。
+/// `patch_session` needs a real database to be reached at all, so this decision
+/// cannot be tested there. And it is precisely the decision in this change most
+/// in need of a test — inverted, it means **the server can bind again**, with
+/// no symptom whatsoever.
 pub(crate) fn workspace_patch(field: Option<Option<&str>>) -> Result<bool> {
     match field {
         Some(Some(_)) => Err(CortexError::Invalid(
@@ -84,22 +99,25 @@ pub(crate) fn workspace_patch(field: Option<Option<&str>>) -> Result<bool> {
     }
 }
 
-/// 校验一个项目名，返回 trim 之后的那份。
+/// Validate a project name, returning the trimmed version.
 ///
-/// # 为什么是一个独立的纯函数
+/// # Why this is a standalone pure function
 ///
-/// 与 [`workspace_patch`] 同一个理由：真正的项目路径要一个数据库才进得去，
-/// 于是这条判断在那里测不到。而它同时被 mock 后端复用 —— 客户端 CI 里
-/// 「空名字会被拒」这条断言必须在 mock 上也成立，否则它测的是一个比真实
-/// 后端宽松的契约。
+/// Same reasoning as [`workspace_patch`]: the real project path needs a database
+/// to be reached at all, so this decision cannot be tested there. It is also
+/// reused by the mock backend — the client CI's assertion "an empty name is
+/// rejected" has to hold on mock too, or it tests a contract looser than the
+/// live backend's.
 ///
-/// # 为什么 trim 之后判空，而不是直接判空
+/// # Why emptiness is checked after trimming rather than directly
 ///
-/// 输入框里敲一个空格就能造出一个名字是空白的项目，而它在侧边栏上是一行
-/// 什么都没有的可点区域 —— 看起来像界面坏了。
+/// Typing one space into the input box would otherwise create a project whose
+/// name is blank, which in the sidebar is a clickable row containing nothing —
+/// it looks like the UI is broken.
 ///
-/// 上限按**字符**而非字节数：数据库那道 CHECK 用的是 `length()`，
-/// 它数的也是字符。两处口径不同的症状是「明明没超，服务端却回 500」。
+/// The ceiling is in **characters**, not bytes: the CHECK in the database uses
+/// `length()`, which also counts characters. The symptom of the two disagreeing
+/// is "it clearly is not over the limit, yet the server returns 500".
 pub(crate) fn validate_project_name(raw: &str) -> Result<String> {
     let name = raw.trim();
     if name.is_empty() {
@@ -114,20 +132,24 @@ pub(crate) fn validate_project_name(raw: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
-/// 同时最多几路抽取。见 [`Live::extract_permit`]。
+/// How many extractions may run at once. See [`Live::extract_permit`].
 const EXTRACT_CONCURRENCY_ENV: &str = "CORTEX_EXTRACT_CONCURRENCY";
 
-/// 默认 3。
+/// Defaults to 3.
 ///
-/// 不按 CPU 核数算：抽取的瓶颈是**供应商那一端**，本地几乎不耗 CPU
-/// （等一次 HTTP 往返）。按核数算会在大机器上放出几十路并发，撞的是
-/// 供应商的速率限制，而那表现为一批 429 —— 每一个 429 都是一轮记忆丢了。
+/// Not derived from the CPU core count: extraction's bottleneck is **the
+/// provider's end**, and locally it costs almost no CPU (it waits on one HTTP
+/// round trip). Deriving from core count would release dozens of concurrent
+/// extractions on a large machine, running straight into the provider's rate
+/// limit — which manifests as a batch of 429s, and every 429 is one turn's
+/// memory lost.
 ///
-/// 3 是个保守值：正常聊天下永远排不上队（人打字比这慢得多），
-/// 而批量写入时它把峰值削平。不够用就调大，那是个明确的运维动作。
+/// 3 is conservative: during normal chat nothing ever queues (a human types far
+/// slower than that), while during bulk writes it flattens the peak. Raise it if
+/// it is not enough; that is an explicit operational act.
 const DEFAULT_EXTRACT_CONCURRENCY: usize = 3;
 
-/// 读并解析 [`EXTRACT_CONCURRENCY_ENV`]。
+/// Read and parse [`EXTRACT_CONCURRENCY_ENV`].
 fn extract_concurrency() -> Result<usize> {
     parse_extract_concurrency(
         std::env::var(EXTRACT_CONCURRENCY_ENV)
@@ -137,14 +159,17 @@ fn extract_concurrency() -> Result<usize> {
     )
 }
 
-/// 与 `MAX_ROUNDS_ENV` 同样的纪律：取值非法就报错，不悄悄用默认值 ——
-/// 配错了却照跑，等于上限失效而运维完全不知情。
+/// The same discipline as `MAX_ROUNDS_ENV`: an invalid value errors rather than
+/// quietly using the default — running on with a misconfiguration means the
+/// ceiling is not in effect while ops has no idea.
 ///
-/// 0 也算非法：那不是「不限制」，是「一路都不许跑」，
-/// 而想关掉抽取该有它自己的开关。
+/// 0 counts as invalid too: that does not mean "unlimited", it means "no
+/// extraction may run at all", and turning extraction off deserves a switch of
+/// its own.
 ///
-/// 单独一个纯函数（而不是直接读环境变量）是为了能测：`env::set_var`
-/// 改的是进程全局状态，同二进制里的别的测试会跟着一起踩。
+/// A standalone pure function (rather than reading the environment variable
+/// directly) so it can be tested: `env::set_var` mutates process-global state,
+/// and other tests in the same binary get trampled along with it.
 fn parse_extract_concurrency(raw: Option<&str>) -> Result<usize> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_EXTRACT_CONCURRENCY);
@@ -157,113 +182,133 @@ fn parse_extract_concurrency(raw: Option<&str>) -> Result<usize> {
     }
 }
 
-/// 在闸门下跑一段抽取。**许可一直持有到它结束。**
+/// Run one extraction under the gate. **The permit is held until it finishes.**
 ///
-/// 单独一个函数，是因为这里有一个很容易写错、且写错之后**一切照常绿**
-/// 的地方：
+/// This is its own function because it contains something very easy to get
+/// wrong, and **everything stays green** once it is wrong:
 ///
 /// ```ignore
-/// let _ = gate.acquire_owned().await;   // ← 许可当场就被丢掉了，闸门失效
-/// let _permit = gate.acquire_owned().await;  // ← 才是对的
+/// let _ = gate.acquire_owned().await;   // ← the permit is dropped immediately; the gate does nothing
+/// let _permit = gate.acquire_owned().await;  // ← this is the correct one
 /// ```
 ///
-/// `_` 是「立刻丢弃」，`_permit` 是「绑定但不用」。两者只差几个字符，
-/// 而前者让整个信号量变成一句昂贵的空操作 —— 没有任何测试会因此变红，
-/// 除非有人专门去测并发度。收进这一个函数之后，那条测试只要写一次。
+/// `_` means "discard immediately"; `_permit` means "bind it and do not use it".
+/// The two differ by a few characters, and the former turns the whole semaphore
+/// into an expensive no-op — no test goes red over it unless somebody
+/// deliberately tests the concurrency level. Gathered into this one function,
+/// that test only has to be written once.
 async fn under_gate<F: Future>(gate: &Arc<tokio::sync::Semaphore>, fut: F) -> F::Output {
-    // acquire 只在信号量被 close 时失败，而我们从不 close 它。
-    // 真失败了也照跑：抽取不该因为闸门坏了就整个停摆
+    // acquire only fails when the semaphore is closed, and we never close it.
+    // Even if it did fail, carry on: extraction should not stop entirely just
+    // because the gate broke
     let _permit = Arc::clone(gate).acquire_owned().await.ok();
     fut.await
 }
 
-/// 会话列表一次给多少条。
+/// How many sessions one listing returns.
 ///
-/// 上限作用在**会话**上而不是消息上 —— 存储层用一句 SQL 聚合，
-/// 不再是「拉最近 N 条消息再归纳」（那样一个话痨会话就能把窗口占满，
-/// 别的会话直接从列表里消失）。
+/// The ceiling applies to **sessions**, not messages — the storage layer
+/// aggregates in a single SQL statement, rather than "pull the most recent N
+/// messages and then group them" (under which one talkative session could fill
+/// the entire window and every other session would simply vanish from the list).
 const SESSION_LIST_LIMIT: i64 = 200;
 
-/// 会话标题取首条用户消息的前多少字。
+/// How many characters of the first user message a session title takes.
 const TITLE_CHARS: usize = 24;
 
-/// 克隆是廉价的 —— 每个字段要么是 `Arc`，要么是 `Arc` 语义的句柄
-/// （`Store` 内部是连接池），要么是标量。[`Live::bind`] 靠它按请求换库。
+/// Cloning is cheap — every field is either an `Arc`, a handle with `Arc`
+/// semantics (`Store` is a connection pool internally), or a scalar.
+/// [`Live::bind`] relies on that to swap databases per request.
 #[derive(Clone)]
 pub struct Live {
     store: Store,
     llm: LlmClient,
     retriever: Retriever<SharedEmbedder>,
     extractor: Arc<Extractor>,
-    /// 媒体转录。未配置 vision 模型时为 None —— 图片照常归档，只是检索不到
+    /// Media transcription. `None` when no vision model is configured — images
+    /// are still archived, they simply cannot be retrieved
     transcribe: Option<Arc<cortex_memory::TranscribePipeline>>,
     device_id: String,
     context_window: usize,
-    /// 当前的向量化后端。
+    /// The current vectorization backend.
     ///
-    /// 单独留一份而不是从 `retriever` 里掏：换模型的回填器要用它算向量，
-    /// `/health` 的普查要用它的 `model_id()` 做比对。`SharedEmbedder` 是
-    /// `Arc`，多一个句柄不多一份模型。
+    /// Kept as its own field rather than dug out of `retriever`: the
+    /// model-change backfiller needs it to compute vectors, and `/health`'s
+    /// census needs its `model_id()` for comparison. `SharedEmbedder` is an
+    /// `Arc`, so one more handle is not one more model.
     embedder: SharedEmbedder,
-    /// 同时最多几路抽取。用法见 [`under_gate`]。
+    /// How many extractions may run at once. Usage in [`under_gate`].
     ///
-    /// # 为什么必须有这个闸门
+    /// # Why this gate is mandatory
     ///
-    /// 抽取是**裸 `tokio::spawn`**：一次 `/episodes` 一个任务，谁都不看别人。
-    /// 正常聊天下这没问题（人打字的速度就是天然的限流），但只要有一个客户端
-    /// 连续快速写入 —— 历史导入是最典型的那个 —— 瞬间就是几千个并发任务，
-    /// 每个都要调一次 LLM。
+    /// Extraction is a **bare `tokio::spawn`**: one task per `/episodes`, none
+    /// of them aware of the others. During normal chat that is fine (human
+    /// typing speed is a natural rate limit), but the moment one client writes
+    /// rapidly and continuously — a history import being the archetype — that
+    /// is thousands of concurrent tasks in an instant, each making one LLM call.
     ///
-    /// 生产那台机器是 2 核 3.5 GB，上面已经跑着十几个容器。几千路并发抽取
-    /// 不是「慢一点」，是把整台机器连同别的服务一起拖死。
+    /// The production machine is 2 cores and 3.5 GB with a dozen containers
+    /// already running. Thousands of concurrent extractions are not "a bit
+    /// slower", they drag the whole machine down along with every other service
+    /// on it.
     ///
-    /// # 为什么在 spawn **之后**才等许可
+    /// # Why the permit is awaited **after** the spawn
     ///
-    /// 等在 spawn 之前的话，`/episodes` 的响应会被抽取排队卡住 —— 而抽取的
-    /// 全部设计前提就是「绝不阻塞调用方，它是给下一轮准备的」。现在排队的是
-    /// 那些后台任务自己，调用方照样立刻拿到响应。
+    /// Awaiting it before the spawn would block `/episodes`'s response behind
+    /// the extraction queue — and the entire design premise of extraction is
+    /// "never block the caller; it is preparation for the next turn". As it
+    /// stands, what queues is those background tasks themselves, and the caller
+    /// still receives its response immediately.
     ///
-    /// 代价说清楚：**这不是背压**。写得太快时队列会一直长，只是长在内存里的
-    /// parked task 上。真正的节流得由客户端自己做（导入器就是这么做的），
-    /// 这个闸门保的是 CPU 与供应商配额。
+    /// State the cost plainly: **this is not backpressure**. When writes come in
+    /// too fast the queue keeps growing, it merely grows as parked tasks in
+    /// memory. Real throttling has to be done by the client (the importer does
+    /// exactly that); what this gate protects is CPU and the provider's quota.
     extract_gate: Arc<tokio::sync::Semaphore>,
 }
 
-/// 已经绑定到某个租户的 [`Live`]。
+/// A [`Live`] that has already been bound to a tenant.
 ///
-/// # 它存在的全部意义：让「忘了绑定」编译不过
+/// # Its entire reason to exist: make "forgot to bind" fail to compile
 ///
-/// 读写数据的那十个方法在 `Live` 上是**模块私有**的，只有这里转发出去。
-/// 于是 `state.rs` 拿着 `Backend::Live(l)` 也调不到 `l.get_episode(…)` ——
-/// 必须先 `l.bind(tenant.store()?)`。
+/// The ten methods that read and write data are **module-private** on `Live`,
+/// and only this type forwards them out. So `state.rs`, holding a
+/// `Backend::Live(l)`, still cannot call `l.get_episode(…)` — it has to call
+/// `l.bind(tenant.store()?)` first.
 ///
-/// 这不是洁癖。上一版里 `TenantPools` 建好了、隔离测过了、故障注入过了，
-/// 唯独**没有一处调用它** —— 请求路径一直握着启动时那个连 `public` 的
-/// `Store`，两个登录的用户读写同一片库。而那个状态下所有测试都是绿的：
-/// 没有任何测试会自然覆盖到「这个方法用的是哪个连接池」。
+/// This is not fastidiousness. In the previous version `TenantPools` was built,
+/// its isolation was tested, and fault injection was performed — and yet
+/// **nothing called it**: the request path kept holding the startup `Store`
+/// connected to `public`, so two logged-in users read and wrote the same
+/// database. And in that state every test was green: no test naturally covers
+/// "which connection pool does this method use".
 ///
-/// 类型能覆盖到。
+/// The type system covers it.
 pub struct BoundLive(Arc<Live>);
 
 impl BoundLive {
-    /// 借出内层。
+    /// Lend out the inner value.
     ///
-    /// 给**后台任务**用：它们要调 `store()` / `embedder()` /
-    /// `transcribe_and_store()` 这些与租户无关的公开方法，而那些方法长在
-    /// `Live` 上。绑定过的这一份，`store` 字段已经指向那个租户了。
+    /// For **background jobs**: they call tenant-independent public methods such
+    /// as `store()` / `embedder()` / `transcribe_and_store()`, and those live on
+    /// `Live`. In this bound copy the `store` field already points at that
+    /// tenant.
     ///
-    /// 请求路径**不要**用它绕过转发层 —— 那等于把「不绑定就调不到」
-    /// 这个保证还回去。`state.rs` 那条守卫测试盯着的就是这件事。
+    /// The request path must **not** use it to bypass the forwarding layer —
+    /// that hands back the guarantee "you cannot call it without binding". The
+    /// guard test in `state.rs` watches precisely for this.
     #[must_use]
     pub fn as_live(&self) -> &Arc<Live> {
         &self.0
     }
 
-    // 以下全是转发。签名与 `Live` 上那份逐字相同，只是多了一层。
+    // Everything below is forwarding. The signatures are character for character
+    // the same as `Live`'s, with one layer added.
     //
-    // 想过用 `Deref<Target = Live>` 省掉这一坨 —— 不行：那样
-    // `Live` 上的方法就又能直接调了，而「不绑定就调不到」正是这个类型
-    // 唯一的产出。转发是这个保证的价格。
+    // `Deref<Target = Live>` was considered to save this pile — it does not
+    // work: it would make `Live`'s methods directly callable again, and "you
+    // cannot call it without binding" is this type's only output. The forwarding
+    // is the price of that guarantee.
 
     pub async fn write_episode(
         &self,
@@ -339,21 +384,24 @@ impl BoundLive {
     }
 }
 
-/// 一次转录的结局。
+/// How one transcription ended.
 ///
-/// 比 [`cortex_memory::transcribe::Outcome`] 多一个 `Disabled`，少了那一大坨
-/// 待写行 —— 调用方要的只是「成没成、要不要重试」。回扫器据此区分
-/// 「这次失败了」与「这个永远转不了」。
+/// One variant more than [`cortex_memory::transcribe::Outcome`] (`Disabled`) and
+/// without that large pile of pending rows — all the caller wants is "did it
+/// work, and should it be retried". The rescanner uses it to distinguish "it
+/// failed this time" from "this can never be transcribed".
 #[derive(Debug)]
 pub enum TranscribeOutcome {
-    /// 转录完成并已落库
+    /// Transcription completed and was persisted
     Stored { segments: usize },
-    /// 该 blob 已被抹除，结果整批丢弃。**不是失败，也永远不该重试**
+    /// This blob has been redacted, so the whole result is discarded. **Not a
+    /// failure, and must never be retried**
     Redacted,
-    /// 没有转录器认领这个 MIME（当前主要是音视频）。
-    /// 将来 ASR 落地后重跑即可，但在此之前重试多少次都是同一个结果
+    /// No transcriber claims this MIME (currently mostly audio and video).
+    /// Rerunning once ASR lands is fine, but until then any number of retries
+    /// produces the same result
     Unsupported { mime: String },
-    /// 没配 vision 模型，整条链路关闭
+    /// No vision model configured; the whole path is off
     Disabled,
 }
 
@@ -368,11 +416,14 @@ impl TranscribeOutcome {
     }
 }
 
-/// 把 `store.is_redacted` 接到转录管线的 [`RedactionGuard`] 上。
+/// Wire `store.is_redacted` into the transcription pipeline's
+/// [`RedactionGuard`].
 ///
-/// 管线把这个约束做进了签名（要 trait 而非闭包），调用方没有办法漏掉它 ——
-/// 漏掉的后果是 redact 执行时正在途中的转录任务，事后把已抹除内容
-/// 又写回 `blob_transcripts`（memory.md §十一 的在途任务防护）。
+/// The pipeline builds this constraint into its signature (taking a trait rather
+/// than a closure), so the caller has no way to omit it — the consequence of
+/// omitting it is that a transcription task already in flight when a redaction
+/// executes writes the erased content back into `blob_transcripts` afterwards
+/// (the in-flight task protection in memory.md §11).
 struct StoreRedactionGuard {
     store: Store,
 }
@@ -389,11 +440,14 @@ impl cortex_memory::transcribe::RedactionGuard for StoreRedactionGuard {
 
 impl Live {
     pub async fn new(config: &Config, embedder: SharedEmbedder) -> Result<Self> {
-        // 全局那套（cortex_auth）先跑：账号表要在任何人能登录之前就位。
+        // The global set (cortex_auth) runs first: the account tables must be in
+        // place before anybody can log in.
         //
-        // 它与租户那套是**两套独立的 migration**，版本表也各在各的 schema 里 ——
-        // 混成一套会让新租户建号时撞上 `relation "users" already exists`，
-        // 而失败点在建号中途。见 migrations-global/ 的文件头
+        // It and the tenant set are **two independent migration sets**, with
+        // their version tables in their own schemas — merging them into one
+        // makes a new tenant's account creation run into
+        // `relation "users" already exists`, with the failure landing halfway
+        // through creating the account. See the header of migrations-global/
         Store::migrate_global(&config.database_url)
             .await
             .map_err(|e| CortexError::Store(format!("全局 schema 迁移失败：{e}")))?;
@@ -402,23 +456,28 @@ impl Live {
             .await
             .map_err(|e| CortexError::Store(format!("连接数据库失败：{e}")))?;
 
-        // 1 号用户的 schema 就是 public，所以这一句同时也是「给他迁移」。
+        // User #1's schema is literally public, so this statement doubles as
+        // "migrate theirs".
         //
-        // 多租户接线之后这里换成 `cortex_store::migrate_all`，逐个迁并把
-        // 坏掉的那几个单独标出来 —— 一个用户的库坏了不该让所有人下线
+        // Once multi-tenancy is wired through, this becomes
+        // `cortex_store::migrate_all`, migrating one by one and calling out the
+        // broken ones individually — one user's database being broken must not
+        // take everybody offline
         store
             .migrate()
             .await
             .map_err(|e| CortexError::Store(format!("数据库迁移失败：{e}")))?;
 
-        // `api_key_env` 为空 = 该供应商免鉴权（本机 Ollama、以及任何
-        // 不校验 key 的自建端点）。
+        // An empty `api_key_env` = this provider requires no credentials (a local
+        // Ollama, and any self-hosted endpoint that does not check keys).
         //
-        // **原先这里没有这一支**，于是 `std::env::var("")` 必然失败，
-        // 报「缺少 ollama 的 API key 环境变量」—— 一条读起来像配置漏了、
-        // 实际上无论怎么配都过不去的错误。cortexd 因此根本起不来，
-        // 而 `cortex-llm::LlmClient::from_config` 那条路一直是对的：
-        // 同一个判断在两处，只写对了一处。
+        // **This branch used to be missing**, so `std::env::var("")` failed
+        // necessarily and reported "missing the API key environment variable for
+        // ollama" — an error that reads like a configuration omission while in
+        // fact no configuration could ever get past it. cortexd therefore could
+        // not start at all, while `cortex-llm::LlmClient::from_config`'s path was
+        // correct the whole time: the same decision in two places, written
+        // correctly in only one.
         let key_var = cortex_llm::provider::api_key_env(&config.llm.provider)?;
         let api_key = if key_var.is_empty() {
             String::new()
@@ -434,8 +493,10 @@ impl Live {
 
         let context_window = llm.model().context_limit();
 
-        // 没配 CORTEX_VISION_PROVIDER 就整条关掉，而不是配了个假的转录器：
-        // 后者会往库里写垃圾 caption，而垃圾比空白更难发现
+        // With no CORTEX_VISION_PROVIDER configured the whole path is off,
+        // rather than wiring up a fake transcriber: the latter would write
+        // garbage captions into the database, and garbage is harder to notice
+        // than nothing at all
         let transcribe = match cortex_memory::transcribe::VisionTranscriber::from_env()? {
             Some(v) => {
                 tracing::info!("媒体转录已启用");
@@ -447,11 +508,13 @@ impl Live {
             None => None,
         };
 
-        // 上一个模型。只在**回填期间**有用：让查询也被编到旧空间去，
-        // 于是还没被补上的旧事实仍然进得了向量召回。
+        // The previous model. Useful **only during the backfill**: it also
+        // encodes the query into the old space, so old facts that have not been
+        // filled in yet can still enter vector retrieval.
         //
-        // ⚠️ 它救不了「fastembed → api」那一次迁移 —— 旧模型是进程内的
-        // fastembed，而它默认不编进二进制。见 ApiEmbedder::legacy_from_env
+        // ⚠️ It cannot rescue the "fastembed → api" migration — the old model
+        // there was the in-process fastembed, which is not compiled into the
+        // binary by default. See ApiEmbedder::legacy_from_env
         let legacy: Option<SharedEmbedder> =
             cortex_memory::embed_api::ApiEmbedder::legacy_from_env()?
                 .map(|e| Arc::new(e) as SharedEmbedder);
@@ -486,24 +549,32 @@ impl Live {
         })
     }
 
-    /// 本地 agent 把一轮对话写回记忆库。
+    /// The local agent writing one conversational turn back into the memory
+    /// database.
     ///
-    /// 这是 [`run_turn`] 的「记忆那一半」被单独拎出来的形态：agent 循环搬到
-    /// 本地之后，循环在那边跑，落库与检索留在这边。两条路走的是**同一段**
-    /// 逻辑（写 episode → 检索 → 归因 → 工具归因 → 抽取），刻意没有分叉。
+    /// This is the "memory half" of [`run_turn`] pulled out on its own: once the
+    /// agent loop moved to the local side, the loop runs there while persistence
+    /// and retrieval stay here. Both paths run **the same** logic (write the
+    /// episode → retrieve → attribute → tool attribution → extract), with no
+    /// fork, deliberately.
     ///
-    /// # 幂等，且判重在事务外
+    /// # Idempotent, with the duplicate check outside the transaction
     ///
-    /// 离线队列重放必然重复投递。判重是先读一次 `episodes`，命中就直接返回 ——
-    /// **不能**改成 `INSERT ... ON CONFLICT DO NOTHING`：`Guarded::insert_row`
-    /// 无条件往 `sync_log` 追一行，空操作会留下一条指向早已同步的 episode
-    /// 的幽灵行，而 `sync_log` 是同步的唯一事实序。
+    /// Offline queue replay necessarily delivers duplicates. The duplicate check
+    /// reads `episodes` first and returns immediately on a hit — it **must not**
+    /// become `INSERT ... ON CONFLICT DO NOTHING`: `Guarded::insert_row`
+    /// unconditionally appends a `sync_log` row, so a no-op would leave a ghost
+    /// row pointing at an episode that synced long ago — and `sync_log` is the
+    /// single source of truth for sync ordering.
     ///
-    /// 读放在事务外还有第二个理由：`write_txn` 刻意不提供读方法
-    ///（见 `cortex-store::txn` 的纪律三，取号事务必须短小纯写）。
+    /// Keeping the read outside the transaction has a second reason: `write_txn`
+    /// deliberately provides no read methods (see discipline #3 in
+    /// `cortex-store::txn`: a ticket-taking transaction must be short and
+    /// write-only).
     ///
-    /// 真并发下两个重放同时穿过判重，后一个会撞 PK 唯一约束 ——
-    /// 那条路由 [`Self::write_episode`] 的调用方映射成同样的「已存在」。
+    /// Under real concurrency, two replays can pass the duplicate check
+    /// simultaneously and the second hits the PK unique constraint — that path
+    /// maps to the same "already existed" for [`Self::write_episode`]'s caller.
     async fn write_episode(
         &self,
         req: NewEpisodeRequest,
@@ -524,7 +595,7 @@ impl Live {
             }
         };
 
-        // ── 幂等判重 ──
+        // ── Idempotent duplicate check ──
         if self
             .store
             .episode(&req.id)
@@ -551,7 +622,8 @@ impl Live {
                 })?,
         };
 
-        // ── 附件预检（事务外，理由同 run_turn 步骤 0）──
+        // ── Attachment pre-check (outside the transaction, same reasoning as
+        //    run_turn step 0) ──
         let attachments = dedup_attachments(&req.attachments);
         for a in &attachments {
             if self.store.blob(&a.hash).await.map_err(store_err)?.is_none() {
@@ -562,11 +634,13 @@ impl Live {
             }
         }
 
-        // ── 写 L0。tsv **由服务端算** ──
+        // ── Write L0. The tsv is **computed by the server** ──
         //
-        // 不接受客户端算好的 tsv：它决定 BM25 那一路能不能召回，算错了
-        // 没有任何症状（只是搜不到），而客户端有很多个、版本各不相同。
-        // 「tsv 与主行同事务」那条约束也只有在这一侧才保证得了。
+        // A client-computed tsv is not accepted: it decides whether the BM25
+        // path can retrieve anything at all, getting it wrong has no symptom
+        // (things simply cannot be found), and there are many clients on many
+        // different versions. The constraint "the tsv is written in the same
+        // transaction as its main row" can also only be guaranteed on this side.
         let tsv = cortex_memory::tokenize::to_tsvector_input(&req.text);
         let ep = NewEpisode {
             id: episode_id,
@@ -606,8 +680,10 @@ impl Live {
             .await
         {
             Ok(_) => {}
-            // 判重与写入之间挤进了另一个重放。这是**正常路径**，不是错误 ——
-            // 报 500 会让客户端把一次成功的重放当成失败，然后永远重试下去
+            // Another replay squeezed in between the duplicate check and the
+            // write. This is a **normal path**, not an error — a 500 would make
+            // the client treat a successful replay as a failure and retry
+            // forever
             Err(e) if e.is_duplicate_key() => {
                 tracing::debug!(episode = %req.id, "并发重放撞上唯一约束，按已存在处理");
                 return Ok(EpisodeAck {
@@ -619,7 +695,7 @@ impl Live {
             Err(e) => return Err(store_err(e)),
         }
 
-        // ── 检索 + 归因 ──
+        // ── Retrieval + attribution ──
         let mut memories = Vec::new();
         if req.retrieve && role == Role::User {
             let retrieved = self
@@ -633,7 +709,8 @@ impl Live {
             }
         }
 
-        // ── 工具归因（单独事务，理由见 run_turn 步骤 5b）──
+        // ── Tool attribution (its own transaction; reasoning in run_turn step
+        //    5b) ──
         if !req.tool_calls.is_empty() {
             let anchor = req.anchor_episode_id.as_deref().unwrap_or(&req.id);
             let anchor: Id = anchor.parse().map_err(|_| {
@@ -655,9 +732,11 @@ impl Live {
                     summary: clamp_chars(&c.summary, cortex_store::TOOL_SUMMARY_MAX_CHARS),
                     ok: c.ok,
                     device_id: self.device_id.clone(),
-                    // 本地 agent 灌上来的那条路（POST /episodes）。diff 与
-                    // path 一样是客户端给的，同样要夹一次上限 —— 入库上限
-                    // 是这一层的责任，不能指望上游都夹好了
+                    // The path where the local agent pushes this in (POST
+                    // /episodes). Like path, diff comes from the client and
+                    // must likewise be clamped — enforcing the storage ceiling
+                    // is this layer's responsibility, and it cannot assume
+                    // upstream already clamped everything
                     diff: c
                         .diff
                         .as_deref()
@@ -675,14 +754,15 @@ impl Live {
                     Ok(last)
                 })
                 .await;
-            // 与 run_turn 同样的取舍：对话已经完成，归因写不进去是可观测性的
-            // 损失，不该表现为一次失败的写入
+            // Same trade-off as run_turn: the conversation has completed, and
+            // failing to write the attribution is a loss of observability that
+            // should not surface as a failed write
             if let Err(e) = res {
                 tracing::warn!(error = %e, calls = n, "工具归因落库失败");
             }
         }
 
-        // ── 异步抽取。绝不阻塞调用方 ──
+        // ── Asynchronous extraction. Never blocks the caller ──
         if role == Role::Assistant {
             self.spawn_extraction(
                 req.anchor_episode_id.clone(),
@@ -699,10 +779,12 @@ impl Live {
         })
     }
 
-    /// 把这一轮送进抽取管线。
+    /// Feed this turn into the extraction pipeline.
     ///
-    /// user 那半从库里读回来而不是让客户端再传一遍：同一句话有两个来源，
-    /// 就有了「两边不一样」这条要处理的路，而库里那一份才是权威。
+    /// The user half is read back from the database rather than having the
+    /// client send it again: the same sentence arriving from two sources creates
+    /// a "the two disagree" path that has to be handled, and the copy in the
+    /// database is the authoritative one.
     fn spawn_extraction(
         &self,
         anchor: Option<String>,
@@ -722,8 +804,10 @@ impl Live {
         let extractor = Arc::clone(&self.extractor);
         let gate = Arc::clone(&self.extract_gate);
         tokio::spawn(async move {
-            // 排队。**在 spawn 之后才等** —— 调用方早就拿到响应了，
-            // 排的是这个后台任务自己。见 `Live::extract_gate` 那个字段的文档
+            // Queue here. **The wait happens after the spawn** — the caller
+            // received its response long ago, and what queues is this background
+            // task itself. See the documentation on the `Live::extract_gate`
+            // field
             under_gate(&gate, async move {
                 let user_text = match store.episode(&anchor).await {
                     Ok(Some(ep)) => ep.text.unwrap_or_default(),
@@ -737,9 +821,10 @@ impl Live {
                     }
                 };
                 let text = format!("用户：{user_text}\n助手：{reply}");
-                // 信任级**只由来源决定**，而来源只由凭据决定（见
-                // `routes::write_episode` 那段）。让请求体说了算，等于让一个
-                // 被注入的 agent 自己挑落哪一档
+                // The trust tier is **decided by the origin alone**, and the
+                // origin is decided by the credential alone (see the passage in
+                // `routes::write_episode`). Letting the request body decide is
+                // letting a prompt-injected agent pick its own tier
                 let ctx = ExtractContext::new(anchor_id, occurred_at).from(origin);
                 match extractor.ingest(&store, &text, &ctx).await {
                     Ok(report) => tracing::info!(
@@ -756,30 +841,38 @@ impl Live {
         });
     }
 
-    /// LLM 代理：把本地 agent 的一次流式调用原样转给供应商。
+    /// The LLM proxy: forward the local agent's streaming call to the provider
+    /// verbatim.
     ///
-    /// **纯转发，不碰记忆、不写库。** 本地那侧走完这一趟拿到的是与直连
-    /// 完全相同的 `MessageStream`（见 `cortex_proto::llm` 的模块注释：
-    /// 线上传的就是 goose 的原生类型，没有中间格式）。
+    /// **Pure forwarding; it touches no memory and writes to no database.** What
+    /// the local side gets back from this trip is exactly the same
+    /// `MessageStream` as a direct connection (see `cortex_proto::llm`'s module
+    /// comment: what travels on the wire is goose's native type, with no
+    /// intermediate format).
     ///
-    /// # 模型由服务端选，不由客户端点名
+    /// # The model is chosen by the server, never named by the client
     ///
-    /// 请求里只有档位。让客户端指定模型名，等于让任何拿到 token 的人
-    /// **拿服务端的 key 跑任意模型** —— 而账单是服务端付。
-    /// 同上，但可以指定用**哪一把 key** 调。
+    /// The request carries only a tier. Letting the client name a model would
+    /// let anyone holding a token **run any model on the server's key** — with
+    /// the server paying the bill.
     ///
-    /// `own` 是用户自己填的那把。给了就现建一个 provider 用它，
-    /// 这次调用因此不占配额（也不花服务端的钱）。
+    /// This variant additionally lets the caller specify **which key** to call
+    /// with.
     ///
-    /// # 为什么每次现建而不是缓存
+    /// `own` is the key the user supplied themselves. When present, a provider
+    /// is constructed on the spot to use it, so this call does not count against
+    /// the quota (and does not spend the server's money).
     ///
-    /// 缓存要按 (用户, 供应商, key) 做键并处理失效 —— 而 key 是可以随时
-    /// 被换掉或撤下的，一个还活着的缓存项意味着「撤下之后还在用旧 key 扣钱」。
-    /// 建一个 provider 只是搭一个 reqwest 客户端，比它随后那次 HTTP
-    /// 便宜得多。
+    /// # Why one is constructed each time rather than cached
+    ///
+    /// A cache would need a key of (user, provider, api key) plus invalidation
+    /// handling — and the key can be rotated or withdrawn at any moment, so a
+    /// still-live cache entry means "still billing against the old key after it
+    /// was withdrawn". Constructing a provider merely assembles a reqwest
+    /// client, far cheaper than the HTTP call that follows it.
     ///
     /// # Errors
-    /// 供应商建不起来，或者上游拒绝。
+    /// The provider could not be constructed, or upstream refused.
     pub async fn llm_stream_with_key(
         &self,
         req: LlmStreamRequest,
@@ -800,9 +893,11 @@ impl Live {
             cortex_llm::provider::build_with(provider_name, api_key, base_url)
                 .map_err(|e| CortexError::Config(format!("自带 key 建不起供应商：{e}")))?
                 .into();
-        // 模型配置沿用服务端那份 —— 用户填的是 key，不是模型。
-        // 让他连模型一起换需要一整套「这个供应商有哪些模型」的校验，
-        // 而填错模型名的表现是每次对话都失败
+        // The model configuration stays the server's — what the user supplied is
+        // a key, not a model. Letting them swap the model too would require a
+        // whole apparatus for validating "which models does this provider have",
+        // and the symptom of a mistyped model name is that every conversation
+        // fails
         let client = cortex_llm::LlmClient::from_provider(
             provider,
             provider_name,
@@ -825,26 +920,31 @@ impl Live {
         }
     }
 
-    /// 存储层句柄。给实时推送的监听任务查游标用。
+    /// The storage-layer handle. For the realtime-push listener task reading the
+    /// cursor.
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
     }
 
-    /// 换到某个租户的库上，其余部件全部共享。
+    /// Switch to one tenant's database, sharing every other component.
     ///
-    /// # 为什么是「克隆一个 Live」而不是「给每个方法加一个 store 参数」
+    /// # Why "clone a Live" rather than "add a store parameter to every method"
     ///
-    /// 后者要改 38 处 `self.store` 与十几个方法签名，而每一处都是**手工**
-    /// 判断「这里该用租户的库还是 public 的库」—— 判断错了不报错，
-    /// 只是把一个人的记忆写进另一个人的 schema。
+    /// The latter would mean editing 38 occurrences of `self.store` and a dozen
+    /// method signatures, with every one of them a **manual** judgement of
+    /// "should this use the tenant's database or public's" — and a wrong
+    /// judgement raises no error, it merely writes one person's memory into
+    /// another person's schema.
     ///
-    /// 克隆则是整体替换：绑定之后，这个 `Live` 上**所有**方法都落在那个
-    /// schema 上，没有一处能例外。代价是每请求多克隆约十个 `Arc`
-    /// 与一个 `String`，比它随后要做的那次数据库往返便宜三个数量级。
+    /// Cloning replaces it wholesale: once bound, **every** method on this
+    /// `Live` lands in that schema, with no possible exception. The price is
+    /// about ten extra `Arc` clones and one `String` per request, three orders
+    /// of magnitude cheaper than the database round trip that follows.
     ///
-    /// 返回 [`BoundLive`] 而不是 `Live`：数据方法只长在它上面，
-    /// **不绑定就调不到**（见 `state.rs` 里那条读源码的守卫测试）。
+    /// Returns a [`BoundLive`] rather than a `Live`: the data methods live only
+    /// on that type, so **they cannot be called without binding** (see the
+    /// source-reading guard test in `state.rs`).
     #[must_use]
     pub fn bind(&self, store: &Store) -> BoundLive {
         BoundLive(Arc::new(Self {
@@ -853,21 +953,24 @@ impl Live {
         }))
     }
 
-    /// 当前的向量化后端。回填器要用它算向量。
+    /// The current vectorization backend. The backfiller uses it to compute
+    /// vectors.
     #[must_use]
     pub fn embedder(&self) -> &SharedEmbedder {
         &self.embedder
     }
 
-    /// 向量化的覆盖情况：当前模型覆盖了多少条有效事实、还有多少条是旧模型的。
+    /// Vectorization coverage: how many active facts the current model covers,
+    /// and how many still belong to an older model.
     ///
-    /// # 为什么这个数字必须能被看见
+    /// # Why this number has to be visible
     ///
-    /// 换模型之后旧向量还在，但四条向量查询全部按 `embedding_model` 过滤
-    /// （见 `cortex_store::Store::recall_vector`），于是旧事实**当天就退出
-    /// 向量召回**。而 BM25 / 图遍历 / recency 三路照常，所以它看起来
-    /// 不像坏了，只像「语义召回好像变差了点」——
-    /// 没有这个数字，没有任何人会被告知。
+    /// After a model change the old vectors are still there, but all four vector
+    /// queries filter on `embedding_model` (see
+    /// `cortex_store::Store::recall_vector`), so old facts **drop out of vector
+    /// retrieval the same day**. Meanwhile BM25, graph traversal and recency all
+    /// keep working, so it does not look broken — it just looks like "semantic
+    /// retrieval seems a bit worse". Without this number, nobody is ever told.
     pub async fn embedding_health(&self) -> crate::dto::EmbeddingHealth {
         let model = self.embedder.model_id().to_owned();
         let (covered, stale) = self
@@ -875,9 +978,10 @@ impl Live {
             .embedding_coverage(&model)
             .await
             .unwrap_or_else(|e| {
-                // 查不到就报 (0, 0) 而不是把整个 /health 打挂：这个端点的
-                // 消费者是 HEALTHCHECK 与探针，为一个诊断字段让容器转
-                // unhealthy 是本末倒置。错误进日志
+                // On a failed query report (0, 0) rather than taking down all
+                // of /health: this endpoint's consumers are HEALTHCHECK and
+                // probes, and turning a container unhealthy over one diagnostic
+                // field has the priorities backwards. The error goes to the log
                 tracing::warn!(error = %e, "统计 embedding 覆盖率失败");
                 (0, 0)
             });
@@ -888,11 +992,12 @@ impl Live {
         }
     }
 
-    /// 启动时报一次向量化的覆盖情况。
+    /// Report vectorization coverage once at startup.
     ///
-    /// 全覆盖时是一行 INFO；有旧模型的存量时是 **WARN**，并逐档列出。
-    /// 这是「换模型导致静默失忆」这件事**唯一**会主动发声的地方 ——
-    /// 检索侧不会报错，界面上也看不出来。
+    /// One INFO line under full coverage; a **WARN** when rows from an older
+    /// model remain, listing them per model. This is the **only** place that
+    /// speaks up about "a model change causing silent amnesia" — the retrieval
+    /// side raises no error, and nothing shows in the UI.
     pub async fn report_embedding_state(&self) {
         let model = self.embedder.model_id();
         let census = match self.store.embedding_census().await {
@@ -938,11 +1043,13 @@ impl Live {
         })
     }
 
-    // ─────────────────────────── 检索 ───────────────────────────
+    // ────────────────────────── retrieval ──────────────────────
 
-    /// 检索的唯一实现。HTTP 端点与 agent 的 `memory_search` 工具都走这里 ——
-    /// 两条路要是各写一份，「工具查到的」与「界面上看到的」迟早会对不上，
-    /// 而那正是最难解释给用户听的一类不一致。
+    /// The one implementation of retrieval. Both the HTTP endpoint and the
+    /// agent's `memory_search` tool go through here — if the two paths each had
+    /// their own copy, "what the tool found" and "what the UI shows" would
+    /// eventually disagree, and that is the hardest class of inconsistency to
+    /// explain to a user.
     async fn retrieve(&self, query: &str, as_of: Option<&str>, limit: i64) -> Result<Retrieved> {
         let at = match as_of {
             Some(t) => Some(
@@ -954,17 +1061,19 @@ impl Live {
         };
 
         match retrieval_plan(query, at) {
-            // 没有查询词时要的就是「那一刻的全貌」，按时间倒序给。
-            // `at` 为 None 时那一刻就是现在
+            // With no query terms, what is wanted is "the whole picture at that
+            // instant", newest first. When `at` is None, that instant is now
             RetrievalPlan::Snapshot(at) => {
                 self.retriever
                     .retrieve_as_of(&self.store, at, limit, self.context_window)
                     .await
             }
-            // 有查询词就该在**同一份 as-of 快照上**做相关性排序。
-            // 快照才是回放的本质，「按时间倒序」只是个跟问题无关的排序 ——
-            // 评测实测：换成快照上的三路 RRF 后，时间回放 R@5
-            // 0.417 → 0.833，gold 平均名次 11.5 → 2.8。
+            // With query terms, relevance ranking should happen **on that same
+            // as-of snapshot**. The snapshot is what replay actually is;
+            // "newest first" is merely an ordering unrelated to the question —
+            // measured on the evaluation set: switching to three-way RRF over
+            // the snapshot moved time-replay R@5 from 0.417 to 0.833, and the
+            // gold answer's mean rank from 11.5 to 2.8.
             RetrievalPlan::SnapshotRanked(at) => {
                 self.retriever
                     .retrieve_as_of_ranked(&self.store, query, at, limit, self.context_window)
@@ -978,25 +1087,33 @@ impl Live {
         }
     }
 
-    /// 给一批检索结果补上「这条**此刻**还成不成立」。见 [`FactDto::invalidated`]。
+    /// Annotate a batch of retrieval results with "does this still hold **right
+    /// now**". See [`FactDto::invalidated`].
     ///
-    /// # 为什么只有回放路径要查库
+    /// # Why only the replay path queries the database
     ///
-    /// 不带 `as_of` 的四路召回全部走 `active_facts` 视图，按定义就查不到
-    /// 已失效的事实 —— 那条路上恒为 `false`，一次查询都不必发。
-    /// 只有 `as_of` 快照会返回「当时有效、现在已被推翻」的行，而
-    /// **那正是这个字段唯一有信息量的场合**。
+    /// Without `as_of`, all four retrieval paths go through the `active_facts`
+    /// view and by definition cannot find an invalidated fact — it is
+    /// permanently `false` on that path, and not a single query need be issued.
+    /// Only an `as_of` snapshot returns rows that were valid then and have since
+    /// been overturned, and **that is the one situation where this field carries
+    /// any information at all**.
     ///
-    /// # 为什么是 N 次小查询而不是一次批量查询
+    /// # Why N small queries rather than one batched query
     ///
-    /// `cortex-store` 目前只有单条的 `fact_status`，而 cortexd 不写 SQL
-    /// （见 `Cargo.toml` 里那段「这里没有 sqlx 而且不该再有」）。加批量接口
-    /// 要动存储层，那是另一个 crate 的事。N 的上限是检索的 `limit`
-    /// （缺省 20），而回放是用户显式发起的低频操作 —— 这里的取舍是
-    /// 「多几次索引命中的点查」换「不在 cortexd 里开 SQL 的口子」。
+    /// `cortex-store` currently offers only the single-row `fact_status`, and
+    /// cortexd does not write SQL (see the passage in `Cargo.toml`: "there is no
+    /// sqlx here and there should not be again"). Adding a batch interface means
+    /// touching the storage layer, which is another crate's business. N is
+    /// bounded by the retrieval `limit` (20 by default), and replay is a
+    /// low-frequency operation the user explicitly initiates — the trade here is
+    /// "a few more index-hitting point queries" in exchange for "no SQL hole
+    /// opened inside cortexd".
     ///
-    /// 顺序发而不是并发发：并发只会跟正在服务的对话抢同一个连接池，
-    /// 而省下的那点墙钟时间对一个用户自己点出来的回放没有意义。
+    /// Issued sequentially rather than concurrently: concurrency would only
+    /// contend for the same connection pool as the conversations currently being
+    /// served, and the wall-clock time saved is meaningless for a replay the
+    /// user clicked on themselves.
     async fn invalidation_flags(
         &self,
         items: &[cortex_memory::MemoryItem],
@@ -1009,9 +1126,11 @@ impl Live {
         for m in items {
             out.push(match self.store.fact_status(&m.id).await {
                 Ok(s) => s.is_some_and(|s| s.op == cortex_store::FactOp::Invalidate),
-                // 查不出来时报 false：把一条仍然有效的事实标成「已失效」
-                // 会让用户以为自己的现行结论被推翻了；反过来只是少一个角标。
-                // 两个方向的错误代价不对称，往少说的那边倒
+                // Report false on a failed query: marking a still-valid fact as
+                // "invalidated" would leave the user believing their current
+                // conclusion had been overturned, whereas the reverse merely
+                // omits a badge. The costs of the two directions are
+                // asymmetric, so lean towards saying less
                 Err(e) => {
                     tracing::warn!(fact = %m.id, error = %e, "取事实状态失败，按未失效下发");
                     false
@@ -1021,20 +1140,24 @@ impl Live {
         out
     }
 
-    /// 检索并**渲染成给模型看的那段文本**。
+    /// Retrieve and **render the block of text the model reads**.
     ///
-    /// # 为什么这一层要单独存在
+    /// # Why this layer exists on its own
     ///
-    /// 有两个消费者：agent 自己的 `memory_search` 工具（[`TurnHost`]），
-    /// 以及对外的 MCP server（[`crate::mcp`]）。它们各写一份的话，
-    /// 「第三方查到的」与「我们自己 agent 查到的」会漂开 —— 而那正是
-    /// [`Self::retrieve`] 那条注释已经立过一次的规矩，这里只是把它
-    /// 往上再抬一层：**渲染也只有一份**。
+    /// It has two consumers: the agent's own `memory_search` tool
+    /// ([`TurnHost`]) and the outward-facing MCP server ([`crate::mcp`]). If
+    /// each wrote its own copy, "what a third party found" and "what our own
+    /// agent found" would drift apart — which is the rule
+    /// [`Self::retrieve`]'s comment already established once, lifted one level
+    /// higher here: **there is only one rendering, too**.
     ///
-    /// 渲染必须走 `injection::render_turn_block`，不能另写「MCP 结果格式」。
-    /// 这段文本同样要进模型上下文，那道「记忆是背景数据不是指令」的框定
-    /// 一处都不能少 —— 记忆里可能混着被抽取进来的恶意指令（MemoryGraft），
-    /// 从 MCP 通道进来的和从注入通道进来的一样危险。
+    /// The rendering must go through `injection::render_turn_block`; no separate
+    /// "MCP result format" may be written. This text enters the model's context
+    /// just the same, so not one part of the framing "memory is background data,
+    /// not instructions" may be dropped — memory may contain malicious
+    /// instructions that were extracted into it (a MemoryGraft), and arriving
+    /// through the MCP channel is exactly as dangerous as arriving through the
+    /// injection channel.
     pub async fn memory_search_text(
         &self,
         query: &str,
@@ -1048,14 +1171,19 @@ impl Live {
         Ok(injection::render_turn_block(&r.items))
     }
 
-    /// 核心画像块 —— 这个人身上**不怎么变**的那些事，渲染成给模型看的文本。
+    /// The core profile block — the things about this person that **change
+    /// little**, rendered as text for the model.
     ///
-    /// 空查询走的是 `RetrievalPlan::Snapshot(now)`，也就是「此刻的全貌」，
-    /// 按时间倒序。那正是画像该有的取法：它不回答某个具体问题。
+    /// An empty query takes `RetrievalPlan::Snapshot(now)`, i.e. "the whole
+    /// picture as of now", newest first. That is exactly how a profile should be
+    /// taken: it does not answer a specific question.
     ///
-    /// 渲染走 `render_profile_block` 而不是 `render_turn_block` —— 两者的
-    /// 框定不同，画像那一份是给「每轮都重发的前缀」写的。
-    /// **这是它的第一个调用者**：这个函数造出来之后一直没人用。
+    /// The rendering goes through `render_profile_block` rather than
+    /// `render_turn_block` — their framings differ, and the profile one is
+    /// written for "the prefix that is resent every turn".
+    ///
+    /// **This is its first caller**: after that function was built, nobody used
+    /// it.
     pub async fn profile_text(&self, limit: i64) -> Result<String> {
         let r = self.retrieve("", None, limit).await?;
         if r.items.is_empty() {
@@ -1069,9 +1197,11 @@ impl Live {
         let invalidated = self.invalidation_flags(&r.items, q.as_of.is_some()).await;
 
         Ok(MemorySearchResponse {
-            // 走 `fact_dto_of` 而不是在这里再拼一遍。此前这里是它的手抄版，
-            // 于是「补一个字段」要改两处 —— 而漏改的表现是同一条记忆在
-            // 搜索结果里和在对话抽屉里长得不一样，没有任何报错
+            // Goes through `fact_dto_of` rather than assembling it again here.
+            // This used to be a hand-copied version of it, so "add one field"
+            // meant editing two places — and the symptom of missing one is the
+            // same memory looking different in the search results and in the
+            // conversation drawer, with no error at all
             facts: r
                 .items
                 .iter()
@@ -1145,19 +1275,21 @@ impl Live {
         Ok(digests.into_iter().map(session_dto).collect())
     }
 
-    // ── 项目 ───────────────────────────────────────────────
+    // ── Projects ───────────────────────────────────────────
 
     async fn list_projects(&self) -> Result<Vec<ProjectDto>> {
         let rows = self.store.projects().await.map_err(store_err)?;
         Ok(rows.into_iter().map(project_dto).collect())
     }
 
-    /// 建一个项目。id 由**服务端**生成。
+    /// Create a project. The id is generated by **the server**.
     ///
-    /// 与会话相反（那边 id 由客户端生成，因为它要在离线时先建起来）：
-    /// 项目只在联网时能建 —— 它的全部意义是「服务端知道这个分组存在」，
-    /// 离线建一个本地项目再等着合并，会引出「两台设备各建了一个同名项目」
-    /// 这种要人工消歧的状态，而分组这件事不值得。
+    /// The opposite of sessions (whose ids are generated by the client, because
+    /// a session has to be creatable offline): a project can only be created
+    /// while online — its entire meaning is "the server knows this grouping
+    /// exists", and creating a local project offline and waiting to merge would
+    /// produce states like "two devices each created a project with the same
+    /// name" that require manual disambiguation. Grouping is not worth that.
     async fn create_project(&self, name: &str) -> Result<ProjectDto> {
         let name = validate_project_name(name)?;
         let id = Id::new().to_string();
@@ -1173,9 +1305,11 @@ impl Live {
             .await
             .map_err(store_err)?;
 
-        // 不拿手上的 name 拼一个 DTO 回去，而是读回末态：并发下另一台设备
-        // 可能刚好改了名，此时回显本次请求的名字就是在告诉客户端一件
-        // 已经不成立的事。多一次读换掉一整类「界面显示的与库里存的不一样」
+        // Rather than assembling a DTO from the name in hand, read the final
+        // state back: under concurrency another device may have just renamed it,
+        // in which case echoing this request's name tells the client something
+        // that is no longer true. One extra read trades away an entire class of
+        // "what the UI shows differs from what the database holds"
         self.project_overview(&id).await
     }
 
@@ -1187,8 +1321,10 @@ impl Live {
         };
         let name = validate_project_name(raw)?;
 
-        // 改名之前先确认它还在。少了这一句，给一个已删除项目改名会**静默成功**
-        // （事件照样落库），而列表里什么都不会出现 —— 用户看到的是「改完就没了」
+        // Confirm it still exists before renaming. Without this line, renaming a
+        // deleted project **silently succeeds** (the event lands as usual) while
+        // nothing appears in the list — what the user sees is "I renamed it and
+        // it vanished"
         self.require_project(id).await?;
 
         let event = cortex_store::NewProjectEvent::rename(
@@ -1205,15 +1341,19 @@ impl Live {
         self.project_overview(id).await
     }
 
-    /// 删项目 —— **解散分组，不动内容**。
+    /// Delete a project — **dissolve the grouping, leave the content alone**.
     ///
-    /// 里面的会话变成未分组（`session_state` 把指向已删除项目的归属收敛成
-    /// NULL），消息、附件、已抽取的事实一条不少。刻意不级联写一批
-    /// `remove_from_project`：那是 N 条写入，而且会让「撤销误删」变成不可能 ——
-    /// 现在只要用同一个 id 再 create 一次，所有会话的归属原样回来。
+    /// The sessions inside become ungrouped (`session_state` collapses a
+    /// membership pointing at a deleted project to NULL), with every message,
+    /// attachment and extracted fact intact. A cascade of
+    /// `remove_from_project` writes is deliberately avoided: that would be N
+    /// writes, and it would make "undo an accidental delete" impossible — as it
+    /// stands, creating again with the same id restores every session's
+    /// membership exactly as it was.
     ///
-    /// **重复删是 404 而不是 200**：客户端在两台设备上各删一次是常见的，
-    /// 但把「已经不在了」说成成功，会让「我删的是哪一个」这种错误永远查不出来。
+    /// **A repeated delete is 404, not 200**: a client deleting once on each of
+    /// two devices is common, but reporting "it is already gone" as success
+    /// makes an error like "which one did I delete" permanently undiagnosable.
     async fn delete_project(&self, id: &str) -> Result<()> {
         self.require_project(id).await?;
 
@@ -1226,19 +1366,23 @@ impl Live {
         Ok(())
     }
 
-    /// 项目此刻的末态。不存在（或已删）时 404。
+    /// The project's final state right now. 404 when it does not exist (or was
+    /// deleted).
     async fn project_overview(&self, id: &str) -> Result<ProjectDto> {
         Ok(project_dto(self.require_project(id).await?))
     }
 
-    /// 「这个项目现在还在吗」—— 读一次末态，不在就 404。
+    /// "Does this project still exist" — read the final state once, and 404 if
+    /// it does not.
     ///
-    /// 单独抽出来是因为改名与删除都要它，而两处都必须在**进写事务之前**问：
-    /// 写事务持着 advisory lock，纪律要求它短小纯写
-    /// （`cortex-store::txn` 的第三条）。
+    /// Factored out because both rename and delete need it, and both must ask
+    /// **before entering the write transaction**: that transaction holds the
+    /// advisory lock, and discipline requires it to be short and write-only
+    /// (rule #3 in `cortex-store::txn`).
     ///
-    /// 把会话移进项目那一处**不**走这里：那条路上项目不存在是 400 不是 404，
-    /// 理由见 [`Self::patch_session`] 里那段注释。
+    /// Moving a session into a project does **not** go through here: on that
+    /// path a nonexistent project is a 400, not a 404; reasoning in the comment
+    /// inside [`Self::patch_session`].
     async fn require_project(&self, id: &str) -> Result<cortex_store::Project> {
         self.store
             .project(id)
@@ -1250,19 +1394,24 @@ impl Live {
             })
     }
 
-    /// 改名 / 归档 / 绑定工作区。
+    /// Rename / archive / bind a workspace.
     ///
-    /// # 为什么不要求会话已经有消息
+    /// # Why the session is not required to have messages already
     ///
-    /// 用户新建会话 → 选工作区 → 发第一句，这是最自然的顺序。若在这里
-    /// 因为「查不到这个会话」返回 404，那个顺序就走不通，客户端只好倒过来
-    /// 强迫用户先说一句话。事件表本来就不依赖 episodes 存在，允许它即可 ——
-    /// 末态与写入顺序无关，消息一到会话就带着标题和工作区出现在列表里。
+    /// New session → choose a workspace → send the first message is the most
+    /// natural order. Returning 404 here because "no such session was found"
+    /// would break that order, forcing the client to invert it and make the user
+    /// say something first. The event tables do not depend on episodes existing
+    /// anyway, so permitting it is enough — the final state is independent of
+    /// write order, and as soon as a message arrives the session appears in the
+    /// list carrying its title and workspace.
     ///
-    /// # 为什么全部改动进同一个写事务
+    /// # Why every change goes into one write transaction
     ///
-    /// 「改名 + 归档」若分两个事务，别的设备会先拉到「改完名但还没归档」
-    /// 那个中间态，列表上闪一下。同事务下它们在 `sync_log` 里连号到达。
+    /// Split "rename + archive" across two transactions and another device pulls
+    /// the intermediate state "renamed but not yet archived" first, making the
+    /// list flicker. In one transaction they arrive with consecutive numbers in
+    /// `sync_log`.
     async fn patch_session(&self, session_id: &str, patch: SessionPatch) -> Result<SessionDto> {
         let mut events: Vec<cortex_store::NewSessionEvent> = Vec::new();
 
@@ -1303,21 +1452,28 @@ impl Live {
             });
         }
 
-        // 校验必须在进事务**之前**：写事务持着 advisory lock，
-        // 而 canonicalize 要打文件系统的往返（网络盘上能到几十毫秒）。
-        // 取号事务短小纯写，这是 cortex-store::txn 的纪律三。
-        // ── 绑定工作区：**服务端明确拒绝** ──
+        // Validation must happen **before** entering the transaction: the write
+        // transaction holds the advisory lock, while canonicalize costs a
+        // filesystem round trip (tens of milliseconds on a network drive). A
+        // ticket-taking transaction is short and write-only — discipline #3 in
+        // cortex-store::txn.
         //
-        // 这条路曾经是 Web 端绑工作区的回落（本地 agent 不在时），而它绑的是
-        // **服务器上**的一个目录 —— 于是一个远端用户的 `read_file` 动的是
-        // 生产机的文件系统。爆炸半径是整台机器加上所有租户的数据。
+        // ── Binding a workspace: **the server refuses explicitly** ──
         //
-        // 拒绝而不是静默忽略：静默的话客户端会显示「已绑定 D:\myproject」，
-        // 然后每个文件操作都失败得莫名其妙 —— 而用户明明看到绑定成功了。
-        // 报错里直接给出两条能走通的路。
+        // This path used to be the web client's fallback for binding a workspace
+        // (when the local agent was absent), and what it bound was a directory
+        // **on the server** — so a remote user's `read_file` touched the
+        // production machine's filesystem. The blast radius is the whole machine
+        // plus every tenant's data.
         //
-        // 解绑（`Some(None)`）**照旧放行**：老会话上可能还留着一条服务端绑定，
-        // 用户要能清掉它。拒绝解绑等于让那条记录永远焊在那儿。
+        // Refused rather than silently ignored: silently, the client would
+        // display "bound to D:\myproject" and then fail every file operation
+        // inexplicably — while the user plainly saw the binding succeed. The
+        // error message names the two paths that do work.
+        //
+        // Unbinding (`Some(None)`) **is still permitted**: an older session may
+        // still carry a server-side binding and the user must be able to clear
+        // it. Refusing to unbind would weld that record in place forever.
         if workspace_patch(patch.workspace.as_ref().map(Option::as_deref))? {
             events.push(cortex_store::NewSessionEvent::unbind_workspace(
                 session_id,
@@ -1326,17 +1482,23 @@ impl Live {
             ));
         }
 
-        // ── 移进 / 移出项目 ──
+        // ── Move into / out of a project ──
         //
-        // 目标项目的存在性在**进事务之前**查（同上：取号事务短小纯写）。
-        // 不查的话，移进一个已删除的项目会静默成功 —— 事件照样落库，而末态
-        // 视图把悬挂的归属当作未分组，于是用户看到的是「拖进去又弹回来了」，
-        // 且没有任何一处报错。
+        // The target project's existence is checked **before entering the
+        // transaction** (as above: a ticket-taking transaction is short and
+        // write-only). Without the check, moving into a deleted project silently
+        // succeeds — the event lands as usual, while the final-state view treats
+        // the dangling membership as ungrouped, so what the user sees is "I
+        // dragged it in and it bounced back out", with nothing reporting an error
+        // anywhere.
         match patch.project_id.as_ref().map(Option::as_deref) {
             Some(Some(project_id)) => {
-                // 目标项目不存在是 **400 而不是 404**：这条请求的资源是那个会话，
-                // 而它好好的。回 404 会让客户端分不清「会话没了」与「项目没了」，
-                // 而两者要做的事完全不同（一个是刷新列表，一个是重建分组）
+                // A nonexistent target project is a **400, not a 404**: the
+                // resource of this request is the session, and it is perfectly
+                // fine. A 404 would leave the client unable to distinguish "the
+                // session is gone" from "the project is gone", and the two call
+                // for entirely different actions (refresh the list vs. rebuild
+                // the grouping)
                 if self
                     .store
                     .project(project_id)
@@ -1363,11 +1525,13 @@ impl Live {
             None => {}
         }
 
-        // ── 执行归属 ──
+        // ── Runtime assignment ──
         //
-        // 不校验「这台机器上真有那个绑定」：服务端**看不到**客户机的
-        // `workspaces.json`，那是这套设计的前提而不是疏漏（见
-        // `cortex-local::workspaces` 的模块头）。声明它的是唯一知情的一方。
+        // "Does that binding really exist on this machine" is not validated: the
+        // server **cannot see** the client machine's `workspaces.json`, which is
+        // a premise of this design rather than an oversight (see
+        // `cortex-local::workspaces`'s module header). The party declaring it is
+        // the only one that knows.
         if let Some(runtime) = patch.runtime {
             events.push(cortex_store::NewSessionEvent::set_runtime(
                 session_id,
@@ -1400,10 +1564,12 @@ impl Live {
         self.session_overview(session_id).await
     }
 
-    /// 会话概览。没有消息时仍然返回一条 —— PATCH 之后客户端要拿回末态，
-    /// 而此刻会话很可能一条消息都还没有。
+    /// The session overview. Still returns a row when there are no messages —
+    /// after a PATCH the client needs the final state back, and at that moment
+    /// the session may well have no messages at all.
     async fn session_overview(&self, session_id: &str) -> Result<SessionDto> {
-        // 有消息时聚合查询已经顺带把标题 / 归档 / 工作区一起带回来了
+        // When messages exist, the aggregate query has already brought back the
+        // title / archived flag / workspace along with them
         if let Some(d) = self
             .store
             .session_digest(session_id)
@@ -1413,8 +1579,9 @@ impl Live {
             return Ok(session_dto(d));
         }
 
-        // 没有消息 —— 用事件末态拼一条空壳。这条路正是「先选工作区、
-        // 再发第一句话」那个顺序要求的
+        // No messages — assemble a shell from the events' final state. This path
+        // is exactly what the order "choose a workspace first, then send the
+        // first message" requires
         let state = self
             .store
             .session_state(session_id)
@@ -1439,19 +1606,26 @@ impl Live {
         })
     }
 
-    /// 一个会话的一页消息，附件与回放抽屉一并挂上。
+    /// One page of a session's messages, with attachments and the replay drawer
+    /// attached.
     ///
-    /// # 概览为什么不再从取回的消息现算
+    /// # Why the overview is no longer computed from the messages fetched
     ///
-    /// 以前是「消息全在手上了，顺手算一下」，分页之后这条路直接错了：
-    /// 手上只有**一页**，算出来的 `message_count` 是页大小、`created_at`
-    /// 是这一页最早那条、派生标题取的是这一页里的首条用户消息。
-    /// 这些数字在第一页上恰好都对，往回翻一页就全错 —— 而它们不报错。
+    /// It used to be "the messages are all in hand anyway, compute it while we
+    /// are here", and pagination made that path outright wrong: only **one
+    /// page** is in hand, so the computed `message_count` is the page size,
+    /// `created_at` is the oldest entry on this page, and the derived title
+    /// takes the first user message on this page. Those numbers happen to be
+    /// correct on the first page and are all wrong one page back — and they
+    /// report no error.
     ///
-    /// 现在概览一律来自 `session_digest` 那句聚合 SQL：它统计的是**全部**消息，
-    /// 与翻到第几页无关。多一次往返换掉一整类「翻页之后数字开始漂」的 bug。
-    /// 客户端拿 `message_count` 与本页条数比对来判断是否被截断的那套补丁，
-    /// 现在有 `has_more` 可用，但旧口径仍然成立（`message_count` 还是总数）。
+    /// The overview now always comes from the `session_digest` aggregate SQL: it
+    /// counts **every** message, independent of which page was requested. One
+    /// extra round trip trades away an entire class of "the numbers start
+    /// drifting once you paginate" bugs. The client-side patch that compared
+    /// `message_count` against the page length to detect truncation now has
+    /// `has_more` available, but the old reading still holds (`message_count` is
+    /// still the total).
     async fn session_detail(
         &self,
         session_id: &str,
@@ -1473,9 +1647,11 @@ impl Live {
             .clamp(1, MAX_EPISODE_PAGE);
         let before = q.before.as_deref().map(crate::cursor::decode).transpose()?;
 
-        // 多要一条来判断「还有没有更早的」。用 len == limit 推断会在恰好整除时
-        // 多骗客户端要一次空页，而客户端多半把空页当成「到头了」——
-        // 两种判断混在一起就是「有时候翻不到最早那几条」
+        // Ask for one extra row to decide "is there anything older". Inferring
+        // from len == limit would trick the client into requesting one empty
+        // page whenever the count divides exactly, and most clients treat an
+        // empty page as "that is the end" — mixing the two criteria produces
+        // "sometimes you cannot page back to the earliest few"
         let mut page = self
             .store
             .episodes_by_session_page(session_id, limit + 1, before.as_ref())
@@ -1484,9 +1660,10 @@ impl Live {
         let has_more = page.len() as i64 > limit;
         page.truncate(limit as usize);
 
-        // 这里拿到的是降序（新 → 老）。反转成正序再下发，理由见
-        // `SessionDetail::episodes` 的文档：下发降序不会报错，只会让老客户端
-        // 把整段对话倒着画出来
+        // What arrives here is descending (newest → oldest). Reverse it to
+        // ascending before sending; reasoning in `SessionDetail::episodes`'s
+        // documentation: sending descending raises no error, it merely makes an
+        // older client draw the whole conversation backwards
         let next_cursor = page
             .last()
             .filter(|_| has_more)
@@ -1510,7 +1687,8 @@ impl Live {
         })
     }
 
-    /// 一页消息的附件 + 回放抽屉，三次批量查询而不是逐条 N+1。
+    /// A page of messages' attachments plus replay drawer, in three bulk queries
+    /// rather than N+1 per row.
     async fn replay_bundle(
         &self,
         episode_ids: &[String],
@@ -1555,10 +1733,11 @@ impl Live {
         Ok(out)
     }
 
-    // ─────────────────────────── 媒体 ───────────────────────────
+    // ──────────────────────────── media ────────────────────────
 
-    /// `blobs` 行的元信息。取回字节时要靠它拿 MIME 与总长度
-    /// （HTTP Range 的 `Content-Range` 分母就是这个长度）。
+    /// The metadata on a `blobs` row. Fetching the bytes relies on it for the
+    /// MIME type and total length (that length is the denominator of HTTP
+    /// Range's `Content-Range`).
     async fn blob_meta(&self, hash: &str) -> Result<cortex_store::Blob> {
         self.store
             .blob(hash)
@@ -1570,14 +1749,18 @@ impl Live {
             })
     }
 
-    /// 登记一个已经落到对象存储里的 blob —— 三步顺序的第二步。
+    /// Register a blob that has already landed in object storage — step two of
+    /// the three-step order.
     ///
-    /// 走 `write_txn` 而不是裸 INSERT：`blobs` 行必须与 `sync_log` 同事务，
-    /// 否则别的设备永远不知道这个对象存在，同步下来的 `episode_blobs`
-    /// 就会指向一条它没有的 blob 行。
+    /// Goes through `write_txn` rather than a bare INSERT: the `blobs` row must
+    /// be in the same transaction as `sync_log`, or other devices never learn
+    /// this object exists and the `episode_blobs` they sync down point at a blob
+    /// row they do not have.
     ///
-    /// 返回 `None` 表示这份内容**早就登记过**，本次没有新增行。这不是错误：
-    /// 内容寻址下两条行会逐字节相同，重复登记既没有意义也没有害处。
+    /// Returning `None` means this content **was already registered** and no row
+    /// was added this time. That is not an error: under content addressing the
+    /// two rows would be byte-for-byte identical, so registering again is
+    /// neither meaningful nor harmful.
     async fn register_blob(&self, new: cortex_store::NewBlob) -> Result<Option<i64>> {
         if self
             .store
@@ -1596,9 +1779,12 @@ impl Live {
         {
             Ok(seq) => Ok(Some(seq)),
             Err(e) => {
-                // 上面那次存在性检查是 TOCTOU，两个设备同时传同一张图就会撞主键。
-                // 回查一次：已经在了就当成功。不去匹配 SQLSTATE ——
-                // 那要求 cortexd 认识 sqlx 的错误结构，而这一层不该再有 sqlx
+                // The existence check above is a TOCTOU: two devices uploading
+                // the same image simultaneously collide on the primary key.
+                // Query again: if it is there now, treat it as success. The
+                // SQLSTATE is deliberately not matched — that would require
+                // cortexd to know sqlx's error structure, and this layer should
+                // not have sqlx again
                 if self
                     .store
                     .blob(&new.hash)
@@ -1615,42 +1801,51 @@ impl Live {
         }
     }
 
-    /// 排一次媒体转录 —— **不阻塞上传响应**。
+    /// Queue one media transcription — **without blocking the upload response**.
     ///
-    /// 转录要调一次 vision 模型（实测十几秒），同步做会让「拖一张图进来」
-    /// 卡住十几秒，而转录结果对**这次上传**毫无用处：它是给将来的检索准备的。
-    /// 与事实抽取同一个理由，也同一个形态。
+    /// Transcription makes one vision model call (measured at over ten seconds),
+    /// and doing it synchronously would stall "drag an image in" for that long,
+    /// while the transcription result is of no use whatsoever to **this upload**:
+    /// it is preparation for future retrieval. Same reasoning as fact
+    /// extraction, and the same shape.
     ///
-    /// 只在 blob **首次**登记时排队：内容寻址下重复上传是同一份字节，
-    /// 转录结果也会一模一样，重转纯属白烧模型钱。
+    /// Queued only on the blob's **first** registration: under content
+    /// addressing a repeated upload is the same bytes, the transcription result
+    /// would be identical, and redoing it burns model money for nothing.
     pub fn spawn_transcription(self: &Arc<Self>, hash: String, bytes: bytes::Bytes, mime: String) {
         if self.transcribe.is_none() {
-            return; // 没配 vision 模型，图片仍然归档，只是检索不到
+            // No vision model configured; images are still archived, they simply
+            // cannot be retrieved
+            return;
         }
         let live = Arc::clone(self);
 
         tokio::spawn(async move {
             match live.transcribe_and_store(&hash, &bytes, &mime).await {
                 Ok(outcome) => outcome.log(&hash),
-                // 转录失败不该影响已经成功的上传，记日志即可
+                // A failed transcription must not affect an upload that already
+                // succeeded; a log line is enough
                 Err(e) => tracing::warn!(hash, error = %e, "媒体转录失败"),
             }
         });
     }
 
-    /// 媒体转录是否启用。后台回扫器据此决定要不要起来 ——
-    /// 没配 `CORTEX_VISION_PROVIDER` 时整条链路关闭，与上传路径的行为一致。
+    /// Whether media transcription is enabled. The background rescanner uses it
+    /// to decide whether to start at all — with no `CORTEX_VISION_PROVIDER`
+    /// configured the whole path is off, matching the upload path's behaviour.
     #[must_use]
     pub fn transcription_enabled(&self) -> bool {
         self.transcribe.is_some()
     }
 
-    /// 跑一遍转录并落库。**同步等待结果** —— 上传路径把它丢进
-    /// [`Self::spawn_transcription`] 里 fire-and-forget，后台回扫器则要拿到
-    /// 结局才能决定「这个 blob 要不要重试」。
+    /// Run one transcription and persist it. **Awaits the result
+    /// synchronously** — the upload path throws it into
+    /// [`Self::spawn_transcription`] fire-and-forget, while the background
+    /// rescanner needs the outcome to decide "should this blob be retried".
     ///
-    /// 抹除防护走 [`StoreRedactionGuard`]，两条路都绕不开它：管线把
-    /// [`cortex_memory::transcribe::RedactionGuard`] 做进了 `run` 的签名。
+    /// Redaction protection goes through [`StoreRedactionGuard`], and neither
+    /// path can bypass it: the pipeline builds
+    /// [`cortex_memory::transcribe::RedactionGuard`] into `run`'s signature.
     pub async fn transcribe_and_store(
         &self,
         hash: &str,
@@ -1666,8 +1861,9 @@ impl Live {
         match pipeline.run(hash, bytes, mime, &guard).await? {
             cortex_memory::transcribe::Outcome::Ready(rows) => {
                 let n = rows.len();
-                // 一个事务写完全部段落：ASR 的分段之间没有独立意义，
-                // 半截的时间轴比没有更糟
+                // All segments are written in one transaction: ASR segments have
+                // no independent meaning between them, and half a timeline is
+                // worse than none
                 self.store
                     .write_txn(async |t| {
                         for r in &rows {
@@ -1686,7 +1882,7 @@ impl Live {
         }
     }
 
-    // ─────────────────────────── 同步 ───────────────────────────
+    // ──────────────────────────── sync ─────────────────────────
 
     async fn sync_since(&self, q: SyncQuery) -> Result<SyncResponse> {
         let limit = q.limit.clamp(1, 1000);
@@ -1708,8 +1904,10 @@ impl Live {
                     seq: r.seq,
                     table: r.table_name,
                     id: r.record_id,
-                    // payload 为 None 说明业务行已不存在（被 purge）。
-                    // 仍要下发这条日志：客户端据此推进游标并知道发生过删除
+                    // A None payload means the business row no longer exists (it
+                    // was purged). The log entry is still sent down: the client
+                    // uses it to advance its cursor and to learn that a deletion
+                    // happened
                     payload: r
                         .payload
                         .as_ref()
@@ -1720,19 +1918,22 @@ impl Live {
     }
 }
 
-/// 把本轮的检索归因写进 `episode_memories`。
+/// Write this turn's retrieval attribution into `episode_memories`.
 ///
-/// 失败只记日志：对话已经在跑了，归因是可观测性，不该把一次成功的对话
-/// 拖成 500。但**必须记**，否则「抽屉为什么是空的」在生产上无从查起。
+/// Failure only logs: the conversation is already under way, attribution is
+/// observability, and it must not drag a successful conversation into a 500. But
+/// it **must be logged**, or "why is the drawer empty" has nothing to
+/// investigate in production.
 async fn record_injected_memories(
     store: &Store,
     episode_id: Id,
     retrieved: &Retrieved,
     device_id: &str,
 ) {
-    // attribution 与 items 等长且同序（见 cortex_memory::Retrieved 的文档），
-    // 但不假设它 —— 按 fact_id 建索引，少一条就少一条归因，不至于错位到
-    // 「A 的分数记在 B 头上」
+    // attribution and items are the same length and in the same order (see
+    // cortex_memory::Retrieved's documentation), but that is not assumed here —
+    // indexing by fact_id means a missing entry costs one attribution rather
+    // than shifting everything into "A's score recorded against B"
     let scores: std::collections::HashMap<&str, &cortex_memory::Attribution> = retrieved
         .attribution
         .iter()
@@ -1741,8 +1942,10 @@ async fn record_injected_memories(
 
     let mut rows: Vec<cortex_store::NewEpisodeMemory> = Vec::with_capacity(retrieved.items.len());
     for (i, item) in retrieved.items.iter().enumerate() {
-        // fact id 形制不对就跳过这一条而不是整批放弃：episode_memories.fact_id
-        // 是 ulid 域，一个坏 id 会让整个事务回滚，连带丢掉其余全部归因
+        // A malformed fact id skips that one entry rather than abandoning the
+        // batch: episode_memories.fact_id is a ulid domain, so one bad id would
+        // roll back the entire transaction and take every other attribution with
+        // it
         let Ok(fact_id) = item.id.parse::<Id>() else {
             tracing::warn!(id = %item.id, "检索结果的 id 不是合法 ULID，跳过这一条归因");
             continue;
@@ -1781,12 +1984,13 @@ async fn record_injected_memories(
     }
 }
 
-/// 按**字符**截断到上限。
+/// Truncate to the ceiling, measured in **characters**.
 ///
-/// 这些上限对应 schema 里的 CHECK。超限不是「这一行写不进去」而是
-/// **整个写事务回滚** —— 一个名字特别长的文件能把整轮对话的归因全带走。
-/// 按字符而非字节：Postgres 的 `length()` 数的是字符，按字节切还会把
-/// 汉字劈成半个。
+/// These ceilings correspond to CHECKs in the schema. Exceeding one is not "this
+/// row cannot be written", it is **the entire write transaction rolling back**
+/// — one file with an unusually long name can take a whole turn's attribution
+/// with it. Characters rather than bytes: Postgres's `length()` counts
+/// characters, and cutting by bytes would also split a CJK character in half.
 fn clamp_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
@@ -1794,31 +1998,34 @@ fn clamp_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-// ───────────────────────── 领域 → DTO ──────────────────────────
+// ─────────────────────── domain → DTO ───────────────────────
 
 fn store_err(e: cortex_store::StoreError) -> CortexError {
     CortexError::Store(e.to_string())
 }
 
-/// 检索结果 → 线上事实。
+/// Retrieval result → wire fact.
 ///
-/// [`run_turn`]（Web 那条路，走 SSE）与 [`Live::write_episode`]
-///（本地 agent 那条路，走 HTTP 响应）共用这一个映射。两处各写一份的话，
-/// 漂移的表现是**同一条记忆在两个客户端上长得不一样**，而没有任何报错。
+/// [`run_turn`] (the web path, over SSE) and [`Live::write_episode`] (the local
+/// agent path, over the HTTP response) share this one mapping. With a copy in
+/// each, the symptom of drift is **the same memory looking different on two
+/// clients**, with no error at all.
 fn fact_dto_of(m: &cortex_memory::MemoryItem) -> FactDto {
     FactDto {
         id: m.id.clone(),
         statement: m.statement.clone(),
         predicate: m.predicate.clone(),
         domain: m.domain.clone(),
-        // `confidence` 曾经在这里写死成 1.0，于是抽屉上**每一条**记忆
-        // 都显示「100%」—— 一个看起来像数据、实际是常量的数字。
-        // 拿不到时给 0.0 而不是 1.0：客户端据此不显示这个角标
+        // `confidence` was once hard-coded to 1.0 here, so **every** memory in
+        // the drawer displayed "100%" — a number that looked like data and was
+        // in fact a constant. When it is unavailable the value is 0.0 rather
+        // than 1.0: the client uses that to omit the badge entirely
         confidence: m.confidence.unwrap_or(0.0),
         valid_at: m.valid_at.clone(),
         created_at: m.known_since.clone(),
-        // 本轮注入走的是不带 as_of 的召回，只查 active_facts ——
-        // 按定义拿不到已失效的事实。见 `Live::invalidation_flags`
+        // This turn's injection goes through retrieval without as_of, querying
+        // active_facts only — by definition it cannot obtain an invalidated
+        // fact. See `Live::invalidation_flags`
         invalidated: false,
         source_episode_id: m.source_episode_id.clone(),
         source_channel: m.source_channel.clone(),
@@ -1826,10 +2033,11 @@ fn fact_dto_of(m: &cortex_memory::MemoryItem) -> FactDto {
     }
 }
 
-/// 一条消息的「附加物」：附件 + 回放抽屉。
+/// A message's "extras": attachments plus the replay drawer.
 ///
-/// 三个 `Vec` 打包成一个结构而不是给 [`episode_dto`] 三个参数：
-/// 三个同型参数排在一起，传错顺序编译器一声不吭。
+/// Three `Vec`s packed into one struct rather than three parameters on
+/// [`episode_dto`]: with three same-typed parameters in a row, passing them in
+/// the wrong order draws no complaint from the compiler.
 #[derive(Debug, Default)]
 struct Replay {
     attachments: Vec<AttachmentDto>,
@@ -1886,8 +2094,9 @@ fn session_dto(d: cortex_store::SessionDigest) -> SessionDto {
     SessionDto {
         id: d.session_id,
         title_is_custom: d.title.is_some(),
-        // 用户起过名就用他起的，否则从首条用户消息派生。
-        // 顺序不能反 —— 反了就是「用户改了名，刷新一下又变回去了」
+        // Use the name the user gave if they gave one, otherwise derive it from
+        // the first user message. The order cannot be inverted — inverted, it
+        // means "the user renamed it and a refresh changed it back"
         title: d
             .title
             .unwrap_or_else(|| session_title(d.first_user_text.as_deref())),
@@ -1902,11 +2111,13 @@ fn session_dto(d: cortex_store::SessionDigest) -> SessionDto {
     }
 }
 
-/// 存储层的枚举 → 线协议的枚举。
+/// Storage-layer enum → wire-protocol enum.
 ///
-/// 两个枚举而不是一个：`cortex-store` 不依赖 `cortex-proto`（依赖方向是
-/// `core ← store ← … ← cortexd`），而线协议的取值一旦定下就不能跟着存储层
-/// 的重构走。多一个 match 的代价，换的是「改数据库表示不会静默改线协议」。
+/// Two enums rather than one: `cortex-store` does not depend on `cortex-proto`
+/// (the dependency direction is `core ← store ← … ← cortexd`), and once the wire
+/// protocol's values are fixed they must not follow a storage-layer refactor.
+/// The price of one extra match buys "changing the database representation
+/// cannot silently change the wire protocol".
 fn runtime_dto(r: cortex_store::SessionRuntime) -> SessionRuntimeDto {
     match r {
         cortex_store::SessionRuntime::Local => SessionRuntimeDto::Local,
@@ -1923,10 +2134,12 @@ fn project_dto(p: cortex_store::Project) -> ProjectDto {
     }
 }
 
-/// 标题由首条用户消息派生。
+/// The title is derived from the first user message.
 ///
-/// 截断放在这一层而不是 SQL 里：它是**展示决策**，存储层不该替 UI 决定
-/// 一个标题该有多长。按字符而非字节截断 —— 中文一刀切在字节上会切出乱码。
+/// The truncation lives at this layer rather than in SQL: it is a
+/// **presentation decision**, and the storage layer should not decide on the
+/// UI's behalf how long a title should be. Truncated by characters rather than
+/// bytes — cutting CJK text at a byte boundary produces mojibake.
 fn session_title(first_user_text: Option<&str>) -> String {
     let trimmed = first_user_text.map(str::trim).unwrap_or_default();
     if trimmed.is_empty() {
@@ -1935,11 +2148,12 @@ fn session_title(first_user_text: Option<&str>) -> String {
     trimmed.chars().take(TITLE_CHARS).collect()
 }
 
-/// 去掉重复的附件哈希，保持客户端给的顺序。
+/// Drop duplicate attachment hashes, preserving the order the client gave.
 ///
-/// `episode_blobs` 的主键是 `(episode_id, blob_hash)`，同一条消息里挂两次
-/// 同一张图会直接撞主键把整个写事务弄回滚 —— 而「同一张图被拖进来两次」
-/// 在界面上是再正常不过的操作。
+/// `episode_blobs`'s primary key is `(episode_id, blob_hash)`, so attaching the
+/// same image twice to one message hits the primary key directly and rolls back
+/// the whole write transaction — while "the same image got dragged in twice" is
+/// about as ordinary as UI operations get.
 fn dedup_attachments(input: &[AttachmentRef]) -> Vec<AttachmentRef> {
     let mut seen = std::collections::HashSet::new();
     input
@@ -1953,37 +2167,40 @@ fn dedup_attachments(input: &[AttachmentRef]) -> Vec<AttachmentRef> {
 mod tests {
     use super::*;
 
-    /// 四格摆齐。**少一格的后果是记忆面板打开就是空的，且不报任何错。**
+    /// All four cells laid out. **Missing one means the memory panel opens
+    /// empty, with no error reported at all.**
     #[test]
-    fn 检索的四格里没有一格是空手而归() {
+    fn no_cell_of_the_retrieval_matrix_comes_back_empty_handed() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("常量时间可解析")
+            .expect("a constant timestamp parses")
             .with_timezone(&Utc);
 
         assert_eq!(
             retrieval_plan("", Some(at)),
             RetrievalPlan::Snapshot(at),
-            "回放 + 没有词 = 当时的全貌"
+            "replay + no query terms = the whole picture as it stood then"
         );
         assert_eq!(
             retrieval_plan("对象存储", Some(at)),
             RetrievalPlan::SnapshotRanked(at),
-            "回放 + 有词 = 在那份快照上排序，而不是退化成按时间倒序"
+            "replay + query terms = ranked over that snapshot, not degraded to newest-first"
         );
         assert_eq!(
             retrieval_plan("对象存储", None),
             RetrievalPlan::Ranked,
-            "此刻 + 有词 = 四路召回"
+            "now + query terms = all four retrieval paths"
         );
 
-        // **这一格曾经是 Ranked。** 而四路召回全都要查询词，于是它恒回 0 条。
-        // 界面上的表现是「还没有记忆」——对着一个有 159 条事实的库
+        // **This cell used to be Ranked.** And all four retrieval paths require
+        // query terms, so it returned 0 rows every time. What showed in the UI
+        // was "no memories yet" — against a database holding 159 facts
         match retrieval_plan("   ", None) {
             RetrievalPlan::Snapshot(_) => {}
             other => panic!(
-                "此刻 + 没有词必须给「最近的全貌」，实际是 {other:?}。\
-                 走四路召回的话空查询恒回 0 条：记忆面板打开就是空的，\
-                 而它会说「还没有记忆」——用户据此认为这个功能没用"
+                "now + no query terms must yield \"the most recent whole picture\"; actually got \
+                 {other:?}. Going through the four retrieval paths, an empty query returns 0 rows \
+                 every time: the memory panel opens empty and says \"no memories yet\" —— from \
+                 which the user concludes the feature is useless"
             ),
         }
     }
@@ -1991,15 +2208,17 @@ mod tests {
     #[test]
     fn a_project_name_must_survive_trimming() {
         assert_eq!(
-            validate_project_name("  记忆引擎  ").expect("两侧空白应当被去掉而不是拒绝"),
+            validate_project_name("  记忆引擎  ")
+                .expect("whitespace on both sides should be trimmed, not rejected"),
             "记忆引擎"
         );
 
         for bad in ["", "   ", "\t\n"] {
             assert!(
                 validate_project_name(bad).is_err(),
-                "{bad:?} 应当被拒 —— 一个名字全是空白的项目在侧边栏上是一行\
-                 什么都没有的可点区域，看起来像界面坏了"
+                "{bad:?} should be rejected —— a project whose name is all whitespace is a \
+                 clickable row in the sidebar containing nothing, which looks like the UI is \
+                 broken"
             );
         }
     }
@@ -2008,40 +2227,54 @@ mod tests {
     fn the_project_name_limit_counts_characters_not_bytes() {
         let max = cortex_store::PROJECT_NAME_MAX_CHARS;
 
-        // 恰好顶格的中文名：按字节算的话它是 3 倍长度，会被误拒
+        // A CJK name exactly at the limit: measured in bytes it is three times
+        // as long and would be wrongly rejected
         let full = "记".repeat(max);
         assert_eq!(
-            validate_project_name(&full)
-                .expect("恰好顶格应当通过 —— 上限按字符数，与数据库 length() 一致"),
+            validate_project_name(&full).expect(
+                "exactly at the limit must pass —— the ceiling counts characters, matching the \
+                 database's length()"
+            ),
             full
         );
 
         assert!(
             validate_project_name(&"记".repeat(max + 1)).is_err(),
-            "超一个字符就该在这里被拒，而不是让数据库的 CHECK 变成一句 500"
+            "one character over must be rejected here, rather than letting the database's CHECK \
+             turn into a 500"
         );
     }
 
     #[test]
     fn session_title_falls_back_and_truncates_by_char() {
         assert_eq!(session_title(None), "新会话");
-        assert_eq!(session_title(Some("   ")), "新会话", "全空白也该回落");
+        assert_eq!(
+            session_title(Some("   ")),
+            "新会话",
+            "all whitespace must fall back too"
+        );
 
-        // 按字符截断。按字节切会把一个汉字劈成半个，JSON 序列化直接产出乱码
-        let long = "一二三四五六七八九十".repeat(4); // 40 个汉字
+        // Truncated by characters. Cutting by bytes would split a CJK character
+        // in half and JSON serialization would emit mojibake outright
+        let long = "一二三四五六七八九十".repeat(4); // 40 CJK characters
         let title = session_title(Some(&long));
         assert_eq!(
             title.chars().count(),
             TITLE_CHARS,
-            "标题应截到 {TITLE_CHARS} 个字符：{title}"
+            "the title should be cut to {TITLE_CHARS} characters: {title}"
         );
-        assert!(title.starts_with("一二三"), "截断后开头应保持原样：{title}");
+        assert!(
+            title.starts_with("一二三"),
+            "the beginning must be unchanged after truncation: {title}"
+        );
     }
 
     #[test]
     fn duplicate_attachments_are_collapsed_in_order() {
-        // episode_blobs 的主键是 (episode_id, blob_hash)，重复挂同一张图会
-        // 撞主键把整个写事务回滚 —— 而「同一张图被拖进来两次」是常规操作
+        // episode_blobs's primary key is (episode_id, blob_hash), so attaching
+        // the same image twice hits the primary key and rolls back the whole
+        // write transaction — while "the same image got dragged in twice" is a
+        // routine operation
         let a = AttachmentRef {
             hash: "a".repeat(64),
             kind: Some("image".into()),
@@ -2056,71 +2289,84 @@ mod tests {
         assert_eq!(
             got.iter().map(|x| x.hash.clone()).collect::<Vec<_>>(),
             vec![a.hash.clone(), b.hash.clone()],
-            "重复的哈希应被去掉，且保持客户端给的顺序"
+            "duplicate hashes should be dropped while preserving the order the client gave"
         );
         assert_eq!(
             got[0].kind.as_deref(),
             Some("image"),
-            "保留的应当是第一次出现的那一条，连同它的 kind"
+            "the entry kept should be the first occurrence, along with its kind"
         );
     }
 
-    /// 服务端**不能**绑工作区，但**能**解绑。
+    /// The server **cannot** bind a workspace, but it **can** unbind one.
     ///
-    /// 绑定那一半写反了的后果是「服务端又能绑了」，而它没有任何症状 ——
-    /// 直到某天一个远端用户的 `read_file` 读到了生产机上的 `.env`。
-    /// 解绑那一半写反了的后果是老会话上的绑定永远清不掉。
+    /// Inverting the binding half means "the server can bind again", with no
+    /// symptom whatsoever — until the day a remote user's `read_file` reads the
+    /// `.env` on the production machine. Inverting the unbinding half means a
+    /// binding on an older session can never be cleared.
     #[test]
     fn the_server_refuses_to_bind_but_still_lets_you_unbind() {
         let msg = workspace_patch(Some(Some("D:/anything")))
-            .expect_err("服务端绑定工作区必须被拒绝")
+            .expect_err("a server-side workspace binding must be refused")
             .to_string();
         assert!(
             msg.contains("你自己的机器") && msg.contains("cortex-local"),
-            "拒绝理由要给出走得通的路（桌面端 / 本机跑 cortex-local），而不只是说不行。实际：{msg}"
+            "the refusal must name paths that do work (the desktop client / running cortex-local \
+             locally), not merely say no. Actual: {msg}"
         );
-        // 沙箱落地之后**多了一条走得通的路**，而这条恰恰是 Web 用户唯一能走的
-        // —— 前两条都要求他先装个桌面端。漏掉它，报错就等于对 Web 用户说
-        // 「你想要的这件事在这里做不到」，而其实开一个开关就有
+        // Once the sandbox landed there was **one more path that works**, and it
+        // is precisely the only one a web user can take — the first two both
+        // require installing a desktop client first. Omitting it makes this error
+        // amount to telling a web user "the thing you want cannot be done here",
+        // when in fact flipping one switch provides it
         assert!(
             msg.contains("云沙箱"),
-            "Web 用户走不了前两条路（都要装桌面端）。不提沙箱，这条报错对他就是死路。实际：{msg}"
+            "a web user cannot take either of the first two paths (both need a desktop client). \
+             Without mentioning the sandbox, this error is a dead end for them. Actual: {msg}"
         );
 
         assert!(
-            workspace_patch(Some(None)).expect("解绑必须放行"),
-            "解绑要照旧能用 —— 老会话上可能还留着一条服务端绑定，拒绝解绑等于让它永远焊在那儿"
+            workspace_patch(Some(None)).expect("unbinding must be permitted"),
+            "unbinding has to keep working —— an older session may still carry a server-side \
+             binding, and refusing to unbind welds it in place forever"
         );
         assert!(
-            !workspace_patch(None).expect("没提这个字段不该报错"),
-            "只改标题的请求不该被工作区这一条拦下来"
+            !workspace_patch(None).expect("not mentioning the field must not error"),
+            "a request that only changes the title must not be blocked by the workspace rule"
         );
     }
 }
 
-/// 一次检索该走哪条路。**四路召回全都要查询词**，所以「有没有词」与
-/// 「回不回放」是两个独立维度，共四格。
+/// Which path one retrieval should take. **All four retrieval paths require
+/// query terms**, so "are there terms" and "is this a replay" are two
+/// independent dimensions, giving four cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetrievalPlan {
-    /// 那一刻的全貌，按时间倒序。没有查询词时走它。
+    /// The whole picture at that instant, newest first. Taken when there are no
+    /// query terms.
     Snapshot(chrono::DateTime<Utc>),
-    /// 在那一刻的快照**之上**做相关性排序。
+    /// Relevance ranking **on top of** the snapshot at that instant.
     SnapshotRanked(chrono::DateTime<Utc>),
-    /// 此刻的四路召回 + RRF。
+    /// The four retrieval paths as of now, plus RRF.
     Ranked,
 }
 
-/// [`Live::retrieve`] 的决策部分，抽成纯函数只为**能把那四格摆出来测**。
+/// The decision part of [`Live::retrieve`], factored into a pure function purely
+/// so that **the four cells can be laid out and tested**.
 ///
-/// # 这里少过一格
+/// # One cell was missing here
 ///
-/// 「没有词 + 不回放」原来落在 `Ranked` 上。而四路召回全都要词：BM25 没有词、
-/// 向量嵌不出方向、图遍历没有种子 —— 于是它恒回 0 条，连 `channels` 都是空的
-/// （一路都没跑）。症状是记忆面板**打开就是空的**，配一句「还没有记忆」，
-/// 而真机那个库里有 159 条。用户据此得出的结论是「这功能没什么用」。
+/// "No terms + no replay" used to land on `Ranked`. And all four retrieval paths
+/// require terms: BM25 has no terms, the vector has no direction to embed, graph
+/// traversal has no seed — so it returned 0 rows every time, with even
+/// `channels` empty (not one path ran). The symptom was that the memory panel
+/// **opened empty**, captioned "no memories yet", against a real database
+/// holding 159 rows. The conclusion the user drew was "this feature is not much
+/// use".
 ///
-/// 正确答案代码里本来就有（`as_of` + 没有词 → 全貌），缺的只是
-/// 「**此刻**也是一个合法的 as_of」。四格摆成一张表，就没有地方藏这种缺口。
+/// The correct answer was already in the code (`as_of` + no terms → the whole
+/// picture); what was missing was only "**now** is also a valid as_of". Laid out
+/// as a table of four cells, a gap like that has nowhere to hide.
 fn retrieval_plan(query: &str, as_of: Option<chrono::DateTime<Utc>>) -> RetrievalPlan {
     match (query.trim().is_empty(), as_of) {
         (true, Some(at)) => RetrievalPlan::Snapshot(at),
@@ -2135,7 +2381,7 @@ mod extract_gate_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// 取值非法就报错，不悄悄用默认值。
+    /// An invalid value errors rather than quietly using the default.
     #[test]
     fn a_bad_concurrency_setting_is_an_error_not_a_fallback() {
         assert_eq!(
@@ -2146,24 +2392,29 @@ mod extract_gate_tests {
         assert_eq!(parse_extract_concurrency(Some(" 8 ")).unwrap(), 8);
 
         for bad in ["0", "abc", "-1", "3.5"] {
-            let err = parse_extract_concurrency(Some(bad))
-                .expect_err("非法取值必须报错，回落到默认值等于上限失效而运维不知情");
+            let err = parse_extract_concurrency(Some(bad)).expect_err(
+                "an invalid value must error; falling back to the default means the ceiling is \
+                 not in effect while ops has no idea",
+            );
             assert!(
                 err.to_string().contains(EXTRACT_CONCURRENCY_ENV),
-                "报错要点名是哪个变量，实际：{err}"
+                "the error must name which variable is at fault; actual: {err}"
             );
         }
     }
 
-    /// **闸门真的把并发压住了。**
+    /// **The gate genuinely holds concurrency down.**
     ///
-    /// 这条测的不是信号量本身（那是 tokio 的事），而是 [`under_gate`]
-    /// 有没有把许可**持有到 future 结束**。写成 `let _ = acquire().await`
-    /// 的话许可当场就被丢掉，闸门变成一句昂贵的空操作 —— 而那种改动
-    /// 不会让任何别的测试变红，因为功能上一切正常，只是没有上限了。
+    /// What this tests is not the semaphore itself (that is tokio's business)
+    /// but whether [`under_gate`] **holds the permit until the future ends**.
+    /// Written as `let _ = acquire().await`, the permit is dropped on the spot
+    /// and the gate becomes an expensive no-op — and that change makes no other
+    /// test go red, because functionally everything works, there is simply no
+    /// ceiling any more.
     ///
-    /// 失败的样子很具体：批量导入时几千路抽取一起打出去，把 2 核 3.5G 的
-    /// 生产节点连同上面别的服务一起拖死。
+    /// The failure looks very concrete: during a bulk import, thousands of
+    /// extractions fire at once and drag the 2-core, 3.5 GB production node down
+    /// along with every other service on it.
     #[tokio::test]
     async fn the_gate_actually_caps_concurrency() {
         const PERMITS: usize = 3;
@@ -2180,8 +2431,10 @@ mod extract_gate_tests {
                 under_gate(&gate, async {
                     let n = now.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(n, Ordering::SeqCst);
-                    // 让出执行权，给别的任务挤进来的机会 —— 不 await 的话
-                    // 每个任务都会一口气跑完，峰值恒为 1，测试就没有意义了
+                    // Yield so other tasks get a chance to squeeze in —
+                    // without an await each task would run straight through,
+                    // the peak would always be 1, and the test would be
+                    // meaningless
                     tokio::task::yield_now().await;
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     now.fetch_sub(1, Ordering::SeqCst);
@@ -2190,17 +2443,19 @@ mod extract_gate_tests {
             }));
         }
         for h in handles {
-            h.await.expect("任务不该 panic");
+            h.await.expect("the task must not panic");
         }
 
         let peak = peak.load(Ordering::SeqCst);
         assert!(
             peak <= PERMITS,
-            "同时有 {peak} 路在跑，而上限是 {PERMITS} —— 许可没被持有到结束"
+            "{peak} were running at once against a ceiling of {PERMITS} —— the permit was not \
+             held until the end"
         );
         assert!(
             peak > 1,
-            "峰值只有 {peak}，说明这些任务根本没重叠过，这条测试测了个寂寞"
+            "the peak was only {peak}, meaning these tasks never overlapped at all and this test \
+             measured nothing"
         );
     }
 }

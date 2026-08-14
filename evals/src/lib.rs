@@ -1,29 +1,35 @@
-//! Cortex 检索质量评测。
+//! Cortex retrieval quality evals.
 //!
-//! 项目文档自己说「瓶颈是检索质量不是数据量」，但在这个 crate 之前，
-//! RRF 的 k 值、四路召回宽度、域加权系数、预算截断——全部只能凭感觉调。
-//! 这里做的事只有一件：**让每一次「优化」都有数字可以对照**。
+//! The project docs say themselves that "the bottleneck is retrieval quality,
+//! not data volume", yet before this crate existed, RRF's k value, the four
+//! retrieval paths' widths, the domain weighting coefficients, and budget
+//! truncation could all only be tuned by feel. This does exactly one thing:
+//! **give every "optimization" a number to compare against**.
 //!
 //! ```text
-//! 题集(JSON) ──► 真实 ingest 管线 ──► 隔离的临时 schema
+//! suite (JSON) ──► the real ingest pipeline ──► an isolated temp schema
 //!                                          │
 //!                     ┌────────────────────┴──────────────────┐
 //!                     ▼                                       ▼
-//!            Retriever::retrieve                    四路原始召回（诊断）
-//!            （四路 + RRF + 域加权 + 预算）          bm25/vector/graph/recency
+//!            Retriever::retrieve                  the four raw paths (diagnostic)
+//!            (four paths + RRF +                  bm25/vector/graph/recency
+//!             domain weighting + budget)
 //!                     │                                       │
-//!                     └──────────────► 指标 ◄─────────────────┘
-//!                        Recall@k · MRR · 逐路独占 · 误召率
+//!                     └──────────────► metrics ◄──────────────┘
+//!                     Recall@k · MRR · per-path exclusives · false-recall rate
 //!                                     │
-//!                          人类可读报告 + 机器可读 JSON
+//!                       human-readable report + machine-readable JSON
 //! ```
 //!
-//! 各模块的取舍写在各自的文件头：
-//! - [`suite`] 题集格式与静态校验（为什么 gold 不能按 fact id 写）
-//! - [`matcher`] gold 匹配（为什么只看 statement）
-//! - [`metrics`] 指标（为什么必须分组、为什么必须有逐路贡献）
-//! - [`harness`] 隔离与真实管线（为什么不能直接 INSERT facts）
-//! - [`report`] 报告（为什么 JSON 与文本都要）
+//! Each module's tradeoffs are written in its own file header:
+//! - [`suite`] the suite format and static validation (why gold cannot be
+//!   written as fact ids)
+//! - [`matcher`] gold matching (why only the statement is examined)
+//! - [`metrics`] the metrics (why grouping is mandatory, why per-path
+//!   contribution is mandatory)
+//! - [`harness`] isolation and the real pipeline (why facts cannot simply be
+//!   INSERTed)
+//! - [`report`] the report (why both JSON and text are needed)
 
 pub mod harness;
 pub mod matcher;
@@ -32,5 +38,5 @@ pub mod report;
 pub mod runner;
 pub mod suite;
 
-/// 仓库内自建题集的默认路径（相对仓库根）。
+/// Default path to the in-repository suite (relative to the repo root).
 pub const DEFAULT_SUITE: &str = "evals/suites/cortex-zh-en-v1.json";

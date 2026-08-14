@@ -1,15 +1,19 @@
-//! 同步查询侧：`GET /sync?since=` 的底层，以及它的实时事件源。
+//! The read side of sync: what sits under `GET /sync?since=`, plus its
+//! real-time event source.
 //!
-//! 客户端只持有**一个**游标（`sync_log.seq`），跨全部表。全序由 `sync_log`
-//! 提供，按 log 序回放天然满足 FK 顺序（facts 永远在其 source episode 之后到达）。
+//! A client holds **one** cursor (`sync_log.seq`) spanning every table. The
+//! total order comes from `sync_log`, and replaying in log order naturally
+//! satisfies FK ordering (facts always arrive after their source episode).
 //!
-//! 写入侧的 advisory lock（见 [`crate::txn`]）保证 seq 顺序 == 可见顺序，
-//! 因此「拉到 seq=N 就把游标推到 N」是安全的 —— 不会有 seq < N 的行在此之后
-//! 才变得可见。
+//! The advisory lock on the write side (see [`crate::txn`]) guarantees seq
+//! order == visibility order, which is what makes "having pulled up to seq=N,
+//! advance the cursor to N" safe — no row with seq < N can become visible after
+//! that point.
 //!
-//! 拉取之外还有一条推送链路（[`Store::listen_sync`]）：`sync_log` 的插入触发
-//! Postgres `NOTIFY`，服务端据此把「游标推进了」这个**信号**扇出给各端。
-//! 它与拉取共用同一个游标语义，不是第二套协议。
+//! Besides pulling there is also a push path ([`Store::listen_sync`]): an
+//! insert into `sync_log` fires a Postgres `NOTIFY`, from which the server fans
+//! out the **signal** "the cursor moved" to every client. It shares the same
+//! cursor semantics as pulling; it is not a second protocol.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -25,19 +29,22 @@ use crate::model::{
 };
 use crate::store::Store;
 
-/// 一条同步记录：`sync_log` 行 + 它指向的业务行。
+/// One sync record: a `sync_log` row plus the business row it points at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncRecord {
     pub seq: i64,
     pub table_name: String,
     pub record_id: String,
     pub logged_at: DateTime<Utc>,
-    /// 业务行。理论上永不为 `None` —— 日志行与业务行同事务提交，
-    /// 日志可见即业务行可见。为 `None` 说明有人绕过本层删了数据。
+    /// The business row. In theory never `None` — the log row and the business
+    /// row commit in the same transaction, so the log being visible means the
+    /// business row is visible. `None` means somebody bypassed this layer and
+    /// deleted data.
     pub payload: Option<SyncPayload>,
 }
 
-/// 业务行的类型化载荷。变体与 `sync_log.table_name` 一一对应。
+/// The typed payload of a business row. The variants map one-to-one onto
+/// `sync_log.table_name`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncPayload {
     Episode(Episode),
@@ -58,7 +65,7 @@ pub enum SyncPayload {
 }
 
 impl SyncPayload {
-    /// 该载荷所属的表名。
+    /// The table name this payload belongs to.
     #[must_use]
     pub const fn table_name(&self) -> &'static str {
         match self {
@@ -81,7 +88,7 @@ impl SyncPayload {
     }
 }
 
-/// `sync_log` 的裸行。
+/// A raw `sync_log` row.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct SyncLogEntry {
     pub seq: i64,
@@ -91,7 +98,8 @@ pub struct SyncLogEntry {
 }
 
 impl Store {
-    /// 当前同步全序的末端。新设备从 0 起拉，老设备用自己的游标。
+    /// The far end of the current sync total order. A new device pulls from 0;
+    /// an existing one uses its own cursor.
     pub async fn latest_seq(&self) -> Result<i64> {
         let (seq,): (i64,) = sqlx::query_as("SELECT coalesce(max(seq), 0) FROM sync_log")
             .fetch_one(self.pool())
@@ -99,7 +107,8 @@ impl Store {
         Ok(seq)
     }
 
-    /// 只取日志行，不取业务行。给「先看看有没有新东西」这类轻量探测用。
+    /// Fetch only the log rows, not the business rows. For lightweight probes
+    /// along the lines of "let me check whether there is anything new".
     pub async fn sync_log_since(&self, cursor: i64, limit: i64) -> Result<Vec<SyncLogEntry>> {
         let rows = sqlx::query_as::<_, SyncLogEntry>(
             "SELECT seq, table_name, record_id, created_at
@@ -112,16 +121,18 @@ impl Store {
         Ok(rows)
     }
 
-    /// 增量拉取：`seq > cursor` 的记录及其业务行，按 seq 升序。
+    /// Incremental pull: records with `seq > cursor` and their business rows,
+    /// ascending by seq.
     ///
-    /// 实现上是「一次取日志 + 每张涉及的表各取一次业务行」，而不是逐行 N+1。
+    /// Implemented as "one fetch of the log + one fetch of business rows per
+    /// table involved" rather than N+1 row by row.
     pub async fn fetch_since(&self, cursor: i64, limit: i64) -> Result<Vec<SyncRecord>> {
         let entries = self.sync_log_since(cursor, limit).await?;
         if entries.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 按表归拢待取的主键
+        // Group the primary keys we need by table
         let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
         for entry in &entries {
             wanted
@@ -130,7 +141,7 @@ impl Store {
                 .push(entry.record_id.clone());
         }
 
-        // (table_name, record_id) → 业务行
+        // (table_name, record_id) → the business row
         let mut payloads: HashMap<(String, String), SyncPayload> = HashMap::new();
         for (table_name, ids) in &wanted {
             self.load_payloads(table_name, ids, &mut payloads).await?;
@@ -153,15 +164,16 @@ impl Store {
             .collect())
     }
 
-    /// 批量取一张表的业务行，塞进 `out`。
+    /// Bulk-fetch the business rows of one table into `out`.
     async fn load_payloads(
         &self,
         table_name: &str,
         ids: &[String],
         out: &mut HashMap<(String, String), SyncPayload>,
     ) -> Result<()> {
-        // `$sql` 收 `expr` 而不是 `literal`：facts 那一支用 `concat!` 拼列名，
-        // 而 `concat!(...)` 在展开前还是一个表达式，匹配不上 `literal`
+        // `$sql` takes an `expr` rather than a `literal`: the facts arm builds
+        // its column list with `concat!`, and `concat!(...)` is still an
+        // expression before expansion, so it does not match `literal`
         macro_rules! collect {
             ($sql:expr, $ty:ty, $key:expr, $wrap:expr) => {{
                 let rows = sqlx::query_as::<_, $ty>($sql)
@@ -200,8 +212,10 @@ impl Store {
                 |row: &EpisodeBlob| format!("{}:{}", row.episode_id, row.blob_hash),
                 SyncPayload::EpisodeBlob
             ),
-            // 回放抽屉的两张表。漏掉任一支的后果与 session_events 那条注释
-            // 说的一样：一条日志就让整批 /sync 拉取失败，客户端游标从此卡死
+            // The two tables of the replay drawer. Missing either arm has the
+            // same consequence as the session_events comment describes: a
+            // single log row makes the whole /sync batch fail, and the client's
+            // cursor is stuck in front of it from then on
             table::EPISODE_MEMORIES => collect!(
                 "SELECT id, episode_id, fact_id, ordinal, channels, score, device_id, created_at
                    FROM episode_memories WHERE id = ANY($1)",
@@ -266,9 +280,12 @@ impl Store {
                 |row: &Summary| row.id.clone(),
                 SyncPayload::Summary
             ),
-            // 派生血缘。客户端拿它做的事与服务端一样：收到 redaction 墓碑后
-            // 顺着边找到本地那些必须一并失效的摘要 / 图边（memory.md §九 的
-            // 传播义务）。不下发的话客户端只能清源、清不掉派生物
+            // Derivation provenance. The client does the same thing with it as
+            // the server: on receiving a redaction tombstone, follow the edges
+            // to find the local summaries / graph edges that must be
+            // invalidated along with it (the propagation obligation of
+            // memory.md §9). Without shipping it, a client can clear the source
+            // but not the records derived from it
             table::DERIVATIONS => collect!(
                 "SELECT id, derived_kind, derived_id, source_kind, source_id,
                         device_id, created_at
@@ -284,9 +301,11 @@ impl Store {
                 |row: &Redaction| row.id.clone(),
                 SyncPayload::Redaction
             ),
-            // 漏掉这一支的后果不是「会话改名同步不了」，而是**整条 /sync 断掉**：
-            // 一条 session_events 日志会让 load_payloads 返回 UnknownTable，
-            // 那一批拉取整个失败，客户端的游标从此卡死在它前面
+            // Missing this arm does not mean "session renames fail to sync", it
+            // means **the whole of /sync breaks**: a single session_events log
+            // row makes load_payloads return UnknownTable, that entire batch
+            // fails, and the client's cursor is stuck in front of it from then
+            // on
             table::SESSION_EVENTS => collect!(
                 "SELECT id, session_id, op, title, workspace, project_id, runtime,
                         actor, device_id, created_at
@@ -295,8 +314,10 @@ impl Store {
                 |row: &SessionEvent| row.id.clone(),
                 SyncPayload::SessionEvent
             ),
-            // 项目事件同理。客户端拿它按同一套状态机自己算末态 ——
-            // 服务端不下发「当前项目列表」，那种快照没有全序可言
+            // Project events likewise. The client runs the same state machine
+            // over them to compute the final state itself — the server never
+            // ships "the current project list", because such a snapshot has no
+            // total order to speak of
             table::PROJECT_EVENTS => collect!(
                 "SELECT id, project_id, op, name, actor, device_id, created_at
                    FROM project_events WHERE id = ANY($1)",
@@ -312,79 +333,101 @@ impl Store {
 }
 
 // ══════════════════════════════════════════════════════════
-//  实时事件源：LISTEN / NOTIFY 挂在 sync_log 上
+//  Real-time event source: LISTEN / NOTIFY hung off sync_log
 // ══════════════════════════════════════════════════════════
 //
-// 这是 sync_log outbox 设计的免费附带收益（docs/memory.md §九）：写入侧
-// 已经保证「每笔业务写事务都往 sync_log 追加一行」且「seq 顺序 == 可见
-// 顺序」，那么监听这张表的插入就等于监听了**全部**数据变更，一张表都不会漏。
+// This is a free side benefit of the sync_log outbox design (docs/memory.md
+// §9): the write side already guarantees that "every business write
+// transaction appends a row to sync_log" and that "seq order == visibility
+// order", so listening to inserts on that one table is equivalent to listening
+// to **every** data change, with no table missed.
 //
-// # 为什么走数据库触发器，而不是在应用层写完 pg_notify
+// # Why a database trigger rather than calling pg_notify from the application
+// after writing
 //
-// 两条路都能通，取舍是「谁保证不漏」：
+// Both work; the trade-off is "who guarantees nothing is missed":
 //
-// - **应用层 notify**（在 `write_txn` 之后手动 `SELECT pg_notify`）要求
-//   **每一条写入路径**都记得调。对话路径好办，但事实抽取跑在
-//   `cortex-memory::extract` 里、将来的摘要与 redact 执行器也各自写库 ——
-//   每加一个写入方就多一个漏掉的机会，而漏掉的表现是「某台设备偶尔不刷新」，
-//   几乎不可能在测试里复现。
-// - **触发器**挂在 `sync_log` 这个所有写入的必经之路上。写入纪律已经用类型
-//   系统强制了「业务行必与 sync_log 同事务」（见 [`crate::txn`]），于是触发器
-//   天然覆盖全部写入方，包括还没写出来的那些。
+// - **Application-level notify** (a manual `SELECT pg_notify` after
+//   `write_txn`) requires **every write path** to remember to call it. The
+//   conversation path is easy enough, but fact extraction runs inside
+//   `cortex-memory::extract`, and the future summarizer and redact executor
+//   each write to the database of their own accord — every new writer adds
+//   another chance to miss it, and missing it shows up as "one device
+//   occasionally doesn't refresh", which is nearly impossible to reproduce in a
+//   test.
+// - **A trigger** hangs off `sync_log`, the choke point every write must pass
+//   through. The write discipline already uses the type system to enforce "a
+//   business row must be in the same transaction as its sync_log row" (see
+//   [`crate::txn`]), so the trigger naturally covers every writer, including
+//   the ones not written yet.
 //
-// 还有一条不明显但决定性的好处：Postgres 的 NOTIFY **在事务提交时才投递**。
-// 触发器在写事务内触发、随该事务一起提交，因此「收到通知」严格晚于
-// 「数据可见」。应用层 notify 若写在事务外，就会出现「通知到了、拉取却看不到
-// 那一行」的竞态。
+// There is one more benefit, less obvious but decisive: Postgres delivers
+// NOTIFY **only at transaction commit**. The trigger fires inside the write
+// transaction and commits along with it, so "the notification arrived" is
+// strictly later than "the data became visible". An application-level notify
+// placed outside the transaction produces the race where "the notification
+// arrived but the pull cannot see that row".
 //
-// # 为什么这段 DDL 不进 migration
+// # Why this DDL does not go into a migration
 //
-// migration 是 schema 的权威版本、只增不改；这段 DDL 是**运行时组件**的一部分：
-// 幂等、可重复执行、换实现时不需要写反向 migration。
+// Migrations are the authoritative version of the schema and are append-only;
+// this DDL is part of a **runtime component**: idempotent, safe to re-run, and
+// requiring no reverse migration when the implementation changes.
 
-/// 通道名的**前缀**。真正的通道名是 `cortex_sync_<schema>`，
-/// 由 [`crate::SchemaName::notify_channel`] 拼出来。
+/// The **prefix** of the channel name. The actual channel name is
+/// `cortex_sync_<schema>`, assembled by
+/// [`crate::SchemaName::notify_channel`].
 ///
-/// 改这里等于改服务端内部约定，客户端不需要知道它（客户端只连 `/ws`）。
+/// Changing this changes a server-internal convention; clients do not need to
+/// know it (a client only connects to `/ws`).
 ///
-/// # 为什么必须带上 schema
+/// # Why the schema has to be part of it
 ///
-/// 通道名的作用域是**数据库**而非 schema。单用户时这只是「同一个库里跑
-/// 两套 Cortex 会互相收到通知」，无害 —— 信号只说「去拉一次」，游标各自独立。
+/// A channel name is scoped to the **database**, not to a schema. In the
+/// single-user case this only meant "two Cortex instances in the same database
+/// receive each other's notifications", which is harmless — the signal only
+/// says "go pull once", and the cursors are independent.
 ///
-/// 多租户之后同一件事变成两个问题：一是**任何人写入都会唤醒所有人**，
-/// 一百个用户就是一百倍的空拉；二是每个用户都能观察到「别人正在写」，
-/// 那是个不该有的旁路信道。
+/// Under multi-tenancy the same fact becomes two problems: first, **anybody's
+/// write wakes everybody**, so a hundred users means a hundred times the empty
+/// pulls; second, every user can observe that "somebody else is writing", which
+/// is a side channel that should not exist.
 pub(crate) const NOTIFY_CHANNEL_PREFIX: &str = "cortex_sync";
 
-/// 安装触发器时用的 advisory lock key。
+/// The advisory lock key used when installing the trigger.
 ///
-/// 刻意不复用写事务那把 [`crate::SYNC_ADVISORY_LOCK_KEY`]：那把锁的语义是
-/// 「同步取号串行化」，拿它来串行化 DDL 会让两件毫不相干的事互相阻塞，
-/// 日后排查锁等待时误导人。
+/// It deliberately does not reuse the write transaction's
+/// [`crate::SYNC_ADVISORY_LOCK_KEY`]: the semantics of that lock are "serialize
+/// sync sequence allocation", and using it to serialize DDL would make two
+/// entirely unrelated things block each other, which is misleading when
+/// somebody later investigates lock waits.
 const DDL_LOCK_KEY: i64 = 4273;
 
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// 通知函数的 DDL。
+/// The DDL for the notify function.
 ///
-/// 通道名现在要拼进来（每租户一个），所以它从常量变成了函数。
+/// The channel name now has to be spliced in (one per tenant), which is why
+/// this went from a constant to a function.
 ///
-/// **拼字符串进 DDL 本来是坏习惯**，这里立得住的唯一理由是：`channel`
-/// 来自 [`crate::SchemaName::notify_channel`]，而那个类型的构造函数是
-/// 白名单校验过的（只可能是 `public` 或 `u_` + 26 位小写 ULID）。
-/// 安全性来自**类型**，不是来自这一行。
+/// **Splicing strings into DDL is normally a bad habit**; the only thing that
+/// makes it defensible here is that `channel` comes from
+/// [`crate::SchemaName::notify_channel`], and that type's constructor is
+/// allowlist-validated (it can only be `public` or `u_` + a 26-character
+/// lowercase ULID). The safety comes from the **type**, not from this line.
 ///
-/// 函数本身也建在租户 schema 里（靠连接的 `search_path`），
-/// 所以不同租户的 `cortex_notify_sync()` 互不覆盖。
+/// The function itself is also created inside the tenant schema (by way of the
+/// connection's `search_path`), so different tenants' `cortex_notify_sync()`
+/// do not overwrite one another.
 fn create_function_sql(channel: &str) -> String {
     format!(
         "CREATE OR REPLACE FUNCTION cortex_notify_sync() RETURNS trigger
 LANGUAGE plpgsql AS $fn$
 BEGIN
-    -- 载荷只带 seq。NOTIFY 载荷上限 8000 字节，塞业务行迟早会炸；
-    -- 更要紧的是客户端本来就该按自己的游标去 /sync 拉
+    -- The payload carries only seq. A NOTIFY payload is capped at 8000 bytes,
+    -- so stuffing business rows in will blow up sooner or later; more to the
+    -- point, the client should be pulling from /sync by its own cursor anyway
     PERFORM pg_notify('{channel}', NEW.seq::text);
     RETURN NULL;
 END;
@@ -392,17 +435,21 @@ $fn$"
     )
 }
 
-/// 触发器的 DDL。
+/// The DDL for the trigger.
 ///
-/// 先查存在性再建，不用 `DROP TRIGGER IF EXISTS` + `CREATE`：DROP 会取
-/// `sync_log` 的 ACCESS EXCLUSIVE 锁，把所有在途写事务堵住。启动是高频动作
-/// （开发期每次改代码都重启），没必要每次都去抖一下写入路径。
+/// It checks for existence before creating rather than using
+/// `DROP TRIGGER IF EXISTS` + `CREATE`: the DROP takes an ACCESS EXCLUSIVE lock
+/// on `sync_log`, blocking every in-flight write transaction. Startup happens
+/// often (during development every code change restarts the process), and there
+/// is no reason to jolt the write path each time.
 const CREATE_TRIGGER_SQL: &str = "\
 DO $do$
 BEGIN
-    -- 存在性检查必须绑到具体的表上（'sync_log'::regclass 按 search_path 解析），
-    -- 光比 tgname 会让「另一个 schema 里已经有同名触发器」被误判成已装好 ——
-    -- 集成测试跑在临时 schema 里，正是这个场景
+    -- The existence check must be bound to the specific table
+    -- ('sync_log'::regclass resolves via search_path); comparing tgname alone
+    -- would misread 'another schema already has a trigger by that name' as
+    -- 'already installed' -- and integration tests running in a temporary
+    -- schema are exactly that scenario
     IF NOT EXISTS (
         SELECT 1 FROM pg_trigger
          WHERE tgname = 'cortex_sync_notify'
@@ -416,29 +463,38 @@ BEGIN
 END
 $do$";
 
-/// 一次「游标推进」的信号。
+/// One "the cursor moved" signal.
 ///
-/// **只是信号，不带业务数据**。收到后按自己的游标去 [`Store::fetch_since`]
-/// 拉 —— 事件里的 `cursor` 只用于判断落后多少与展示，绝不能拿它当下次拉取的
-/// 起点（那样会跳过自己还没拉的区间）。
+/// **Only a signal; it carries no business data.** On receiving it, pull from
+/// [`Store::fetch_since`] using your own cursor — the `cursor` in the event is
+/// only for gauging how far behind you are and for display, and must never be
+/// used as the starting point of the next pull (that would skip the range you
+/// have not pulled yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncSignal {
-    /// 有新数据，服务端游标已推进到 `cursor`。
+    /// There is new data; the server cursor has advanced to `cursor`.
     Bump { cursor: i64 },
-    /// 中间可能漏过若干次推进 —— 与 Postgres 的通知连接断过。
+    /// Some number of advances may have been missed in between — the
+    /// notification connection to Postgres was broken at some point.
     ///
-    /// 语义与 [`Self::Bump`] 相同（都是「去拉」），单列一个变体是为了让上层能把
-    /// 「正常增量」与「可能有缺口」分开度量：后者频繁出现就是运维信号。
+    /// Semantically identical to [`Self::Bump`] (both mean "go pull"); it gets
+    /// its own variant so that layers above can measure "normal increments"
+    /// separately from "there may be a gap": the latter appearing frequently is
+    /// an operational signal.
     Resync { cursor: i64 },
 }
 
-/// `sync_log` 推进通知的订阅句柄，由 [`Store::listen_sync`] 交出。
+/// The subscription handle for `sync_log` advance notifications, handed out by
+/// [`Store::listen_sync`].
 ///
-/// 一个句柄独占存储层连接池里的一条连接（`LISTEN` 是连接级状态，
-/// 池化连接上做不了）。这是 daemon 里唯一的常驻长连接，池子按此留了余量。
+/// One handle exclusively occupies one connection from the storage layer's pool
+/// (`LISTEN` is connection-level state and cannot be done on a pooled
+/// connection). This is the only long-lived resident connection in the daemon,
+/// and the pool leaves headroom accordingly.
 pub struct SyncNotifications {
     store: Store,
-    /// `None` 表示尚未连上或刚断开，下一次 [`Self::recv`] 会去（重）连。
+    /// `None` means not yet connected or just disconnected; the next
+    /// [`Self::recv`] will (re)connect.
     listener: Option<PgListener>,
     backoff: Duration,
 }
@@ -453,14 +509,18 @@ impl std::fmt::Debug for SyncNotifications {
 }
 
 impl SyncNotifications {
-    /// 等下一条信号。
+    /// Wait for the next signal.
     ///
-    /// **不返回错误**：连接断了在内部指数退避重连，重连成功后先补一条
-    /// [`SyncSignal::Resync`]（断开期间的通知永久丢失，必须让客户端主动追平 ——
-    /// 这正是「只推信号、不推数据」的价值：补救只有一句话）。
+    /// **Never returns an error**: if the connection drops it reconnects
+    /// internally with exponential backoff, and on success first emits a
+    /// [`SyncSignal::Resync`] (notifications during the outage are lost forever,
+    /// so the client must be made to catch up on its own — which is exactly the
+    /// value of "push the signal, not the data": the remedy is one sentence).
     ///
-    /// 返回 `None` **只有一个原因**：存储层连接池已关闭，即进程正在退出。
-    /// 上层据此结束转发任务，而不是对着一个永远连不上的池子退避到天荒地老。
+    /// Returning `None` has **exactly one cause**: the storage layer's pool has
+    /// been closed, i.e. the process is shutting down. Layers above use that to
+    /// end the forwarding task rather than backing off until the end of time
+    /// against a pool that will never connect again.
     pub async fn recv(&mut self) -> Option<SyncSignal> {
         loop {
             if self.store.pool().is_closed() {
@@ -487,15 +547,21 @@ impl SyncNotifications {
                 }
             }
 
-            // 监听连接不在主池子里（见 [`subscribe`]），主池子关掉时不会打断
-            // `try_recv`。因此显式跟池子的关闭事件赛跑 —— 否则进程退出时这个
-            // 任务会一直挂在一条没人再写的连接上。
+            // The listening connection is not in the main pool (see
+            // [`subscribe`]), so closing the main pool does not interrupt
+            // `try_recv`. Hence we explicitly race the pool's close event —
+            // otherwise this task would hang forever on a connection nobody
+            // writes to once the process exits.
             let closed = self.store.pool().close_event();
 
-            // 单独取出结果再 match：否则 listener 的可变借用会一直活到 match 体内，
-            // 而分支里要用 &self.store 去查游标
+            // Pull the result out first and match afterwards: otherwise the
+            // mutable borrow of listener would stay alive inside the match
+            // body, while the arms need &self.store to query the cursor
             let received = {
-                let listener = self.listener.as_mut().expect("上一步保证了它已就位");
+                let listener = self
+                    .listener
+                    .as_mut()
+                    .expect("the step above guarantees it is in place");
                 let closed = std::pin::pin!(closed);
                 tokio::select! {
                     received = listener.try_recv() => received,
@@ -507,21 +573,24 @@ impl SyncNotifications {
                 Ok(Some(note)) => {
                     let cursor = match note.payload().parse::<i64>() {
                         Ok(v) => v,
-                        // 载荷不是数字说明有别人在往同一个通道发东西。
-                        // 不猜、去库里问一次真实游标
+                        // A non-numeric payload means somebody else is sending
+                        // on the same channel. Do not guess — ask the database
+                        // once for the real cursor
                         Err(_) => self.cursor_or_zero().await,
                     };
                     return Some(SyncSignal::Bump { cursor });
                 }
-                // try_recv 返回 None = 连接断过且已重连
+                // try_recv returning None = the connection dropped and has
+                // already been reconnected
                 Ok(None) => {
                     let cursor = self.cursor_or_zero().await;
                     tracing::warn!(cursor, "通知连接曾中断，降级为 resync");
                     return Some(SyncSignal::Resync { cursor });
                 }
                 Err(e) => {
-                    // 池子关闭也会走到这里（PoolClosed）。下一圈开头的 is_closed
-                    // 会认出它并收工，不会白退避
+                    // A closed pool also lands here (PoolClosed). The is_closed
+                    // check at the top of the next iteration recognizes it and
+                    // wraps up, so no backoff is wasted
                     self.listener = None;
                     tracing::warn!(error = %e, "通知连接出错，将重连");
                     self.sleep_backoff().await;
@@ -530,8 +599,10 @@ impl SyncNotifications {
         }
     }
 
-    /// 查当前游标末端。查不到时返回 0 —— 上层拿到偏小的 cursor 只会多拉一次，
-    /// 拿到偏大的才会漏，所以失败必须往小了取。
+    /// Query the current far end of the cursor. Returns 0 when the query fails
+    /// — a cursor that is too small only makes the layer above pull one extra
+    /// time, whereas one that is too large makes it skip rows, so failure must
+    /// err on the small side.
     async fn cursor_or_zero(&self) -> i64 {
         self.store.latest_seq().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "读取 latest_seq 失败，按 0 下发");
@@ -545,46 +616,56 @@ impl SyncNotifications {
     }
 }
 
-/// 用主池子的**连接选项**另建一个只放一条连接的池子，在其上订阅通道。
+/// Build a second pool holding exactly one connection from the main pool's
+/// **connection options**, and subscribe to the channel on it.
 ///
-/// # 为什么不直接 `PgListener::connect_with(主池子)`
+/// # Why not `PgListener::connect_with(the main pool)` directly
 ///
-/// `LISTEN` 是连接级状态，监听会把那条连接永久占住。从 16 条的主池里少一条
-/// 是小事，真正的问题是 [`Store::close`] 要等所有连接归还，而监听那条只在
-/// `try_recv` 被轮询到时才归还 —— 谁要是在同一个任务里先 `await close()`
-/// 再 `await recv()`，两边互等，直接死锁。实测踩过。
+/// `LISTEN` is connection-level state, so listening occupies that connection
+/// permanently. Losing one connection out of a pool of 16 is a small matter;
+/// the real problem is that [`Store::close`] waits for every connection to be
+/// returned, and the listening one is only returned when `try_recv` is polled —
+/// so anybody who does `await close()` and then `await recv()` in the same task
+/// has the two waiting on each other, a flat deadlock. Observed in practice.
 ///
-/// # 为什么不重新解析连接串
+/// # Why not re-parse the connection string
 ///
-/// 复用 `connect_options` 意味着 TLS、`search_path` 等一切选项自动跟上。
-/// 拿连接串重拼是「监听连的库/schema 与写入的不是同一个」这类问题的来源，
-/// 而它的症状是「一切正常，就是不推送」。
+/// Reusing `connect_options` means TLS, `search_path`, and every other option
+/// follow along automatically. Reassembling from the connection string is the
+/// source of problems of the form "the listener is connected to a different
+/// database/schema than the writer", and the symptom of that is "everything is
+/// fine, it just doesn't push".
 async fn subscribe(pool: &PgPool, channel: &str) -> Result<PgListener> {
     let options = pool.connect_options().as_ref().clone();
     let dedicated = PgPoolOptions::new()
         .max_connections(1)
-        // 监听连接必须一直活着：池子的生命周期上限与空闲回收在这里只会造成
-        // 「静默换连接」，而换连接的瞬间通知就漏了，且不报错
+        // The listening connection has to stay alive: a pool lifetime cap or
+        // idle reaping would only produce a "silent connection swap" here, and
+        // notifications are lost at the moment of the swap, with no error
         .max_lifetime(None)
         .idle_timeout(None)
         .connect_with(options)
         .await?;
 
     let mut listener = PgListener::connect_with(&dedicated).await?;
-    // 这个池子是监听专用的，除了它自己没人持有，也就没人会去 close 它
+    // This pool is dedicated to listening; nobody but the listener holds it,
+    // so nobody is going to close it
     listener.ignore_pool_close_event(true);
     listener.listen(channel).await?;
     Ok(listener)
 }
 
 impl Store {
-    /// 幂等地安装 `sync_log` 的通知触发器。
+    /// Idempotently install the notify trigger on `sync_log`.
     ///
-    /// 函数用 `CREATE OR REPLACE`，触发器先查存在性再建；两者都在一个持有
-    /// [`DDL_LOCK_KEY`] 的事务里，于是并发启动的多个实例会排队而不是撞名字。
+    /// The function uses `CREATE OR REPLACE`, and the trigger checks for
+    /// existence before creating; both happen inside a transaction holding
+    /// [`DDL_LOCK_KEY`], so several instances starting concurrently queue up
+    /// rather than colliding on the name.
     ///
     /// # Errors
-    /// 权限不足或连不上数据库时返回 [`StoreError`]。
+    /// Returns [`StoreError`] on insufficient permissions or when the database
+    /// cannot be reached.
     pub async fn install_sync_notify(&self) -> Result<()> {
         let mut tx = self.pool().begin().await?;
 
@@ -594,8 +675,9 @@ impl Store {
             .await?;
 
         let channel = self.schema().notify_channel();
-        // AssertSqlSafe 背得起：`channel` 由 `SchemaName::notify_channel`
-        // 拼出，而那个类型的构造函数是白名单校验过的。安全性来自类型
+        // AssertSqlSafe is affordable here: `channel` is assembled by
+        // `SchemaName::notify_channel`, and that type's constructor is
+        // allowlist-validated. The safety comes from the type
         sqlx::query(sqlx::AssertSqlSafe(create_function_sql(&channel)))
             .execute(&mut *tx)
             .await?;
@@ -606,12 +688,16 @@ impl Store {
         Ok(())
     }
 
-    /// 安装触发器并订阅「游标推进」通知。
+    /// Install the trigger and subscribe to "the cursor moved" notifications.
     ///
-    /// 触发器安装失败**不**中止订阅：它可能只是已被同集群的另一个实例建好，
-    /// 而即使真的没建上，返回一个永不出声的订阅也比让调用方启动失败要好 ——
-    /// `GET /sync` 轮询这条底线路径不依赖推送。失败以 `error` 级别记日志，
-    /// 因为它的后果（推送静默失效）在界面上只表现为「偶尔不刷新」。
+    /// A failure to install the trigger does **not** abort the subscription: it
+    /// may simply have been created already by another instance in the same
+    /// cluster, and even if it genuinely was not created, returning a
+    /// subscription that never speaks is better than making the caller fail to
+    /// start — the `GET /sync` polling path, our floor, does not depend on
+    /// push. Failures are logged at `error` level, because their consequence
+    /// (push silently stops working) shows up in the UI merely as "it sometimes
+    /// doesn't refresh".
     pub async fn listen_sync(&self) -> SyncNotifications {
         if let Err(e) = self.install_sync_notify().await {
             tracing::error!(error = %e, "安装 sync_log 通知触发器失败，实时推送可能不可用");
@@ -630,11 +716,13 @@ mod tests {
 
     #[test]
     fn ddl_and_channel_name_agree() {
-        // 通道名在 DDL 里是字面量、在 Rust 里是常量，两处必须一致，
-        // 否则触发器往一个没人听的通道发消息 —— 症状是「静默不推送」
+        // The channel name is a literal inside the DDL and a constant in Rust,
+        // and the two must agree, or the trigger sends to a channel nobody is
+        // listening on — the symptom being "silently no push"
         assert!(
             create_function_sql("cortex_sync_public").contains("'cortex_sync_public'"),
-            "DDL 里没有拼进通道名 —— 触发器会往一个没人监听的通道上发"
+            "the channel name was not spliced into the DDL -- the trigger would send on a channel \
+             nobody listens to"
         );
     }
 
@@ -643,18 +731,23 @@ mod tests {
         assert_ne!(
             DDL_LOCK_KEY,
             i64::from(crate::SYNC_ADVISORY_LOCK_KEY),
-            "复用写事务那把锁会让建 DDL 与同步取号互相阻塞"
+            "reusing the write transaction's lock would make DDL creation and sync sequence \
+             allocation block each other"
         );
     }
 
     #[test]
     fn backoff_is_bounded() {
-        // 退避无上界的话，一次长时间的数据库维护会让重连间隔涨到几小时，
-        // 数据库恢复后界面却要等很久才重新有推送
+        // With an unbounded backoff, one long database maintenance window would
+        // grow the reconnect interval to hours, and once the database is back
+        // the UI would wait a very long time before push resumed
         let mut d = RECONNECT_MIN;
         for _ in 0..20 {
             d = (d * 2).min(RECONNECT_MAX);
         }
-        assert_eq!(d, RECONNECT_MAX, "退避应收敛到上限而不是无限增长");
+        assert_eq!(
+            d, RECONNECT_MAX,
+            "the backoff should converge to the ceiling rather than growing without bound"
+        );
     }
 }

@@ -1,32 +1,36 @@
-//! Cortex 记忆引擎。
+//! The Cortex memory engine.
 //!
-//! **本项目唯一必须自己写的部分。** 供应商适配、沙箱、diff 应用都能从
-//! goose / codex 取件，唯独记忆是别人没有的东西。
+//! **The one part of this project we have to write ourselves.** Provider
+//! adapters, the sandbox, diff application — all of those can be lifted from
+//! goose / codex. Memory is the only thing nobody else already has.
 //!
-//! 四个子模块对应记忆的四个阶段：
+//! The submodules map onto the stages a memory passes through:
 //!
-//! | 模块 | 阶段 |
+//! | Module | Stage |
 //! |---|---|
-//! | [`tokenize`] | 入库：中文分词 → `tsvector`（BM25 那一路的前提） |
-//! | [`embed`]    | 入库：向量化（本地推理，记忆内容不出网） |
-//! | [`extract`]  | 入库：一轮对话 → 结构化事实 → 落库 |
-//! | [`trace`]    | 入库：一轮**工具轨迹** → 结构化事实（硬信号，不问模型） |
-//! | [`transcribe`]| 入库：媒体 → 文本（不转成文本的媒体是检索黑洞） |
-//! | [`crosslink`]| 离线：跨域 `relates_to` 边（让图遍历自己走通两个领域） |
-//! | [`fusion`]   | 检索：四路召回的 RRF 融合 |
-//! | [`injection`]| 出库：以什么形式进 prompt（决定 caching 成本结构） |
+//! | [`tokenize`] | Ingest: Chinese word segmentation → `tsvector` (the prerequisite for the BM25 channel) |
+//! | [`embed`]    | Ingest: vectorization (local inference, so memory content never leaves the machine) |
+//! | [`extract`]  | Ingest: one conversational turn → structured facts → persisted |
+//! | [`trace`]    | Ingest: one turn of **tool traces** → structured facts (hard signal, no model asked) |
+//! | [`transcribe`]| Ingest: media → text (media that never becomes text is a retrieval black hole) |
+//! | [`crosslink`]| Offline: cross-domain `relates_to` edges (so graph traversal can walk between two domains on its own) |
+//! | [`fusion`]   | Retrieval: RRF fusion over the four recall channels |
+//! | [`injection`]| Egress: what shape memory takes inside the prompt (this decides the caching cost structure) |
 
-/// 出库：以什么形式进 prompt。
+/// Egress: what shape memory takes inside the prompt.
 ///
-/// **实现已搬到 [`cortex_core::injection`]** —— 本地 agent 与 cortexd 要渲染出
-/// 逐字节相同的记忆块，而本地 agent 不该为了这 245 行把整个记忆引擎
-/// （连带 `cortex-store` → sqlx）拖进去。这里保留 re-export 让既有调用点不动。
+/// **The implementation now lives in [`cortex_core::injection`].** The local
+/// agent and cortexd must render byte-for-byte identical memory blocks, and the
+/// local agent should not have to drag the whole memory engine (and with it
+/// `cortex-store` → sqlx) in just for those 245 lines. The re-export is kept
+/// here so existing call sites don't have to move.
 pub use cortex_core::injection;
 
 pub mod crosslink;
 pub mod embed;
 pub mod embed_api;
-/// 进程内 ONNX 推理后端。**默认不编** —— 见 [`embed_api`] 的模块注释。
+/// In-process ONNX inference backend. **Not built by default** — see the
+/// module docs on [`embed_api`] for why.
 #[cfg(feature = "local-embed")]
 pub mod embed_local;
 pub mod extract;

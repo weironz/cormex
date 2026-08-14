@@ -1,8 +1,9 @@
-//! 抽取管线集成测试的脚手架。
+//! Scaffolding for the extraction pipeline's integration tests.
 //!
-//! 与 `cortex-store/tests/common` 同款：每个测试跑在自己的临时 schema 里，
-//! 拿不到数据库时返回 `None`（测试 skip 而非 fail —— CI 有 Postgres，
-//! 开发机上可能没起 `docker compose`）。
+//! Same shape as `cortex-store/tests/common`: every test runs in its own
+//! temporary schema, and returns `None` when the database is unreachable (the
+//! test skips rather than fails — CI has Postgres, a dev machine may not have
+//! `docker compose` up).
 
 #![allow(dead_code)]
 
@@ -43,7 +44,8 @@ impl TestDb {
     }
 }
 
-/// 建一个隔离的测试库。拿不到数据库返回 `None`。
+/// Builds an isolated test database. Returns `None` when the database is
+/// unreachable.
 pub async fn setup() -> Option<TestDb> {
     let url = database_url()?;
 
@@ -65,22 +67,22 @@ pub async fn setup() -> Option<TestDb> {
         return None;
     }
 
-    // public 留在 search_path 里是为了让 vector 扩展的类型可见
+    // public stays on the search_path so the vector extension's types remain visible
     let options = PgConnectOptions::from_str(&url)
-        .expect("DATABASE_URL 应当是合法的连接串")
+        .expect("DATABASE_URL should be a valid connection string")
         .options([("search_path", format!("{schema},public"))]);
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect_with(options)
         .await
-        .expect("临时 schema 建好之后应当能连上");
+        .expect("should be able to connect once the temporary schema exists");
 
     let store = Store::from_pool(pool);
     store
         .migrate()
         .await
-        .expect("migration 应当能在临时 schema 里跑通");
+        .expect("migrations should run through inside the temporary schema");
 
     Some(TestDb {
         store,
@@ -104,7 +106,7 @@ fn unique_schema_name() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{SCHEMA_PREFIX}{millis}_{}_{n}", std::process::id())
@@ -113,7 +115,7 @@ fn unique_schema_name() -> String {
 async fn sweep_stale_schemas(admin: &PgPool) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
 
     let names: Vec<(String,)> = sqlx::query_as(
@@ -137,14 +139,16 @@ async fn sweep_stale_schemas(admin: &PgPool) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  造数据
+//  Fixtures
 // ══════════════════════════════════════════════════════════
 
-/// 造一个**不联网**的抽取器。
+/// Builds an extractor that **never touches the network**.
 ///
-/// `LlmClient::from_config` 只是装配 goose Provider，不会发请求，所以拿一个
-/// 假密钥就能构造。只要不调 `extract()`（走 `write_candidates` 直接喂候选），
-/// 整条确定性链路就能脱离模型测试 —— 这正是把抽取与落库拆成两个方法的原因。
+/// `LlmClient::from_config` only assembles the goose Provider; it sends no
+/// request, so a fake key is enough to construct one. As long as `extract()`
+/// is never called (candidates are fed in directly through `write_candidates`),
+/// the entire deterministic chain can be tested without a model — which is
+/// exactly why extraction and persistence were split into two methods.
 pub fn offline_extractor() -> Extractor {
     let cfg = LlmConfig {
         provider: "deepseek".to_string(),
@@ -152,14 +156,17 @@ pub fn offline_extractor() -> Extractor {
         cheap_model: "deepseek-v4-flash".to_string(),
         base_url: None,
     };
-    let llm = LlmClient::from_config(&cfg, "not-a-real-key").expect("应能离线构造");
+    let llm = LlmClient::from_config(&cfg, "not-a-real-key").expect("should construct offline");
     Extractor::new(llm, Arc::new(HashEmbedder::new()), DEVICE)
-        // HashEmbedder 是字符 bigram 散列，不是语义模型，别名之间的余弦
-        // 天然低于真实的 bge-m3。显式调低阈值，让测试测的是消解逻辑本身。
+        // HashEmbedder is a character-bigram hash, not a semantic model, so the
+        // cosine between two aliases is naturally lower than a real bge-m3 would
+        // give. Lower the threshold explicitly, so what the test measures is the
+        // resolution logic itself.
         .with_entity_match_threshold(0.75)
 }
 
-/// 落一条 episode 并返回它的 id。事实的 `source_episode_id` 是 NOT NULL 的。
+/// Persists one episode and returns its id. A fact's `source_episode_id` is
+/// NOT NULL.
 pub async fn seed_episode(store: &Store, text: &str) -> Id {
     let id = Id::new();
     let episode = NewEpisode {
@@ -176,15 +183,17 @@ pub async fn seed_episode(store: &Store, text: &str) -> Id {
     store
         .write_txn(async |tx| tx.insert_episode(&episode).await)
         .await
-        .expect("episode 应能落库");
+        .expect("the episode should be persisted");
     id
 }
 
-/// 落一条 episode 并把 `(name, path, ok, summary)` 挂成工具轨迹。
+/// Persists one episode and hangs `(name, path, ok, summary)` off it as a tool
+/// trace.
 ///
-/// 与生产的 `live.rs`、评测的 harness 一致：轨迹与 episode **同一个
-/// `write_txn`**。拆成两个事务会造出「episode 已提交、轨迹还没提交」这个
-/// 中间态，而抽取器正是在 episode 提交之后被触发的。
+/// Same as production's `live.rs` and the eval harness: the trace and the
+/// episode share **one `write_txn`**. Splitting them into two transactions
+/// would create the intermediate state "episode committed, trace not yet" —
+/// and the extractor is triggered precisely after the episode commits.
 pub async fn seed_episode_with_tools(
     store: &Store,
     text: &str,
@@ -208,7 +217,7 @@ pub async fn seed_episode_with_tools(
         .map(|(i, (name, path, ok, summary))| NewEpisodeToolCall {
             id: Id::new(),
             episode_id: id,
-            ordinal: i32::try_from(i).expect("测试里的调用数不会溢出"),
+            ordinal: i32::try_from(i).expect("a test's call count will not overflow"),
             name: (*name).to_owned(),
             path: path.map(str::to_owned),
             summary: (*summary).to_owned(),
@@ -227,7 +236,7 @@ pub async fn seed_episode_with_tools(
             Ok(())
         })
         .await
-        .expect("episode 与工具轨迹应能同事务落库");
+        .expect("episode and tool trace should be persisted in one transaction");
     id
 }
 
@@ -238,10 +247,10 @@ pub fn ctx(episode_id: Id, occurred_at: DateTime<Utc>) -> ExtractContext {
 pub fn ts(y: i32, m: u32, d: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(y, m, d, 0, 0, 0)
         .single()
-        .expect("测试用的日期应当合法")
+        .expect("the dates used in tests should be valid")
 }
 
-/// 字面量宾语的候选事实。
+/// A candidate fact whose object is a literal.
 pub fn candidate(
     subject: &str,
     kind: &str,

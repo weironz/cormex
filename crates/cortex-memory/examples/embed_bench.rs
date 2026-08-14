@@ -1,36 +1,43 @@
-//! 实测 embedding 的加载耗时、单条延迟与语义区分度。
+//! Measures embedding load time, single-item latency and semantic
+//! discrimination for real.
 //!
-//! 部署文档需要这几个数字（architecture.md 的「最低推荐配置」那一节），
-//! 而它们高度依赖机器，只能实测：
+//! The deployment docs need these numbers (the "minimum recommended
+//! configuration" section of architecture.md), and they depend heavily on the
+//! machine, so they can only be measured:
 //!
 //! ```bash
 //! cargo run -p cortex-memory --example embed_bench --release
 //! ```
 //!
-//! 必须用 `--release`：debug 下 ONNX Runtime 周边的 ndarray 拷贝没有内联，
-//! 测出来的延迟会高一个数量级，写进部署文档就是误导。
+//! `--release` is mandatory: in debug the ndarray copies around ONNX Runtime
+//! are not inlined, the latency comes out an order of magnitude higher, and
+//! writing that into the deployment docs is simply misleading.
 //!
-//! # 一次实测（Windows 11 / x86_64 桌面 CPU / bge-m3 int8 / release）
+//! # One measured run (Windows 11 / x86_64 desktop CPU / bge-m3 int8 / release)
 //!
 //! ```text
-//! 首次下载        约 590 MB，3–4 分钟（带宽相关，只发生一次）
-//! 加载（缓存已热） 1.61 s
-//! 单条 embed      中位 14.7 ms   p95 16.3 ms
-//! 批量 64 条      363 ms → 每条 5.7 ms
+//! first download        ~590 MB, 3–4 minutes (bandwidth-dependent, happens once)
+//! load (cache warm)     1.61 s
+//! single embed          median 14.7 ms   p95 16.3 ms
+//! batch of 64           363 ms → 5.7 ms each
 //! ```
 //!
-//! 批量把每条摊薄到 1/2.6 —— 这就是「交互 batch=1、回填大 batch」
-//! 值得分成两条路的量化依据。
+//! Batching thins the per-item cost to 1/2.6 — this is the quantitative basis
+//! for why "interactive batch=1, backfill large batch" is worth splitting into
+//! two paths.
 //!
-//! architecture.md 给低配 VPS（2 vCPU）估的是单条约 700 ms；
-//! 上面是桌面 CPU 的数字，两者相差约 50 倍，**部署文档不能混用**。
+//! architecture.md estimates about 700 ms per item for a low-spec VPS
+//! (2 vCPU); the numbers above are from a desktop CPU, the two differ by about
+//! 50×, and **the deployment docs must not mix them**.
 //!
-//! # 一个 Windows 上的坑
+//! # One trap on Windows
 //!
-//! `hf-hub` 0.5 下载完会 `assert!(pointer_path.exists())`，而它在 Windows 上
-//! 先试符号链接、失败才回退到 rename。未开开发者模式时这个断言会 panic
-//! （表现为「加载模型的阻塞任务 panic」），但**文件其实已经下载完整**，
-//! 再跑一次即可通过。不是本 crate 的缺陷，记在这里免得重复排查。
+//! `hf-hub` 0.5 runs `assert!(pointer_path.exists())` after downloading, and
+//! on Windows it tries a symlink first and only falls back to rename on
+//! failure. Without developer mode enabled that assertion panics (presenting
+//! as "加载模型的阻塞任务 panic"), but **the file has in fact downloaded
+//! completely**, and running it once more passes. Not a defect of this crate;
+//! recorded here so nobody diagnoses it twice.
 
 use std::time::Instant;
 
@@ -54,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
     let fast = FastEmbedder::new(cfg).await?;
     println!("加载耗时：{:?}（含首次下载则远不止）", t0.elapsed());
 
-    // 预热：第一次推理要分配 ONNX 的内部 arena，算进延迟统计会虚高
+    // Warm-up: the first inference has to allocate ONNX's internal arena, and
+    // counting it into the latency statistics inflates them
     let _ = fast.embed_one("预热").await?;
 
     let probe = "对象存储用 RustFS";

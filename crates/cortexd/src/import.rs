@@ -1,23 +1,28 @@
-//! Web 端的导入：**先把文件传上来**，再解析。
+//! Import from the web client: **upload the file first**, then parse it.
 //!
-//! 桌面端不走这条路 —— 它的文件在本机，由本地 agent 直接读
-//! （见 `cortex_local::local_import`）。浏览器读不到磁盘，所以只剩上传。
+//! The desktop client does not take this path — its file is on the local
+//! machine and the local agent reads it directly (see
+//! `cortex_local::local_import`). A browser cannot read the disk, so uploading is
+//! all that is left.
 //!
-//! 两条路解析用的是**同一份** [`cortex_import`]，回的是同一批线上类型
-//! （[`cortex_proto::import`]），所以客户端那张导入页只有一份。
+//! Both paths parse with **the same** [`cortex_import`] and return the same wire
+//! types ([`cortex_proto::import`]), so there is only one import page on the
+//! client.
 //!
-//! # 为什么落盘而不是留在内存
+//! # Why it is spooled to disk rather than held in memory
 //!
-//! 一份真的 Claude 导出是 97 MB。`serde_json::Value` 解析它会膨胀到
-//! 几百 MB，而生产那台是 **2 核 3.5 GB、已经跑着 19 个容器**。
-//! 上传直接流进临时文件，解析时才读 —— 内存里最多同时存在一份解析结果，
-//! 而不是「上传缓冲 + 解析结果」两份。
+//! A real Claude export is 97 MB. Parsing it into `serde_json::Value` balloons
+//! to several hundred MB, and the production machine is **2 cores, 3.5 GB, with
+//! 19 containers already running**. The upload streams straight into a temporary
+//! file and is only read at parse time — so memory holds at most one parsed
+//! result, rather than both an upload buffer and a parsed result.
 //!
-//! # 临时文件必须自己清理
+//! # The temporary files have to clean themselves up
 //!
-//! 用户传完 97 MB 之后可能就关掉页面了。没有清理的话，那台机器的磁盘
-//! 会被一堆没人认领的导出文件慢慢填满 —— 而磁盘满的表现是**数据库写不进去**，
-//! 一个与导入八竿子打不着的故障。
+//! A user may well close the page right after uploading 97 MB. Without cleanup,
+//! that machine's disk slowly fills with unclaimed export files — and a full
+//! disk manifests as **the database being unable to write**, a failure with no
+//! apparent connection to imports whatsoever.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -37,32 +42,36 @@ use tokio::sync::mpsc;
 use crate::routes::ApiError;
 use crate::state::AppState;
 
-/// 单份上传的上限。
+/// Ceiling for a single upload.
 ///
-/// 比真实导出（97 MB）留了一倍余量。设上限的理由不是省磁盘，而是
-/// **没有上限就没有背压** —— 一个连接能一直写下去，直到磁盘满。
+/// Twice the headroom over a real export (97 MB). The reason for having a
+/// ceiling is not saving disk, it is that **without one there is no
+/// backpressure** — a connection can keep writing until the disk is full.
 const MAX_UPLOAD: u64 = 256 * 1024 * 1024;
 
-/// 上传的文件多久没人认领就清掉。
+/// How long an unclaimed uploaded file survives before it is swept away.
 ///
-/// 一小时足够「传完 → 看账 → 想一想 → 点开始」，又不至于让废弃的
-/// 97 MB 在磁盘上留一整天。这个数会原样告诉客户端（[`UploadAck::expires_in_secs`]），
-/// 好让界面能提前说清楚。
+/// One hour is enough for "upload → look at the estimate → think about it →
+/// click start", without leaving an abandoned 97 MB on disk for an entire day.
+/// This number is reported to the client verbatim
+/// ([`UploadAck::expires_in_secs`]), so the UI can say so up front.
 const TTL: Duration = Duration::from_secs(3600);
 
-/// 临时文件放哪。
+/// Where the temporary files go.
 ///
-/// 放系统临时目录下的一个专属子目录，而不是直接摊在 `/tmp` 里：
-/// 清理时要能只扫自己的东西，`remove_dir_all` 一个共享目录是灾难。
+/// Into a dedicated subdirectory of the system temp directory rather than
+/// strewn across `/tmp` directly: cleanup has to be able to scan only our own
+/// files, and `remove_dir_all` on a shared directory is a catastrophe.
 fn spool_dir() -> PathBuf {
     std::env::temp_dir().join("cortex-import-spool")
 }
 
-/// 句柄 → 文件路径。
+/// Handle → file path.
 ///
-/// **句柄必须当成不可信输入**：它从客户端来，而它会被拼进路径。
-/// 只认 ULID 的字母表，于是 `..`、`/`、`\` 全都进不来 ——
-/// 路径穿越在这里的后果是「解析服务器上任意一个文件」。
+/// **The handle must be treated as untrusted input**: it comes from the client
+/// and it gets joined into a path. Only the ULID alphabet is accepted, so `..`,
+/// `/` and `\` cannot get through — the consequence of path traversal here is
+/// "parse any file at all on the server".
 fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
     let ok = handle.len() == 26
         && handle
@@ -74,17 +83,19 @@ fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
     Ok(spool_dir().join(handle))
 }
 
-/// `POST /import/upload` —— 流式落盘。
+/// `POST /import/upload` — stream straight to disk.
 ///
 /// # Errors
-/// 建不了目录、写不了盘，或者超过 [`MAX_UPLOAD`]。
+/// The directory could not be created, the disk could not be written, or the
+/// upload exceeded [`MAX_UPLOAD`].
 pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<UploadAck>, ApiError> {
     let dir = spool_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| ApiError::internal(format!("建不了上传暂存目录：{e}")))?;
-    // 顺手清一次。挂定时器要多一个后台任务与它的失败路径，而这条路
-    // 本来就是「有人来传文件」时才走 —— 用不上的时候不需要清
+    // Sweep while we are here. A timer would mean one more background task plus
+    // its failure path, whereas this code path only runs when somebody is
+    // actually uploading a file — when nobody is, there is nothing to sweep
     sweep(&dir).await;
 
     let handle = cortex_core::Id::new().to_string();
@@ -99,8 +110,9 @@ pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<Upload
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                // 半截文件留着只会被当成合法输入解析，然后报一个
-                // 莫名其妙的 JSON 错误。删掉，让失败停在这里
+                // A half-written file left behind would just be parsed as
+                // legitimate input and produce a baffling JSON error. Delete
+                // it, so the failure stops here
                 let _ = tokio::fs::remove_file(&path).await;
                 return Err(ApiError::bad_request(format!("上传中断：{e}")));
             }
@@ -130,7 +142,7 @@ pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<Upload
     }))
 }
 
-/// 清掉过了 TTL 的暂存文件。
+/// Sweep away spooled files that have outlived the TTL.
 async fn sweep(dir: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
@@ -150,7 +162,7 @@ async fn sweep(dir: &Path) {
     }
 }
 
-/// 把请求解析成 `Plan`。**什么都不写。**
+/// Turn the request into a `Plan`. **Writes nothing.**
 async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
     let handle = req
         .handle
@@ -161,7 +173,8 @@ async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
         })?;
     let path = path_of(handle)?;
     let bytes = tokio::fs::read(&path).await.map_err(|_| {
-        // 不回显路径：那是服务器的文件系统布局。而且最可能的原因就一个
+        // Do not echo the path back: that is the server's filesystem layout.
+        // And there is really only one likely cause
         ApiError::bad_request("这个上传句柄已经失效了（超过一小时会被清理），请重新上传")
     })?;
 
@@ -184,16 +197,19 @@ async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
         ),
     };
 
-    // anyhow 的链要**整条**带上：最常见的失败是「结构认不出来」，
-    // 而那条错误里带着实际见到的键 —— 只报最外层就把线索扔了
+    // Carry **the whole** anyhow chain through: the most common failure is
+    // "the structure was not recognised", and that error carries the keys
+    // actually encountered — reporting only the outermost layer throws the clue
+    // away
     cortex_import::plan_from_bytes(&bytes, platform, since, req.max_conversations)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))
 }
 
-/// `POST /import/preview` —— 只读。
+/// `POST /import/preview` — read-only.
 ///
 /// # Errors
-/// 句柄失效、筛选条件不合法，或者文件结构认不出来。
+/// The handle has expired, a filter is invalid, or the file structure was not
+/// recognised.
 pub async fn preview(
     State(_): State<AppState>,
     Json(req): Json<ImportRequest>,
@@ -202,7 +218,7 @@ pub async fn preview(
     Ok(Json(plan.estimate().to_wire(plan.platform)).into_response())
 }
 
-/// `POST /import/run` —— SSE。
+/// `POST /import/run` — SSE。
 pub async fn run(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -211,8 +227,9 @@ pub async fn run(
     let (tx, rx) = mpsc::channel::<ImportEvent>(64);
 
     tokio::spawn(async move {
-        // 租户在**动工之前**解析。解析不出来就一条都不写 ——
-        // 写了一半才发现不知道该写给谁，是没法回滚的
+        // The tenant is resolved **before any work starts**. If it cannot be
+        // resolved, not a single row is written — discovering halfway through
+        // that we do not know whose data this is cannot be rolled back
         let tenant = match st.tenant(&headers).await {
             Ok(t) => t,
             Err(e) => {
@@ -243,8 +260,9 @@ pub async fn run(
 
         let sink = LocalSink(st, tenant);
         let progress_tx = tx.clone();
-        // 进度可丢：满了就跳过这一条，丢一条只是进度条跳一下，
-        // 而阻塞在这里会让导入本身停下来等客户端
+        // Progress events are droppable: when the channel is full, skip this
+        // one. Dropping one only makes the progress bar jump, whereas blocking
+        // here would stop the import itself to wait for the client
         let outcome = cortex_import::execute(&sink, &plan, move |p| {
             let _ = progress_tx.try_send(ImportEvent::Progress {
                 conversations_done: p.conversations_done,
@@ -279,15 +297,19 @@ pub async fn run(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-/// 走 cortexd **自己**的写入路径 —— 不绕一圈回到自己的 HTTP 面。
+/// Uses cortexd's **own** write path — it does not loop back around through its
+/// own HTTP surface.
 ///
-/// 这一点与另外两处不同：CLI 与本地 agent 都是通过网络打 `POST /episodes`，
-/// 而这里已经在服务端进程里了。再打一次自己的 HTTP 只会白白多一次
-/// 序列化 + 认证 + TCP 往返，而且那条路上的失败模式（连接池耗尽）
-/// 与导入毫无关系。
-/// 带着租户 —— 导入是**某个人**的导入。
+/// This differs from the other two callers: both the CLI and the local agent
+/// reach `POST /episodes` over the network, whereas this code is already inside
+/// the server process. Calling our own HTTP again would buy nothing but an extra
+/// serialization + authentication + TCP round trip, and the failure modes on
+/// that path (connection pool exhaustion) have nothing to do with importing.
 ///
-/// 少了它，一个人上传的三年历史会落进另一个人的库，而全过程没有任何报错。
+/// It carries the tenant — an import belongs to **a particular person**.
+///
+/// Without it, one person's uploaded three-year history lands in someone else's
+/// database, and nothing reports an error at any point.
 struct LocalSink(AppState, crate::request_tenant::Tenant);
 
 impl cortex_import::Sink for LocalSink {
@@ -296,13 +318,15 @@ impl cortex_import::Sink for LocalSink {
         req: &cortex_proto::episodes::NewEpisodeRequest,
     ) -> anyhow::Result<cortex_proto::episodes::EpisodeAck> {
         self.0
-            // 导入不是沙箱写的：这条路上的字节来自用户上传的导出文件，
-            // 由 cortexd 自己解析，中间没有容器
+            // An import is not written by a sandbox: the bytes on this path come
+            // from an export file the user uploaded, parsed by cortexd itself,
+            // with no container in between
             .write_episode(
                 &self.1,
                 req.clone(),
-                // 导入的是**用户自己**的历史对话（ChatGPT / Claude 导出包），
-                // 与他在我们这儿说的话同一档
+                // What is being imported is the user's **own** conversation
+                // history (a ChatGPT / Claude export), which belongs in the same
+                // tier as the things they say to us directly
                 cortex_memory::extract::TurnOrigin::Trusted,
             )
             .await
@@ -314,10 +338,13 @@ impl cortex_import::Sink for LocalSink {
             .patch_session(
                 &self.1,
                 session_id,
-                // `..Default::default()` 而不是逐个填 None：这里只想改标题，
-                // 而 SessionPatch 每加一个维度（工作区、项目……）都会让
-                // 「全列一遍」的写法编译不过，然后有人顺手填一个 None ——
-                // 那正好是「不动它」的意思，但那是巧合，不是它该被写下来的理由
+                // `..Default::default()` rather than spelling out each None:
+                // all we want here is to change the title, and every new
+                // dimension added to SessionPatch (workspace, project, ...)
+                // would break a "list them all" spelling, at which point
+                // somebody fills in a None by reflex — which happens to mean
+                // "leave it alone", but that is a coincidence, not a reason to
+                // write it down
                 cortex_proto::dto::SessionPatch {
                     title: Some(title.to_string()),
                     ..Default::default()
@@ -333,10 +360,11 @@ impl cortex_import::Sink for LocalSink {
 mod tests {
     use super::*;
 
-    /// **句柄是不可信输入，而它会被拼进路径。**
+    /// **The handle is untrusted input, and it gets joined into a path.**
     ///
-    /// 放行 `..` 的后果是「解析服务器上任意一个文件」，而报错信息里
-    /// 带着解析失败时看到的键 —— 那是个可以拿来探测文件内容的口子。
+    /// Letting `..` through means "parse any file at all on the server", and the
+    /// error message carries the keys seen while parsing failed — which is a
+    /// hole usable for probing the contents of those files.
     #[test]
     fn a_handle_can_never_escape_the_spool_directory() {
         for bad in [
@@ -345,23 +373,23 @@ mod tests {
             "a/b",
             "a\\b",
             "",
-            "0123456789012345678901234",    // 25 位，短一位
-            "0123456789012345678901234567", // 28 位
-            "0123456789ABCDEFGHIJKLMNOI",   // 含 I，不在 ULID 字母表里
-            "0123456789abcdefghjkmnpqrs",   // 小写
+            "0123456789012345678901234",    // 25 chars, one short
+            "0123456789012345678901234567", // 28 chars
+            "0123456789ABCDEFGHIJKLMNOI",   // contains I, not in the ULID alphabet
+            "0123456789abcdefghjkmnpqrs",   // lowercase
         ] {
             assert!(
                 path_of(bad).is_err(),
-                "这个句柄必须被拒：{bad:?} —— 它会被拼进路径"
+                "this handle must be rejected: {bad:?} —— it gets joined into a path"
             );
         }
 
         let good = cortex_core::Id::new().to_string();
-        let p = path_of(&good).expect("真的 ULID 要能通过");
+        let p = path_of(&good).expect("a genuine ULID must be accepted");
         assert_eq!(
             p.parent(),
             Some(spool_dir().as_path()),
-            "解出来的路径必须还在暂存目录里"
+            "the resolved path must still be inside the spool directory"
         );
     }
 }

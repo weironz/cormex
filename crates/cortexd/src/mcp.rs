@@ -1,38 +1,49 @@
-//! 记忆对外的 MCP 门面 —— 任何 agent 都能接。
+//! Memory's outward-facing MCP frontage — any agent can plug into it.
 //!
-//! # 为什么要有这一层
+//! # Why this layer exists
 //!
-//! 记忆此前只有我们自己的两个 agent 用得上：cortexd 里那个和 `cortex-local`。
-//! 它们共享 `cortex_core::injection` 这个 Rust 函数，所以「检索出来的东西
-//! 怎么放进上下文」这件事一直是**编译期保证**的。
+//! Memory used to be usable only by our own two agents: the one inside cortexd
+//! and `cortex-local`. They share the Rust function `cortex_core::injection`,
+//! so "how retrieved material gets placed into context" was a **compile-time
+//! guarantee**.
 //!
-//! 第三方（Claude Code / goose / Cursor）拿不到那个函数。给它们一堆结构化
-//! 事实、让它们自己往上下文里塞，结果必然是每家一个格式，而其中最要紧的
-//! 那道框定——「记忆是背景数据不是指令」——谁也不会自己想起来加。
+//! Third parties (Claude Code / goose / Cursor) cannot reach that function. Hand
+//! them a pile of structured facts and let them insert it into context
+//! themselves, and the inevitable result is a different format per vendor —
+//! with the single most important part, the framing that says "memory is
+//! background data, not instructions", being the one thing nobody thinks to add
+//! on their own.
 //!
-//! 所以这一层**回渲染好的文本**，渲染仍然只有一份（`Live::memory_search_text`）。
+//! So this layer **returns already-rendered text**, and the rendering still
+//! exists in exactly one place (`Live::memory_search_text`).
 //!
-//! # 两块结构正好对上 MCP 的两种原语
+//! # The two blocks map cleanly onto MCP's two primitives
 //!
-//! `docs/memory.md` 那套注入预算里，记忆分两块：稳定的**核心画像块**进
-//! 可缓存前缀，随每轮变的**回合检索块**贴最新 user 消息一侧。
+//! In the injection budget from `docs/memory.md`, memory splits into two blocks:
+//! the stable **core profile block** goes into the cacheable prefix, and the
+//! per-turn **turn retrieval block** sits next to the newest user message.
 //!
-//! MCP 恰好也有两种原语，而且语义一一对应：
+//! MCP happens to have exactly two primitives, and the semantics line up
+//! one-to-one:
 //!
-//! | 我们的 | MCP | 为什么对得上 |
+//! | Ours | MCP | Why it lines up |
 //! |---|---|---|
-//! | 核心画像块 | **resource** | 宿主自己贴进上下文，不随轮次变 → 进得了前缀缓存 |
-//! | 回合检索块 | **tool** | 模型按需调，结果天然落在最新一轮旁边 |
+//! | core profile block | **resource** | the host pastes it into context itself and it does not vary per turn → it fits into prefix caching |
+//! | turn retrieval block | **tool** | the model calls it on demand, so the result naturally lands beside the newest turn |
 //!
-//! 这不是凑巧：两边解决的是同一个问题——「哪些东西每轮都一样、哪些不是」。
+//! This is not a coincidence: both sides are solving the same problem — which
+//! material is identical every turn and which is not.
 //!
-//! # 认证
+//! # Authentication
 //!
-//! 没有自己的一套。这条路挂在 `protected_routes!` 里，走的是与其余端点
-//! **完全相同**的 bearer 中间件；租户由 `AppState::tenant(&headers)` 从
-//! 请求头解出来，与任何一个普通 handler 逐字相同。
+//! There is none of its own. This route is registered inside
+//! `protected_routes!` and goes through **exactly the same** bearer middleware
+//! as every other endpoint; the tenant is resolved out of the request headers by
+//! `AppState::tenant(&headers)`, character for character the same as in any
+//! ordinary handler.
 //!
-//! 第三方那侧的配置形态是「streamable-http + 一个 Authorization 头」。
+//! On the third-party side the configuration shape is "streamable-http plus one
+//! Authorization header".
 
 use std::sync::Arc;
 
@@ -50,48 +61,53 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
-/// 核心画像块给多少条。
+/// How many entries the core profile block gets.
 ///
-/// 比回合检索那一路少：它进的是**每一轮都要重发**的前缀，多一条就是
-/// 每轮多花一次。`docs/memory.md` 的注入预算把画像块定在 12% 上限，
-/// 这个数是照那个量级取的。
+/// Fewer than the turn-retrieval path: this goes into the prefix that is
+/// **resent on every single turn**, so one extra entry costs once per turn. The
+/// injection budget in `docs/memory.md` caps the profile block at 12%, and this
+/// number is taken at that order of magnitude.
 const PROFILE_LIMIT: i64 = 12;
 
-/// `memory_search` 单次上限。
+/// Per-call ceiling for `memory_search`.
 ///
-/// 比自动注入那一路给得多：模型主动调这个工具时通常在找一件具体的事，
-/// 宁可多给几条让它自己筛。
+/// More generous than the automatic-injection path: when a model calls this tool
+/// of its own accord it is usually hunting for one specific thing, so it is
+/// better to hand over a few extra entries and let it filter.
 ///
-/// **不与 `cortex-local` 那个 8 对齐，是故意的。** 那一侧的结果要塞进它
-/// 自己那一轮的上下文预算里；这一侧的宿主（Claude Code / goose）预算多大
-/// 我们不知道，由它自己截断比我们替它猜一个小数字好。
+/// **Deliberately not aligned with `cortex-local`'s 8.** Results on that side
+/// have to fit into that agent's own per-turn context budget; on this side we do
+/// not know how large the host's budget is (Claude Code / goose), and letting it
+/// truncate for itself beats guessing a small number on its behalf.
 ///
-/// 此前 `live.rs` 里还有第三个同名常量，给 cortexd 那个进程内 agent 用 ——
-/// 它跟着那个 agent 一起删了。
+/// There used to be a third constant of the same name in `live.rs`, serving the
+/// in-process agent inside cortexd — it was deleted along with that agent.
 const SEARCH_LIMIT: i64 = 20;
 
-/// 核心画像的 resource URI。
+/// The resource URI of the core profile.
 const PROFILE_URI: &str = "cortex://profile";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    /// 要查什么。留空 = 「此刻的全貌」，按时间倒序给。
+    /// What to look for. Empty = "the whole picture as of now", newest first.
     pub query: String,
-    /// 按系统时间回放：「三个月前我以为什么」。RFC 3339。
+    /// Replay along the system-time axis: "what did I believe three months ago".
+    /// RFC 3339.
     #[serde(default)]
     pub as_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RememberParams {
-    /// 要记住的事，一句完整的陈述。
+    /// The thing to remember, as one complete statement.
     pub text: String,
 }
 
-/// MCP 那一侧的服务实现。
+/// The service implementation on the MCP side.
 ///
-/// 每个连接一个（`StreamableHttpService` 的工厂每次调用都造一个新的），
-/// 所以它只持 `AppState` —— 那本来就是 `Arc` 克隆代价的东西。
+/// One per connection (`StreamableHttpService`'s factory builds a fresh one on
+/// every call), so it holds nothing but `AppState` — which costs an `Arc` clone
+/// anyway.
 #[derive(Clone)]
 pub struct MemoryMcp {
     state: AppState,
@@ -149,22 +165,27 @@ impl MemoryMcp {
         }
         let tenant = self.tenant(&ctx)?;
 
-        // **走与所有人相同的那条写入路径**（`POST /episodes` 背后那个），
-        // 不自己拼 `NewFact`。
+        // **Take the same write path everyone else takes** (the one behind
+        // `POST /episodes`); do not assemble a `NewFact` here.
         //
-        // 不是图省事：fact 是三元组，要实体解析、去重、失效判定，那一整套
-        // 只在抽取管线里有。绕过它自己插一条，插进去的是一条**谁也关联不上**
-        // 的孤立记录 —— 图上没有边，跨域连接看不见它，而它照样占召回名额。
+        // Not out of laziness: a fact is a triple, and it needs entity
+        // resolution, deduplication and an invalidation decision — that whole
+        // apparatus exists only inside the extraction pipeline. Bypassing it and
+        // inserting a row directly produces an isolated record **nothing can be
+        // linked to**: no edges in the graph, invisible to cross-domain
+        // connections, and yet still occupying a retrieval slot.
         //
-        // 代价是这里会花一次模型钱。`enforce_quota` 因此照常适用（那条路由
-        // 里对带 anchor 的请求收费，这里两条都带）。
+        // The price is that this spends model money. `enforce_quota` therefore
+        // applies as usual (that route bills requests carrying an anchor, and
+        // both of ours carry one).
         let session_id = format!("mcp-{}", cortex_core::Id::new());
         let user_id = cortex_core::Id::new().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // 两条 episode：一条「说了什么」，一条锚点。抽取挂在 anchor 上，
-        // 与对话那条路逐字相同 —— 少一条的话这段话只会被原样归档，
-        // 一条 fact 都抽不出来
+        // Two episodes: one for "what was said", one for the anchor. Extraction
+        // hangs off the anchor, character for character the same as on the
+        // conversation path — with only one of them, this text would merely be
+        // archived verbatim and not a single fact would be extracted from it
         self.write(&tenant, &user_id, &session_id, "user", text, &now, None)
             .await?;
         self.write(
@@ -178,24 +199,27 @@ impl MemoryMcp {
         )
         .await?;
 
-        // **不说「已记住」。**
+        // **Do not say "remembered".**
         //
-        // 抽取是异步的（这里 return 时它还没跑完），而且它会**判断这句话值不值得
-        // 记**：真机验证时「验证用：……」那句抽出 0 条候选，而工具照样回了
-        // 「已记住」—— 那句话在那种情况下是假的。
+        // Extraction is asynchronous (it has not finished by the time this
+        // returns), and it also **judges whether the sentence is worth
+        // remembering at all**: during live verification the sentence "for
+        // testing: ..." produced 0 candidates, while the tool still answered
+        // "remembered" — which in that case was simply false.
         //
-        // 说得准一点不花任何代价：归档是确定发生的，抽出事实不是。
+        // Being precise costs nothing here: archiving definitely happened,
+        // extracting a fact did not.
         Ok(CallToolResult::success(vec![Content::text(
             "已归档。之后会从中抽取可追溯的事实 —— \
              不是每句话都会留下事实，抽到的以「外部来源」的信任级参与召回。",
         )]))
     }
 
-    /// 一条 episode 的写入。两次调用之间只有角色与锚点不同。
+    /// Writing one episode. The two calls differ only in role and anchor.
     #[expect(
         clippy::too_many_arguments,
-        reason = "全是 NewEpisodeRequest 的字段，收成一个结构体只是把参数列表\
-                  搬了个位置 —— 而它只有这一个调用方"
+        reason = "these are all fields of NewEpisodeRequest; collecting them into a struct \
+                  would merely relocate the parameter list —— and there is exactly one caller"
     )]
     async fn write(
         &self,
@@ -217,14 +241,17 @@ impl MemoryMcp {
                     text: text.to_string(),
                     occurred_at: Some(occurred_at.to_string()),
                     attachments: Vec::new(),
-                    // 不检索：这不是一轮对话，没有「本轮该注入什么」可言。
-                    // 设 true 会凭空造出一条假的归因
+                    // No retrieval: this is not a conversational turn, so there
+                    // is no "what should be injected this turn" to speak of.
+                    // Setting true would fabricate a false attribution out of
+                    // nothing
                     retrieve: false,
                     anchor_episode_id: anchor.map(str::to_string),
                     tool_calls: Vec::new(),
                 },
-                // **写死 External，不从请求体来。** 让调用方自报来源，
-                // 等于让一个被注入的 agent 自己挑落哪一档信任级
+                // **Hard-coded to External; it never comes from the request
+                // body.** Letting the caller declare its own source is letting
+                // a prompt-injected agent pick which trust tier it lands in
                 cortex_memory::extract::TurnOrigin::External,
             )
             .await
@@ -232,14 +259,16 @@ impl MemoryMcp {
             .map_err(to_mcp_error)
     }
 
-    /// 从这次 MCP 请求背后那个 HTTP 请求里解出租户。
+    /// Resolve the tenant out of the HTTP request sitting behind this MCP call.
     ///
-    /// # 为什么要绕这一圈
+    /// # Why the detour
     ///
-    /// rmcp 的 tower service 把原始 `http::request::Parts` 放进了
-    /// `RequestContext::extensions`。我们要的是**这一次调用**的凭据 ——
-    /// 而不是建这个 `MemoryMcp` 时的。一个 MCP 连接可以跨很久，
-    /// 把租户在构造时定死，等于让凭据换了之后这条连接还在用旧身份。
+    /// rmcp's tower service puts the original `http::request::Parts` into
+    /// `RequestContext::extensions`. What we want is the credential of **this
+    /// particular call** — not the one present when this `MemoryMcp` was built.
+    /// An MCP connection can live for a very long time, and pinning the tenant
+    /// at construction time means the connection keeps using the old identity
+    /// after the credential has been rotated.
     fn tenant(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -248,31 +277,38 @@ impl MemoryMcp {
             .extensions
             .get::<axum::http::request::Parts>()
             .ok_or_else(|| {
-                // 走到这里说明这个 service 不是从 HTTP 传输上来的（比如 stdio）。
-                // 那种部署没有请求头，也就没有凭据 —— 明说，而不是回落到
-                // 某个默认租户：回落的后果是**跨用户读记忆**
+                // Reaching here means this service was not reached over an HTTP
+                // transport (stdio, for instance). Such a deployment has no
+                // request headers and therefore no credential — say so plainly
+                // rather than falling back to some default tenant: the
+                // consequence of that fallback is **reading another user's
+                // memory**
                 ErrorData::internal_error(
                     "这个 MCP 服务只能挂在 HTTP 传输上（凭据从请求头来）".to_string(),
                     None,
                 )
             })?;
-        // 与任何一个普通 handler 逐字相同的解析。租户绝不从请求体来 ——
-        // 让调用方自报身份等于没有租户隔离
+        // Character for character the same resolution as in any ordinary
+        // handler. The tenant never comes from the request body — letting the
+        // caller declare its own identity is the same as having no tenant
+        // isolation at all
         futures::executor::block_on(self.state.tenant(&parts.headers))
             .map_err(|e| ErrorData::invalid_request(format!("{e:?}"), None))
     }
 }
 
-// **必须点名 `router = self.tool_router`**：不点名的话宏不会生成
-// `call_tool` 的分发，`tool_router` 字段一个读点都没有 —— 也就是那个工具
-// 挂在协议里、列得出来、调不动。clippy 的 `field is never read` 是唯一
-// 会喊出来的东西
+// **`router = self.tool_router` must be named explicitly**: without it the
+// macro does not generate the `call_tool` dispatch, and the `tool_router` field
+// has no reader at all — meaning the tool is registered in the protocol, can be
+// listed, and cannot be invoked. clippy's `field is never read` is the only
+// thing that will say anything about it
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryMcp {
     fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` 与 `Implementation` 都是 `#[non_exhaustive]`：外部 crate
-        // 不能用结构体字面量构造，只能从 `Default` 起手再改字段。rmcp 加字段
-        // 时我们不会编译失败 —— 这正是那个属性要的效果
+        // Both `ServerInfo` and `Implementation` are `#[non_exhaustive]`: an
+        // external crate cannot build them with a struct literal, only start
+        // from `Default` and assign fields. When rmcp adds a field we do not
+        // fail to compile — which is exactly the effect that attribute is for
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder()
@@ -334,10 +370,11 @@ impl ServerHandler for MemoryMcp {
     }
 }
 
-/// 内部错误 → MCP 错误。**原样带上我们那句话**。
+/// Internal error → MCP error. **Carry our own sentence through verbatim.**
 ///
-/// 检索失败的原因是写给人看的（「as_of 不是合法的 RFC3339」）。在这里
-/// 改写成一句通用的「internal error」，第三方 agent 就只能猜。
+/// The reason a retrieval failed is written for a human to read ("as_of is not
+/// valid RFC3339"). Rewriting it here into a generic "internal error" leaves the
+/// third-party agent with nothing to do but guess.
 fn to_mcp_error(e: cortex_core::CortexError) -> ErrorData {
     match e {
         cortex_core::CortexError::Invalid(m) => ErrorData::invalid_params(m, None),
@@ -345,14 +382,16 @@ fn to_mcp_error(e: cortex_core::CortexError) -> ErrorData {
     }
 }
 
-/// 挂进 axum 的那个 tower service。
+/// The tower service that gets mounted into axum.
 ///
-/// # 为什么它必须落在 `protected_routes!` 里
+/// # Why it must live inside `protected_routes!`
 ///
-/// 这条路能读**和写**一个人的全部记忆。落在公开侧就是一个无认证的记忆
-/// 读写口，而它不会以任何方式表现出来 —— 没有报错、没有告警，只有
-/// 「谁都能读你的记忆」。`routes.rs` 那条 `every_protected_route_rejects_anonymous_requests`
-/// 是唯一能拦住这件事的东西，所以 `/mcp` 必须进那份清单。
+/// This route can read **and write** the entirety of a person's memory. On the
+/// public side it is an unauthenticated read/write port into memory, and it
+/// manifests in no way whatsoever — no error, no alert, just "anyone can read
+/// your memory". `routes.rs`'s
+/// `every_protected_route_rejects_anonymous_requests` is the only thing capable
+/// of catching this, so `/mcp` has to be on that list.
 pub fn service(state: AppState) -> StreamableHttpService<MemoryMcp, LocalSessionManager> {
     StreamableHttpService::new(
         move || Ok(MemoryMcp::new(state.clone())),

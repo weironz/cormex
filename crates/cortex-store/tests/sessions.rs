@@ -1,7 +1,8 @@
-//! 会话概览与附件批量读取。
+//! Session digests and bulk attachment reads.
 //!
-//! 这两条查询都是「从 episodes 归纳」，没有对应的实体表，所以它们的正确性
-//! 全在 SQL 里 —— 单测测不到，只能真连库。
+//! Both queries summarize from `episodes` with no corresponding entity table,
+//! so their correctness lives entirely in the SQL — a unit test cannot reach it,
+//! only a real database connection can.
 
 mod common;
 
@@ -9,7 +10,7 @@ use chrono::{Duration, Utc};
 use cortex_core::Id;
 use cortex_store::{NewBlob, NewEpisode, NewEpisodeBlob, Role, Store};
 
-/// 造一条指定角色与时间的消息。
+/// Manufacture a message with a given role and timestamp.
 fn episode(session: &str, role: Role, text: &str, minutes_ago: i64) -> NewEpisode {
     NewEpisode {
         id: Id::new(),
@@ -29,7 +30,7 @@ async fn write(store: &Store, ep: NewEpisode) -> Id {
     store
         .write_txn(async |t| t.insert_episode(&ep).await)
         .await
-        .expect("写 episode 不该失败");
+        .expect("writing the episode should not fail");
     id
 }
 
@@ -40,7 +41,8 @@ async fn digests_summarise_each_session() {
     };
     let s = &db.store;
 
-    // 老会话：两条消息，第一条是助手（标题不该取它）
+    // The old session: several messages, the first from the assistant (the
+    // title must not be taken from it)
     write(s, episode("sess-old", Role::Assistant, "开场白", 300)).await;
     write(
         s,
@@ -49,13 +51,13 @@ async fn digests_summarise_each_session() {
     .await;
     write(s, episode("sess-old", Role::User, "老会话的最后一句", 290)).await;
 
-    // 新会话：只有一条
+    // The new session: only one message
     write(s, episode("sess-new", Role::User, "新会话唯一的一句", 5)).await;
 
     let digests = s
         .session_digests(10, false, None)
         .await
-        .expect("查会话概览不该失败");
+        .expect("querying session digests should not fail");
     let outcome: Vec<_> = digests
         .iter()
         .map(|d| {
@@ -70,28 +72,38 @@ async fn digests_summarise_each_session() {
 
     db.cleanup().await;
 
-    assert_eq!(outcome.len(), 2, "应当恰好归纳出两个会话：{outcome:?}");
+    assert_eq!(
+        outcome.len(),
+        2,
+        "exactly two sessions should be summarized: {outcome:?}"
+    );
     assert_eq!(
         outcome[0].0, "sess-new",
-        "列表必须按最后活动时间倒序，最新的会话排第一：{outcome:?}"
+        "the list must be ordered by last activity descending, newest session first: {outcome:?}"
     );
-    assert_eq!(outcome[1].1, 3, "老会话应当有 3 条消息：{outcome:?}");
+    assert_eq!(
+        outcome[1].1, 3,
+        "the old session should have 3 messages: {outcome:?}"
+    );
     assert_eq!(
         outcome[1].2.as_deref(),
         Some("老会话的第一句用户消息"),
-        "标题应取首条**用户**消息，不能取助手的开场白：{outcome:?}"
+        "the title must come from the first **user** message, not the assistant's opening line: \
+         {outcome:?}"
     );
     assert_eq!(
         outcome[1].3.as_deref(),
         Some("老会话的最后一句"),
-        "预览应取最后一条有正文的消息：{outcome:?}"
+        "the preview must come from the last message that had a body: {outcome:?}"
     );
 }
 
-/// limit 必须作用在**会话**上，而不是「先取最近 N 条消息再归纳」。
+/// The limit must apply to **sessions**, not to "take the most recent N
+/// messages and then summarize".
 ///
-/// 后者是曾经的实现，缺陷不会报错：一个话痨会话就能把消息窗口占满，
-/// 于是昨天的会话从列表里消失 —— 用户看到的是「我的历史丢了」。
+/// The latter is what this used to do, and the defect raises no error: one
+/// talkative session can fill the whole message window, so yesterday's sessions
+/// disappear from the list — and what the user sees is "my history is gone".
 #[tokio::test]
 async fn a_chatty_session_cannot_crowd_out_a_quiet_one() {
     let Some(db) = common::setup().await else {
@@ -99,14 +111,14 @@ async fn a_chatty_session_cannot_crowd_out_a_quiet_one() {
     };
     let s = &db.store;
 
-    // 安静的老会话：一条消息，且是最早的
+    // The quiet old session: one message, and the earliest of all
     write(
         s,
         episode("sess-quiet", Role::User, "很久以前说过的一句话", 600),
     )
     .await;
 
-    // 话痨会话：40 条，全都比上面那条新
+    // The talkative session: 40 messages, all newer than the one above
     for i in 0..40 {
         write(
             s,
@@ -118,7 +130,7 @@ async fn a_chatty_session_cannot_crowd_out_a_quiet_one() {
     let digests = s
         .session_digests(10, false, None)
         .await
-        .expect("查会话概览不该失败");
+        .expect("querying session digests should not fail");
     let ids: Vec<String> = digests.iter().map(|d| d.session_id.clone()).collect();
     let chatty_count = digests
         .iter()
@@ -129,12 +141,18 @@ async fn a_chatty_session_cannot_crowd_out_a_quiet_one() {
 
     assert!(
         ids.contains(&"sess-quiet".to_string()),
-        "安静的老会话被话痨会话挤出了列表 —— 归纳没有下沉到 SQL：{ids:?}"
+        "the quiet old session was crowded out of the list by the talkative one -- the \
+         summarizing was not pushed down into SQL: {ids:?}"
     );
-    assert_eq!(chatty_count, Some(40), "话痨会话的消息数不对：{ids:?}");
+    assert_eq!(
+        chatty_count,
+        Some(40),
+        "the talkative session's message count is wrong: {ids:?}"
+    );
 }
 
-/// 会话详情要给每条消息挂附件，逐条查就是 N+1。
+/// Session detail has to hang attachments off every message, and querying one at
+/// a time is N+1.
 #[tokio::test]
 async fn attachments_come_back_in_one_round_trip() {
     let Some(db) = common::setup().await else {
@@ -145,7 +163,8 @@ async fn attachments_come_back_in_one_round_trip() {
     let with_image = write(s, episode("sess-media", Role::User, "看这张图", 10)).await;
     let plain = write(s, episode("sess-media", Role::Assistant, "收到", 9)).await;
 
-    // blob 行必须先于关联行 —— episode_blobs 对两侧都有外键
+    // The blob rows must precede the link rows -- episode_blobs has foreign
+    // keys onto both sides
     let hash_a = "a".repeat(64);
     let hash_b = "b".repeat(64);
     for hash in [&hash_a, &hash_b] {
@@ -157,11 +176,12 @@ async fn attachments_come_back_in_one_round_trip() {
         };
         s.write_txn(async |t| t.insert_blob(&blob).await)
             .await
-            .expect("写 blob 不该失败");
+            .expect("writing the blob should not fail");
     }
     for (hash, kind, filename) in [
         (&hash_a, "image", Some("设计稿.png")),
-        // 文件名可空：老数据没有，回填不出来
+        // The filename may be null: old data has none, and it cannot be
+        // backfilled
         (&hash_b, "document", None),
     ] {
         let link = NewEpisodeBlob {
@@ -172,48 +192,53 @@ async fn attachments_come_back_in_one_round_trip() {
         };
         s.write_txn(async |t| t.link_episode_blob(&link).await)
             .await
-            .expect("写 episode_blobs 不该失败");
+            .expect("writing episode_blobs should not fail");
     }
 
     let ids = vec![with_image.to_string(), plain.to_string()];
     let links = s
         .episode_attachments_bulk(&ids)
         .await
-        .expect("批量查附件不该失败");
+        .expect("the bulk attachment query should not fail");
     let empty = s
         .episode_attachments_bulk(&[])
         .await
-        .expect("空入参不该发查询，更不该报错");
+        .expect("empty input should issue no query, let alone raise an error");
 
     db.cleanup().await;
 
     assert_eq!(
         links.len(),
         2,
-        "两条关联都该回来，且只用一次往返：{links:?}"
+        "both links should come back, and in a single round trip: {links:?}"
     );
     assert!(
         links.iter().all(|l| l.episode_id == with_image.to_string()),
-        "另一条消息没有附件，不该混进来：{links:?}"
+        "the other message has no attachments and must not get mixed in: {links:?}"
     );
     assert_eq!(
         links.iter().filter_map(|l| l.kind.as_deref()).count(),
         2,
-        "kind 应当原样返回，它是客户端区分图片 / 文档的唯一依据：{links:?}"
+        "kind must be returned verbatim; it is the client's only basis for telling images from \
+         documents: {links:?}"
     );
-    // 这条是 R3 的要害：没有 mime / size 的话，重开会话时一个 PDF
-    // 只能显示成「文档 · a1b2c3d4」
+    // This one is the crux of R3: without mime / size, reopening a session
+    // leaves a PDF displayable only as "document · a1b2c3d4"
     assert!(
         links
             .iter()
             .all(|l| l.mime == "image/png" && l.size_bytes == 1),
-        "mime 与 size 必须从 blobs JOIN 出来随行返回：{links:?}"
+        "mime and size must be JOINed out of blobs and ride along: {links:?}"
     );
     let named: Vec<_> = links.iter().filter_map(|l| l.filename.as_deref()).collect();
     assert_eq!(
         named,
         vec!["设计稿.png"],
-        "文件名属于这一次引用，有就该原样带回、没有就是 None：{links:?}"
+        "the filename belongs to this particular reference: carry it back verbatim when present, \
+         and None when absent: {links:?}"
     );
-    assert!(empty.is_empty(), "空入参应当直接返回空");
+    assert!(
+        empty.is_empty(),
+        "empty input should return empty straight away"
+    );
 }

@@ -1,8 +1,9 @@
-//! 对仓库内自建题集本身的检查。
+//! Checks on the in-repository suite itself.
 //!
-//! 题集是评测的地基，地基坏了所有数字都是假的。这些检查**不需要数据库**，
-//! 因此可以无条件进 CI —— 它们挡住的是「题目写错了」这一类最容易发生、
-//! 又最难从报告里看出来的问题。
+//! The suite is the eval's foundation, and if the foundation is broken every
+//! number is fake. These checks **need no database** and can therefore go into
+//! CI unconditionally — what they stop is "the question is written wrong", the
+//! most likely class of problem and the hardest to spot from a report.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,15 +12,17 @@ use cortex_evals::matcher::Matcher;
 use cortex_evals::suite::{Lang, QuestionKind, Suite};
 
 fn suite_path() -> PathBuf {
-    // 测试的工作目录是 crate 目录（evals/）
+    // A test's working directory is the crate directory (evals/)
     PathBuf::from("suites/cortex-zh-en-v1.json")
 }
 
 fn load() -> Suite {
-    Suite::load(&suite_path()).expect("仓库内的题集必须能加载并通过静态校验")
+    Suite::load(&suite_path())
+        .expect("the in-repository suite must load and pass static validation")
 }
 
-/// 题集里全部铺垫事实的 statement —— gold 就是往这些串上匹配的。
+/// The statements of every seeded fact in the suite — these are the strings
+/// gold matches against.
 fn statements(suite: &Suite) -> Vec<String> {
     suite
         .scenarios
@@ -30,22 +33,26 @@ fn statements(suite: &Suite) -> Vec<String> {
         .collect()
 }
 
-/// 工具轨迹声明的「一个正确的抽取器应当得出的陈述」。
+/// The "statements a correct extractor should derive" declared by the tool
+/// traces.
 ///
-/// 它**不是**铺垫事实，一个字都不会落库。之所以要单独有这个池子：
-/// 工具经验题的 gold 按定义匹配不到任何 `SeedFact`（匹配得到就说明
-/// 这道题问的是对话里已经说过的事，与工具轨迹无关），
-/// 但也不能因此就允许它凭空发明 —— 得有个锚点。
+/// They are **not** seeded facts and not one word of them reaches the store.
+/// The reason this pool exists separately: a tool-experience question's gold
+/// matches no `SeedFact` by definition (if it did, the question would be asking
+/// about something the conversation already said, with nothing to do with the
+/// tool trace), but that cannot become license to invent one out of thin air —
+/// there has to be an anchor.
 fn tool_expectations(suite: &Suite) -> Vec<String> {
     suite.turns().flat_map(|t| t.tool_expect.clone()).collect()
 }
 
-/// 工具轨迹声明的「绝对不该被抽出来的东西」。
+/// The "things that must never be extracted" declared by the tool traces.
 fn tool_avoidances(suite: &Suite) -> Vec<String> {
     suite.turns().flat_map(|t| t.tool_avoid.clone()).collect()
 }
 
-/// 每一轮的轨迹全文（工具名 + 路径 + 一行结论拼起来）。
+/// The full text of each turn's trace (tool name + path + one-line conclusion,
+/// joined).
 fn trace_texts(suite: &Suite) -> Vec<String> {
     suite
         .turns()
@@ -71,23 +78,26 @@ fn bundled_suite_loads_and_validates() {
     let suite = load();
     assert!(
         suite.questions.len() >= 60,
-        "题量少于 60 时分组指标的每一格都只剩个位数，统计上没有意义，实际 {} 题",
+        "with fewer than 60 questions every cell of the grouped metrics falls \
+         into single digits and means nothing statistically; got {}",
         suite.questions.len()
     );
 }
 
 #[test]
 fn every_gold_matcher_hits_at_least_one_seeded_fact() {
-    // seed 模式下 gold 匹配不到任何铺垫事实，这道题就是恒定 0 分的死题 ——
-    // 它会把基线数字压低，而且压低的原因看报告根本看不出来
+    // In seed mode, a gold that matches no seeded fact makes the question a
+    // dead one scoring a constant 0 — it drags the baseline numbers down, and
+    // the reason it does is invisible in the report
     let suite = load();
     let stmts = statements(&suite);
 
     let mut orphans = Vec::new();
     for q in &suite.questions {
-        // 工具经验题的 gold 按定义匹配不到任何铺垫事实 —— 它要的那条事实
-        // 还不存在，得由抽取器从轨迹里造出来。它的锚点检查在
-        // `tool_experience_gold_is_anchored_in_a_declared_expectation`
+        // A tool-experience question's gold matches no seeded fact by
+        // definition — the fact it wants does not exist yet and has to be
+        // constructed by the extractor from the trace. Its anchor check lives
+        // in `tool_experience_gold_is_anchored_in_a_declared_expectation`
         if q.kind == QuestionKind::ToolExperience {
             continue;
         }
@@ -100,15 +110,17 @@ fn every_gold_matcher_hits_at_least_one_seeded_fact() {
     }
     assert!(
         orphans.is_empty(),
-        "以下 gold 匹配不到任何铺垫事实（题目写错了，不是检索的问题）：\n{}",
+        "the following golds match no seeded fact (the question is written \
+         wrong; this is not a retrieval problem):\n{}",
         orphans.join("\n")
     );
 }
 
 #[test]
 fn every_forbidden_matcher_hits_at_least_one_seeded_fact() {
-    // forbidden 匹配不到任何东西 = 这条断言永远为真 = 白写。
-    // 「应当召回不到」那一类全靠 forbidden 支撑，形同虚设就等于没测
+    // A forbidden that matches nothing = the assertion is always true = wasted.
+    // The whole "should retrieve nothing" kind rests on forbidden, and a
+    // meaningless one is the same as not testing at all
     let suite = load();
     let stmts = statements(&suite);
 
@@ -123,14 +135,16 @@ fn every_forbidden_matcher_hits_at_least_one_seeded_fact() {
     }
     assert!(
         orphans.is_empty(),
-        "以下 forbidden 匹配不到任何铺垫事实，这条断言恒为真：\n{}",
+        "the following forbidden entries match no seeded fact, so the assertion \
+         is always true:\n{}",
         orphans.join("\n")
     );
 }
 
 #[test]
 fn gold_and_forbidden_never_overlap() {
-    // 同一条事实既是 gold 又是 forbidden，这道题无论如何都判不对
+    // One fact being both gold and forbidden makes the question impossible to
+    // judge correctly under any outcome
     let suite = load();
     let stmts = statements(&suite);
 
@@ -142,7 +156,7 @@ fn gold_and_forbidden_never_overlap() {
                 let clash = stmts.iter().any(|s| gm.matches(s) && fm.matches(s));
                 assert!(
                     !clash,
-                    "题目 {} 的 gold「{}」与 forbidden「{}」命中了同一条事实",
+                    "question {}'s gold \"{}\" and forbidden \"{}\" hit the same fact",
                     q.id,
                     gm.describe(),
                     fm.describe()
@@ -154,13 +168,15 @@ fn gold_and_forbidden_never_overlap() {
 
 #[test]
 fn every_kind_has_enough_questions_to_be_readable() {
-    // 分组指标的意义在于「中文语义类 R@5 只有 0.3」这种可行动的结论。
-    // 一类只有两三题时，一道题的抖动就是 30 个百分点
+    // The point of grouped metrics is an actionable conclusion like "the
+    // chinese-semantic kind has R@5 of only 0.3". With two or three questions
+    // in a kind, one question's jitter is 30 percentage points
     let suite = load();
     for (kind, n) in suite.count_by_kind() {
         assert!(
             n >= 8,
-            "题型「{}」只有 {n} 题，单题抖动会淹没信号",
+            "the \"{}\" kind has only {n} questions; single-question jitter \
+             would drown the signal",
             kind.label()
         );
     }
@@ -168,13 +184,15 @@ fn every_kind_has_enough_questions_to_be_readable() {
 
 #[test]
 fn suite_is_bilingual() {
-    // 自建集的存在理由之一就是公开基准全是英文；反过来也不能只有中文
+    // One reason the home-grown suite exists is that the public benchmarks are
+    // entirely English; the converse — being entirely Chinese — is equally
+    // unacceptable
     let suite = load();
     let by_lang = suite.count_by_lang();
     for lang in [Lang::Zh, Lang::En, Lang::Mixed] {
         assert!(
             by_lang.get(&lang).copied().unwrap_or(0) >= 5,
-            "语种「{}」题量不足：{:?}",
+            "not enough questions in the \"{}\" language: {:?}",
             lang.label(),
             by_lang
         );
@@ -183,7 +201,8 @@ fn suite_is_bilingual() {
 
 #[test]
 fn temporal_questions_reference_distinct_checkpoints() {
-    // 全部回放题都指向同一个时点的话，测的只是「当前有效集」，不是双时间轴
+    // If every replay question pointed at the same moment, what is being tested
+    // is only "the currently active set", not the bitemporal axis
     let suite = load();
     let used: HashSet<&String> = suite
         .questions
@@ -193,16 +212,18 @@ fn temporal_questions_reference_distinct_checkpoints() {
         .collect();
     assert!(
         used.len() >= 3,
-        "时间回放题只用了 {} 个 checkpoint，覆盖不到多个认知时点",
+        "the time-replay questions use only {} checkpoints, which cannot cover \
+         several moments of knowledge",
         used.len()
     );
 }
 
 #[test]
 fn superseding_facts_share_subject_and_predicate() {
-    // 取代关系靠 (subject, predicate) 撞车 + valid_at 分先后来成立。
-    // 谓词不在 `PredicateRules` 的单值表里，或者两条的 valid_at 相同，
-    // 取代就不会发生，回放题会静默地全部答成「两条都在」
+    // A supersession holds by (subject, predicate) colliding plus valid_at
+    // ordering them. If the predicate is not in `PredicateRules`' single-valued
+    // table, or the two rows share a valid_at, supersession never happens and
+    // every replay question silently answers "both are present"
     let suite = load();
     let mut slots: HashMap<(String, String), Vec<Option<String>>> = HashMap::new();
     for f in suite
@@ -217,7 +238,7 @@ fn superseding_facts_share_subject_and_predicate() {
             .push(f.valid_at.clone());
     }
 
-    // 题集刻意安排的四组取代
+    // The four supersessions the suite deliberately arranges
     for (subject, predicate) in [
         ("对象存储", "stores_in"),
         ("存储层", "assigned_to"),
@@ -225,34 +246,37 @@ fn superseding_facts_share_subject_and_predicate() {
         ("同步协议", "decided_on"),
     ] {
         let key = (subject.to_owned(), predicate.to_owned());
-        let dates = slots
-            .get(&key)
-            .unwrap_or_else(|| panic!("题集里应当有 {subject}/{predicate} 这一组取代"));
+        let dates = slots.get(&key).unwrap_or_else(|| {
+            panic!("the suite should contain the {subject}/{predicate} supersession")
+        });
         assert_eq!(
             dates.len(),
             2,
-            "{subject}/{predicate} 应当正好两条（旧值 + 新值），实际 {}",
+            "{subject}/{predicate} should have exactly two entries (old value + \
+             new value), got {}",
             dates.len()
         );
         let mut sorted: Vec<&Option<String>> = dates.iter().collect();
         sorted.sort();
         assert!(
             sorted[0] < sorted[1],
-            "{subject}/{predicate} 的两条 valid_at 必须分得出先后，否则只会被打成 flag 而不是取代"
+            "{subject}/{predicate}'s two valid_at values must be orderable, \
+             otherwise it is only marked flag rather than superseded"
         );
     }
 }
 
 #[test]
 fn unanswerable_questions_have_tempting_distractors() {
-    // 「应当召回不到」题的价值全在干扰项的诱惑力上。
-    // 干扰项太少，这一类就退化成「随便问句废话」
+    // A "should retrieve nothing" question's entire value lies in how tempting
+    // its distractors are. Too few distractors and the kind degenerates into
+    // "ask any old nonsense"
     let suite = load();
     for q in &suite.questions {
         if q.kind == QuestionKind::Unanswerable {
             assert!(
                 !q.forbidden.is_empty(),
-                "题目 {} 没有干扰项，测不出任何东西",
+                "question {} has no distractors and measures nothing",
                 q.id
             );
         }
@@ -260,12 +284,15 @@ fn unanswerable_questions_have_tempting_distractors() {
 }
 
 // ══════════════════════════════════════════════════════════
-//  工具经验题的准入规程
+//  Admission rules for tool-experience questions
 //
-//  这一类题最容易变成自证：自己写一条「应当抽出来的陈述」，再自己写一条
-//  匹配它的 gold，然后宣布评测覆盖了工具轨迹抽取。下面六条是防这个的，
-//  规程照 README 里 `relates_to` 那次的做法：先定形状再写字、gold 必须
-//  有语料侧的锚点、证伪先行、不许反向筛题。
+//  This kind is the easiest to turn into self-proof: write a "statement that
+//  should be extracted" yourself, then write a gold matching it yourself, and
+//  declare that the eval covers tool-trace extraction. The six checks below
+//  guard against that, following the same procedure as the `relates_to` round
+//  in the README: fix the shape before writing the words, require a
+//  corpus-side anchor for every gold, attempt falsification first, and never
+//  select questions backwards from the results.
 // ══════════════════════════════════════════════════════════
 
 fn tool_questions(suite: &Suite) -> Vec<&cortex_evals::suite::Question> {
@@ -278,9 +305,11 @@ fn tool_questions(suite: &Suite) -> Vec<&cortex_evals::suite::Question> {
 
 #[test]
 fn tool_experience_gold_is_anchored_in_a_declared_expectation() {
-    // gold 必须命中某条 `tool_expect`。允许 gold 凭空发明，等于允许
-    // 「题目要一个语料里根本没有依据的答案」—— 那样这道题永远挂，
-    // 而挂的原因看报告与「抽取器没接轨迹」完全一样，分不出来
+    // A gold must match some `tool_expect`. Allowing gold to be invented out of
+    // thin air is allowing "the question demands an answer with no basis in the
+    // corpus at all" — such a question fails forever, and in the report the
+    // reason looks identical to "the extractor is not wired to traces",
+    // indistinguishable
     let suite = load();
     let expectations = tool_expectations(&suite);
 
@@ -295,16 +324,18 @@ fn tool_experience_gold_is_anchored_in_a_declared_expectation() {
     }
     assert!(
         orphans.is_empty(),
-        "以下工具经验题的 gold 没有对应的 tool_expect，等于凭空发明答案：\n{}",
+        "the following tool-experience golds have no corresponding tool_expect, \
+         which amounts to inventing an answer out of thin air:\n{}",
         orphans.join("\n")
     );
 }
 
 #[test]
 fn tool_experience_gold_is_absent_from_the_seeded_corpus() {
-    // gold 若能命中某条铺垫事实，这道题在 seed 模式下就**已经能答对**了 ——
-    // 它量的是「一条手写事实能不能被召回」，而不是「轨迹能不能被抽成事实」。
-    // 这是这一类题最隐蔽的失效方式：它会安安静静地过，并且看起来像个好消息
+    // If a gold can match a seeded fact, the question is **already answerable**
+    // in seed mode — it measures "can a handwritten fact be retrieved" rather
+    // than "can a trace be extracted into a fact". This is the kind's most
+    // insidious failure mode: it passes quietly and looks like good news
     let suite = load();
     let stmts = statements(&suite);
 
@@ -314,8 +345,9 @@ fn tool_experience_gold_is_absent_from_the_seeded_corpus() {
             let hit = stmts.iter().find(|s| m.matches(s));
             assert!(
                 hit.is_none(),
-                "工具经验题 {} 的 gold「{}」命中了铺垫事实「{}」—— \
-                 这道题不用抽取器就能答，量到的不是工具轨迹",
+                "tool-experience question {}'s gold \"{}\" hit the seeded fact \
+                 \"{}\" — this question is answerable without the extractor, so \
+                 what it measures is not the tool trace",
                 q.id,
                 m.describe(),
                 hit.map_or("", String::as_str)
@@ -326,9 +358,11 @@ fn tool_experience_gold_is_absent_from_the_seeded_corpus() {
 
 #[test]
 fn tool_experience_gold_is_absent_from_every_conversation_turn() {
-    // 第二条自证通路：结论写在了对话原文里。那样 llm 模式下抽取器读 text
-    // 就能得出 gold，轨迹一眼都不用看 —— 这道题就退化成了普通的抽取题。
-    // 工具轨迹这一格的全部价值就在于「对话里一个字都没说」
+    // The second self-proof route: the conclusion is written into the
+    // conversation text. Then in llm mode the extractor derives the gold by
+    // reading text without glancing at the trace once — and the question
+    // degenerates into an ordinary extraction question. The entire value of the
+    // tool-trace cell rests on "the conversation says not one word of it"
     let suite = load();
     let texts: Vec<&str> = suite.turns().map(|t| t.text.as_str()).collect();
 
@@ -338,8 +372,9 @@ fn tool_experience_gold_is_absent_from_every_conversation_turn() {
             let leak = texts.iter().find(|t| m.matches(t));
             assert!(
                 leak.is_none(),
-                "工具经验题 {} 的 gold「{}」能直接从对话原文「{}」读出来 —— \
-                 那就不需要工具轨迹了",
+                "tool-experience question {}'s gold \"{}\" can be read straight \
+                 out of the conversation text \"{}\" — no tool trace is needed \
+                 at all",
                 q.id,
                 m.describe(),
                 leak.copied().unwrap_or("")
@@ -350,12 +385,15 @@ fn tool_experience_gold_is_absent_from_every_conversation_turn() {
 
 #[test]
 fn tool_experience_gold_is_copyable_from_the_trace() {
-    // 反过来的约束：gold 的每个片段都必须**逐字**出现在某一轮的轨迹里。
-    // 抽取器只能看见 name / path / summary 三样东西，要一个它无从得知的
-    // 词，这道题就永远挂 —— 而那是题目的错，不是实现的错。
+    // The constraint in the other direction: every fragment of a gold must
+    // appear **verbatim** in some turn's trace. The extractor can only see
+    // name / path / summary, so demanding a word it has no way of knowing makes
+    // the question fail forever — and that is the question's fault, not the
+    // implementation's.
     //
-    // 这条同时解释了为什么工具经验题的 gold 全压在命令、参数、环境变量、
-    // 路径这类标识符上：statement 的措辞由模型决定，只有标识符是稳的
+    // This also explains why tool-experience golds all rest on identifiers like
+    // commands, arguments, environment variables, and paths: a statement's
+    // wording is decided by the model, and only identifiers are stable
     let suite = load();
     let traces = trace_texts(&suite);
 
@@ -365,8 +403,9 @@ fn tool_experience_gold_is_copyable_from_the_trace() {
                 let needle = part.to_lowercase();
                 assert!(
                     traces.iter().any(|t| t.to_lowercase().contains(&needle)),
-                    "工具经验题 {} 的 gold 片段「{part}」在任何一段轨迹里都没有逐字出现 —— \
-                     抽取器无从得知这个词",
+                    "tool-experience question {}'s gold fragment \"{part}\" does \
+                     not appear verbatim in any trace — the extractor has no way \
+                     of knowing that word",
                     q.id
                 );
             }
@@ -376,8 +415,9 @@ fn tool_experience_gold_is_copyable_from_the_trace() {
 
 #[test]
 fn tool_experience_query_never_leaks_its_gold() {
-    // 查询里直接出现 gold 的标识符，等于把答案写进了题面。
-    // 规程第 1 步「先定形状再写字」的落点
+    // A gold's identifier appearing directly in the query means the answer was
+    // written into the question. This is where step 1 of the procedure, "fix
+    // the shape before writing the words", lands
     let suite = load();
     for q in tool_questions(&suite) {
         let query = q.query.to_lowercase();
@@ -385,7 +425,9 @@ fn tool_experience_query_never_leaks_its_gold() {
             for part in group {
                 assert!(
                     !query.contains(&part.to_lowercase()),
-                    "工具经验题 {} 的查询里出现了 gold 片段「{part}」—— 答案写在题面上了",
+                    "tool-experience question {}'s query contains the gold \
+                     fragment \"{part}\" — the answer is written into the \
+                     question",
                     q.id
                 );
             }
@@ -395,8 +437,10 @@ fn tool_experience_query_never_leaks_its_gold() {
 
 #[test]
 fn tool_traces_contain_failure_then_success_sequences() {
-    // 「差异即知识」这条判据要成立，语料里必须真有「先失败后成功」的序列。
-    // 全是单次成功的轨迹只能考「这条命令跑过」，那和普通召回没有区别
+    // For the criterion "the difference is the knowledge" to hold, the corpus
+    // must really contain "failed first, then succeeded" sequences. Traces of
+    // nothing but single successes can only test "this command has been run",
+    // which is no different from ordinary retrieval
     let suite = load();
     let with_diff = suite
         .turns()
@@ -404,17 +448,19 @@ fn tool_traces_contain_failure_then_success_sequences() {
         .count();
     assert!(
         with_diff >= 4,
-        "只有 {with_diff} 轮轨迹是「失败→成功」的序列。\
-         差异即知识是这一类题的核心判据，语料不给差异就无从考起"
+        "only {with_diff} turns' traces are failure→success sequences. \"The \
+         difference is the knowledge\" is this kind's core criterion, and a \
+         corpus with no difference gives it nothing to test"
     );
 }
 
 #[test]
 fn never_extracted_is_anchored_and_not_self_contradictory() {
-    // 三条一起查，因为它们只有合在一起才挡得住「这条断言恒为真」：
-    //   ① 必须命中某条 `tool_avoid`     —— 否则是凭空写的
-    //   ② 不得命中任何铺垫事实           —— 否则 seed 模式下恒定判为泄漏
-    //   ③ 不得命中任何 `tool_expect`     —— 否则「必须抽」与「绝对不抽」自相矛盾
+    // All three are checked together, because only together do they stop "this
+    // assertion is always true":
+    //   ① it must match some `tool_avoid`   — otherwise it was written out of thin air
+    //   ② it must match no seeded fact      — otherwise seed mode judges it a leak every time
+    //   ③ it must match no `tool_expect`    — otherwise "must extract" and "never extract" contradict each other
     let suite = load();
     let avoidances = tool_avoidances(&suite);
     let stmts = statements(&suite);
@@ -427,14 +473,16 @@ fn never_extracted_is_anchored_and_not_self_contradictory() {
             let m = Matcher::new(group);
             assert!(
                 avoidances.iter().any(|s| m.matches(s)),
-                "题目 {} 的 never_extracted「{}」没有对应的 tool_avoid —— 凭空写的断言",
+                "question {}'s never_extracted \"{}\" has no corresponding \
+                 tool_avoid — an assertion written out of thin air",
                 q.id,
                 m.describe()
             );
             let clash = stmts.iter().find(|s| m.matches(s));
             assert!(
                 clash.is_none(),
-                "题目 {} 的 never_extracted「{}」命中了铺垫事实「{}」—— 这条断言恒定失败",
+                "question {}'s never_extracted \"{}\" hit the seeded fact \
+                 \"{}\" — this assertion fails every time",
                 q.id,
                 m.describe(),
                 clash.map_or("", String::as_str)
@@ -442,8 +490,9 @@ fn never_extracted_is_anchored_and_not_self_contradictory() {
             let contradiction = expectations.iter().find(|s| m.matches(s));
             assert!(
                 contradiction.is_none(),
-                "题目 {} 的 never_extracted「{}」命中了 tool_expect「{}」—— \
-                 同一条东西既要求抽出来又要求别抽",
+                "question {}'s never_extracted \"{}\" hit the tool_expect \
+                 \"{}\" — the same thing is required to be extracted and \
+                 required not to be",
                 q.id,
                 m.describe(),
                 contradiction.map_or("", String::as_str)
@@ -452,15 +501,17 @@ fn never_extracted_is_anchored_and_not_self_contradictory() {
     }
     assert!(
         any >= 3,
-        "只写了 {any} 条「不该被抽出来」的断言。抽取 prompt 里「绝对不抽」那一节\
-         没有别的落点，这一列薄了那一节就等于没测"
+        "only {any} \"should never be extracted\" assertions are written. The \
+         \"never extract this\" section of the extraction prompt has nowhere \
+         else to land, so a thin column here means that section is untested"
     );
 }
 
 #[test]
 fn tool_avoidance_quotes_the_trace_verbatim() {
-    // `tool_avoid` 是「抽取器可能会误抽的那段东西」，必须真的出现在轨迹里。
-    // 写一段轨迹里没有的话当 avoid，等于给自己发了一张永远通过的许可证
+    // `tool_avoid` is "the passage the extractor might wrongly extract", so it
+    // must really appear in the trace. Writing an avoid entry that is nowhere
+    // in the trace is issuing yourself a permanent pass
     let suite = load();
     for turn in suite.turns() {
         let trace = turn
@@ -473,8 +524,9 @@ fn tool_avoidance_quotes_the_trace_verbatim() {
         for a in &turn.tool_avoid {
             assert!(
                 trace.contains(&a.to_lowercase()),
-                "tool_avoid「{a}」在本轮的任何一条 summary 里都没有逐字出现，\
-                 抽取器根本不可能误抽出它"
+                "tool_avoid \"{a}\" does not appear verbatim in any of this \
+                 turn's summaries, so the extractor could never wrongly extract \
+                 it in the first place"
             );
         }
     }
@@ -482,10 +534,15 @@ fn tool_avoidance_quotes_the_trace_verbatim() {
 
 #[test]
 fn question_ids_are_sorted_and_dense() {
-    // 报告与基线 JSON 要能直接 diff，id 乱序会让 diff 满屏噪声
+    // Reports and baseline JSON have to be diffable directly, and out-of-order
+    // ids fill the diff with noise
     let suite = load();
     let ids: Vec<&str> = suite.questions.iter().map(|q| q.id.as_str()).collect();
     let mut sorted = ids.clone();
     sorted.sort_unstable();
-    assert_eq!(ids, sorted, "题目 id 应当按字典序排列，便于比对报告");
+    assert_eq!(
+        ids, sorted,
+        "question ids should be in lexicographic order, so reports can be \
+         compared"
+    );
 }

@@ -1,7 +1,9 @@
-//! 事实生命周期与实体归属：视图语义的验收。
+//! Fact lifecycle and entity ownership: acceptance tests for the views'
+//! semantics.
 //!
-//! 这几条断言直接对应 docs/memory.md §十一 与 §四 的承诺 ——
-//! 删除是可逆的、末态由最后一条状态事件决定、链式合并能走到底。
+//! These assertions correspond directly to the promises in docs/memory.md §11
+//! and §4 — deletion is reversible, the final state is decided by the last
+//! status event, and a chained merge can be walked to its end.
 
 mod common;
 
@@ -29,17 +31,17 @@ async fn delete_then_restore_round_trips_through_active_facts() {
             tx.insert_fact(&fact).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let subject = entity.id.to_string();
     let fact_id = fact.id.to_string();
 
-    // ① 刚写入：有效
+    // ① Just written: valid
     assert_eq!(
         store
             .active_facts_by_subject(&subject, 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         1
     );
@@ -47,69 +49,77 @@ async fn delete_then_restore_round_trips_through_active_facts() {
         store
             .fact_status(&fact_id)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .is_none(),
-        "从未失效过的事实不该出现在 fact_status 里"
+        "a fact that has never been invalidated must not appear in fact_status"
     );
 
-    // ② 用户删除 → 退出 active_facts，但主行仍在（append-only）
+    // ② The user deletes it → it leaves active_facts, but the main row remains
+    // (append-only)
     let retract = NewFactEvent::retracted(fact.id, common::now(), "记错了", common::DEVICE);
     store
         .write_txn(async |tx| tx.insert_fact_event(&retract).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert!(
         store
             .active_facts_by_subject(&subject, 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .is_empty(),
-        "已删除的事实不该出现在 active_facts"
+        "a deleted fact must not appear in active_facts"
     );
     assert!(
-        store.fact(&fact_id).await.expect("查询不应失败").is_some(),
-        "删除只是追加事件，主行必须还在"
+        store
+            .fact(&fact_id)
+            .await
+            .expect("the query should not fail")
+            .is_some(),
+        "deletion only appends an event, so the main row must still be there"
     );
 
     let status = store
         .fact_status(&fact_id)
         .await
-        .expect("查询不应失败")
-        .expect("应当有状态事件");
+        .expect("the query should not fail")
+        .expect("there should be a status event");
     assert_eq!(status.op, FactOp::Invalidate);
     assert_eq!(status.kind, Some(InvalidationKind::Retracted));
     assert_eq!(status.actor, Actor::User);
 
-    // ③ 恢复 → 重新进入 active_facts
+    // ③ Restore → it re-enters active_facts
     let revoke = NewFactEvent::revoke(fact.id, Actor::User, common::DEVICE);
     store
         .write_txn(async |tx| tx.insert_fact_event(&revoke).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert_eq!(
         store
             .active_facts_by_subject(&subject, 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         1,
-        "revoke 之后事实应当重新有效"
+        "the fact should be valid again after the revoke"
     );
     assert_eq!(
         store
             .fact_status(&fact_id)
             .await
-            .expect("查询不应失败")
-            .expect("应当有状态事件")
+            .expect("the query should not fail")
+            .expect("there should be a status event")
             .op,
         FactOp::Revoke
     );
 
-    // ④ 时间线完整可见：三条事件一条不少
-    let timeline = store.fact_events(&fact_id).await.expect("查询不应失败");
-    assert_eq!(timeline.len(), 2, "两条生命周期事件");
+    // ④ The timeline is fully visible: not one of the events is missing
+    let timeline = store
+        .fact_events(&fact_id)
+        .await
+        .expect("the query should not fail");
+    assert_eq!(timeline.len(), 2, "two lifecycle events");
     assert_eq!(timeline[0].op, FactOp::Invalidate);
     assert_eq!(timeline[1].op, FactOp::Revoke);
 
@@ -134,38 +144,38 @@ async fn last_status_event_wins_and_flag_is_only_an_annotation() {
             tx.insert_fact(&fact).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let subject = entity.id.to_string();
     let fact_id = fact.id.to_string();
 
-    // flag 是批注，不改变状态
+    // flag is an annotation and does not change the status
     let flag = NewFactEvent::flag(fact.id, "与另一条矛盾", common::DEVICE);
     store
         .write_txn(async |tx| tx.insert_fact_event(&flag).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert_eq!(
         store
             .active_facts_by_subject(&subject, 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         1,
-        "flag 不该让事实退出 active_facts"
+        "a flag must not push the fact out of active_facts"
     );
     assert!(
         store
             .fact_status(&fact_id)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .is_none(),
-        "flag 不是状态事件，不该进 fact_status"
+        "a flag is not a status event and must not enter fact_status"
     );
 
-    // 序列 [invalidate, invalidate, revoke] 之后事实**有效** ——
-    // 状态机语义，不是撤销栈
+    // After the sequence [invalidate, invalidate, revoke] the fact is **valid**
+    // -- state machine semantics, not an undo stack
     for event in [
         NewFactEvent::retracted(fact.id, common::now(), "删一次", common::DEVICE),
         NewFactEvent::retracted(fact.id, common::now(), "再删一次", common::DEVICE),
@@ -174,17 +184,18 @@ async fn last_status_event_wins_and_flag_is_only_an_annotation() {
         store
             .write_txn(async |tx| tx.insert_fact_event(&event).await)
             .await
-            .expect("写事务不应失败");
+            .expect("the write transaction should not fail");
     }
 
     assert_eq!(
         store
             .active_facts_by_subject(&subject, 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         1,
-        "末态是 revoke，事实应当有效（撤销栈语义会算成失效，那是错的）"
+        "the final state is revoke, so the fact should be valid (undo-stack semantics would call \
+         it invalidated, which is wrong)"
     );
 
     db.cleanup().await;
@@ -209,9 +220,10 @@ async fn superseding_a_fact_links_the_evolution_chain() {
             tx.insert_fact(&old).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
-    // 取代：新事实与失效事件同事务写入
+    // Supersede: the new fact and the invalidation event are written in the
+    // same transaction
     let supersede = NewFactEvent::superseded(old.id, new.id, common::now(), common::DEVICE);
     store
         .write_txn(async |tx| {
@@ -219,25 +231,29 @@ async fn superseding_a_fact_links_the_evolution_chain() {
             tx.insert_fact_event(&supersede).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let active = store
         .active_facts_by_subject_predicate(&entity.id.to_string(), "uses")
         .await
-        .expect("查询不应失败");
-    assert_eq!(active.len(), 1, "同一 (主语, 谓词) 下只应剩新的那条");
+        .expect("the query should not fail");
+    assert_eq!(
+        active.len(),
+        1,
+        "only the new one should remain under the same (subject, predicate)"
+    );
     assert_eq!(active[0].id, new.id.to_string());
 
     let status = store
         .fact_status(&old.id.to_string())
         .await
-        .expect("查询不应失败")
-        .expect("旧事实应当有状态事件");
+        .expect("the query should not fail")
+        .expect("the old fact should have a status event");
     assert_eq!(status.kind, Some(InvalidationKind::Superseded));
     assert_eq!(
         status.superseded_by,
         Some(new.id.to_string()),
-        "演化链必须指明被谁取代"
+        "the evolution chain must state what superseded it"
     );
 
     db.cleanup().await;
@@ -261,9 +277,10 @@ async fn chained_entity_merges_resolve_to_the_final_canonical() {
             tx.insert_entity(&c).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
-    // A → B → C，两步分开写，模拟先后发生的两次消解
+    // A → B → C, written as two separate steps, simulating two resolutions
+    // that happened one after the other
     for merge in [
         NewEntityMerge {
             id: cortex_core::Id::new(),
@@ -285,7 +302,7 @@ async fn chained_entity_merges_resolve_to_the_final_canonical() {
         store
             .write_txn(async |tx| tx.insert_entity_merge(&merge).await)
             .await
-            .expect("写事务不应失败");
+            .expect("the write transaction should not fail");
     }
 
     let canonical = c.id.to_string();
@@ -294,15 +311,18 @@ async fn chained_entity_merges_resolve_to_the_final_canonical() {
             store
                 .canonical_entity(&id.to_string())
                 .await
-                .expect("查询不应失败"),
+                .expect("the query should not fail"),
             Some(canonical.clone()),
-            "链式合并 A→B→C 之后 {id} 的归属应当是 C"
+            "after the chained merge A→B→C, {id}'s owner should be C"
         );
     }
 
-    // 批量解析走同一视图
+    // Bulk resolution goes through the same view
     let ids: Vec<String> = vec![a.id.to_string(), b.id.to_string(), c.id.to_string()];
-    let resolved = store.canonical_entities(&ids).await.expect("查询不应失败");
+    let resolved = store
+        .canonical_entities(&ids)
+        .await
+        .expect("the query should not fail");
     assert_eq!(resolved.len(), 3);
     assert!(resolved.iter().all(|row| row.canonical == canonical));
 
@@ -327,7 +347,7 @@ async fn concurrent_merge_fork_is_first_writer_wins() {
             tx.insert_entity(&c).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let first = NewEntityMerge {
         id: cortex_core::Id::new(),
@@ -340,9 +360,10 @@ async fn concurrent_merge_fork_is_first_writer_wins() {
     store
         .write_txn(async |tx| tx.insert_entity_merge(&first).await)
         .await
-        .expect("第一条合并应当成功");
+        .expect("the first merge should succeed");
 
-    // 另一台设备把 A 并进 C —— UNIQUE(from_entity) 在物理层拒绝后到者
+    // Another device merges A into C -- UNIQUE(from_entity) rejects whoever
+    // arrives second at the physical level
     let fork = NewEntityMerge {
         id: cortex_core::Id::new(),
         from_entity: a.id,
@@ -354,26 +375,28 @@ async fn concurrent_merge_fork_is_first_writer_wins() {
     let err = store
         .write_txn(async |tx| tx.insert_entity_merge(&fork).await)
         .await
-        .expect_err("并发分叉的后到者应当被唯一约束拒绝");
+        .expect_err(
+            "the later arrival of a concurrent fork should be rejected by the unique constraint",
+        );
 
     match err {
         StoreError::Sql(sqlx::Error::Database(db_err)) => {
             assert_eq!(
                 db_err.code().as_deref(),
                 Some("23505"),
-                "应当是唯一约束冲突，实际：{db_err}"
+                "it should be a unique constraint violation; got: {db_err}"
             );
         }
-        other => panic!("错误类型不对：{other}"),
+        other => panic!("wrong error type: {other}"),
     }
 
     assert_eq!(
         store
             .canonical_entity(&a.id.to_string())
             .await
-            .expect("查询不应失败"),
+            .expect("the query should not fail"),
         Some(b.id.to_string()),
-        "first-writer-wins：归属仍应是先写入的 B"
+        "first-writer-wins: the owner should still be B, which was written first"
     );
 
     db.cleanup().await;
@@ -415,29 +438,31 @@ async fn blobs_transcripts_and_vectors_round_trip() {
 
     store
         .write_txn(async |tx| {
-            // 三步固定顺序：对象存储 → blobs 行 → episode + 关联行
+            // The fixed three-step order: object storage → the blobs row →
+            // the episode plus its link rows
             tx.insert_blob(&blob).await?;
             tx.insert_episode(&episode).await?;
             tx.link_episode_blob(&link).await?;
             tx.insert_blob_transcript(&transcript).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert_eq!(
         store
             .blob_reference_count(&blob.hash)
             .await
-            .expect("查询不应失败"),
+            .expect("the query should not fail"),
         1
     );
     let attachments = store
         .episode_attachments(&episode.id.to_string())
         .await
-        .expect("查询不应失败");
+        .expect("the query should not fail");
     assert_eq!(attachments.len(), 1);
-    // mime 与 size 必须随行返回：只给 hash 的话，重开会话时客户端手上
-    // 除了一串哈希什么都没有，只能画成「文档 · b1b2b3b4」
+    // mime and size must ride along: given only the hash, a client reopening
+    // the session has nothing in hand but a string of hex and can only draw it
+    // as "document · b1b2b3b4"
     assert_eq!(
         (
             attachments[0].mime.as_str(),
@@ -445,30 +470,37 @@ async fn blobs_transcripts_and_vectors_round_trip() {
             attachments[0].filename.as_deref()
         ),
         ("audio/mpeg", 1024, Some("会议录音.mp3")),
-        "附件必须带上 mime / 大小 / 文件名，否则回放时只剩一串哈希：{attachments:?}"
+        "an attachment must carry mime / size / filename, or replay is left with nothing but a \
+         string of hex: {attachments:?}"
     );
 
     let transcripts = store
         .blob_transcripts(&blob.hash)
         .await
-        .expect("查询不应失败");
+        .expect("the query should not fail");
     assert_eq!(transcripts.len(), 1);
     assert_eq!(transcripts[0].kind, TranscriptKind::Asr);
     assert_eq!(transcripts[0].span_start_ms, Some(1_900_000));
     assert_eq!(
         transcripts[0].embedding.as_ref(),
         Some(&embedding),
-        "1024 维向量应当原样读回"
+        "the 1024-dimensional vector should read back verbatim"
     );
 
-    // episode_blobs 的复合 record_id 在同步侧也解析得回来
-    let batch = store.fetch_since(0, 100).await.expect("拉取不应失败");
+    // episode_blobs' composite record_id also resolves on the sync side
+    let batch = store
+        .fetch_since(0, 100)
+        .await
+        .expect("the pull should not fail");
     let composite = batch
         .iter()
         .find(|r| r.table_name == cortex_store::table::EPISODE_BLOBS)
-        .expect("应当有 episode_blobs 的同步记录");
+        .expect("there should be a sync record for episode_blobs");
     assert_eq!(composite.record_id, link.record_id());
-    assert!(composite.payload.is_some(), "复合键的业务行也应当被取回来");
+    assert!(
+        composite.payload.is_some(),
+        "the business row behind a composite key should be fetched back too"
+    );
 
     db.cleanup().await;
 }
@@ -484,14 +516,14 @@ async fn redaction_tombstone_is_visible_to_in_flight_guard() {
     store
         .write_txn(async |tx| tx.insert_episode(&episode).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let target_id = episode.id.to_string();
     assert!(
         !store
             .is_redacted(RedactionTarget::Episode, &target_id)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
     );
 
     let tombstone = NewRedaction {
@@ -506,20 +538,20 @@ async fn redaction_tombstone_is_visible_to_in_flight_guard() {
     store
         .write_txn(async |tx| tx.insert_redaction(&tombstone).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert!(
         store
             .is_redacted(RedactionTarget::Episode, &target_id)
             .await
-            .expect("查询不应失败"),
-        "在途任务防护必须能看到墓碑"
+            .expect("the query should not fail"),
+        "the in-flight task guard must be able to see the tombstone"
     );
     assert_eq!(
         store
             .redactions_for_target(RedactionTarget::Episode, &target_id)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         1
     );
@@ -541,24 +573,28 @@ async fn summaries_and_episode_queries_work() {
         store
             .write_txn(async |tx| tx.insert_episode(&episode).await)
             .await
-            .expect("写事务不应失败");
+            .expect("the write transaction should not fail");
     }
     let other = common::new_episode("sess-b", "另一场会话");
     store
         .write_txn(async |tx| tx.insert_episode(&other).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     assert_eq!(
         store
             .episodes_by_session("sess-a", 10)
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .len(),
         3
     );
     assert_eq!(
-        store.recent_episodes(2).await.expect("查询不应失败").len(),
+        store
+            .recent_episodes(2)
+            .await
+            .expect("the query should not fail")
+            .len(),
         2
     );
 
@@ -572,8 +608,9 @@ async fn summaries_and_episode_queries_work() {
         embedding_model: common::MODEL.to_owned(),
         covers_from: None,
         covers_to: None,
-        // 摘要必须说清楚自己是从哪几条 episode 摘出来的，否则源被 redact 后
-        // 没有任何办法找到它（docs/memory-content.md §5.3）
+        // A summary must state which episodes it was summarized from, or once
+        // the source is redacted there is no way whatsoever to find it
+        // (docs/memory-content.md §5.3)
         sources: covered
             .iter()
             .copied()
@@ -584,12 +621,12 @@ async fn summaries_and_episode_queries_work() {
     store
         .write_txn(async |tx| tx.insert_summary(&summary).await)
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
     let found = store
         .summaries_for_scope(SummaryScope::Session, "sess-a", 10)
         .await
-        .expect("查询不应失败");
+        .expect("the query should not fail");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].scope, SummaryScope::Session);
 

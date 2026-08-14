@@ -1,30 +1,35 @@
-//! 环境变量设成**空串**时，必须走默认值，不能把空串当成用户的选择。
+//! When an environment variable is set to the **empty string**, the default
+//! must apply; the empty string must not be taken as the user's choice.
 //!
-//! 单独一个文件、单独一个测试函数：`env::set_var` 改的是进程全局状态，
-//! 和别的测试同二进制并行跑会互相踩。（`crates/cortex-agent/tests/
-//! sandbox_degraded.rs` 是同一个理由。）
+//! Its own file, its own single test function: `env::set_var` mutates
+//! process-global state, and running in the same binary as other tests in
+//! parallel means stepping on each other. (`crates/cortex-agent/tests/
+//! sandbox_degraded.rs` exists for the same reason.)
 //!
-//! # 这条测试挡的是什么
+//! # What this test blocks
 //!
-//! `env::var(k)` 对「设成空串」返回 `Ok("")` 而不是 `Err`。所以
-//! `env::var(k).unwrap_or(default)` 里的默认值**永远不会生效**——
-//! 只要那个变量被设过，哪怕设成空。
+//! `env::var(k)` returns `Ok("")` rather than `Err` for a variable set to the
+//! empty string. So the default in `env::var(k).unwrap_or(default)` **never
+//! takes effect** — as long as the variable was set at all, even to empty.
 //!
-//! 这个 bug 在本地开发时不可见：`.env` 的写法是「不写这一行」。
-//! 它只在容器里显形 —— docker compose 的
-//! `CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}` 在 `.env` 缺这一项时
-//! 会把变量**设成空串**。第一次上生产就是这么炸的：进程正常启动、
-//! `/health` 返回 ok、日志一切正常，直到发出第一条真实对话才收到
-//! DeepSeek 的 `... but you passed .`。
+//! This bug is invisible during local development: the way you write `.env` is
+//! by omitting the line. It only shows up inside a container — docker compose's
+//! `CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}` **sets the variable to the empty
+//! string** when `.env` is missing that entry. This is exactly how the first
+//! production deploy blew up: the process started normally, `/health` returned
+//! ok, the logs looked entirely fine, right up until the first real
+//! conversation came back with DeepSeek's `... but you passed .`.
 
 use cortex_core::Config;
 
-/// 一条用例：环境变量名、从 [`Config`] 里把它取出来的取值器、期望的默认值。
+/// One case: the environment variable's name, the getter that pulls it back out
+/// of [`Config`], and the expected default.
 type Getter = for<'a> fn(&'a Config) -> &'a str;
 type Case = (&'static str, Getter, &'static str);
 
-/// 这些 key 的共同点：空串都不是合法取值。
-/// 真有「空是合法值」的配置项时，它不该走 `optional`。
+/// What these keys have in common: the empty string is not a legal value for
+/// any of them. A setting where empty really is a legal value should not go
+/// through `optional`.
 const CASES: &[Case] = &[
     ("CORTEXD_BIND", |c| &c.bind, "127.0.0.1:8080"),
     ("S3_BUCKET", |c| &c.s3.bucket, "cortex-blobs"),
@@ -40,35 +45,41 @@ const CASES: &[Case] = &[
 
 #[test]
 fn empty_env_falls_back_to_default() {
-    // SAFETY: 本文件只有这一个测试函数，没有别的线程读写这些变量。
+    // SAFETY: this file has only this one test function, so no other thread
+    // reads or writes these variables.
     unsafe {
         std::env::set_var("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/x");
         std::env::set_var("CORTEX_LLM_PROVIDER", "deepseek");
         for (key, _, _) in CASES {
             std::env::set_var(key, "");
         }
-        // 空白也算空：`FOO=  ` 与 `FOO=` 在 compose 里是一回事
+        // Whitespace counts as empty too: `FOO=  ` and `FOO=` are the same
+        // thing in compose
         std::env::set_var("CORTEX_DEVICE_ID", "   ");
     }
 
-    let cfg = Config::from_env().expect("全部设成空串时也该能加载（走默认值）");
+    let cfg = Config::from_env()
+        .expect("loading should still work with everything set to empty (via the defaults)");
 
     for (key, get, want) in CASES {
         assert_eq!(
             get(&cfg),
             *want,
-            "{key} 被设成空串时应回落到默认值 {want}，实际拿到 {:?} —— \
-             env::var 对空串返回 Ok(\"\")，默认值被顶掉了",
+            "{key} set to the empty string should fall back to the default \
+             {want}, but got {:?} — env::var returns Ok(\"\") for an empty \
+             string, and the default got knocked out",
             get(&cfg)
         );
     }
 
-    // ── required 那一侧：空串应当报「缺少」，而不是放一个空串过去 ──
-    // 否则 DATABASE_URL="" 会一路走到 sqlx 才炸，错误信息面目全非
+    // ── The required side: an empty string should report "missing" rather
+    // than letting an empty string through. Otherwise DATABASE_URL="" travels
+    // all the way to sqlx before blowing up, with an unrecognizable error ──
     unsafe { std::env::set_var("DATABASE_URL", "") };
-    let err = Config::from_env().expect_err("DATABASE_URL 为空串时应当报错");
+    let err = Config::from_env().expect_err("an empty DATABASE_URL should be an error");
     assert!(
         err.to_string().contains("DATABASE_URL"),
-        "空的 DATABASE_URL 应当报「缺少环境变量 DATABASE_URL」，实际是：{err}"
+        "an empty DATABASE_URL should report the missing-variable error for \
+         DATABASE_URL, but got: {err}"
     );
 }

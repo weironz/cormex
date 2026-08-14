@@ -1,15 +1,21 @@
-//! 同步全序的正确性 —— 本 crate 最要紧的一组测试。
+//! Correctness of the sync total order — the most important group of tests in
+//! this crate.
 //!
-//! 核心断言：**并发写不漏行**。一个不断推进游标的客户端，在写入并发进行的
-//! 同时反复拉取，最终必须一条不少、一条不重地拿到全部记录。
+//! The core assertion: **concurrent writes never drop a row**. A client that
+//! keeps advancing its cursor, pulling repeatedly while writes are happening
+//! concurrently, must end up with every record, none missing and none
+//! duplicated.
 //!
-//! 这是对 `pg_advisory_xact_lock(4272)` 方案的直接验证。若去掉那把锁，
-//! 事务 A 可能先取到 seq=100 却后提交，客户端在 A 提交前拉到了 B 的 101、
-//! 把游标推到 101，A 那一行就**永久**不可见。
+//! This is a direct verification of the `pg_advisory_xact_lock(4272)` approach.
+//! Without that lock, transaction A may take seq=100 first yet commit later; the
+//! client pulls B's 101 before A commits and advances its cursor to 101, and A's
+//! row becomes **permanently** invisible.
 //!
-//! 这条测试是**做过反向验证**的：把 `WriteTxn::begin` 里的 advisory lock 注释掉，
-//! 它稳定失败（32 条里漏 12～13 条）；锁加回来则稳定通过。所以它确实在测那件事，
-//! 而不是碰巧成立。想复现这个反向验证，只需临时删掉那一句再跑本文件。
+//! This test has been **fault-injection verified**: comment out the advisory
+//! lock in `WriteTxn::begin` and it fails consistently (12–13 of the 32 rows go
+//! missing); put the lock back and it passes consistently. So it really is
+//! testing that thing rather than holding by coincidence. To reproduce the
+//! verification, temporarily delete that one statement and run this file.
 
 mod common;
 
@@ -20,13 +26,17 @@ use std::time::Duration;
 
 use cortex_store::{SyncPayload, table};
 
-/// 并发写事务数。写得多一点，才压得出提交乱序。
+/// The number of concurrent write transactions. Writing plenty of them is what
+/// squeezes out-of-order commits into the open.
 const WRITERS: usize = 32;
 
-/// 一半的写事务在取号之后拖这么久才提交，制造「取号序 != 提交序」的窗口。
+/// Half the write transactions stall this long after allocating their sequence
+/// number before committing, manufacturing a window where
+/// "allocation order != commit order".
 ///
-/// 加了 advisory lock 之后这些事务被串行化，总耗时约
-/// `WRITERS / 2 * SLOW_COMMIT`，所以这个值不能太大。
+/// With the advisory lock in place these transactions are serialized and the
+/// total takes roughly `WRITERS / 2 * SLOW_COMMIT`, so this value cannot be
+/// large.
 const SLOW_COMMIT: Duration = Duration::from_millis(6);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -38,7 +48,7 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
 
     let writers_done = Arc::new(AtomicBool::new(false));
 
-    // ── 读端：模拟一个不断推进游标的客户端 ──
+    // ── Reader: simulate a client that keeps advancing its cursor ──
     let reader = {
         let store = store.clone();
         let writers_done = Arc::clone(&writers_done);
@@ -47,14 +57,16 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
             let mut seen: Vec<(i64, String)> = Vec::new();
 
             loop {
-                // 先读标志再拉取：若标志已置位，则本次拉取覆盖了全部已提交的写入，
-                // 拉空即可断定确实拉干净了。反过来（先拉后读）会漏掉两者之间提交的行。
+                // Read the flag before pulling: if the flag is already set, this
+                // pull covers every committed write, so an empty pull proves we
+                // really are drained. The other way around (pull first, read
+                // after) would miss rows committed in between.
                 let finished = writers_done.load(Ordering::SeqCst);
 
                 let batch = store
                     .fetch_since(cursor, 8)
                     .await
-                    .expect("增量拉取不应失败");
+                    .expect("the incremental pull should not fail");
 
                 if let Some(last) = batch.last() {
                     cursor = last.seq;
@@ -66,7 +78,8 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
                     if finished {
                         break;
                     }
-                    // 轮询要足够密，才落得进上面那个提交乱序窗口
+                    // The polling has to be tight enough to land inside the
+                    // out-of-order commit window above
                     tokio::time::sleep(Duration::from_micros(200)).await;
                 }
             }
@@ -75,7 +88,7 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
         })
     };
 
-    // ── 写端：并发跑 WRITERS 个写事务 ──
+    // ── Writers: run WRITERS write transactions concurrently ──
     let mut writers = Vec::with_capacity(WRITERS);
     for i in 0..WRITERS {
         let store = store.clone();
@@ -86,17 +99,21 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
             store
                 .write_txn(async |tx| {
                     let seq = tx.insert_episode(&episode).await?;
-                    // 关键：**取号之后**再拖一会儿才提交。
-                    // 一半事务立刻提交、一半拖 SLOW_COMMIT_MS，于是必然出现
-                    // 「先取号的后提交」。没有 advisory lock 时，读端会在这个
-                    // 窗口里读到后取号者、把游标推过去，先取号那一行就永久丢失。
+                    // The crucial part: stall for a while **after allocating
+                    // the sequence number** and only then commit. Half the
+                    // transactions commit immediately and half stall for
+                    // SLOW_COMMIT, so "allocated first, committed later" is
+                    // guaranteed to occur. Without the advisory lock the reader
+                    // reads the later allocator inside that window and advances
+                    // its cursor past it, and the earlier allocator's row is
+                    // lost forever.
                     if i % 2 == 0 {
                         tokio::time::sleep(SLOW_COMMIT).await;
                     }
                     Ok(seq)
                 })
                 .await
-                .expect("写事务不应失败");
+                .expect("the write transaction should not fail");
 
             id
         }));
@@ -104,34 +121,34 @@ async fn concurrent_writes_are_never_missed_by_a_cursor() {
 
     let mut expected = HashSet::with_capacity(WRITERS);
     for writer in writers {
-        expected.insert(writer.await.expect("写任务不应 panic"));
+        expected.insert(writer.await.expect("the write task should not panic"));
     }
     writers_done.store(true, Ordering::SeqCst);
 
-    let seen = reader.await.expect("读任务不应 panic");
+    let seen = reader.await.expect("the read task should not panic");
 
-    // ① 一条不少
+    // ① None missing
     let seen_ids: HashSet<String> = seen.iter().map(|(_, id)| id.clone()).collect();
     let missing: Vec<_> = expected.difference(&seen_ids).collect();
     assert!(
         missing.is_empty(),
-        "游标漏掉了 {} 条记录（advisory lock 失效）：{missing:?}",
+        "the cursor dropped {} records (the advisory lock is not working): {missing:?}",
         missing.len()
     );
 
-    // ② 一条不重
+    // ② None duplicated
     assert_eq!(
         seen.len(),
         WRITERS,
-        "拉取结果有重复：拿到 {} 条，期望 {WRITERS} 条",
+        "the pull results contain duplicates: got {} records, expected {WRITERS}",
         seen.len()
     );
 
-    // ③ seq 严格递增 —— 游标语义成立的前提
+    // ③ seq strictly increasing -- the premise on which cursor semantics rest
     let seqs: Vec<i64> = seen.iter().map(|(seq, _)| *seq).collect();
     assert!(
         seqs.windows(2).all(|w| w[0] < w[1]),
-        "seq 未严格递增：{seqs:?}"
+        "seq is not strictly increasing: {seqs:?}"
     );
 
     db.cleanup().await;
@@ -148,7 +165,10 @@ async fn one_business_row_yields_exactly_one_sync_log_row() {
     let entity = common::new_entity("project", "Cortex");
     let fact = common::new_fact(entity.id, "uses", "Postgres", episode.id);
 
-    let before = store.latest_seq().await.expect("取末端 seq 不应失败");
+    let before = store
+        .latest_seq()
+        .await
+        .expect("reading the far end seq should not fail");
 
     let last_seq = store
         .write_txn(async |tx| {
@@ -157,32 +177,43 @@ async fn one_business_row_yields_exactly_one_sync_log_row() {
             tx.insert_fact(&fact).await
         })
         .await
-        .expect("写事务不应失败");
+        .expect("the write transaction should not fail");
 
-    // 三行业务数据 → 三行 sync_log，一一对应
+    // Three business rows → three sync_log rows, one for one
     assert_eq!(last_seq, before + 3);
 
-    let batch = store.fetch_since(before, 100).await.expect("拉取不应失败");
+    let batch = store
+        .fetch_since(before, 100)
+        .await
+        .expect("the pull should not fail");
     assert_eq!(batch.len(), 3);
 
     assert_eq!(batch[0].table_name, table::EPISODES);
     assert_eq!(batch[1].table_name, table::ENTITIES);
     assert_eq!(batch[2].table_name, table::FACTS);
 
-    // 业务行随日志行一并返回，且是类型化的
-    match batch[0].payload.as_ref().expect("episode 载荷应当存在") {
+    // The business row comes back alongside the log row, and is typed
+    match batch[0]
+        .payload
+        .as_ref()
+        .expect("the episode payload should be present")
+    {
         SyncPayload::Episode(row) => {
             assert_eq!(row.id, episode.id.to_string());
             assert_eq!(row.text.as_deref(), Some("你好"));
         }
-        other => panic!("载荷类型不对：{other:?}"),
+        other => panic!("wrong payload type: {other:?}"),
     }
-    match batch[2].payload.as_ref().expect("fact 载荷应当存在") {
+    match batch[2]
+        .payload
+        .as_ref()
+        .expect("the fact payload should be present")
+    {
         SyncPayload::Fact(row) => {
             assert_eq!(row.id, fact.id.to_string());
             assert_eq!(row.subject_id, entity.id.to_string());
         }
-        other => panic!("载荷类型不对：{other:?}"),
+        other => panic!("wrong payload type: {other:?}"),
     }
 
     db.cleanup().await;
@@ -195,16 +226,20 @@ async fn failed_transaction_leaves_no_trace_in_the_sync_log() {
     };
     let store = &db.store;
 
-    let before = store.latest_seq().await.expect("取末端 seq 不应失败");
+    let before = store
+        .latest_seq()
+        .await
+        .expect("reading the far end seq should not fail");
 
     let episode = common::new_episode("s1", "会被回滚");
-    // 第二条 fact 的 source_episode 指向不存在的 episode → FK 违约 → 整事务回滚
+    // The second fact's source_episode points at an episode that does not
+    // exist → FK violation → the whole transaction rolls back
     let orphan_entity = common::new_entity("project", "Ghost");
     let orphan_fact = common::new_fact(
         orphan_entity.id,
         "uses",
         "Nothing",
-        cortex_core::Id::new(), // 无主的出处
+        cortex_core::Id::new(), // an ownerless provenance
     );
 
     let outcome = store
@@ -215,21 +250,28 @@ async fn failed_transaction_leaves_no_trace_in_the_sync_log() {
         })
         .await;
 
-    assert!(outcome.is_err(), "外键违约应当让写事务失败");
+    assert!(
+        outcome.is_err(),
+        "a foreign key violation should make the write transaction fail"
+    );
 
-    // 业务行与 sync_log 同生共死：回滚之后两边都不该留下任何痕迹
+    // The business row and sync_log live and die together: after a rollback
+    // neither side should leave a trace
     assert_eq!(
-        store.latest_seq().await.expect("取末端 seq 不应失败"),
+        store
+            .latest_seq()
+            .await
+            .expect("reading the far end seq should not fail"),
         before,
-        "回滚的事务不应推进 sync_log"
+        "a rolled-back transaction should not advance sync_log"
     );
     assert!(
         store
             .episode(&episode.id.to_string())
             .await
-            .expect("查询不应失败")
+            .expect("the query should not fail")
             .is_none(),
-        "回滚的事务不应留下业务行"
+        "a rolled-back transaction should not leave a business row behind"
     );
 
     db.cleanup().await;
@@ -249,21 +291,30 @@ async fn fetch_since_paginates_in_seq_order() {
         store
             .write_txn(async |tx| tx.insert_episode(&episode).await)
             .await
-            .expect("写事务不应失败");
+            .expect("the write transaction should not fail");
     }
 
     let mut cursor = 0_i64;
     let mut collected = Vec::new();
     loop {
-        let batch = store.fetch_since(cursor, 3).await.expect("拉取不应失败");
+        let batch = store
+            .fetch_since(cursor, 3)
+            .await
+            .expect("the pull should not fail");
         if batch.is_empty() {
             break;
         }
-        cursor = batch.last().expect("非空批次必有末条").seq;
+        cursor = batch
+            .last()
+            .expect("a non-empty batch must have a last element")
+            .seq;
         collected.extend(batch.into_iter().map(|r| r.record_id));
     }
 
-    assert_eq!(collected, ids, "分页拉取的顺序应当与写入顺序一致");
+    assert_eq!(
+        collected, ids,
+        "the order of paginated pulls should match the write order"
+    );
 
     db.cleanup().await;
 }

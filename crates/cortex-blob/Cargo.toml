@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex 对象存储：内容寻址的 blob 读写"
+description = "Cortex object storage: content-addressed blob reads and writes"
 
 [dependencies]
 cortex-core.workspace = true
@@ -16,15 +16,15 @@ tracing.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 
-# ── S3 客户端 ──
-# default-features = false 后手工挑选：
-#   rt-tokio                —— 复用 workspace 的 tokio runtime
-#   behavior-version-latest —— 不锁行为版本，否则 Client::from_conf 直接 panic
-#   http-1x                 —— 与 workspace 的 hyper 1.x / reqwest 0.13 同代
-#   default-https-client    —— rustls + aws-lc-rs，与 reqwest 的 TLS 后端同源，
-#                              不额外拖进 ring 与 hyper 0.14
-# 刻意不开 sigv4a：那是 multi-region access point 的签名变体，
-# RustFS / R2 / 单区 S3 都用不上，白背一条加密路径。
+# ── S3 client ──
+# default-features = false, then picked by hand:
+#   rt-tokio                -- reuse the workspace's tokio runtime
+#   behavior-version-latest -- do not pin the behavior version, or Client::from_conf panics outright
+#   http-1x                 -- the same generation as the workspace's hyper 1.x / reqwest 0.13
+#   default-https-client    -- rustls + aws-lc-rs, the same TLS backend as reqwest uses,
+#                              so ring and hyper 0.14 are not dragged in on top
+# sigv4a is deliberately left off: it is the signing variant for multi-region access points,
+# which RustFS / R2 / single-region S3 have no use for -- an encryption path carried for nothing.
 aws-sdk-s3 = { version = "1.141", default-features = false, features = [
     "rt-tokio",
     "behavior-version-latest",
@@ -39,14 +39,14 @@ sha2 = "0.10"
 hex = "0.4"
 url = "2.5"
 
-# 媒体探测：两个都是「只读文件头、不解码」的轻量库。
-# 不用 image crate —— 它为了拿宽高会拖进十几个 codec。
+# Media probing: both are lightweight libraries that read the file header only and never decode.
+# Not the image crate -- it would drag in a dozen codecs just to obtain width and height.
 infer = { version = "0.22", default-features = false }
 imagesize = "0.15"
 
 [dev-dependencies]
-# 只在测试里用：验 BlobRef 的 JSON 契约（生产路径不碰 JSON，
-# 序列化由 cortexd 在自己的响应层做）
+# Used in tests only: to check the JSON contract of BlobRef (the production path never
+# touches JSON; serialization is done by cortexd in its own response layer)
 serde_json.workspace = true
 tempfile = "3"
 dotenvy.workspace = true

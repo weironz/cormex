@@ -1,24 +1,26 @@
-//! `FastEmbedder` 的真实模型验证。
+//! `FastEmbedder` verified against the real model.
 //!
-//! 全部标 `#[ignore]`：跑一次要下载数百 MB 权重，CI 与无网开发不该被它卡住。
-//! 手动跑：
+//! Everything is marked `#[ignore]`: one run downloads hundreds of MB of
+//! weights, and neither CI nor offline development should be blocked on that.
+//! Run manually:
 //!
 //! ```bash
 //! cargo test -p cortex-memory --test fastembed -- --ignored --nocapture
 //! ```
 //!
-//! # 为什么这些断言值得单独存在
+//! # Why these assertions deserve to exist on their own
 //!
-//! `HashEmbedder` 是字符 bigram 散列，「对象存储」与「blob 存储」的余弦
-//! 接近 0——向量召回那一路等于没有。下面的 `semantics_beat_hashing`
-//! 用同一组输入同时跑两个后端，把「换模型是否真的有用」变成可断言的数字，
-//! 而不是一句「应该更好」。
+//! `HashEmbedder` is a character-bigram hash, so the cosine between
+//! 「对象存储」 and 「blob 存储」 is close to 0 — the vector retrieval path might
+//! as well not be there. `semantics_beat_hashing` below runs both backends over
+//! the same inputs, turning "is swapping the model actually worth anything" into
+//! a number you can assert on, rather than a claim that it "should be better".
 
 use cortex_memory::EMBEDDING_DIM;
 use cortex_memory::embed::{Embedder, HashEmbedder};
 use cortex_memory::embed_local::{FastEmbedder, FastEmbedderConfig};
 
-/// 单位向量的余弦相似度就是点积。
+/// For unit vectors, cosine similarity is just the dot product.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -26,7 +28,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 async fn load() -> FastEmbedder {
     FastEmbedder::new(FastEmbedderConfig::default())
         .await
-        .expect("加载 BGE-M3 int8 失败；首次运行需要能访问 huggingface.co")
+        .expect("failed to load BGE-M3 int8; the first run needs access to huggingface.co")
 }
 
 #[tokio::test]
@@ -38,15 +40,19 @@ async fn produces_schema_dimension_and_unit_length() {
     assert_eq!(
         v.len(),
         EMBEDDING_DIM,
-        "维度必须与 migration 的 VECTOR({EMBEDDING_DIM}) 一致，实际 {}",
+        "the dimension must match the migration's VECTOR({EMBEDDING_DIM}); got {}",
         v.len()
     );
-    assert_eq!(e.dim(), EMBEDDING_DIM, "dim() 应与实际产出一致");
+    assert_eq!(
+        e.dim(),
+        EMBEDDING_DIM,
+        "dim() must agree with what is really produced"
+    );
 
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 1e-4,
-        "pgvector 的 cosine 距离要求单位向量，实际模长 {norm}"
+        "pgvector's cosine distance requires unit vectors; the norm is {norm}"
     );
 }
 
@@ -54,43 +60,55 @@ async fn produces_schema_dimension_and_unit_length() {
 #[ignore = "需要下载模型权重"]
 async fn is_deterministic() {
     let e = load().await;
-    // 同一条文本两次调用必须逐位相同，否则「同一句话重复入库会产生两个不同
-    // 向量」，去重与回填的幂等性都无从谈起
+    // Two calls on the same text must be bit-identical, otherwise "the same
+    // sentence stored twice produces two different vectors", and neither
+    // deduplication nor idempotent backfill means anything any more
     let a = e.embed_one("对象存储用 RustFS").await.unwrap();
     let b = e.embed_one("对象存储用 RustFS").await.unwrap();
-    assert_eq!(a, b, "相同输入必须得到逐位相同的向量");
+    assert_eq!(a, b, "identical input must yield bit-identical vectors");
 }
 
-/// batch=1（交互路径）与 batch=N（回填路径）之间可容忍的数值漂移。
+/// The numeric drift tolerated between batch=1 (the interactive path) and
+/// batch=N (the backfill path).
 ///
-/// **不是 0。** int8 GEMM 在 batch 维度变化时会换一条 kernel 路径
-/// （不同的 tiling 与累加顺序），实测漂移稳定在 0.012–0.015，
-/// 且与批内其它文本的长度无关（同长伙伴 0.0146、超长伙伴 0.0145、
-/// 短伙伴 0.0121），重复同一 batch 则完全一致（-1e-7）——
-/// 说明这是量化算子的固定偏差，不是 padding 泄漏。
+/// **It is not 0.** int8 GEMM switches kernel path when the batch dimension
+/// changes (different tiling and accumulation order); measured drift sits
+/// steadily at 0.012–0.015 and is independent of the length of the other texts
+/// in the batch (same-length partner 0.0146, very long partner 0.0145, short
+/// partner 0.0121), while repeating the same batch is exactly identical (-1e-7)
+/// — which says this is a fixed bias of the quantized operator, not padding
+/// leakage.
 ///
-/// 为什么可以接受：语义信号的量级远大于它。实测同义句 0.81、
-/// 无关句 0.38，间距 0.43，是这个漂移的 30 倍。
-/// 若哪天漂移涨到 0.05 以上，说明模型或 ORT 版本换了 kernel，需要重新评估。
+/// Why that is acceptable: the semantic signal is far larger in magnitude.
+/// Measured, synonymous sentences score 0.81 and unrelated ones 0.38, a gap of
+/// 0.43 — thirty times this drift.
+/// If the drift ever climbs above 0.05, the model or the ORT version has changed
+/// kernels and this needs re-evaluating.
 const MAX_BATCH_DRIFT: f32 = 0.03;
 
 #[tokio::test]
 #[ignore = "需要下载模型权重"]
 async fn batch_stays_comparable_with_single() {
     let e = load().await;
-    // 回填走大 batch、查询走 batch=1，两者产出的向量必须落在可比的位置上，
-    // 否则「查询向量」与「库里的向量」根本不在一个坐标系
+    // Backfill runs large batches, queries run batch=1, and the vectors the two
+    // produce must land in comparable positions — otherwise the "query vector"
+    // and the "vectors in the store" are not even in the same coordinate system
     let texts: Vec<String> = vec!["对象存储用 RustFS".into(), "今天天气不错".into()];
     let batch = e.embed(&texts).await.unwrap();
     let single = e.embed_one(&texts[0]).await.unwrap();
 
-    assert_eq!(batch.len(), 2, "批量结果条数必须与输入一致");
+    assert_eq!(
+        batch.len(),
+        2,
+        "the batch must return as many results as it had inputs"
+    );
     let drift = 1.0 - cosine(&batch[0], &single);
     println!("batch/single 漂移：{drift:.6}");
     assert!(
         drift < MAX_BATCH_DRIFT,
-        "batch 与单条的余弦差 {drift:.6} 超过容忍上限 {MAX_BATCH_DRIFT}；\
-         超出说明 kernel 路径变了，回填向量与查询向量不再可比"
+        "the cosine gap between batch and single, {drift:.6}, exceeds the tolerance \
+         {MAX_BATCH_DRIFT}; exceeding it means the kernel path changed and backfilled \
+         vectors are no longer comparable with query vectors"
     );
 }
 
@@ -98,13 +116,17 @@ async fn batch_stays_comparable_with_single() {
 #[ignore = "需要下载模型权重"]
 async fn same_batch_is_bit_stable() {
     let e = load().await;
-    // 上一个测试容忍了漂移，这个测试划定它的边界：
-    // **同样的 batch 组成必须逐次一致**。若这条也漂，那就不是 kernel 固定偏差
-    // 而是真随机，去重与幂等回填全部失效
+    // The previous test tolerates drift; this one draws its boundary:
+    // **the same batch composition must be identical from run to run**. If this
+    // one drifts too, it is not a fixed kernel bias but genuine randomness, and
+    // deduplication and idempotent backfill both stop working
     let texts: Vec<String> = vec!["对象存储用 RustFS".into(), "今天天气不错".into()];
     let a = e.embed(&texts).await.unwrap();
     let b = e.embed(&texts).await.unwrap();
-    assert_eq!(a, b, "同样的批次组成必须产出逐位相同的向量");
+    assert_eq!(
+        a, b,
+        "the same batch composition must produce bit-identical vectors"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +136,7 @@ async fn model_id_identifies_weights() {
     assert_eq!(
         e.model_id(),
         "fastembed:gpahal/bge-m3-onnx-int8",
-        "model_id 会写进各表的 embedding_model 列，是渐进回填的唯一判据"
+        "model_id lands in every embedding_model column — the sole criterion for backfill"
     );
 }
 
@@ -124,7 +146,7 @@ async fn semantics_beat_hashing() {
     let fast = load().await;
     let hash = HashEmbedder::new();
 
-    // (左, 右, 是否应该相似)
+    // (left, right, should they be similar)
     let pairs = [
         ("对象存储用 RustFS", "blob 存储选了 RustFS", true),
         ("对象存储", "object storage", true),
@@ -151,15 +173,21 @@ async fn semantics_beat_hashing() {
         if *want_similar {
             assert!(
                 *f > 0.6,
-                "「{l}」与「{r}」是同义表述，余弦应显著高，实际 {f:.4}"
+                "「{l}」 and 「{r}」 say the same thing, so the cosine should be \
+                 markedly high; got {f:.4}"
             );
         } else {
-            assert!(*f < 0.5, "「{l}」与「{r}」毫无关系，余弦应低，实际 {f:.4}");
+            assert!(
+                *f < 0.5,
+                "「{l}」 and 「{r}」 have nothing to do with each other, so the cosine \
+                 should be low; got {f:.4}"
+            );
         }
     }
 
-    // 本任务存在的理由，落成一条断言：语义模型必须把「相似」与「无关」
-    // 拉开比哈希桩更大的间距。若这条不成立，这次替换就不值得
+    // The reason this whole task exists, turned into an assertion: the semantic
+    // model must open a wider gap between "similar" and "unrelated" than the
+    // hash stub does. If that does not hold, the replacement was not worth it
     let sim_min = scores
         .iter()
         .filter(|s| s.2)
@@ -187,7 +215,7 @@ async fn semantics_beat_hashing() {
     println!("区分度：fast={fast_margin:.4}  hash={hash_margin:.4}\n");
     assert!(
         fast_margin > hash_margin,
-        "语义模型的区分度（{fast_margin:.4}）必须优于哈希桩（{hash_margin:.4}），\
-         否则这次替换没有意义"
+        "the semantic model's separation ({fast_margin:.4}) must beat the hash stub's \
+         ({hash_margin:.4}), otherwise this replacement is pointless"
     );
 }

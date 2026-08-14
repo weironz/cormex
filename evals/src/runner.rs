@@ -1,4 +1,5 @@
-//! 把题集、语料、检索器、指标串成一次完整的评测。
+//! Wire the suite, the corpus, the retriever, and the metrics into one complete
+//! eval run.
 
 use anyhow::{Context, Result};
 
@@ -12,7 +13,7 @@ use crate::report::{CorpusInfo, Report, RunInfo, SuiteInfo, kind_order, lang_ord
 use crate::suite::{Question, QuestionKind, Suite};
 use cortex_memory::retrieval::{DEFAULT_ABSTAIN_BELOW, RecencyMode};
 
-/// 把近因形态写成报告里那一行字。
+/// Render the recency mode as the line of text that goes into the report.
 fn describe_recency(mode: RecencyMode) -> String {
     match mode {
         RecencyMode::Channel => "channel".to_owned(),
@@ -28,19 +29,24 @@ pub struct RunOptions {
     pub database_url: String,
     pub mode: ExtractMode,
     pub keep_schema: bool,
-    /// 实体向量近似归并的阈值。`None` 用生产默认值
+    /// Threshold for approximate entity-vector merging. `None` uses the
+    /// production default
     pub entity_threshold: Option<f32>,
     pub retrieval: RetrievalConfig,
-    /// 只跑 id 里含此子串的题（调 bad case 用）
+    /// Run only the questions whose id contains this substring (for chasing bad
+    /// cases)
     pub only: Option<String>,
-    /// 不把题目的 domain 传给检索器，等价于关掉域加权。
+    /// Do not pass the question's domain to the retriever, which is equivalent
+    /// to turning domain weighting off.
     ///
-    /// `Retriever` 没有暴露 `domain_boost` 的 setter，但传 `None` 时
-    /// `apply_domain_boost` 直接返回 —— 这就是现成的 A/B 开关，
-    /// 用来回答「域加权到底帮了还是害了跨域题」。
+    /// `Retriever` exposes no setter for `domain_boost`, but with `None`
+    /// passed, `apply_domain_boost` returns immediately — that is a ready-made
+    /// A/B switch for answering "did domain weighting help or hurt the
+    /// cross-domain questions".
     pub ignore_domain: bool,
-    /// 灌完语料后跑一遍跨域连接扫描。默认关 —— 它会往库里写额外的边，
-    /// 不显式要求就不该改变基线
+    /// Run a cross-domain link scan after the corpus is loaded. Off by default —
+    /// it writes extra edges into the store, and without an explicit request it
+    /// should not move the baseline
     pub cross_link: CrossLinkOptions,
 }
 
@@ -48,7 +54,8 @@ pub async fn run(suite: &Suite, opts: &RunOptions) -> Result<Report> {
     let db = EvalDb::create(&opts.database_url).await?;
     let schema = db.schema().to_owned();
 
-    // 出错也要把临时 schema 清掉，否则调试期间会攒出几十个死 schema
+    // Clean the temp schema up even on error, otherwise debugging accumulates
+    // dozens of dead schemas
     let outcome = run_inner(&db, suite, opts).await;
     let keep = opts.keep_schema || outcome.is_err();
     db.cleanup(keep).await;
@@ -65,9 +72,11 @@ async fn run_inner(db: &EvalDb, suite: &Suite, opts: &RunOptions) -> Result<Repo
 
     let (ingest, checkpoints) = ingest_suite(db, suite, &extractor, opts.mode).await?;
 
-    // 扫描必须在 ingest 之后、快照之前：写进去的 relates_to 也是 facts，
-    // gold 存在性核对要看得见它们（否则拿它们当 gold 的题会被判成 GoldMissing，
-    // 而那正好会把「桥没建起来」伪装成「题目坏了」）
+    // The scan has to run after ingest and before the snapshot: the relates_to
+    // edges it writes are facts too, and the gold existence check has to see
+    // them (otherwise a question using them as gold would be judged
+    // GoldMissing, which would disguise "the bridge was never built" as "the
+    // question is broken")
     let cross_links = if opts.cross_link.enabled {
         Some(build_cross_links(db, &embedder, opts.cross_link).await?)
     } else {
@@ -78,9 +87,11 @@ async fn run_inner(db: &EvalDb, suite: &Suite, opts: &RunOptions) -> Result<Repo
     let entities = db.count_entities().await?;
     let tool_calls_in_db = db.count_tool_calls().await?;
 
-    // 题集声明了多少条轨迹，库里就该有多少行。对不上说明轨迹在写入路径上丢了，
-    // 而丢了的表现（工具经验题全挂）与「抽取器还没接轨迹」一模一样 ——
-    // 不在这里断言，这两件事在报告里永远分不开
+    // However many tool calls the suite declares, the store should hold that
+    // many rows. A mismatch means the trace was lost somewhere on the write
+    // path, and losing it looks exactly like "the extractor is not wired to
+    // traces yet" (all the tool-experience questions fail) — without asserting
+    // here, those two would be permanently indistinguishable in the report
     let declared = i64::try_from(suite.tool_call_count()).unwrap_or(i64::MAX);
     anyhow::ensure!(
         tool_calls_in_db == declared,
@@ -102,7 +113,7 @@ async fn run_inner(db: &EvalDb, suite: &Suite, opts: &RunOptions) -> Result<Repo
     }
 
     let refs: Vec<&QuestionResult> = questions.iter().collect();
-    let overall = aggregate("全部", &refs);
+    let overall = aggregate("all", &refs);
 
     let by_kind: Vec<Aggregate> = kind_order()
         .into_iter()
@@ -179,8 +190,10 @@ async fn evaluate_one(
     let status = gold_status(q, &matchers, facts);
     let leaked = leaks(&matchers, facts);
 
-    // gold 根本没落库时，检索必然是 0 分，跑它只是浪费一次数据库往返。
-    // 但仍然要产出一条结果 —— 报告里必须看得见「有几道题是坏的」。
+    // When the gold never landed in the store, retrieval is guaranteed to score
+    // 0, and running it merely wastes a database round-trip. A result still has
+    // to be produced, though — the report must show "how many questions are
+    // broken".
     if status == Status::GoldMissing {
         return Ok(score(
             q,
@@ -199,9 +212,12 @@ async fn evaluate_one(
                 .get(name)
                 .copied()
                 .with_context(|| format!("题目 {} 引用的 checkpoint「{name}」不存在", q.id))?;
-            // 回放走的是**快照内**的三路（同一份 as-of 集合上的 bm25/向量/时间倒序），
-            // 与日常四路查的不是同一批数据。把它塞进逐路诊断会让两套口径混在
-            // 一张表里，所以这里仍然留空 —— 回放的排序质量由主指标衡量
+            // Replay uses three paths **within the snapshot** (bm25 / vector /
+            // reverse-chronological over the same as-of set), which is not the
+            // same body of data the everyday four paths query. Feeding it into
+            // the per-path diagnostics would mix two different accountings into
+            // one table, so it is left empty here — replay's ranking quality is
+            // measured by the main metrics
             (
                 retriever.replay(&db.store, &q.query, at).await?,
                 Vec::new(),
@@ -220,11 +236,13 @@ async fn evaluate_one(
     ))
 }
 
-/// 「不该被抽出来」的断言里，有哪几条实际在语料快照里找到了。
+/// Which of the "should never have been extracted" assertions were actually
+/// found in the corpus snapshot.
 ///
-/// 比对的是**全部**事实而不是有效事实：失效只是打了个墓碑，行还在、
-/// 向量还在（`docs/memory-content.md` §八.5 的 Ghost Vectors）。
-/// 「抽出来又失效掉」不等于「没抽」。
+/// The comparison is against **all** facts, not just active ones: invalidation
+/// merely places a tombstone, and the row and the vector both remain (the Ghost
+/// Vectors of `docs/memory-content.md` §8.5). "Extracted and then invalidated"
+/// is not the same as "never extracted".
 fn leaks(matchers: &QuestionMatchers, facts: &[FactRow]) -> Vec<String> {
     matchers
         .never_extracted
@@ -234,11 +252,13 @@ fn leaks(matchers: &QuestionMatchers, facts: &[FactRow]) -> Vec<String> {
         .collect()
 }
 
-/// gold 是否真的落进了库。
+/// Whether the gold really landed in the store.
 ///
-/// 这一步把两类失败分开：**检索没找到**（检索的锅）与
-/// **压根没这条事实**（抽取或题目的锅）。不分开的话，抽取管线的问题
-/// 会全部记在检索头上，而后者是这套评测唯一要衡量的东西。
+/// This step separates two kinds of failure: **retrieval did not find it**
+/// (retrieval's fault) versus **the fact is not there at all** (extraction's or
+/// the question's fault). Without the separation, extraction-pipeline problems
+/// would all be charged to retrieval, and retrieval is the only thing this eval
+/// exists to measure.
 fn gold_status(q: &Question, matchers: &QuestionMatchers, facts: &[FactRow]) -> Status {
     if matchers.gold.is_empty() {
         return Status::Scored;
@@ -255,7 +275,8 @@ fn gold_status(q: &Question, matchers: &QuestionMatchers, facts: &[FactRow]) -> 
         }
     }
 
-    // 时间回放题的 gold 本来就该是已被取代的旧事实，不算标注错误
+    // A time-replay question's gold is supposed to be a superseded old fact, so
+    // that is not a labeling error
     if any_inactive && q.kind != QuestionKind::TemporalReplay {
         return Status::GoldInactive;
     }
@@ -298,7 +319,8 @@ mod tests {
         assert_eq!(
             gold_status(&q, &m, &[fact("别的事实", true)]),
             Status::GoldMissing,
-            "gold 没落库时把责任算给检索，会让抽取的问题永远查不出来"
+            "charging retrieval when the gold never landed in the store would \
+             keep extraction problems permanently undiagnosable"
         );
     }
 
@@ -309,7 +331,8 @@ mod tests {
         assert_eq!(
             gold_status(&q, &m, &[fact("对象存储先用 MinIO", false)]),
             Status::GoldInactive,
-            "非回放题却把已失效的事实当 gold，是题目标错了"
+            "a non-replay question using an invalidated fact as gold means the \
+             question is mislabelled"
         );
     }
 
@@ -320,7 +343,7 @@ mod tests {
         assert_eq!(
             gold_status(&q, &m, &[fact("对象存储先用 MinIO", false)]),
             Status::Scored,
-            "回放题的 gold 本来就该是被取代掉的旧事实"
+            "a replay question's gold is supposed to be a superseded old fact"
         );
     }
 
@@ -329,7 +352,8 @@ mod tests {
         let mut q = question(QuestionKind::ToolExperience, &["--locked"]);
         q.never_extracted = vec![vec!["failed to select a version".into()]];
         let m = QuestionMatchers::of(&q);
-        // 这条事实排在第几名无关紧要 —— 它**存在**本身就是抽取侧的失败
+        // What rank this fact lands at is irrelevant — its **existence** is
+        // itself the failure on the extraction side
         let corpus = [fact(
             "error: failed to select a version for `sqlx-core`",
             true,
@@ -337,7 +361,8 @@ mod tests {
         assert_eq!(
             leaks(&m, &corpus).len(),
             1,
-            "命令原始输出被抽成了事实，必须能量到（docs/memory-content.md §二③）"
+            "raw command output was extracted into a fact, which must be \
+             measurable (docs/memory-content.md §2③)"
         );
     }
 
@@ -350,7 +375,9 @@ mod tests {
         assert_eq!(
             leaks(&m, &corpus).len(),
             1,
-            "失效只是加了个墓碑，行和向量都还在 —— 抽出来又失效不等于没抽"
+            "invalidation only adds a tombstone; the row and the vector both \
+             remain — extracted then invalidated is not the same as never \
+             extracted"
         );
     }
 

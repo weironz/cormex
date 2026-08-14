@@ -1,10 +1,11 @@
-//! `/ws` —— 多端同步的实时推送。
+//! `/ws` — the realtime push channel for multi-device sync.
 //!
-//! 契约见 [`crate::dto::SyncEvent`]（含「为什么只推信号不推数据」）。
-//! 事件源见 [`crate::sync_notify`]（含「为什么走数据库触发器」）。
+//! The contract is in [`crate::dto::SyncEvent`] (including "why we push only a
+//! signal and never the data"). The event source is [`crate::sync_notify`]
+//! (including "why it goes through a database trigger").
 //!
-//! 本模块只负责一件事：把总线上的信号扇出到每个连接，并且**在任何一端
-//! 出问题时都不留下挂着的任务**。
+//! This module does exactly one thing: fan the signals on the bus out to every
+//! connection, and **leave no dangling task behind when either end goes wrong**.
 
 use std::time::Duration;
 
@@ -20,10 +21,12 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::dto::SyncEvent;
 use crate::state::AppState;
 
-/// 应用层心跳间隔。
+/// Application-level heartbeat interval.
 ///
-/// 中间代理（nginx、云负载均衡）普遍在 60s 空闲后掐连接，而同步推送在
-/// 用户不操作时可以静默几小时。TCP keepalive 默认两小时才动，指望不上。
+/// Intermediate proxies (nginx, cloud load balancers) commonly cut a connection
+/// after 60s of idleness, while sync push can stay silent for hours when the
+/// user is not doing anything. TCP keepalive defaults to two hours before it
+/// stirs, so it is no help here.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 pub async fn handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
@@ -31,9 +34,11 @@ pub async fn handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Respon
 }
 
 async fn serve(socket: WebSocket, st: AppState) {
-    // 先订阅再读游标，顺序不能反：反过来的话，两步之间提交的事务
-    // 既不在 hello 的 cursor 里、也不会被这条连接收到 bump —— 永久漏一段。
-    // 这个顺序下最坏只是重复收到一次已知的 bump，客户端幂等
+    // Subscribe first, read the cursor second; the order cannot be swapped. The
+    // other way round, a transaction committing between the two steps is neither
+    // covered by hello's cursor nor delivered as a bump on this connection —
+    // a permanently missing stretch. In this order the worst case is receiving
+    // one already-known bump twice, and the client is idempotent
     let mut rx = st.subscribe_sync();
     let cursor = st.latest_cursor().await;
 
@@ -53,20 +58,22 @@ async fn serve(socket: WebSocket, st: AppState) {
     }
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.tick().await; // interval 首次立即触发，丢掉
+    ping.tick().await; // interval fires immediately the first time; drop that one
 
     loop {
         tokio::select! {
             event = rx.recv() => {
                 let event = match event {
                     Ok(e) => e,
-                    // 本连接消费太慢被落下。语义等同于断线：客户端按自己的
-                    // 游标补拉即可 —— 这正是只推信号换来的好处
+                    // This connection consumed too slowly and fell behind.
+                    // Semantically identical to a disconnect: the client just
+                    // backfills from its own cursor — exactly the payoff of
+                    // pushing only a signal
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "WS 订阅者滞后，降级为 resync");
                         SyncEvent::Resync { cursor: st.latest_cursor().await }
                     }
-                    // 总线关闭 = 服务端在退出
+                    // A closed bus means the server is shutting down
                     Err(RecvError::Closed) => break,
                 };
                 if send(&mut sink, &event).await.is_err() {
@@ -76,9 +83,10 @@ async fn serve(socket: WebSocket, st: AppState) {
 
             incoming = stream.next() => {
                 match incoming {
-                    // 上行一律走 HTTP，这里收到什么都不解释。
-                    // 保留读取本身是必须的：不读就收不到 Close 帧，
-                    // 连接会一直挂到心跳失败为止
+                    // Everything upstream goes over HTTP, so whatever arrives
+                    // here is not interpreted. Keeping the read itself is
+                    // mandatory: without it we never see the Close frame and
+                    // the connection hangs around until the heartbeat fails
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "WS 读取出错，关闭连接");
@@ -96,13 +104,15 @@ async fn serve(socket: WebSocket, st: AppState) {
         }
     }
 
-    // 显式关闭：让对端立刻知道，而不是等它自己心跳超时
+    // Close explicitly, so the peer finds out immediately instead of waiting for
+    // its own heartbeat to time out
     let _ = sink.close().await;
 }
 
 async fn send(sink: &mut SplitSink<WebSocket, Message>, event: &SyncEvent) -> Result<(), ()> {
-    // 序列化 SyncEvent 不可能失败（全是数字与静态串），但真失败时
-    // 断开连接比发一条畸形帧好：客户端至少会重连
+    // Serialising a SyncEvent cannot fail (it is all numbers and static
+    // strings), but if it somehow does, dropping the connection beats sending a
+    // malformed frame: the client will at least reconnect
     let Ok(json) = serde_json::to_string(event) else {
         tracing::error!("SyncEvent 序列化失败");
         return Err(());

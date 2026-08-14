@@ -1,14 +1,18 @@
-//! 多路召回的查询侧。
+//! The query side of multi-channel retrieval.
 //!
-//! 每一路各自返回**已按该路自身相关性排好序**的候选，融合交给
-//! `cortex-memory::fusion` 的 RRF 完成 —— 存储层不做排序策略，
-//! 只负责把各路的原始结果捞出来。哪几路要、哪几路不要，
-//! 由 `cortex-memory::retrieval` 按评测数据裁决，不在这里判断。
+//! Each channel returns candidates **already sorted by that channel's own
+//! notion of relevance**, and fusion is left to the RRF in
+//! `cortex-memory::fusion` — the storage layer implements no ranking policy, it
+//! only pulls each channel's raw results out. Which channels are used and which
+//! are not is decided by `cortex-memory::retrieval` on the basis of evaluation
+//! data, not judged here.
 //!
-//! 日常召回全部只查 `active_facts` 视图（已失效的事实不该进日常检索）。
-//! 例外是 `facts_as_of*` 那一组：它们要的正是「在那个时刻我以为什么是真的」，
-//! 必须回到 `facts` + `fact_events` 重放。三条回放召回共用一份快照判定
-//! （`as_of_snapshot!`），差别只在**快照之上按什么排序**。
+//! Everyday retrieval queries only the `active_facts` view (invalidated facts
+//! should not enter everyday retrieval). The exception is the `facts_as_of*`
+//! group: what they want is precisely "what I believed to be true at that
+//! moment", so they must go back to `facts` + `fact_events` and replay. The
+//! three replay retrievals share one snapshot predicate (`as_of_snapshot!`) and
+//! differ only in **what they sort by on top of that snapshot**.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow as _, Row as _};
@@ -17,19 +21,23 @@ use crate::error::Result;
 use crate::model::{Entity, Fact, fact_columns};
 use crate::store::Store;
 
-/// 一次召回返回的条数上限的合理区间。
-/// 太少会让 RRF 没有融合空间，太多会拖慢图遍历那一路。
+/// The sane range for the cap on how many rows one retrieval returns.
+/// Too few leaves RRF no room to fuse; too many slows down the graph traversal
+/// channel.
 ///
-/// `pub(crate)`：换模型的回填待办查询（`query.rs`）也用同一个上限。
-/// 复制一份常量的下场是两处慢慢漂开，而漂开的症状是「某条路径悄悄
-/// 返回得比别处多/少」，没有任何报错。
+/// `pub(crate)`: the backfill-todo query used when switching models
+/// (`query.rs`) shares the same cap. Copying the constant would let the two
+/// slowly drift apart, and the symptom of that drift is "some path quietly
+/// returns more/fewer rows than the others", with no error at all.
 pub(crate) const MAX_LIMIT: i64 = 200;
 
-/// 「在 `$1` 那一刻 Cortex 认为仍然为真」的快照。
+/// The snapshot of "what Cortex still believed to be true at the instant `$1`".
 ///
-/// 三条回放召回（近因 / BM25 / 向量）共用同一份判定。**必须查 `facts` 而非
-/// `active_facts`**：后者是**当前**的有效集，用它做回放会把「后来才被推翻的
-/// 结论」提前抹掉，那正好是回放要看的东西。
+/// The three replay retrievals (recency / BM25 / vector) share this one
+/// predicate. It **must query `facts` and not `active_facts`**: the latter is
+/// the **current** valid set, and using it for replay would prematurely erase
+/// "conclusions that were only overturned later" — which is exactly what replay
+/// exists to look at.
 macro_rules! as_of_snapshot {
     () => {
         concat!(
@@ -47,57 +55,69 @@ macro_rules! as_of_snapshot {
     };
 }
 
-/// 向量召回的**并集**：事实原列 ∪ `fact_embeddings` 旁表。
+/// The **union** for vector retrieval: the fact's own column ∪ the
+/// `fact_embeddings` side table.
 ///
-/// # 为什么是并集
+/// # Why a union
 ///
-/// 换模型之后，「模型 M 下的向量」分散在两处：写入时就用 M 的落在
-/// `facts.embedding`，后来被回填器补出来的落在 `fact_embeddings`。
-/// 只查一处的后果是**静默的部分失忆** —— 漏掉的那一半照常有 BM25 与
-/// 图遍历兜着，所以它看起来不像坏了（见 migrations/20260808000001 的注释）。
+/// After a model switch, "the vectors under model M" are scattered across two
+/// places: the ones written with M from the start sit in `facts.embedding`,
+/// while the ones the backfiller filled in later sit in `fact_embeddings`.
+/// Querying only one place produces **silent partial amnesia** — the missing
+/// half is still covered by BM25 and graph traversal, so it does not look
+/// broken (see the comments in migrations/20260808000001).
 ///
-/// # 为什么写成两个各自 `ORDER BY … LIMIT` 的分支
+/// # Why it is written as two branches, each with its own `ORDER BY … LIMIT`
 ///
-/// 为了让每一侧都**有机会**走自己的向量索引。写成 `JOIN` 之后再统一
-/// `ORDER BY`，或者用 `LATERAL`，索引连机会都没有 —— 那种查询在小库上
-/// 跑得飞快，等库长大了才暴露，而那时它看起来像「数据库变慢了」
-/// 而不是「索引没被用上」。
+/// So that each side gets a **chance** to use its own vector index. Written as
+/// a `JOIN` followed by a single `ORDER BY`, or with `LATERAL`, the index never
+/// even gets the chance — that kind of query is blazingly fast on a small
+/// database and only surfaces once the database grows, at which point it looks
+/// like "the database got slower" rather than "the index isn't being used".
 ///
-/// 两侧现在都真的走索引了 —— 但分支一是**后来才修好的**，这段历史值得留着：
+/// Both sides genuinely use their index now — but branch one was **only fixed
+/// later**, and that history is worth keeping:
 ///
-/// `active_facts` 原本是 `facts LEFT JOIN fact_status`，而外连接必须先做完
-/// 才能按距离排序，于是 `idx_facts_vec` 从这个项目的第一天起就没被用上过。
-/// 5 万条事实上实测 289.7ms、19.8 万次缓冲、4.3 万次 1024 维距离计算；
-/// 换成反连接之后 0.5ms、531 次缓冲。视图定义见
-/// migrations/20260810000001，那里有三种写法的完整对照。
+/// `active_facts` used to be `facts LEFT JOIN fact_status`, and the outer join
+/// has to complete before anything can be sorted by distance, so `idx_facts_vec`
+/// had gone unused since day one of this project. Measured over 50,000 facts:
+/// 289.7ms, 198,000 buffer hits, 43,000 distance computations over 1024
+/// dimensions; switching to an anti-join brought it to 0.5ms and 531 buffer
+/// hits. The view definition is in migrations/20260810000001, which has a full
+/// side-by-side comparison of the three formulations.
 ///
-/// **教训是它不报错**：结果始终完全正确，只是慢，而小库上根本看不出来。
-/// 所以给 `active_facts` 改形状之前先看一眼那条 migration ——
-/// 一个不小心加回来的 join 会把这里悄悄打回原形。
+/// **The lesson is that it raises no error**: the results were always entirely
+/// correct, merely slow, and on a small database that is invisible. So before
+/// reshaping `active_facts`, take a look at that migration — one carelessly
+/// reintroduced join quietly puts this back the way it was.
 ///
-/// # 为什么 `$base` 被写了两遍，而不是抽成 CTE
+/// # Why `$base` is written out twice instead of being factored into a CTE
 ///
-/// 写成 `WITH base AS (…)` 更好看，但**它会让分支一的 HNSW 失效**。
-/// PG 12 起只在 CTE 被引用**一次**时内联；这里两个分支各引用一次，
-/// 于是它被物化成临时结果，`ORDER BY embedding <=> $1` 只能对着
-/// 一堆已经落地的行做排序。
+/// `WITH base AS (…)` would look nicer, but **it defeats the HNSW index in
+/// branch one**. Since PG 12 a CTE is inlined only when it is referenced
+/// **once**; here each of the two branches references it once, so it gets
+/// materialized into a temporary result and `ORDER BY embedding <=> $1` can
+/// only sort a pile of already-materialized rows.
 ///
-/// 这不是推测 —— 第一版就是 CTE，`EXPLAIN` 打出来是：
+/// This is not speculation — the first version was a CTE, and `EXPLAIN` printed:
 ///
 /// ```text
 ///   ->  Sort  (Sort Key: b.embedding <=> …)
-///         ->  CTE Scan on base b          ← 分支一，没有索引
-///   ->  Index Scan using idx_fact_embeddings_vec on fact_embeddings  ← 分支二有
+///         ->  CTE Scan on base b          ← branch one, no index
+///   ->  Index Scan using idx_fact_embeddings_vec on fact_embeddings  ← branch two has one
 /// ```
 ///
-/// 去掉 CTE 之后两侧都是 `Index Scan`。重复那段 SQL 是它的代价。
+/// With the CTE removed, both sides are `Index Scan`. Repeating that piece of
+/// SQL is the price.
 ///
-/// # `DISTINCT ON` 是防御性的
+/// # The `DISTINCT ON` is defensive
 ///
-/// 正常情况下两侧不会撞：回填器只挑 `embedding_model <> 当前` 的事实
-/// （见 `Store::facts_missing_embedding`），所以一条事实不会同时在两边。
-/// 但「换走再换回来」这种路径能造出重叠，而重叠的症状是同一条记忆
-/// 在召回里出现两次、RRF 给它双份排名 —— 一个悄悄放大的偏置。
+/// Under normal circumstances the two sides do not collide: the backfiller only
+/// picks facts whose `embedding_model <> the current one` (see
+/// `Store::facts_missing_embedding`), so a fact cannot be on both sides at
+/// once. But a path like "switch away and then switch back" can manufacture an
+/// overlap, and the symptom of an overlap is the same memory appearing twice in
+/// retrieval and RRF giving it a double ranking — a quietly amplifying bias.
 macro_rules! vector_union {
     (base = $base:expr, vec = $v:literal, model = $m:literal, limit = $l:literal) => {
         concat!(
@@ -154,11 +174,13 @@ macro_rules! vector_union {
     };
 }
 
-/// 实时向量召回用的那条 SQL。
+/// The SQL used by live vector retrieval.
 ///
-/// 提成常量只为一件事：让 `tests/embedding_migration.rs` 能对**真正跑的那条
-/// 查询**做 `EXPLAIN`。测试里手抄一份 SQL 的下场是它慢慢漂开，
-/// 而漂开之后那条测试守的是一条已经不存在的查询 —— 它照样绿。
+/// It is lifted into a constant for exactly one reason: so that
+/// `tests/embedding_migration.rs` can run `EXPLAIN` against **the query that
+/// actually runs**. Hand-copying the SQL into the test would let it slowly
+/// drift, and after drifting the test guards a query that no longer exists —
+/// while still passing.
 #[doc(hidden)]
 pub const RECALL_VECTOR_SQL: &str = vector_union!(
     base = "active_facts",
@@ -168,11 +190,13 @@ pub const RECALL_VECTOR_SQL: &str = vector_union!(
 );
 
 impl Store {
-    /// ① BM25 全文召回 —— 专有名词与精确匹配。
+    /// ① BM25 full-text retrieval — proper nouns and exact matches.
     ///
-    /// `tsquery_input` 由 `cortex-memory::tokenize::to_tsquery_input` 生成
-    /// （jieba 分词后 OR 连接）。这一路是中文检索的主力：向量对
-    /// 「张伟」这类专有名词表现很差，全文才能精确命中。
+    /// `tsquery_input` is produced by
+    /// `cortex-memory::tokenize::to_tsquery_input` (jieba segmentation joined
+    /// with OR). This channel does the heavy lifting for Chinese retrieval:
+    /// vectors perform poorly on proper nouns like "张伟", and only full text
+    /// hits them exactly.
     pub async fn recall_bm25(&self, tsquery_input: &str, limit: i64) -> Result<Vec<Fact>> {
         if tsquery_input.trim().is_empty() {
             return Ok(Vec::new());
@@ -192,20 +216,24 @@ impl Store {
         Ok(rows)
     }
 
-    /// ② 向量余弦召回 —— 语义相近。
+    /// ② Vector cosine retrieval — semantic proximity.
     ///
-    /// 按 `embedding_model` 过滤：换模型期间新旧向量不在同一语义空间，
-    /// 距离不可比。混着查会得到毫无意义的排序（见 memory.md §七）。
+    /// Filtered by `embedding_model`: during a model switch the old and new
+    /// vectors do not live in the same semantic space, so their distances are
+    /// not comparable. Querying them mixed together yields a meaningless
+    /// ranking (see memory.md §7).
     pub async fn recall_vector(
         &self,
         embedding: &pgvector::Vector,
         embedding_model: &str,
         limit: i64,
     ) -> Result<Vec<Fact>> {
-        // 与 recall_vector_scored 共用同一条 SQL：多回来的 distance 列
-        // 被 `FromRow for Fact` 按名取列时直接忽略。
-        // 两份手抄的 SQL 迟早会漂开，而漂开的症状是「带分数的那条路和不带
-        // 分数的那条路召回结果不一样」—— 没有任何报错
+        // Shares the same SQL as recall_vector_scored: the extra distance
+        // column that comes back is simply ignored when `FromRow for Fact`
+        // picks columns by name.
+        // Two hand-copied versions of the SQL would drift apart sooner or
+        // later, and the symptom of that drift is "the scored path and the
+        // unscored path retrieve different results" -- with no error at all
         let rows = sqlx::query_as::<_, Fact>(RECALL_VECTOR_SQL)
             .bind(embedding)
             .bind(embedding_model)
@@ -215,21 +243,27 @@ impl Store {
         Ok(rows)
     }
 
-    /// ② 的带分数版本 —— 除事实外一并返回**余弦距离**（不是相似度）。
+    /// The scored version of ② — returns the **cosine distance** (not the
+    /// similarity) alongside each fact.
     ///
-    /// # 为什么要把分数捞出来
+    /// # Why the scores are pulled out at all
     ///
-    /// RRF 只用排名，这是它的优点（量纲免疫），但也意味着融合分**完全不含
-    /// 绝对相关性信息**：一个库里根本没有答案的问题，四路照样各自返回自己
-    /// 最好的那几条，它们照样互相印证，融合分照样很高。评测实测：
-    /// 弃权阈值从 0 扫到 0.045，误召率纹丝不动地停在 0.370 ——
-    /// 那道闸门管的是**注入条数**，不是**相不相关**。
+    /// RRF uses only ranks, which is its virtue (immunity to differing scales),
+    /// but it also means the fused score **carries no absolute relevance
+    /// information whatsoever**: for a question the database simply has no
+    /// answer to, all four channels still return their own best few, those
+    /// still corroborate each other, and the fused score is still high.
+    /// Measured in evaluation: sweeping the abstention threshold from 0 to
+    /// 0.045 left the false-recall rate frozen at 0.370 — that gate controls
+    /// **how many memories get injected**, not **whether they are relevant**.
     ///
-    /// 唯一还带绝对量纲的信号就是这里的余弦距离：它由模型定标，
-    /// 与语料规模无关。相似度 = 1 - 距离。
+    /// The only signal that still carries an absolute scale is the cosine
+    /// distance here: it is calibrated by the model and independent of corpus
+    /// size. Similarity = 1 - distance.
     ///
-    /// 保留不带分数的 [`Store::recall_vector`] 是因为召回路本身不需要分数，
-    /// 而多返回一列会让那条热路径每次多搬一遍 f64。
+    /// The unscored [`Store::recall_vector`] is kept because the retrieval path
+    /// itself does not need scores, and returning an extra column would make
+    /// that hot path shuttle an f64 around on every call.
     pub async fn recall_vector_scored(
         &self,
         embedding: &pgvector::Vector,
@@ -251,24 +285,30 @@ impl Store {
             .collect()
     }
 
-    /// ③ 图遍历召回 —— 从命中实体出发扩展 1–2 跳的关联事实。
+    /// ③ Graph traversal retrieval — expand 1–2 hops of related facts outward
+    /// from the entities that were hit.
     ///
-    /// `facts` 表里 `subject_id → object_entity_id` 的每一行就是图的一条边，
-    /// 因此这里是普通的递归 CTE，不需要图数据库。
+    /// Every row of `subject_id → object_entity_id` in the `facts` table is an
+    /// edge of the graph, so this is an ordinary recursive CTE with no need for
+    /// a graph database.
     ///
-    /// 实体先经 `canonical_entities` 归并，否则别名会让同一实体的邻居分裂。
-    /// 结果**按跳数升序** —— 近的比远的相关。
+    /// Entities are first collapsed through `canonical_entities`, or aliases
+    /// would split one entity's neighbors apart. Results are **ascending by hop
+    /// count** — nearer is more relevant than farther.
     ///
-    /// # 为什么要嵌一层子查询
+    /// # Why the extra nested subquery
     ///
-    /// `DISTINCT ON (f.id)` 强制 `ORDER BY` 以 `f.id` 打头，于是外层排序
-    /// 只能是 `ORDER BY f.id, hop` —— 那是**按 fact id 排序**，而 id 是
-    /// ULID（创建顺序），跟相关性毫无关系。更糟的是 `LIMIT` 也会按 id 截断，
-    /// 语料一大，近跳的事实会被远跳的老事实挤掉。
+    /// `DISTINCT ON (f.id)` forces `ORDER BY` to lead with `f.id`, so the outer
+    /// sort could only be `ORDER BY f.id, hop` — which is **sorting by fact
+    /// id**, and the id is a ULID (creation order), utterly unrelated to
+    /// relevance. Worse, the `LIMIT` would also truncate by id, so as the
+    /// corpus grows, near-hop facts get squeezed out by older far-hop ones.
     ///
-    /// 所以先在内层用 `DISTINCT ON` 完成「每条事实只保留最小跳数」的去重，
-    /// 再在外层按跳数排序与截断。评测发现了这个 bug：某题的 gold 是全库
-    /// 最新的事实，却在 7 条图召回里排到第 6。
+    /// So the inner level uses `DISTINCT ON` to do the "keep only the smallest
+    /// hop count per fact" deduplication, and the outer level sorts and
+    /// truncates by hop count. Evaluation found this bug: for one question the
+    /// gold answer was the most recent fact in the entire database, yet it
+    /// ranked 6th out of 7 graph retrieval results.
     pub async fn recall_graph(
         &self,
         seed_entity_ids: &[String],
@@ -317,10 +357,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// ④ 时间近因召回 —— 上下文连续性。
+    /// ④ Temporal recency retrieval — contextual continuity.
     ///
-    /// 按**系统时间**（`created_at`，即 Cortex 何时知道）而非事件时间排序：
-    /// 「最近聊过什么」问的是认知的新鲜度，不是世界的时间线。
+    /// Sorted by **system time** (`created_at`, i.e. when Cortex learned it)
+    /// rather than event time: "what have we talked about lately" asks about
+    /// the freshness of knowledge, not about the world's timeline.
     pub async fn recall_recent(&self, within_days: i64, limit: i64) -> Result<Vec<Fact>> {
         let rows = sqlx::query_as::<_, Fact>(concat!(
             "SELECT ",
@@ -337,16 +378,21 @@ impl Store {
         Ok(rows)
     }
 
-    /// ⑤ episodes 全文召回 —— 从**原始对话**倒查它抽出来的事实。
+    /// ⑤ Episode full-text retrieval — work backwards from the **raw
+    /// conversation** to the facts extracted from it.
     ///
-    /// 前四路全部只看 `facts.statement`，也就是抽取器改写过的一句话。
-    /// 「上次我们说的那个」「你是从哪儿知道的」这类**出处追问**里，
-    /// 用户复述的是当时的原话，而原话的措辞往往一个字都没进 statement——
-    /// 于是 BM25 那一路查无此词，向量那一路也对不上。
-    /// `episodes.tsv` 的 GIN 索引建了却一直没人用，这一路就是补上它。
+    /// The first four channels all look only at `facts.statement`, which is a
+    /// sentence the extractor rewrote. In **provenance follow-ups** like "that
+    /// thing we discussed last time" or "where did you learn that", the user is
+    /// paraphrasing what was actually said at the time, and the original
+    /// wording often did not make it into the statement at all — so the BM25
+    /// channel finds no such term and the vector channel does not line up
+    /// either. The GIN index on `episodes.tsv` had been built but never used;
+    /// this channel is what finally uses it.
     ///
-    /// 排序按 episode 的 `ts_rank`，同一 episode 内按事实新旧。
-    /// 返回的仍然是 `Fact` —— 注入契约只认事实，L0 原文不进 prompt。
+    /// Sorted by the episode's `ts_rank`, and within one episode by fact
+    /// recency. What is returned is still a `Fact` — the injection contract
+    /// recognizes facts only, and L0 raw text never enters the prompt.
     pub async fn recall_via_episodes(
         &self,
         tsquery_input: &str,
@@ -379,15 +425,18 @@ impl Store {
         Ok(rows)
     }
 
-    /// 按**系统时间**回放：在 `as_of` 那一刻，Cortex 认为哪些事实为真。
+    /// Replay by **system time**: which facts Cortex believed to be true at the
+    /// instant `as_of`.
     ///
-    /// 这是双时间轴的核心能力，回答「三个月前我以为什么」。
-    /// 注意它不能查 `active_facts` 视图——那是**当前**的有效集；
-    /// 必须回到 `facts` + `fact_events` 按时间重放。
+    /// This is the core bitemporal capability, answering "what did I believe
+    /// three months ago". Note that it cannot query the `active_facts` view —
+    /// that is the **current** valid set; it must go back to `facts` +
+    /// `fact_events` and replay along time.
     ///
-    /// 只按 `created_at` 降序 —— 这是「当时的全貌」。带查询词的回放走
-    /// [`Store::facts_as_of_bm25`] 与 [`Store::facts_as_of_vector`]，
-    /// 三者在 `cortex-memory` 侧再 RRF 到一起。
+    /// Sorted by `created_at` descending only — this is "the whole picture as
+    /// it stood then". Replay with a query term goes through
+    /// [`Store::facts_as_of_bm25`] and [`Store::facts_as_of_vector`], and the
+    /// three are then RRF'd together on the `cortex-memory` side.
     pub async fn facts_as_of(&self, as_of: DateTime<Utc>, limit: i64) -> Result<Vec<Fact>> {
         let rows = sqlx::query_as::<_, Fact>(concat!(
             as_of_snapshot!(),
@@ -400,13 +449,15 @@ impl Store {
         Ok(rows)
     }
 
-    /// 回放快照上的 BM25 排序。
+    /// BM25 ranking on top of the replay snapshot.
     ///
-    /// # 为什么不是「先取全貌再在内存里排」
+    /// # Why not "fetch the whole picture and sort it in memory"
     ///
-    /// 全貌在十万条量级根本取不回来。回放的相关性排序必须**下推到 SQL**，
-    /// 让 `idx_facts_tsv` 那个 GIN 索引干活，否则这条路在语料变大后
-    /// 只会从「排序不对」退化成「查不动」。
+    /// At a scale of a hundred thousand rows the whole picture cannot be
+    /// fetched back at all. Relevance ranking for replay must be **pushed down
+    /// into SQL** so that the `idx_facts_tsv` GIN index does the work;
+    /// otherwise, as the corpus grows, this path degrades from "the ordering is
+    /// wrong" into "the query won't run".
     pub async fn facts_as_of_bm25(
         &self,
         as_of: DateTime<Utc>,
@@ -430,9 +481,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// 回放快照上的向量排序。理由同 [`Store::facts_as_of_bm25`]。
+    /// Vector ranking on top of the replay snapshot. Same reasoning as
+    /// [`Store::facts_as_of_bm25`].
     ///
-    /// 同样按 `embedding_model` 过滤：跨模型的距离不可比，回放也不例外。
+    /// Likewise filtered by `embedding_model`: distances across models are not
+    /// comparable, and replay is no exception.
     pub async fn facts_as_of_vector(
         &self,
         as_of: DateTime<Utc>,
@@ -440,8 +493,10 @@ impl Store {
         embedding_model: &str,
         limit: i64,
     ) -> Result<Vec<Fact>> {
-        // 回放的基准集是 as_of 快照（**必须查 facts 而非 active_facts**，
-        // 理由见 as_of_snapshot! 的注释），并集那一层的逻辑与实时召回相同
+        // The base set for replay is the as_of snapshot (**it must query facts
+        // and not active_facts**; for why see the comments on
+        // as_of_snapshot!), and the union layer's logic is identical to live
+        // retrieval
         let rows = sqlx::query_as::<_, Fact>(vector_union!(
             base = concat!("(", as_of_snapshot!(), ")"),
             vec = "$2",
@@ -457,10 +512,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// 由文本反查候选实体，供图遍历取种子。
+    /// Look candidate entities up from text, to seed graph traversal.
     ///
-    /// 先精确匹配名称，再回落到前缀匹配——实体名通常很短，
-    /// 全文检索在这里反而不如直接匹配准。
+    /// Exact name match first, then falling back to prefix match — entity names
+    /// are usually very short, and full-text search is actually less accurate
+    /// than direct matching here.
     pub async fn entities_matching(&self, terms: &[String], limit: i64) -> Result<Vec<String>> {
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -485,17 +541,22 @@ impl Store {
 }
 
 impl Store {
-    /// 按向量近邻查实体，供抽取期的**别名消解**使用。
+    /// Find entities by vector nearest neighbor, for **alias resolution**
+    /// during extraction.
     ///
-    /// 与 [`Store::recall_vector`] 的区别在用途：那是检索召回，这是写入前
-    /// 判断「cortex」和「Cortex 项目」是不是同一个东西。
+    /// What separates this from [`Store::recall_vector`] is purpose: that one
+    /// is retrieval, this one decides before writing whether "cortex" and "the
+    /// Cortex project" are the same thing.
     ///
-    /// 返回按余弦距离升序的候选及其**距离**（不是相似度）——
-    /// 阈值判断留给调用方，因为「多近算同一个」高度依赖 embedding 模型，
-    /// 存储层不该替它做决定。相似度 = 1 - 距离。
+    /// Returns candidates ascending by cosine distance along with their
+    /// **distance** (not similarity) — the threshold decision is left to the
+    /// caller, because "how close counts as the same" depends heavily on the
+    /// embedding model and the storage layer should not decide it on the
+    /// caller's behalf. Similarity = 1 - distance.
     ///
-    /// 按 `kind` 过滤：人和项目即使同名也不该合并。
-    /// 按 `embedding_model` 过滤：跨模型的距离不可比。
+    /// Filtered by `kind`: a person and a project should not be merged even if
+    /// they share a name. Filtered by `embedding_model`: distances across
+    /// models are not comparable.
     pub async fn entities_near(
         &self,
         kind: &str,
@@ -503,15 +564,20 @@ impl Store {
         embedding_model: &str,
         limit: i64,
     ) -> Result<Vec<(Entity, f64)>> {
-        // 与事实侧同样的并集：写入时就用当前模型的落在 entities.embedding，
-        // 回填补出来的落在 entity_embeddings。只查一处会让消解在换模型后
-        // 静默失灵 —— 而失灵的表现是给同一个人建出第二个实体，
-        // 从此他的事实分裂在两个节点上，图遍历再也走不通
+        // The same union as on the fact side: the ones written with the current
+        // model sit in entities.embedding, the backfilled ones in
+        // entity_embeddings. Querying only one place makes resolution silently
+        // stop working after a model switch -- and the way it stops working is
+        // by creating a second entity for the same person, splitting their
+        // facts across two nodes from then on so that graph traversal can no
+        // longer get through
         let rows = sqlx::query(
-            // 三层：内层两个分支各自走自己的 HNSW → 中层 DISTINCT ON 去重
-            // （它强制按 id 排序）→ **外层必须重新按 distance 排**，
-            // 否则调用方拿到的是按 ULID 排的结果，而 ULID 有序意味着
-            // 「按创建时间排」—— 那看起来像一份合理的列表，只是和相关性无关
+            // Three levels: the inner two branches each use their own HNSW →
+            // the middle DISTINCT ON deduplicates (which forces sorting by id)
+            // → **the outer level must re-sort by distance**, or the caller
+            // receives results ordered by ULID, and ULIDs being ordered means
+            // "ordered by creation time" -- which looks like a reasonable list,
+            // only it has nothing to do with relevance
             "SELECT id, kind, name, summary, embedding, embedding_model,
                     device_id, created_at, distance
                FROM (

@@ -1,75 +1,93 @@
-//! 认证 —— 「谁能连上这个 cortexd」。
+//! Authentication — "who is allowed to connect to this cortexd".
 //!
-//! 在此之前谁连上谁就是主人。一个绑到 `0.0.0.0` 的 cortexd、一条随手开的
-//! ngrok、一个把端口映射出去的 docker-compose，任何一个都足以让整个记忆库
-//! 对公网敞开，而且**不会有任何迹象**。
+//! Before this, whoever connected was the owner. A cortexd bound to `0.0.0.0`,
+//! an ngrok tunnel opened on a whim, a docker-compose that maps the port out —
+//! any one of them is enough to expose the whole memory database to the public
+//! internet, and **there will be no sign of it at all**.
 //!
-//! # 方案：预共享 token，服务端只存摘要
+//! # The approach: a pre-shared token, with the server storing only the digest
 //!
 //! ```text
-//! 运维：cortexd --generate-token
-//!        ├─► 明文 token ──────────────► 客户端（CORTEXD_TOKEN，只显示这一次）
-//!        └─► SHA-256 摘要 ────────────► 服务端（.env 的 CORTEX_AUTH_TOKEN_SHA256）
+//! ops: cortexd --generate-token
+//!        ├─► plaintext token ─────────► client (CORTEXD_TOKEN, shown exactly once)
+//!        └─► SHA-256 digest ──────────► server (CORTEX_AUTH_TOKEN_SHA256 in .env)
 //!
-//! 客户端：Authorization: Bearer <明文>
-//! 服务端：sha256(明文) == 摘要 ?
+//! client: Authorization: Bearer <plaintext>
+//! server: sha256(plaintext) == digest ?
 //! ```
 //!
-//! ## 为什么不是签发式 / 带过期的会话令牌
+//! ## Why not issued / expiring session tokens
 //!
-//! 那两条都需要一个**签发端点**，也就是需要一份先于它存在的凭据去换令牌 ——
-//! 单用户自托管场景下那份凭据只能还是预共享的东西，于是多出来的一层只是把
-//! 同一个秘密换了个包装，代价是密钥轮换、时钟偏移、令牌撤销三件事都要处理。
-//! 真正需要签发式的是「多用户 + 要能单独踢掉某个人」，而那是多租户的需求，
-//! 这一轮明确不做（见本文件末尾）。
+//! Both of those require an **issuing endpoint**, i.e. a credential that exists
+//! before it in order to exchange for a token — and in a single-user
+//! self-hosted setting that credential can only be pre-shared anyway. So the
+//! extra layer merely repackages the same secret, at the cost of having to
+//! handle key rotation, clock skew and token revocation. What genuinely needs an
+//! issuing model is "multiple users plus the ability to kick out one of them
+//! individually", and that is a multi-tenancy requirement, explicitly out of
+//! scope for this round (see the end of this file).
 //!
-//! OAuth 之类更不必谈：自托管的东西不该为了登录去依赖一个外部服务，
-//! 那台服务挂了你就进不去自己的记忆库。
+//! OAuth and its relatives are further out of the question: a self-hosted thing
+//! should not depend on an external service in order to log in — when that
+//! service goes down you cannot reach your own memory database.
 //!
-//! ## 为什么摘要用 SHA-256 而不是 argon2 / bcrypt
+//! ## Why the digest is SHA-256 rather than argon2 / bcrypt
 //!
-//! 慢 KDF 防的是**低熵秘密被离线爆破**（人选的密码）。这里的 token 是
-//! 256 位内核随机数，爆破它需要的次数与 KDF 快慢无关 —— 慢 100 万倍，
-//! 爆破时间从「宇宙年龄」变成「宇宙年龄」。付出的是一个新依赖和每次请求
-//! 几十毫秒的 CPU。
+//! A slow KDF defends against **offline brute-forcing of a low-entropy secret**
+//! (a human-chosen password). The token here is 256 bits of kernel randomness,
+//! and the number of attempts required to brute-force it is independent of how
+//! slow the KDF is — make it a million times slower and the brute-force time
+//! goes from "the age of the universe" to "the age of the universe". What you
+//! pay is one new dependency and tens of milliseconds of CPU per request.
 //!
-//! **这个论证依赖一个前提：token 必须是高熵随机的。** 所以
-//! [`generate`] 不接受用户自选的口令，只吐随机值 —— 前提一旦被人绕开
-//! （拿 `echo -n hunter2 | sha256sum` 填进去），上面这段就不成立了。
+//! **This argument rests on one premise: the token must be high-entropy
+//! random.** Which is why [`generate`] does not accept a user-chosen passphrase
+//! and only emits random values — the moment someone routes around that premise
+//! (by pasting in `echo -n hunter2 | sha256sum`), the paragraph above stops
+//! holding.
 //!
-//! ## 凭据存在哪
+//! ## Where the credentials live
 //!
-//! - **服务端**：只有摘要，放 `.env`（已被 gitignore 排除）。摘要泄露不能
-//!   直接用来登录 —— 它不能被当成 bearer token 提交，服务端会先对收到的
-//!   东西做一次 SHA-256 再比。
-//! - **不存数据库**：那会让凭据跟着 `sync_log` 同步到每一台设备上，
-//!   而且在 append-only 体系里写进去就删不掉 —— 轮换一次旧摘要永远留在库里。
-//! - **客户端**：明文，环境变量 `CORTEXD_TOKEN`。同样不进任何被 git 跟踪的文件。
+//! - **Server**: the digest only, in `.env` (excluded by gitignore). A leaked
+//!   digest cannot be used to log in directly — it cannot be submitted as a
+//!   bearer token, because the server runs SHA-256 over whatever it receives
+//!   before comparing.
+//! - **Never the database**: that would sync the credential to every device via
+//!   `sync_log`, and in an append-only system whatever is written can never be
+//!   removed — after one rotation the old digest stays in the database forever.
+//! - **Client**: the plaintext, in the environment variable `CORTEXD_TOKEN`.
+//!   Likewise never in any git-tracked file.
 //!
-//! # 没配凭据时：拒绝启动
+//! # With no credential configured: refuse to start
 //!
-//! 与 agent 那一侧的沙箱降级策略同一类判断，答案也一样：
-//! **静默不生效是最危险的失败形态**。开放默认值的代价是「有人在不知情的
-//! 情况下把记忆库挂在公网上」，而这件事没有任何症状；拒绝启动的代价是
-//! 「第一次跑要多做一步」，而这件事当场就被发现。
+//! Same class of judgement as the sandbox degradation policy on the agent side,
+//! and the same answer: **silently not taking effect is the most dangerous
+//! failure shape**. The cost of an open default is "somebody exposes their
+//! memory database to the internet without knowing it", which has no symptom
+//! whatsoever; the cost of refusing to start is "one extra step the first time
+//! you run it", which is discovered on the spot.
 //!
-//! 逃生口同样刻意不是 `1` / `true`：只有 `CORTEX_AUTH=disabled` 这个字面量
-//! 才关得掉它，没法被「顺手设个环境变量」误开。关掉之后 `/health` 会一直报
-//! `auth: disabled`，启动日志里也有一行警告 —— 任何时候都必须能回答
-//! 「我现在到底有没有被保护」。
+//! The escape hatch is likewise deliberately not `1` / `true`: only the literal
+//! `CORTEX_AUTH=disabled` turns it off, so it cannot be enabled by absent-minded
+//! environment-variable setting. Once off, `/health` permanently reports
+//! `auth: disabled` and the startup log carries a warning — at any moment it
+//! must be possible to answer "am I actually protected right now".
 //!
-//! # 浏览器的真实约束：`EventSource` 与 `WebSocket` 加不了请求头
+//! # The real browser constraint: `EventSource` and `WebSocket` cannot set
+//! # request headers
 //!
-//! 这不是可以绕过的，是浏览器 API 的硬限制。三条常见出路里：
+//! This is not something to be worked around; it is a hard limit of the browser
+//! APIs. Of the three common ways out:
 //!
-//! | 出路 | 问题 |
+//! | Way out | Problem |
 //! |---|---|
-//! | 把长期 token 放查询串 | 它会进 access log、进反代日志、进浏览器历史，而且是**长期**凭据 |
-//! | Cookie | 要配 CORS credentials，且立刻引入 CSRF —— 而本服务的 CORS 是 permissive |
-//! | **短命票据** | 用长期 token 换一张 60 秒的票，票才进 URL |
+//! | put the long-lived token in the query string | it lands in access logs, reverse proxy logs and browser history — and it is a **long-lived** credential |
+//! | cookies | requires CORS credentials and immediately introduces CSRF — and this service's CORS is permissive |
+//! | **short-lived tickets** | exchange the long-lived token for a 60-second ticket, and only the ticket goes into the URL |
 //!
-//! 选第三条。见 [`TicketBook`]。票据同样能解决 `<img src>` 取附件的问题：
-//! `Image.network` 一样加不了请求头。
+//! The third is chosen. See [`TicketBook`]. Tickets also solve fetching
+//! attachments through `<img src>`: `Image.network` cannot set request headers
+//! either.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -85,37 +103,44 @@ use sha2::{Digest as _, Sha256};
 
 use crate::state::AppState;
 
-/// 服务端摘要的环境变量。
+/// Environment variable holding the server-side digest.
 pub const TOKEN_SHA256_ENV: &str = "CORTEX_AUTH_TOKEN_SHA256";
 
-/// 关闭认证的环境变量。
+/// Environment variable that turns authentication off.
 pub const AUTH_ENV: &str = "CORTEX_AUTH";
 
-/// 关闭认证的**唯一**取值。见模块文档里「为什么不是 `1`」。
+/// The **only** value that turns authentication off. See "why not `1`" in the
+/// module docs.
 pub const DISABLED_VALUE: &str = "disabled";
 
-/// 票据有效期。
+/// Ticket lifetime.
 ///
-/// 60 秒够开一条 WebSocket、够加载一屏图片，短到即使整条 URL 被记进日志，
-/// 捡到它的人也基本上赶不上。**它不是单次使用的** —— 单次会让一个页面上的
-/// 第二张图直接 401，也会让 WS 断线重连时手上那张票作废；用「短」换「一次性」
-/// 在这里是划算的，因为要保护的性质是「长期凭据不进 URL」，不是「URL 不可重放」。
+/// 60 seconds is enough to open a WebSocket and to load a screenful of images,
+/// and short enough that even if the whole URL is written to a log, whoever
+/// picks it up will essentially never be in time. **It is not single-use** —
+/// single-use would 401 the second image on a page outright, and would
+/// invalidate the ticket in hand when a WS reconnects after a drop. Trading
+/// "single-use" for "short" pays off here, because the property being protected
+/// is "the long-lived credential never enters a URL", not "the URL cannot be
+/// replayed".
 pub const TICKET_TTL: Duration = Duration::from_secs(60);
 
-/// 查询串里放票据的参数名。
+/// Query-string parameter name carrying the ticket.
 pub const TICKET_PARAM: &str = "ticket";
 
-/// 本部署的认证形态。
+/// This deployment's authentication shape.
 #[derive(Debug, Clone)]
 pub enum AuthMode {
-    /// 校验 bearer token（与短命票据）
+    /// Verify the bearer token (and short-lived tickets)
     Token { digest: [u8; 32] },
-    /// 显式关闭 —— 只该出现在只听回环的开发机上
+    /// Explicitly off — should only ever appear on a development machine
+    /// listening on loopback
     Disabled,
 }
 
 impl AuthMode {
-    /// 从环境变量加载。**配置缺失是错误，不是「就当没配」。**
+    /// Load from the environment. **Missing configuration is an error, not
+    /// "assume it was not configured".**
     pub fn from_env() -> cortex_core::Result<Self> {
         let disabled = std::env::var(AUTH_ENV).is_ok_and(|v| v.trim() == DISABLED_VALUE);
         let digest_hex = std::env::var(TOKEN_SHA256_ENV)
@@ -124,9 +149,12 @@ impl AuthMode {
             .filter(|v| !v.is_empty());
 
         match (disabled, digest_hex) {
-            // 两个都配了：意图不明。安全配置上的「不明」必须是响亮的错误 ——
-            // 猜错的两个方向分别是「以为关了其实开着」（只是不好用）和
-            // 「以为开着其实关了」（记忆库裸奔），后者不能靠猜
+            // Both configured: the intent is ambiguous. Ambiguity in a security
+            // configuration has to be a loud error — the two ways of guessing
+            // wrong are "thought it was off, it is actually on" (merely
+            // inconvenient) and "thought it was on, it is actually off" (the
+            // memory database is running naked), and the latter is not something
+            // to be guessed at
             (true, Some(_)) => Err(cortex_core::CortexError::Config(format!(
                 "{AUTH_ENV}={DISABLED_VALUE} 与 {TOKEN_SHA256_ENV} 同时配置了，意图不明。\
                  想关认证就删掉 {TOKEN_SHA256_ENV}；想开认证就删掉 {AUTH_ENV}。"
@@ -161,7 +189,7 @@ impl AuthMode {
         }
     }
 
-    /// 给 `/health` 与启动日志的一句话。
+    /// One word for `/health` and the startup log.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -170,7 +198,7 @@ impl AuthMode {
         }
     }
 
-    /// 启动时打给运维看的那一行。
+    /// The line printed for ops at startup.
     #[must_use]
     pub fn status_line(&self) -> String {
         match self {
@@ -187,15 +215,17 @@ impl AuthMode {
             Self::Disabled => true,
             Self::Token { digest } => {
                 let got = Sha256::digest(presented.as_bytes());
-                // 先哈希再比，所以即使这里泄露时序也只泄露摘要的字节 ——
-                // 但常数时间比较是白给的，没有理由不做
+                // Hashing happens before the comparison, so even a timing leak
+                // here would only leak bytes of the digest — but a
+                // constant-time comparison is free, so there is no reason not to
+                // do it
                 constant_time_eq(&got, digest)
             }
         }
     }
 }
 
-/// 逐字节全量比较，不提前返回。
+/// Compare every byte, never returning early.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -203,40 +233,52 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// 生成一份新凭据：(明文 token, SHA-256 摘要的十六进制)。
+/// Generate a fresh credential: (plaintext token, hex of the SHA-256 digest).
 ///
-/// 明文只在这一刻存在。服务端拿摘要，客户端拿明文，没有任何一处同时持有两者
-/// 之外的东西 —— 服务端被读走 `.env` 也拿不到能用来登录的凭据。
+/// The plaintext exists only at this instant. The server keeps the digest, the
+/// client keeps the plaintext, and no single place holds anything beyond its own
+/// half — someone who reads the server's `.env` still obtains nothing usable to
+/// log in with.
 #[must_use]
 pub fn generate() -> (String, String) {
     let mut buf = [0u8; 32];
-    getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝生成可预测的凭据");
+    getrandom::fill(&mut buf).expect(
+        "the kernel entropy source is unavailable; refusing to mint a predictable credential",
+    );
     let token = hex::encode(buf);
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     (token, digest)
 }
 
-// ────────────────────────── 短命票据 ──────────────────────────
+// ─────────────────────── Short-lived tickets ──────────────────
 
-/// 已签发、尚未过期的票据。
+/// Tickets that have been issued and have not yet expired.
 ///
-/// 存内存不存库：它活不过一分钟，而写进 `sync_log` 的东西会同步到每台设备
-/// 并且永远删不掉。进程重启后全部票据作废，客户端重新换一张即可 ——
-/// 反正它手上有长期 token。
+/// Kept in memory, never in the database: a ticket does not survive a minute,
+/// while anything written to `sync_log` syncs to every device and can never be
+/// removed. All tickets are void after a process restart, and the client simply
+/// exchanges for another one — it holds the long-lived token anyway.
 #[derive(Default)]
 pub struct TicketBook {
     inner: Mutex<HashMap<String, Instant>>,
 }
 
 impl TicketBook {
-    /// 签一张票。调用方必须**已经**通过了 bearer 校验。
+    /// Issue a ticket. The caller must **already** have passed bearer
+    /// verification.
     pub fn issue(&self) -> String {
         let mut buf = [0u8; 32];
-        getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝签发可预测的票据");
+        getrandom::fill(&mut buf).expect(
+            "the kernel entropy source is unavailable; refusing to issue a predictable ticket",
+        );
         let ticket = hex::encode(buf);
-        let mut guard = self.inner.lock().expect("票据本的锁不该中毒");
-        // 顺手清一遍过期的。没有单独的清理任务：签票是唯一会让这个表长大的
-        // 动作，在这里清就不可能出现「只涨不清」
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("the ticket book's lock should never be poisoned");
+        // Prune the expired ones while we are here. There is no separate cleanup
+        // task: issuing is the only action that grows this map, so pruning here
+        // makes "grows and never shrinks" impossible
         let now = Instant::now();
         guard.retain(|_, exp| *exp > now);
         guard.insert(ticket.clone(), now + TICKET_TTL);
@@ -244,33 +286,41 @@ impl TicketBook {
     }
 
     fn valid(&self, ticket: &str) -> bool {
-        let guard = self.inner.lock().expect("票据本的锁不该中毒");
+        let guard = self
+            .inner
+            .lock()
+            .expect("the ticket book's lock should never be poisoned");
         guard.get(ticket).is_some_and(|exp| *exp > Instant::now())
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().expect("票据本的锁不该中毒").len()
+        self.inner
+            .lock()
+            .expect("the ticket book's lock should never be poisoned")
+            .len()
     }
 }
 
-// ──────────────────────────── 中间件 ───────────────────────────
+// ────────────────────────── Middleware ─────────────────────────
 
-/// 认证中间件。
+/// The authentication middleware.
 ///
-/// # 为什么不在这里写「这几条路径不用认证」
+/// # Why "these paths skip authentication" is not written here
 ///
-/// 路径白名单是这类中间件最经典的出事点：加一条新路由的人不会想起来去
-/// 更新那张表，而漏掉的方向恰好是**默认放行**。所以豁免不在这里表达 ——
-/// `/health` 压根不挂这层中间件（见 [`crate::routes::router`]），
-/// 新加的路由默认落在受保护那一侧。
+/// A path allow-list is the single most classic failure point of this kind of
+/// middleware: whoever adds a new route will not remember to update that table,
+/// and the direction the omission falls in is **allow by default**. So the
+/// exemption is not expressed here — `/health` simply does not have this
+/// middleware attached at all (see [`crate::routes::router`]), and a newly added
+/// route lands on the protected side by default.
 pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let mode = st.auth_mode();
     if matches!(mode, AuthMode::Disabled) {
         return next.run(req).await;
     }
 
-    // 1) 常规路径：Authorization: Bearer
+    // 1) The normal path: Authorization: Bearer
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -278,33 +328,41 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
     if let Some(tok) = bearer {
-        // 预共享 token（老路，也是自托管的常态）
+        // The pre-shared token (the old path, and the norm for self-hosting)
         if mode.verify(tok) {
             return next.run(req).await;
         }
-        // 登录换来的 access token。
+        // The access token obtained by logging in.
         //
-        // **这一支曾经不存在**，而缺了它整个账号体系是不通的：注册、登录、
-        // 拿到 token，然后每一个请求 401 —— 因为这道门只认那把预共享的。
-        // 端到端跑一次才发现，而三类测试都没覆盖到：
-        // 服务端测试单独测 `/auth/login`，中间件测试只查公开路由表，
-        // 客户端测试打的是 mock。**没有一条从登录走到用它**。
+        // **This branch used to be missing**, and without it the entire accounts
+        // system was broken end to end: register, log in, receive a token, and
+        // then every request 401s — because this gate only recognised the
+        // pre-shared one. It surfaced only on an end-to-end run, and all three
+        // classes of test missed it: the server tests exercised `/auth/login` in
+        // isolation, the middleware tests only inspected the public route table,
+        // and the client tests hit a mock. **Not one of them went from logging
+        // in to using the result.**
         if st.access_book().resolve(tok).is_some() {
             return next.run(req).await;
         }
-        // 沙箱令牌。**与上面两支的差别是它带作用域** —— 认出来还不够，
-        // 还要问一句「这条路由它够得着吗」。
+        // A sandbox token. **What sets it apart from the two branches above is
+        // that it carries a scope** — recognising it is not enough, we still
+        // have to ask "can it reach this route".
         //
-        // 为什么不能像另外两把那样认了就放行：容器里跑的是不可信代码，
-        // 而 `/episodes` 与 `/memory/search` 是**穿透容器边界的持久通道**
-        //（写进去的记忆会在未来所有会话、所有设备上被召回）。
-        // 完整论证见 `sandbox_token` 的模块文档。
+        // Why it cannot simply be admitted on recognition like the other two:
+        // what runs inside the container is untrusted code, and `/episodes` and
+        // `/memory/search` are **persistent channels that pierce the container
+        // boundary** (memory written through them will be retrieved in every
+        // future session, on every device). Full reasoning in `sandbox_token`'s
+        // module docs.
         if let Some(scope) = st.delegations().resolve(tok) {
             let (method, path) = (req.method().clone(), req.uri().path().to_owned());
             if scope.allows(&method, &path) {
-                // 作用域塞进扩展，供 handler 做**会话级**收窄
-                //（认证只答「够不够得着这条路由」，答不了「够不够得着这条
-                // 会话的数据」—— 后者要 handler 拿到 body/参数才判断得了）
+                // Put the scope into the extensions so the handler can narrow
+                // further at the **session** level (authentication only answers
+                // "can it reach this route"; it cannot answer "can it reach this
+                // session's data" — that requires the handler to have the body
+                // and parameters in hand)
                 let mut req = req;
                 req.extensions_mut().insert(scope);
                 return next.run(req).await;
@@ -323,15 +381,17 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         }
     }
 
-    // 2) 加不了请求头的那些客户端：短命票据
+    // 2) Clients that cannot set request headers: short-lived tickets
     if let Some(ticket) = ticket_from_query(req.uri().query())
         && st.ticket_book().valid(&ticket)
     {
         return next.run(req).await;
     }
 
-    // 不区分「没带凭据」与「凭据不对」：分开报等于给暴力破解一个进度条。
-    // WWW-Authenticate 照给 —— 那是 401 的标准形状，客户端据此知道该带什么
+    // No distinction between "no credential supplied" and "wrong credential":
+    // reporting them separately hands a brute-forcer a progress bar.
+    // WWW-Authenticate is still sent — that is the standard shape of a 401, and
+    // it is how a client learns what to bring
     tracing::debug!(path = %req.uri().path(), "未通过认证");
     (
         StatusCode::UNAUTHORIZED,
@@ -345,11 +405,13 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         .into_response()
 }
 
-/// 从查询串里取 `ticket=`。
+/// Pull `ticket=` out of the query string.
 ///
-/// 手写而不是走 `Query<T>` 提取器：中间件跑在**所有**路由前面，而各路由的
-/// 查询参数五花八门，用强类型提取器会因为「多了个不认识的字段」把请求打回，
-/// 那是一个非常难查的 400。
+/// Hand-written rather than going through the `Query<T>` extractor: this
+/// middleware runs in front of **every** route, the query parameters vary wildly
+/// from route to route, and a strongly typed extractor would bounce requests for
+/// "an unrecognised extra field" — which is an extremely hard 400 to
+/// diagnose.
 fn ticket_from_query(query: Option<&str>) -> Option<String> {
     let q = query?;
     q.split('&').find_map(|kv| {
@@ -359,41 +421,56 @@ fn ticket_from_query(query: Option<&str>) -> Option<String> {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  多租户：这一轮**不做**，理由与代价写在这里
+//  Multi-tenancy: **not done** this round; the reasoning and the cost are here
 // ══════════════════════════════════════════════════════════════
 //
-// 「认证」与「数据按人隔离」是两件事，代价差一个数量级。上面这一整个模块是
-// 前者：一层中间件加一份凭据。后者要动的是：
+// "Authentication" and "data isolated per person" are two different things, an
+// order of magnitude apart in cost. The whole module above is the former: one
+// middleware layer plus one credential. The latter would have to touch:
 //
-// 1. **每张业务表加归属列**。`episodes` / `facts` / `entities` / `blobs` /
-//    `summaries` / `session_events` / `fact_events` / `episode_memories` /
-//    `episode_tool_calls` / `blob_transcripts` / `redactions` —— 一张都不能漏。
-// 2. **`sync_log` 的游标要按租户切**。现在是全库单一全序（一个 BIGSERIAL +
-//    advisory lock）。多租户下 A 的写会推高 B 看到的游标，B 拉到的记录里
-//    全是被过滤掉的空洞 —— 不算错，但每个客户端都要为别人的写量付带宽。
-//    真要分开就得每租户一条序列，而那把「单一全序」这个同步协议的地基换掉了。
-// 3. **四路召回的 SQL 全部要加过滤**（BM25 / 向量 / 图 / episode），
-//    外加 RRF 融合之后的取回、`as_of` 快照那两条路、以及注入块的渲染。
-// 4. **`pg_advisory_xact_lock(4272)` 要不要按租户分**。分了并发上去了，
-//    但「取号顺序 == 提交顺序」这个论证是针对单一序列成立的，换成每租户
-//    一把锁就得重新论证一遍（而现有的那份反向验证 —— 32 并发写漏 12 条 ——
-//    也要重跑）。
-// 5. **`blobs` 是内容寻址的**，同一份字节天然被多个租户共享。归属加在
-//    `blobs` 上就破坏了去重，加在 `episode_blobs` 上则意味着删最后一个引用
-//    时要做引用计数 —— 而这是个 append-only 系统，引用计数没地方放。
+// 1. **An ownership column on every business table.** `episodes` / `facts` /
+//    `entities` / `blobs` / `summaries` / `session_events` / `fact_events` /
+//    `episode_memories` / `episode_tool_calls` / `blob_transcripts` /
+//    `redactions` — not one of them may be missed.
+// 2. **`sync_log`'s cursor would have to be split per tenant.** Today it is a
+//    single database-wide total order (one BIGSERIAL plus an advisory lock).
+//    Under multi-tenancy, A's writes push up the cursor B sees, and the records
+//    B pulls are full of filtered-out holes — not incorrect, but every client
+//    pays bandwidth for everyone else's write volume. Genuinely splitting it
+//    requires a sequence per tenant, and that replaces the foundation of the
+//    sync protocol, namely "a single total order".
+// 3. **All four retrieval paths' SQL would need the filter** (BM25 / vector /
+//    graph / episode), plus the fetch after RRF fusion, plus both `as_of`
+//    snapshot paths, plus rendering of the injection blocks.
+// 4. **Whether `pg_advisory_xact_lock(4272)` should be split per tenant.**
+//    Splitting it raises concurrency, but the argument "ticket order == commit
+//    order" holds for a single sequence; switching to one lock per tenant means
+//    re-deriving it from scratch (and re-running the existing falsification test
+//    — 32 concurrent writers losing 12 rows).
+// 5. **`blobs` is content-addressed**, so identical bytes are naturally shared
+//    across tenants. Putting ownership on `blobs` destroys deduplication;
+//    putting it on `episode_blobs` means reference counting when the last
+//    reference is deleted — and this is an append-only system, where a
+//    reference count has nowhere to live.
 //
-// 而这是一个 **append-only** 系统：事后给已有数据补归属列，唯一诚实的做法是
-// 加一列带默认值（「都归第一个用户」），这一步本身不难；难的是第 2、3、4 条，
-// 它们**什么时候做都一样难**，跟现在有多少数据无关。也就是说「趁数据少赶紧
-// 加列」买不到什么 —— 真正的成本不在数据迁移上。
+// And this is an **append-only** system: retrofitting an ownership column onto
+// existing data has exactly one honest form, adding a column with a default
+// ("everything belongs to the first user"), and that step is not the hard part.
+// The hard parts are items 2, 3 and 4, and they are **equally hard whenever they
+// are done**, independent of how much data exists now. In other words, "add the
+// column while the data is still small" buys nothing — the real cost is not in
+// the data migration.
 //
-// 所以这一轮只做认证。**没有加任何归属列**：一个「有列但读侧不过滤」的状态
-// 会让下一个人以为隔离已经生效了一半，而事实上四路召回里任何一路漏了过滤，
-// 泄露就是全量的。要做就整套做，包括读侧。
+// So this round is authentication only. **No ownership column was added**: a
+// state where the columns exist but the read side does not filter would leave
+// the next person believing isolation is already half in effect, when in fact if
+// any one of the four retrieval paths misses its filter, the leak is total. It
+// gets done as a whole or not at all, read side included.
 //
-// 当前的产品形态是单用户自托管，认证这一层已经完整地解决了它面对的威胁
-// （「别人能不能连上我的 cortexd」）。做一半的多租户比不做更危险：
-// 它会让人以为数据是隔离的。
+// The current product shape is single-user self-hosting, and this authentication
+// layer completely addresses the threat it faces ("can somebody else connect to
+// my cortexd"). Half-built multi-tenancy is more dangerous than none: it leaves
+// people believing their data is isolated.
 
 #[cfg(test)]
 mod tests {
@@ -401,48 +478,58 @@ mod tests {
 
     fn token_mode() -> (String, AuthMode) {
         let (token, digest_hex) = generate();
-        let raw = hex::decode(&digest_hex).expect("生成的摘要应当是合法十六进制");
-        let digest: [u8; 32] = raw.try_into().expect("SHA-256 应当是 32 字节");
+        let raw = hex::decode(&digest_hex).expect("a generated digest should be valid hex");
+        let digest: [u8; 32] = raw.try_into().expect("SHA-256 should be 32 bytes");
         (token, AuthMode::Token { digest })
     }
 
     #[test]
     fn the_right_token_passes_and_everything_else_does_not() {
         let (token, mode) = token_mode();
-        assert!(mode.verify(&token), "正确的 token 必须通过");
-        assert!(!mode.verify(""), "空凭据不能通过");
-        assert!(!mode.verify("wrong"), "错误的 token 不能通过");
+        assert!(mode.verify(&token), "the correct token must pass");
+        assert!(!mode.verify(""), "an empty credential must not pass");
+        assert!(!mode.verify("wrong"), "an incorrect token must not pass");
 
-        // 改一个字符就该失败
+        // Changing one character must fail
         let mut tampered = token.clone();
-        let last = tampered.pop().expect("token 非空");
+        let last = tampered.pop().expect("the token is not empty");
         tampered.push(if last == 'a' { 'b' } else { 'a' });
-        assert!(!mode.verify(&tampered), "只差一个字符的 token 不能通过");
+        assert!(
+            !mode.verify(&tampered),
+            "a token differing by a single character must not pass"
+        );
 
-        // 摘要本身不能被当成凭据提交：它只是 token 的哈希，
-        // 服务端会再哈希一次，对不上
+        // The digest itself must not be submittable as a credential: it is only
+        // the hash of the token, and the server hashes again, so it will not
+        // match
         let (_, digest_hex) = generate();
         assert!(!mode.verify(&digest_hex));
     }
 
-    /// 摘要**开头几个字节相同**的错误 token 必须被拒。
+    /// A wrong token whose digest **merely starts with the same bytes** must be
+    /// rejected.
     ///
-    /// 上面那条「改一个字符」的断言其实拦不住把比较写成
-    /// `got.starts_with(&digest[..1])` 这类退化：随便改一个字符，
-    /// 摘要首字节有 255/256 的概率也跟着变，于是那条测试照样绿。
-    /// 而这个退化是灾难性的 —— 只比一个字节意味着任意随机 token 有
-    /// 1/256 的概率被放行。
+    /// The "change one character" assertion above cannot actually catch a
+    /// degeneration such as writing the comparison as
+    /// `got.starts_with(&digest[..1])`: change an arbitrary character and the
+    /// digest's first byte changes too with probability 255/256, so that test
+    /// stays green. And this degeneration is catastrophic — comparing a single
+    /// byte means any random token is admitted with probability 1/256.
     ///
-    /// 所以这里现场爆破出一个首字节相同的 token 再去试（SHA-256 算几百次，
-    /// 微秒级）。它是**确定性**的：只要比较不是全量的，就一定红。
+    /// So this test brute-forces a token sharing the first digest byte on the
+    /// spot and then tries it (a few hundred SHA-256 computations, microseconds).
+    /// It is **deterministic**: if the comparison is not over the full digest,
+    /// it goes red.
     #[test]
     fn a_token_whose_digest_merely_starts_the_same_is_rejected() {
         let (real, mode) = token_mode();
         let real_digest = Sha256::digest(real.as_bytes());
 
         let mut collided = None;
-        // 首字节 1/256，两万次里撞不上的概率小到可以忽略；
-        // 真撞不上就是 SHA-256 出问题了，此时失败也是对的
+        // At 1/256 per attempt, the chance of not hitting a match in twenty
+        // thousand tries is negligible; genuinely failing to find one would mean
+        // something is wrong with SHA-256, in which case failing here is also
+        // the right outcome
         for _ in 0..20_000 {
             let (cand, _) = generate();
             if Sha256::digest(cand.as_bytes())[0] == real_digest[0] && cand != real {
@@ -450,23 +537,28 @@ mod tests {
                 break;
             }
         }
-        let collided = collided.expect("应当能爆破出一个首字节相同的 token");
+        let collided =
+            collided.expect("should have been able to brute-force a token sharing the first byte");
         assert!(
             !mode.verify(&collided),
-            "摘要只是开头相同的 token 竟然通过了 —— 凭据比较不是全量的"
+            "a token whose digest merely starts the same was admitted —— the credential \
+             comparison is not over the full digest"
         );
     }
 
     #[test]
     fn the_stored_digest_is_not_the_token() {
         let (token, digest) = generate();
-        assert_ne!(token, digest, "存的必须是摘要，不能是明文");
+        assert_ne!(
+            token, digest,
+            "what is stored must be the digest, never the plaintext"
+        );
         assert_eq!(token.len(), 64);
         assert_eq!(digest.len(), 64);
         assert_eq!(
             hex::encode(Sha256::digest(token.as_bytes())),
             digest,
-            "摘要必须真的是 token 的 SHA-256"
+            "the digest must genuinely be the SHA-256 of the token"
         );
     }
 
@@ -481,7 +573,10 @@ mod tests {
     fn constant_time_eq_agrees_with_normal_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"), "长度不同必须判否");
+        assert!(
+            !constant_time_eq(b"abc", b"ab"),
+            "differing lengths must compare false"
+        );
     }
 
     #[test]
@@ -489,8 +584,11 @@ mod tests {
         let book = TicketBook::default();
         let t = book.issue();
         assert!(book.valid(&t));
-        assert!(!book.valid("deadbeef"), "没签发过的票据不能通过");
-        // 可重复使用：一个页面上的第二张图不该 401
+        assert!(
+            !book.valid("deadbeef"),
+            "a ticket that was never issued must not pass"
+        );
+        // Reusable: the second image on a page must not 401
         assert!(book.valid(&t));
     }
 
@@ -503,7 +601,11 @@ mod tests {
         }
         assert_eq!(book.len(), 1);
         let fresh = book.issue();
-        assert_eq!(book.len(), 1, "过期票据应当在签新票时被清掉");
+        assert_eq!(
+            book.len(),
+            1,
+            "expired tickets should be pruned when a new one is issued"
+        );
         assert!(book.valid(&fresh));
         assert!(!book.valid("old"));
     }
@@ -517,34 +619,40 @@ mod tests {
         );
         assert_eq!(ticket_from_query(Some("since=3")), None);
         assert_eq!(ticket_from_query(None), None);
-        // 名字相近的参数不能被误认
+        // A similarly named parameter must not be mistaken for it
         assert_eq!(ticket_from_query(Some("myticket=abc")), None);
     }
 
-    /// 关闭开关只认那一个字面量。守的是模块文档里那条论证。
+    /// The disable switch accepts that one literal only. This guards the
+    /// argument in the module docs.
     #[test]
     fn the_disable_switch_only_accepts_the_exact_literal() {
         for v in ["1", "true", "yes", "off", "DISABLED", "disable"] {
             assert_ne!(
                 v.trim(),
                 DISABLED_VALUE,
-                "{v:?} 绝不能关掉认证 —— 开关必须是读懂了才会写下的东西"
+                "{v:?} must never turn authentication off —— the switch has to be something you \
+                 only write down after understanding it"
             );
         }
         assert_eq!("disabled".trim(), DISABLED_VALUE);
     }
 
-    /// **登录换来的 access token 必须能过这道门。**
+    /// **An access token obtained by logging in must get through this gate.**
     ///
-    /// 这条曾经是不成立的：`require` 只调 `mode.verify`，而那只认预共享
-    /// token 的摘要。于是账号体系整条链是断的 —— 注册成功、登录成功、
-    /// 拿到 token，然后**每一个请求 401**。
+    /// This did not hold once: `require` only called `mode.verify`, which only
+    /// recognises the digest of the pre-shared token. So the whole accounts
+    /// chain was broken — registration succeeds, login succeeds, a token comes
+    /// back, and then **every request 401s**.
     ///
-    /// 三类测试都没覆盖到：服务端测试单独测 `/auth/login` 的返回，
-    /// 中间件测试只查公开路由表，客户端测试打的是 mock。
-    /// 没有一条**从登录走到用它**，端到端跑一次才撞出来。
+    /// All three classes of test missed it: the server tests exercised
+    /// `/auth/login`'s response in isolation, the middleware tests only
+    /// inspected the public route table, and the client tests hit a mock. Not
+    /// one of them went **from logging in to using the result**, and it only
+    /// surfaced on an end-to-end run.
     ///
-    /// 这里不起 axum，只钉住那个不变式：门要认的是两样东西的**并集**。
+    /// No axum is started here; this pins down the invariant only: the gate must
+    /// recognise the **union** of the two things.
     #[test]
     fn a_logged_in_access_token_is_not_the_preshared_one() {
         let book = crate::accounts::AccessBook::default();
@@ -555,12 +663,17 @@ mod tests {
         };
         assert!(
             !mode.verify(&issued),
-            "刚签发的 access token 与预共享 token 无关，`verify` 当然认不出它 ——              所以 `require` 里**必须**另有一支去问 AccessBook。             这条断言本身不会红；它在这里是为了让下一条的意思清楚"
+            "a freshly issued access token has nothing to do with the pre-shared token, so of \
+             course `verify` does not recognise it —— which is why `require` **must** have a \
+             separate branch that asks the AccessBook. This assertion will never go red on its \
+             own; it is here to make the next one's meaning clear"
         );
         assert_eq!(
             book.resolve(&issued).as_deref(),
             Some("01ABCDEF"),
-            "簿子必须认得出自己签发的 token。这条红了，说明账号体系又断在同一个地方：             登录成功但每个后续请求 401"
+            "the book must recognise a token it issued itself. If this goes red, the accounts \
+             system has broken in the same place again: login succeeds but every subsequent \
+             request 401s"
         );
     }
 }

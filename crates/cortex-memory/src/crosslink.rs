@@ -1,35 +1,45 @@
-//! 跨域连接 —— 用 `relates_to` 边把「编码」与「办公」两座记忆孤岛接上。
+//! Cross-domain linking — using `relates_to` edges to connect the two memory
+//! islands of "coding" and "office".
 //!
 //! ```text
-//! 夜间扫描
+//! Nightly scan
 //!     │
-//!     ├─① 候选   向量近邻 → 跨域 → 尚未连通 → 相似度落在带内   ← 便宜，管召回
-//!     ├─② 判定   廉价模型逐对判「值不值得连」                  ← 贵，管精度，事务外
-//!     ├─③ 计划   实体对 → 两条有向 relates_to 的 NewFact       ← 纯逻辑
-//!     └─④ 落库   一个 write_txn 写完                           ← 唯一进事务的一步
+//!     ├─① candidates  vector neighbours → cross-domain → not yet connected → distance inside the band   ← cheap, governs recall
+//!     ├─② judgement   a cheap model decides pair by pair whether the link is worth it                   ← expensive, governs precision, outside the transaction
+//!     ├─③ plan        entity pair → two directed relates_to NewFacts                                    ← pure logic
+//!     └─④ persist     written by a single write_txn                                                     ← the only step inside a transaction
 //! ```
 //!
-//! # 为什么这件事不需要动检索代码
+//! # Why none of this requires touching the retrieval code
 //!
-//! `recall_graph` 沿 `facts` 的邻接关系走（`subject_id → object_entity_id`），
-//! 而 `facts.predicate` 在 schema 里刻意不做枚举。于是「多写一条边」这件事
-//! **本身就是**「让图遍历多带出一片子图」——检索侧一行都不用改。
-//! 这是这套 schema 设计最漂亮的地方，也是本模块要保住的性质。
+//! `recall_graph` walks the adjacency relation in `facts`
+//! (`subject_id → object_entity_id`), and `facts.predicate` is deliberately not
+//! enumerated in the schema. So "write one more edge" **is by itself** "make graph
+//! traversal pull in one more subgraph" — not a single line changes on the
+//! retrieval side. This is the prettiest thing about this schema design, and the
+//! property this module exists to preserve.
 //!
-//! 唯一的例外在融合侧：`relates_to` 带出来的东西**按定义就是跨域的**，
-//! 而 [`crate::fusion::apply_domain_boost`] 会给当前领域的事实加分、
-//! 等价于给跨域的减分。刚架好桥又把它压下去等于白做，所以那里需要一处豁免
-//! （范围的取舍见 [`crate::retrieval`] 里 `bridged_entities` 的注释）。
+//! The one exception is on the fusion side: what `relates_to` pulls in is
+//! **cross-domain by definition**, and [`crate::fusion::apply_domain_boost`]
+//! boosts facts in the current domain, which is equivalent to penalizing
+//! cross-domain ones. Building a bridge and immediately pushing it back down is
+//! doing the work for nothing, so an exemption is needed over there (for the
+//! trade-offs in its scope, see the comments on `bridged_entities` in
+//! [`crate::retrieval`]).
 //!
-//! # 三条纪律
+//! # Three rules
 //!
-//! 1. **LLM 与 embedding 一律在事务外算完**（CLAUDE.md 约束 2 的推论）。
-//!    本模块把「决定写什么」与「写」拆成 [`Linker::plan`] 与 [`Linker::write`]，
-//!    形状与 [`crate::extract`] 的 `extract` / `write_candidates` 一致。
-//! 2. **不能加唯一约束**（schema 不在本模块的改动范围内），所以幂等靠写前查：
-//!    见 [`LinkCorpus::out_edges`]。
-//! 3. **噪声边在图遍历里会传染** —— 一条错边让整个无关子图被召回。
-//!    因此有度数上限、批次上限，且默认判定器不是「向量够近就连」。
+//! 1. **LLM calls and embeddings are always computed outside the transaction**
+//!    (a corollary of constraint 2 in CLAUDE.md). This module splits "decide what
+//!    to write" from "write" into [`Linker::plan`] and [`Linker::write`], the same
+//!    shape as `extract` / `write_candidates` in [`crate::extract`].
+//! 2. **A unique constraint cannot be added** (the schema is outside this module's
+//!    scope of change), so idempotency comes from checking before writing: see
+//!    [`LinkCorpus::out_edges`].
+//! 3. **Noisy edges are contagious under graph traversal** — one wrong edge causes
+//!    an entire unrelated subgraph to be recalled. Hence the degree cap, the batch
+//!    cap, and a default judge that is not "link it if the vectors are close
+//!    enough".
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,97 +51,124 @@ use serde_json::Value;
 use crate::embed::Embedder;
 use crate::tokenize;
 
-/// 跨域连接用的谓词。
+/// The predicate used for cross-domain links.
 ///
-/// 它不在 [`crate::extract::DEFAULT_FUNCTIONAL`] 里，因此是**多值**谓词：
-/// 同一个实体可以连出多条边而不会互相取代。这是想要的 —— 一个模块本来就
-/// 可能同时对应一次会议决策和一条预算约束。
+/// It is not in [`crate::extract::DEFAULT_FUNCTIONAL`], which makes it a
+/// **multi-valued** predicate: one entity can have several edges out without them
+/// superseding each other. That is what we want — one module may perfectly well
+/// correspond to both a decision from a meeting and a budget constraint at the
+/// same time.
 pub const RELATES_TO: &str = "relates_to";
 
-/// 写进 `facts.confidence` 的值。
+/// The value written into `facts.confidence`.
 ///
-/// # 为什么是 0.30，以及它现在**并不起作用**
+/// # Why 0.30, and why it currently **does nothing**
 ///
-/// roadmap 只说「低 confidence」。定成 0.30 的依据是它必须明显低于抽取器的
-/// 产物：解析器缺省给 0.80，题集手写的是 0.90，实践中没见过低于 0.50 的。
-/// 于是将来任何「只把 confidence ≥ 0.5 的事实当作断言写进 prompt」的闸门
-/// 都会天然把这些推断出来的边挡在断言之外，同时不影响图遍历把它们走通。
+/// The roadmap says only "low confidence". The basis for settling on 0.30 is that
+/// it must sit clearly below what the extractor produces: the parser's default is
+/// 0.80, the dataset's hand-written values are 0.90, and nothing below 0.50 has
+/// been seen in practice. That way, any future gate along the lines of "only write
+/// facts with confidence ≥ 0.5 into the prompt as assertions" will naturally keep
+/// these inferred edges out of the assertions, without stopping graph traversal
+/// from walking them.
 ///
-/// **但必须说清楚现状**：把 `confidence` 全仓库 grep 一遍，检索侧
-/// （`fusion` / `retrieval`）与注入侧（`injection`）一处都没有读它，
-/// 只有 DTO 与同步载荷在原样透传。也就是说今天写 0.30 还是 0.99，
-/// 对召回与排序**完全没有区别**。这个数字现在是给人看的与给将来留的，
-/// 不是一道生效中的闸门 —— 谁要拿它当安全边界，得先去把闸门建出来。
+/// **But the current state has to be stated plainly**: grep the whole repository
+/// for `confidence` and neither the retrieval side (`fusion` / `retrieval`) nor
+/// the injection side (`injection`) reads it anywhere; only the DTOs and the sync
+/// payload pass it through untouched. Which means that writing 0.30 versus 0.99
+/// today makes **no difference whatsoever** to recall or ranking. This number is
+/// currently for human readers and for the future, not a gate that is in force —
+/// anyone wanting to treat it as a security boundary has to go build the gate
+/// first.
 pub const DEFAULT_LINK_CONFIDENCE: f32 = 0.30;
 
-/// 候选的余弦距离上界。超过它就当作无关。
+/// The upper bound on a candidate's cosine distance. Beyond it, treat the pair as
+/// unrelated.
 ///
-/// 参照物是 [`crate::retrieval::BGE_M3_SEMANTIC_FLOOR`]（0.50）：那是
-/// 「全库最近的一条都够不着 ⇒ 这个问题的答案不在记忆里」的判据。
-/// 两条**事实之间**要算「值得连」，理应比「查询勉强够得着答案」更严，
-/// 所以取到它以内。0.45 是起点不是定论 —— 换 embedding 模型必须重标。
+/// The reference point is [`crate::retrieval::BGE_M3_SEMANTIC_FLOOR`] (0.50),
+/// which is the criterion for "even the nearest fact in the whole database is out
+/// of reach ⇒ the answer to this question is not in memory". Deciding that two
+/// **facts** are worth linking ought to be stricter than "a query can just barely
+/// reach an answer", so this value stays inside it. 0.45 is a starting point, not
+/// a settled conclusion — changing the embedding model requires recalibrating it.
 ///
-/// 散列桩（`hash-stub-v1`）下这个带几乎捞不到东西（69 条语料只出 1 对），
-/// 那是**对的失败方式**：它的「距离」只反映字符 bigram 重合度，不是语义，
-/// 与其在离线 CI 里凭字形连一堆边，不如什么都不连。
+/// Under the hash stub (`hash-stub-v1`) this band picks up almost nothing (1 pair
+/// out of a 69-entry corpus), and that is **the right way to fail**: its
+/// "distance" reflects only character-bigram overlap rather than meaning, and
+/// rather than linking a pile of edges by glyph shape in offline CI, it is better
+/// to link nothing at all.
 pub const DEFAULT_MAX_DISTANCE: f64 = 0.45;
 
-/// 候选的余弦距离下界。比它还近的**不连**。
+/// The lower bound on a candidate's cosine distance. Anything closer than this is
+/// **not** linked.
 ///
-/// # 语义相近 ≠ 值得连
+/// # Semantically close ≠ worth linking
 ///
-/// 「Cortex 用 Rust 写」与「Cortex 用 Rust 写」之间距离趋近 0，连起来
-/// 一个 bit 的信息都不产生，却白白多一条边、多一份注入预算、多一个
-/// 图遍历的分叉。真正有价值的是**同一个话题、两套词汇**：
-/// 「上周会上定的那个方案」对「代码里那个模块」—— 那种关系在向量空间里
-/// 有距离但不远。所以候选是一个**带**而不是一个上界。
+/// The distance between 「Cortex 用 Rust 写」 and 「Cortex 用 Rust 写」 approaches
+/// 0, and linking them produces not one bit of information while costing an extra
+/// edge, an extra slice of injection budget, and an extra branch for graph
+/// traversal. What actually has value is **one topic in two vocabularies**: "the
+/// plan we settled on at last week's meeting" against "that module in the code" —
+/// a relationship that has some distance in vector space without being far. So a
+/// candidate must fall inside a **band** rather than merely under a ceiling.
 ///
-/// 下界还顺带挡住一类真实噪声：同一件事在两个 domain 各被抽了一遍
-/// （会议纪要与代码注释重复陈述同一个决定）。那是**该合并的重复**，
-/// 不是该架桥的关联，交给实体消解与矛盾消解，不该在这里补一条边。
+/// The lower bound also blocks a real class of noise along the way: the same thing
+/// extracted once in each of two domains (meeting notes and a code comment
+/// restating one decision). That is **duplication that should be merged**, not a
+/// relationship that needs a bridge; it belongs to entity resolution and conflict
+/// resolution, and should not be papered over with an edge here.
 pub const DEFAULT_MIN_DISTANCE: f64 = 0.12;
 
-/// 单个实体最多连出多少条 `relates_to`。
+/// How many `relates_to` edges a single entity may have out at most.
 ///
-/// # 这是噪声控制的主闸门
+/// # This is the main gate for noise control
 ///
-/// 图遍历的代价结构决定了度数上限比距离阈值更要紧：一条错边只是多带一条
-/// 事实，但一个**枢纽实体**（被 20 条边连着）会在任何提到它的查询上
-/// 把二十片无关子图一起拖进来 —— 噪声在图里是会传染的。距离阈值管不了
-/// 这个，因为每一条边单独看都「够近」。
+/// The cost structure of graph traversal makes the degree cap more important than
+/// the distance threshold: one wrong edge merely drags in one extra fact, but a
+/// **hub entity** (connected by 20 edges) drags twenty unrelated subgraphs along
+/// on any query that mentions it — noise is contagious in a graph. The distance
+/// threshold cannot govern this, because each individual edge looks "close
+/// enough" on its own.
 ///
-/// 4 的依据是量纲而非曲线：图遍历默认 2 跳，度数 d 的枢纽在两跳内
-/// 能带出 O(d²) 片子图，d=4 时是 16，与 `RecallWidth::graph`（30 条）
-/// 同量级；d=10 就是 100，直接吃满整路召回。
+/// The basis for 4 is scale rather than a curve: graph traversal defaults to 2
+/// hops, and a hub of degree d can pull in O(d²) subgraphs within two hops. At
+/// d=4 that is 16, the same order of magnitude as `RecallWidth::graph` (30
+/// entries); at d=10 it is 100, which eats the entire channel's recall outright.
 pub const DEFAULT_DEGREE_CAP: usize = 4;
 
-/// 每条待考察事实取多少个向量近邻。
+/// How many vector neighbours to take per fact under examination.
 ///
-/// 与 `RecallWidth::vector` 同宽。近邻里绝大多数是同域的（同域语料本来
-/// 就更密），跨域的只剩尾巴上几条 —— 取窄了这一路就直接哑火。
+/// The same width as `RecallWidth::vector`. The overwhelming majority of
+/// neighbours are same-domain (same-domain corpus is simply denser), leaving only
+/// a few cross-domain ones in the tail — take it too narrow and this whole channel
+/// goes silent.
 pub const DEFAULT_NEIGHBOR_WIDTH: i64 = 40;
 
 // ══════════════════════════════════════════════════════════
-//  语料来源
+//  Corpus source
 // ══════════════════════════════════════════════════════════
 
-/// 扫描要读的东西。
+/// What the scan needs to read.
 ///
-/// 抽成 trait 而不是直接吃 `&Store`，理由与 [`crate::extract::EntityIndex`]
-/// 同款：`cortex-store` 现在没有「按游标分页遍历全部事实」这样的方法，
-/// 而给存储层加方法不在本模块的改动范围内。默认实现 [`StoreCorpus`] 用
-/// 现有的三个公开查询拼出来，够跑；等存储层补上 `facts_since(cursor)`
-/// 之后换个实现即可，`Linker` 一行不用改。
+/// This is a trait rather than taking `&Store` directly, for the same reason as
+/// [`crate::extract::EntityIndex`]: `cortex-store` currently has no method for
+/// "walk all facts paginated by cursor", and adding methods to the storage layer
+/// is outside this module's scope of change. The default implementation,
+/// [`StoreCorpus`], is assembled from the three existing public queries, which is
+/// enough to run; once the storage layer grows a `facts_since(cursor)`, swapping
+/// in another implementation is all it takes and `Linker` doesn't change by a
+/// line.
 ///
-/// **已知的界**：[`StoreCorpus::scan_batch`] 受存储层 `MAX_LIMIT`（200）
-/// 的钳制，一次扫不完更大的增量。夜间扫描按天跑的话 200 条/天是够的，
-/// 但这是个真实的天花板，不是可以忽略的细节。
+/// **A known limit**: [`StoreCorpus::scan_batch`] is clamped by the storage
+/// layer's `MAX_LIMIT` (200), so it cannot cover a larger increment in one pass.
+/// If the nightly scan runs daily, 200 entries per day is sufficient — but this is
+/// a real ceiling, not a detail that can be waved away.
 #[async_trait::async_trait]
 pub trait LinkCorpus: Send + Sync {
-    /// 本轮要作为「左侧」考察的事实。
+    /// The facts to examine as the "left" side this round.
     async fn scan_batch(&self) -> Result<Vec<Fact>>;
 
-    /// 向量近邻，按余弦**距离**升序（不是相似度）。
+    /// Vector neighbours, ascending by cosine **distance** (not similarity).
     async fn neighbors(
         &self,
         embedding: &Vector,
@@ -139,27 +176,34 @@ pub trait LinkCorpus: Send + Sync {
         limit: i64,
     ) -> Result<Vec<(Fact, f64)>>;
 
-    /// 该实体已经连出去的全部实体（任意谓词，只看**有效**事实）。
+    /// Every entity this entity already links out to (any predicate, considering
+    /// only **valid** facts).
     ///
-    /// 一个方法同时兑现两件事：
+    /// One method delivers two things at once:
     ///
-    /// 1. **幂等** —— 第二次扫描时上一次写的边就在这里面，不会重复写。
-    ///    append-only 且不能加唯一约束，写前查是唯一的去重手段。
-    /// 2. **别做无用功** —— 两条事实若已经共享实体或已经直接相连，
-    ///    图遍历本来就能从一边走到另一边，再补一条 `relates_to` 只是噪声。
-    ///    真正的缺口只在「语义相关但图上不通」的那些对上。
+    /// 1. **Idempotency** — on the second scan, the edges written by the first one
+    ///    are already in here, so they don't get written again. Given append-only
+    ///    storage and no way to add a unique constraint, checking before writing is
+    ///    the only deduplication mechanism available.
+    /// 2. **Don't do pointless work** — if two facts already share an entity or are
+    ///    already directly connected, graph traversal can walk from one to the
+    ///    other as it is, and adding another `relates_to` is just noise. The real
+    ///    gap lies only in the pairs that are semantically related but unreachable
+    ///    in the graph.
     async fn out_edges(&self, subject_id: &str) -> Result<Vec<String>>;
 
-    /// 实体的显示名。`statement` 与判定 prompt 都要用它。
+    /// An entity's display name. Both the `statement` and the judgement prompt need
+    /// it.
     async fn entity_name(&self, entity_id: &str) -> Result<Option<String>>;
 }
 
-/// 用 `Store` 现有的公开查询拼出来的默认实现。
+/// The default implementation, assembled from `Store`'s existing public queries.
 pub struct StoreCorpus<'a> {
     store: &'a Store,
-    /// `scan_batch` 回看多少天
+    /// How many days back `scan_batch` looks
     within_days: i64,
-    /// `scan_batch` 最多取多少条（存储层还会再钳到 200）
+    /// How many entries `scan_batch` takes at most (the storage layer clamps this
+    /// further, to 200)
     limit: i64,
 }
 
@@ -173,7 +217,8 @@ impl<'a> StoreCorpus<'a> {
         }
     }
 
-    /// 回看窗口。夜间扫描跑「昨天写进来的」，重建索引时可以放宽。
+    /// The lookback window. The nightly scan runs over "what was written
+    /// yesterday"; it can be widened when rebuilding the index.
     #[must_use]
     pub fn with_window(mut self, within_days: i64, limit: i64) -> Self {
         self.within_days = within_days;
@@ -226,18 +271,21 @@ impl LinkCorpus for StoreCorpus<'_> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  候选与判定
+//  Candidates and judgement
 // ══════════════════════════════════════════════════════════
 
-/// 候选一侧的锚点：这条事实，以及它挂在哪个实体上。
+/// The anchor on one side of a candidate: this fact, and which entity it hangs
+/// off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub fact_id: String,
-    /// 锚点实体 = 该事实的 `subject_id`。
+    /// The anchor entity = that fact's `subject_id`.
     ///
-    /// 用主语而不是宾语：`statement` 是围绕主语组织的，宾语常常是字面量
-    /// （根本没有实体 id）。挂错锚点的后果不是「少召回」而是「召回一片
-    /// 不相干的东西」，所以宁可挂在最稳的那个位置上。
+    /// The subject rather than the object: a `statement` is organized around its
+    /// subject, and the object is frequently a literal (with no entity id at all).
+    /// The consequence of anchoring in the wrong place is not "recall too little"
+    /// but "recall a pile of unrelated things", so it is better to anchor at the
+    /// most stable position available.
     pub entity_id: String,
     pub entity_name: String,
     pub statement: String,
@@ -245,17 +293,18 @@ pub struct Anchor {
     pub source_episode_id: String,
 }
 
-/// 一对通过预筛的候选。
+/// One pair that passed the pre-filter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub left: Anchor,
     pub right: Anchor,
-    /// 两条事实 statement 向量的余弦距离
+    /// The cosine distance between the two facts' statement vectors
     pub distance: f64,
 }
 
 impl Candidate {
-    /// 实体对的无序规范键 —— 去重与度数统计都按它。
+    /// The unordered canonical key for an entity pair — both deduplication and
+    /// degree counting go by it.
     #[must_use]
     pub fn pair_key(&self) -> (String, String) {
         pair_key(&self.left.entity_id, &self.right.entity_id)
@@ -270,38 +319,45 @@ fn pair_key(a: &str, b: &str) -> (String, String) {
     }
 }
 
-/// 判定结果。
+/// The result of a judgement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Accepted {
     pub candidate: Candidate,
-    /// 为什么值得连。会写进 `statement`，是这条边**唯一**的可审计说明 ——
-    /// 没有它，用户看到一条 `relates_to` 只能猜它凭什么存在。
+    /// Why the link is worth making. It gets written into the `statement` and is
+    /// the **only** auditable explanation this edge has — without it, a user
+    /// looking at a `relates_to` can do nothing but guess why it exists.
     pub reason: String,
 }
 
-/// 「这一对值不值得连」的判定器。
+/// The judge deciding "is this pair worth linking".
 ///
-/// # 为什么必须是可换的
+/// # Why it has to be swappable
 ///
-/// 纯向量距离会产出大量噪声边，而噪声边在图遍历里会传染；LLM 判定质量高
-/// 但每对都要花钱。**在哪里花钱**是这个模块最重要的一个取舍，所以它是
-/// 一个显式的接口而不是写死的逻辑：
+/// Pure vector distance produces a great many noisy edges, and noisy edges are
+/// contagious under graph traversal; LLM judgement is high quality but costs money
+/// per pair. **Where to spend the money** is the single most important trade-off
+/// in this module, which is why it is an explicit interface rather than hard-coded
+/// logic:
 ///
-/// | 实现 | 成本 | 用途 |
+/// | Implementation | Cost | Purpose |
 /// |---|---|---|
-/// | [`AcceptAll`] | 0 | 测量「预筛单独能做到什么」的对照组；确定性，可进 CI |
-/// | [`CheapModelJudge`] | 每批一次廉价模型调用 | 生产 |
+/// | [`AcceptAll`] | 0 | The control group measuring what the pre-filter achieves on its own; deterministic, safe for CI |
+/// | [`CheapModelJudge`] | One cheap-model call per batch | Production |
 ///
-/// 注意 [`AcceptAll`] **不是**「关掉判定」的同义词 —— 它是一个有意义的
-/// 对照组：预筛已经做了跨域、未连通、距离带三道过滤，AcceptAll 量的
-/// 正是这三道过滤单独的精度。评测里拿它当基线，才知道模型判定买到了什么。
+/// Note that [`AcceptAll`] is **not** a synonym for "turn judgement off" — it is a
+/// meaningful control group: the pre-filter has already applied three filters
+/// (cross-domain, not yet connected, inside the distance band), and AcceptAll
+/// measures exactly what those three filters achieve in precision by themselves.
+/// Using it as the baseline in the evals is the only way to know what model
+/// judgement actually buys.
 #[async_trait::async_trait]
 pub trait LinkJudge: Send + Sync {
-    /// 判定一批候选。返回值只含**接受**的那些，顺序不必与输入一致。
+    /// Judge a batch of candidates. The return value contains only the **accepted**
+    /// ones, and need not preserve the input order.
     async fn judge(&self, candidates: &[Candidate]) -> Result<Vec<Accepted>>;
 }
 
-/// 全部接受 —— 预筛的对照组，确定性，不花钱。
+/// Accept everything — the pre-filter's control group; deterministic and free.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcceptAll;
 
@@ -348,11 +404,13 @@ const JUDGE_SYSTEM: &str = r#"你在为一个记忆系统判定「两条来自�
 
 一对都不该连时输出 {"links": []}。reason 写不出具体影响的，就是不该连。"#;
 
-/// 用廉价模型判定。**绝不用主对话模型** —— 这是每晚都要跑的东西。
+/// Judge using the cheap model. **Never the main conversation model** — this is
+/// something that runs every single night.
 pub struct CheapModelJudge {
     llm: LlmClient,
-    /// 一次请求塞多少对。批量是这里唯一的省钱手段：system prompt 比
-    /// 单对候选长得多，一对一请求等于每次重付一遍它。
+    /// How many pairs go into one request. Batching is the only cost-saving lever
+    /// here: the system prompt is far longer than a single candidate pair, so
+    /// one request per pair means paying for it over again every time.
     batch: usize,
 }
 
@@ -377,10 +435,11 @@ impl std::fmt::Debug for CheapModelJudge {
     }
 }
 
-/// 判定 reason 的长度上限。
+/// The length limit on a judgement's reason.
 ///
-/// 不只是为了好看：`reason` 会原样进 `statement`，而 `statement` 会进
-/// prompt。让模型自由发挥等于给注入预算开了一个没有上界的口子。
+/// Not merely cosmetic: `reason` goes into the `statement` verbatim, and the
+/// `statement` goes into the prompt. Letting the model write as much as it likes
+/// amounts to opening an unbounded hole in the injection budget.
 const MAX_REASON_CHARS: usize = 40;
 
 #[async_trait::async_trait]
@@ -413,11 +472,14 @@ fn build_judge_prompt(chunk: &[Candidate]) -> String {
     s
 }
 
-/// 解析判定结果。**逐条容错**：某一条编号越界只丢那一条。
+/// Parse the judgement results. **Fault-tolerant per entry**: an out-of-range
+/// index drops only that entry.
 ///
-/// 与 [`crate::extract::parse_candidates`] 不同，这里解析失败不报错而是
-/// 返回空 —— 判定失败的正确行为是「这批不连」，而不是让整个夜间扫描红掉。
-/// 少一条边只是少一点召回，扫描崩掉则是下一晚才有人发现。
+/// Unlike [`crate::extract::parse_candidates`], a parse failure here does not
+/// raise an error but returns empty — the correct behaviour on a failed judgement
+/// is "link nothing in this batch", not turning the entire nightly scan red. One
+/// missing edge is a little less recall; a crashed scan is something nobody
+/// notices until the following night.
 fn parse_judgements(raw: &str, chunk: &[Candidate]) -> Vec<Accepted> {
     let Some(blob) = crate::extract::extract_json_blob(raw) else {
         tracing::warn!("跨域连接判定结果里找不到 JSON，本批全部不连");
@@ -470,11 +532,11 @@ fn parse_judgements(raw: &str, chunk: &[Candidate]) -> Vec<Accepted> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  扫描器
+//  The scanner
 // ══════════════════════════════════════════════════════════
 
-/// 一条计划中的边。两条**有向**的 `NewFact` 一起构成一条无向关联，
-/// 理由见 [`Linker::plan`]。
+/// One planned edge. Two **directed** `NewFact`s together constitute one
+/// undirected relationship; the reasoning is in [`Linker::plan`].
 #[derive(Debug, Clone)]
 pub struct PlannedLink {
     pub forward: NewFact,
@@ -483,23 +545,25 @@ pub struct PlannedLink {
     pub distance: f64,
 }
 
-/// 一次扫描的结果。
+/// The result of one scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinkReport {
-    /// 作为左侧考察了多少条事实
+    /// How many facts were examined as the left side
     pub scanned: usize,
-    /// 通过预筛的候选实体对数
+    /// How many candidate entity pairs passed the pre-filter
     pub candidates: usize,
-    /// 判定器接受的对数
+    /// How many pairs the judge accepted
     pub accepted: usize,
-    /// 因度数上限被丢掉的对数 —— 这个数字一旦不为 0，就说明语料里出现了
-    /// 枢纽实体，值得人看一眼是不是抽取把什么东西抽成了万能主语
+    /// How many pairs were dropped by the degree cap — the moment this number is
+    /// non-zero, a hub entity has appeared in the corpus, and it is worth a human
+    /// glancing at whether extraction has turned something into a
+    /// catch-all subject
     pub degree_capped: usize,
-    /// 实际写入的 fact id（每对两条）
+    /// The fact ids actually written (two per pair)
     pub written: Vec<Id>,
 }
 
-/// 跨域连接扫描器。
+/// The cross-domain link scanner.
 #[derive(Debug, Clone)]
 pub struct Linker {
     min_distance: f64,
@@ -507,27 +571,37 @@ pub struct Linker {
     degree_cap: usize,
     neighbor_width: i64,
     confidence: f32,
-    /// 一次扫描最多写多少对。防止某次语料异常把库灌满噪声边
+    /// How many pairs one scan may write at most. Prevents one anomalous corpus
+    /// from flooding the database with noisy edges
     batch_cap: usize,
-    /// 边的 statement 要不要进 `tsv` 与 `embedding` 索引。**默认不进。**
+    /// Whether an edge's statement enters the `tsv` and `embedding` indexes.
+    /// **It does not by default.**
     ///
-    /// # 这是评测逼出来的一个反直觉决定
+    /// # A counterintuitive decision the evals forced
     ///
-    /// 第一版照常建了索引，结果整体 R@5 从 0.923 掉到 0.907、
-    /// MRR 0.817→0.799，而且掉的是**跟跨域毫无关系的题**。逐题看下去，
-    /// 机制一目了然：边的 statement 形如「「A」（域）与「B」（域）相关：理由」，
-    /// 它把两个实体名和一句摘要挤在一句话里 —— 这正是 BM25 的 `ts_rank`
-    /// 最偏爱的形状（词频高、文档短）。于是任何提到 A 或 B 的查询，
-    /// 榜首都是这条**什么也没多说**的边，真正回答问题的那条被挤下去。
-    /// `q072「v1 发布这件事上都定了什么」`最惨：top-5 里四条是边。
+    /// The first version indexed them as a matter of course, and overall R@5 fell
+    /// from 0.923 to 0.907 and MRR from 0.817 to 0.799 — and what fell were
+    /// **questions with nothing whatsoever to do with cross-domain linking**.
+    /// Going through them question by question makes the mechanism obvious: an
+    /// edge's statement has the form 「「A」（domain）与「B」（domain）相关：reason」,
+    /// packing two entity names and a one-line summary into a single sentence —
+    /// which is precisely the shape BM25's `ts_rank` likes best (high term
+    /// frequency, short document). So for any query mentioning A or B, the top of
+    /// the list is this edge that **says nothing extra at all**, and the entry that
+    /// actually answers the question gets pushed down.
+    /// `q072「v1 发布这件事上都定了什么」` was the worst: four of its top five were
+    /// edges.
     ///
-    /// 修法不是调权重，是想清楚这行**是什么**：它是一条**边**，不是一条
-    /// 关于世界的陈述。它的用途是被**遍历**，不是被**检索**。
-    /// `tsv`/`embedding` 都留 NULL，它就只会经图遍历出现 ——
-    /// 也就是只在「查询确实命中了桥的某一端」时出现，正是想要的语义。
+    /// The fix is not to adjust weights but to be clear about **what this row
+    /// is**: it is an **edge**, not a statement about the world. Its purpose is to
+    /// be **traversed**, not to be **retrieved**. Leaving both `tsv` and
+    /// `embedding` NULL means it can only ever surface via graph traversal — that
+    /// is, only when the query genuinely hit one end of the bridge, which is
+    /// exactly the semantics we want.
     ///
-    /// 留成开关是因为这个结论依赖语料规模（69 条事实、12 行边，占比 11%），
-    /// 语料上千条之后挤占效应会稀释，值得重测。
+    /// It is kept as a switch because this conclusion depends on corpus size (69
+    /// facts and 12 edge rows, 11% of the total); once the corpus is in the
+    /// thousands the crowding effect will dilute, and it is worth re-measuring.
     indexed: bool,
     device_id: String,
 }
@@ -547,15 +621,16 @@ impl Linker {
         }
     }
 
-    /// 让边的 statement 也进 `tsv` / `embedding` 索引。见 [`Self::indexed`]
-    /// 上的注释与那组数字 —— 默认关，开之前先重跑评测。
+    /// Let edge statements enter the `tsv` / `embedding` indexes too. See the
+    /// comment on [`Self::indexed`] and the numbers there — off by default, and
+    /// re-run the evals before turning it on.
     #[must_use]
     pub fn with_indexed(mut self, indexed: bool) -> Self {
         self.indexed = indexed;
         self
     }
 
-    /// 候选的距离带。评测扫参用。
+    /// The candidate distance band. For eval parameter sweeps.
     #[must_use]
     pub fn with_distance_band(mut self, min: f64, max: f64) -> Self {
         self.min_distance = min;
@@ -581,26 +656,30 @@ impl Linker {
         self
     }
 
-    // ── ① 候选 ─────────────────────────────────────────────
+    // ── ① Candidates ───────────────────────────────────────
 
-    /// 预筛出跨域候选对。
+    /// Pre-filter cross-domain candidate pairs.
     ///
-    /// # 为什么不是全量两两比对
+    /// # Why not compare all pairs exhaustively
     ///
-    /// O(n²) 在几千条事实上就跑不动了，而且绝大多数对根本不沾边。
-    /// 这里对每条待考察事实发一次向量近邻（HNSW，O(log n)），再在近邻里
-    /// 筛跨域 —— 总代价 O(n·k·log n)。代价是**会漏**：同域语料更密，
-    /// 跨域的邻居可能被挤出前 k。这是刻意选的方向：漏一条边只是少一点
-    /// 召回，多一条错边则会在图里传染。
+    /// O(n²) stops being runnable at a few thousand facts, and the overwhelming
+    /// majority of pairs have nothing to do with each other. Here, one vector
+    /// nearest-neighbour query is issued per fact under examination (HNSW,
+    /// O(log n)), and the cross-domain ones are filtered out of those neighbours —
+    /// total cost O(n·k·log n). The price is that **it misses things**: the
+    /// same-domain corpus is denser, so cross-domain neighbours may be crowded out
+    /// of the top k. That direction is a deliberate choice: a missed edge is
+    /// merely a little less recall, whereas an extra wrong edge is contagious in
+    /// the graph.
     ///
-    /// 四道过滤，每一道都在回答一个不同的问题：
+    /// Four filters, each answering a different question:
     ///
-    /// | 过滤 | 挡掉什么 |
+    /// | Filter | What it blocks |
     /// |---|---|
-    /// | 同一 `embedding_model` | 跨模型的距离不可比（memory.md §七） |
-    /// | 两侧 domain 都有且不同 | 这条边的**全部**理由就是跨域 |
-    /// | 距离落在 `[min, max]` 带内 | 太远是噪声；太近是重复陈述，连了不产生信息 |
-    /// | 图上尚未连通 | 已经能走到的，补一条边只是噪声（见 [`LinkCorpus::out_edges`]） |
+    /// | Same `embedding_model` | Distances across models are not comparable (memory.md §7) |
+    /// | Both sides have a domain, and they differ | Being cross-domain is this edge's **entire** justification |
+    /// | Distance falls inside the `[min, max]` band | Too far is noise; too close is a restatement, and linking it produces no information |
+    /// | Not yet connected in the graph | For pairs already reachable, another edge is just noise (see [`LinkCorpus::out_edges`]) |
     pub async fn propose(&self, corpus: &dyn LinkCorpus) -> Result<(Vec<Candidate>, usize)> {
         let batch = corpus.scan_batch().await?;
         let scanned = batch.len();
@@ -634,7 +713,8 @@ impl Linker {
                 if right_domain == left_domain || left.subject_id == right.subject_id {
                     continue;
                 }
-                // 两条事实共享任一实体 ⇒ 图遍历本来就通，不需要这条边
+                // Two facts sharing any entity ⇒ graph traversal already gets
+                // through, so this edge is not needed
                 if shares_entity(left, &right) {
                     continue;
                 }
@@ -646,7 +726,8 @@ impl Linker {
                 }
 
                 let key = pair_key(&left.subject_id, &right.subject_id);
-                // 同一实体对可能被多组事实撞上，只留最近的那一组作为证据
+                // The same entity pair may be hit by several sets of facts; keep
+                // only the closest set as the evidence
                 if best.get(&key).is_some_and(|c| c.distance <= distance) {
                     continue;
                 }
@@ -654,7 +735,8 @@ impl Linker {
                 let left_name = resolve_name(corpus, &mut names, &left.subject_id).await?;
                 let right_name = resolve_name(corpus, &mut names, &right.subject_id).await?;
                 let (Some(left_name), Some(right_name)) = (left_name, right_name) else {
-                    // 实体行查不到 ⇒ 这条事实的锚点是坏的，宁可跳过
+                    // The entity row cannot be found ⇒ this fact's anchor is
+                    // broken, and skipping it is preferable
                     continue;
                 };
 
@@ -670,8 +752,9 @@ impl Linker {
         }
 
         let mut out: Vec<Candidate> = best.into_values().collect();
-        // 稳定顺序：距离升序，同距离按实体对字典序。扫描要可复现，
-        // HashMap 的迭代序不是
+        // A stable order: ascending by distance, and lexicographic by entity pair
+        // on ties. The scan has to be reproducible, and HashMap iteration order is
+        // not
         out.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
@@ -699,25 +782,29 @@ impl Linker {
         Ok(false)
     }
 
-    // ── ③ 计划 ─────────────────────────────────────────────
+    // ── ③ Plan ─────────────────────────────────────────────
 
-    /// 把接受的候选变成待写的 `NewFact`。**纯逻辑 + 向量化，仍在事务外。**
+    /// Turn accepted candidates into `NewFact`s ready to write. **Pure logic plus
+    /// vectorization; still outside the transaction.**
     ///
-    /// # 为什么一条关联要写两行
+    /// # Why one relationship requires writing two rows
     ///
-    /// `recall_graph` 的实体扩展是**有向**的：
+    /// `recall_graph`'s entity expansion is **directed**:
     /// `SELECT COALESCE(f.object_entity_id, …) FROM reach r JOIN active_facts f
-    /// ON f.subject_id = r.entity_id`。也就是说从主语能走到宾语，反过来走不动
-    /// （反向只能收集到那条边本身，收集不到对面实体的其它事实）。
+    /// ON f.subject_id = r.entity_id`. That is, you can walk from subject to
+    /// object but not the other way (going backwards collects only the edge
+    /// itself, never the other entity's other facts).
     ///
-    /// 而「相关」这个关系本身是无向的，演示场景两个方向都要成立：
-    /// 在 coding 语境问 office 的事，以及反过来。要么改 `recall_graph` 让它
-    /// 双向扩展（那是存储层，且会让**所有**遍历的宽度翻倍），要么把无向关系
-    /// 物化成两条有向边。选后者：代价局限在这一个谓词上，而且正是它让
-    /// 「无需改检索代码」这句话真的成立。
+    /// But "related to" is inherently undirected, and the demo scenario needs both
+    /// directions to hold: asking about office matters in a coding context, and the
+    /// reverse. Either `recall_graph` is changed to expand bidirectionally (that is
+    /// the storage layer, and it would double the width of **every** traversal), or
+    /// the undirected relationship is materialized as two directed edges. The
+    /// latter was chosen: the cost is confined to this one predicate, and it is
+    /// precisely what makes "no retrieval code needs to change" actually true.
     ///
-    /// 代价是诚实的：每对关联占两行、两份注入预算。degree_cap 因此按
-    /// **对**计而不是按行计。
+    /// The price is honest: each relationship occupies two rows and two slices of
+    /// injection budget. This is why degree_cap counts **pairs** rather than rows.
     pub async fn plan(
         &self,
         embedder: &dyn Embedder,
@@ -728,7 +815,8 @@ impl Linker {
         let mut kept: Vec<Accepted> = Vec::new();
         let mut capped = 0usize;
 
-        // 已按距离升序：度数上限撞上时留下的是更近的那些
+        // Already ascending by distance: when the degree cap is hit, what survives
+        // is the closer pairs
         for a in accepted {
             if kept.len() >= self.batch_cap {
                 capped += 1;
@@ -761,8 +849,10 @@ impl Linker {
             })
             .collect();
 
-        // 不建索引时连算都不用算 —— 向量白算一遍是纯浪费，而且这是每晚
-        // 都要跑的东西。要算的话也必须在这里算完：事务里跨网络是死罪
+        // When not indexing there is no need to compute them at all — computing
+        // vectors for nothing is pure waste, and this runs every single night. And
+        // if they are computed, it has to finish here: a network round trip inside
+        // the transaction is a capital offence
         let mut vectors: Vec<Option<Vec<f32>>> = if self.indexed {
             let v = embedder.embed(&statements).await?;
             if v.len() != statements.len() {
@@ -787,15 +877,21 @@ impl Linker {
             let forward = self.new_fact(
                 &c.left,
                 &c.right,
-                texts.next().expect("statement 与候选一一对应"),
-                vecs.next().expect("向量槽与 statement 一一对应"),
+                texts
+                    .next()
+                    .expect("statements correspond one-to-one with candidates"),
+                vecs.next()
+                    .expect("vector slots correspond one-to-one with statements"),
                 &model,
             )?;
             let backward = self.new_fact(
                 &c.right,
                 &c.left,
-                texts.next().expect("statement 与候选一一对应"),
-                vecs.next().expect("向量槽与 statement 一一对应"),
+                texts
+                    .next()
+                    .expect("statements correspond one-to-one with candidates"),
+                vecs.next()
+                    .expect("vector slots correspond one-to-one with statements"),
                 &model,
             )?;
             out.push(PlannedLink {
@@ -826,37 +922,49 @@ impl Linker {
             predicate: RELATES_TO.to_owned(),
             object_text: None,
             object_entity_id: Some(parse(&to.entity_id, "实体 id")?),
-            // 见 `Linker::indexed`：默认两个索引都不进 —— 这行是一条**边**，
-            // 用途是被遍历而不是被检索。`tsv` 留 NULL 是**决定**不是遗漏，
-            // 与「永不异步补写 tsv」那条纪律不冲突（那条禁的是事后 UPDATE）
+            // See `Linker::indexed`: neither index by default — this row is an
+            // **edge**, meant to be traversed rather than retrieved. Leaving `tsv`
+            // NULL is a **decision**, not an omission, and does not conflict with
+            // the "never backfill tsv asynchronously" rule (that one forbids an
+            // after-the-fact UPDATE)
             tsv_source: self
                 .indexed
                 .then(|| tokenize::to_tsvector_input(&statement)),
             statement,
             embedding: vector.map(Vector::from),
             embedding_model: model.to_owned(),
-            // 刻意留空。这条边不属于任何一个领域 —— 给它一个 domain 会让
-            // `apply_domain_boost` 偏袒其中一个方向，而它存在的全部理由
-            // 恰恰是「两个领域都算数」
+            // Deliberately left empty. This edge belongs to no single domain —
+            // giving it one would make `apply_domain_boost` favour one direction
+            // over the other, when the entire reason it exists is that "both
+            // domains count"
             domain: None,
             confidence: self.confidence,
-            // 事件时间未知：没有任何一刻「这两者开始相关」。留 NULL 才诚实，
-            // 填 now() 等于用系统时间冒充事件时间，双时间轴就白设计了
+            // Event time is unknown: there is no instant at which "these two
+            // started being related". Leaving it NULL is the honest choice; filling
+            // in now() would pass system time off as event time, and the whole
+            // bitemporal design would have been for nothing
             valid_at: None,
-            // 出处指向**本方向左侧**那条事实的原始对话。它并没有陈述这条关联，
-            // 但它是唯一真实存在的锚点，而且能让 redact 级联把这条边一起带走。
+            // Provenance points at the original conversation behind the fact on
+            // **this direction's left side**. It does not itself state this
+            // relationship, but it is the only anchor that genuinely exists, and it
+            // lets a redact cascade take this edge along with it.
             source_episode_id: parse(&from.source_episode_id, "episode id")?,
-            // 这条边是模型从两条**已有事实**推出来的，不是从对话里读出来的
+            // This edge was inferred by a model from two **existing facts**, not
+            // read out of a conversation
             source: FactSource::Derived,
-            // 两端的源事实都记下来。
+            // Record the source facts on both ends.
             //
-            // 这补上了 `source_episode_id` 只能记左侧留下的那个洞：在此之前
-            // 只 redact 右侧时，本行会带着右侧实体名活下来，而且没有任何
-            // 查询能找到它。现在顺着 derivations 反查 (fact, 右侧 id) 就能
-            // 定位到这条边（源事实 → 其 source_episode_id 是第二跳）。
+            // This closes the hole left by `source_episode_id` recording only the
+            // left side: previously, redacting only the right side would leave this
+            // row alive carrying the right-hand entity's name, with no query able to
+            // find it. Now, looking up (fact, right-hand id) through derivations
+            // locates this edge (source fact → its source_episode_id is the second
+            // hop).
             //
-            // ⚠️ 仍未解的是「信任洗白」：这条边固定 tier 2，不继承两端源事实
-            // 的档位。补法的前置正是这两行边（见 migration 20260807000006）
+            // ⚠️ Still unsolved is "trust laundering": this edge is fixed at tier 2
+            // and does not inherit the tier of the source facts on either end. The
+            // prerequisite for fixing that is exactly these two rows (see migration
+            // 20260807000006)
             derived_from: vec![
                 ProvenanceRef::fact(parse(&from.fact_id, "事实 id")?),
                 ProvenanceRef::fact(parse(&to.fact_id, "事实 id")?),
@@ -866,16 +974,18 @@ impl Linker {
         })
     }
 
-    // ── ④ 落库 ─────────────────────────────────────────────
+    // ── ④ Persist ──────────────────────────────────────────
 
-    /// 唯一进事务的一步。事务里只有 INSERT，没有任何读、没有任何网络调用。
+    /// The only step that enters a transaction. The transaction contains nothing
+    /// but INSERTs — no reads and no network calls of any kind.
     pub async fn write(&self, store: &Store, planned: Vec<PlannedLink>) -> Result<Vec<Id>> {
         if planned.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 在途任务防护，与 `extract::write_candidates` 同款：扫描跑起来之后
-        // 可能有人执行了 redact，不查这一句就会把已抹除内容派生的边写回去
+        // In-flight task guard, the same as in `extract::write_candidates`:
+        // somebody may have run a redact after the scan started, and without this
+        // check the edges derived from the erased content would get written back in
         let mut rows: Vec<&NewFact> = Vec::with_capacity(planned.len() * 2);
         for p in &planned {
             for f in [&p.forward, &p.backward] {
@@ -905,7 +1015,7 @@ impl Linker {
         Ok(ids)
     }
 
-    /// 一条龙：候选 → 判定 → 计划 → 落库。
+    /// End to end: candidates → judgement → plan → persist.
     pub async fn run(
         &self,
         store: &Store,
@@ -925,7 +1035,8 @@ impl Linker {
         let accepted = judge.judge(&candidates).await?;
         let n_accepted = accepted.len();
 
-        // 已有的度数：接着上一次扫描往上加，否则每晚都能再加满一轮
+        // Existing degrees: counted on top of the previous scan, otherwise every
+        // night could fill up another full round
         let mut existing: HashMap<String, usize> = HashMap::new();
         for c in &candidates {
             for id in [&c.left.entity_id, &c.right.entity_id] {
@@ -991,11 +1102,13 @@ async fn resolve_name(
     Ok(name)
 }
 
-/// 边的自然语言表述。
+/// The natural-language phrasing of an edge.
 ///
-/// 刻意**只用实体名**，不复述任何一侧的 `statement`：复述会把两个领域的
-/// 原文各抄一份进注入块，既撑爆预算，也让 redact 的级联范围凭空变大
-/// （抹掉一侧的原文，抄件还在另一条边上）。
+/// Deliberately uses **only the entity names** and does not restate either side's
+/// `statement`: restating would copy the raw text from both domains into the
+/// injection block, which both blows the budget and enlarges redact's cascade
+/// scope out of nowhere (erase one side's raw text and the copy is still sitting
+/// on the other edge).
 fn link_statement(from: &Anchor, to: &Anchor, reason: &str) -> String {
     format!(
         "「{}」（{}）与「{}」（{}）相关：{}",
@@ -1010,21 +1123,24 @@ mod tests {
     use chrono::Utc;
     use std::sync::Mutex;
 
-    /// 造一个形状合法的 ULID。`Linker::plan` 要把实体 id 解析成 [`Id`]，
-    /// 拿 `"E1"` 当 id 只会测出「解析器认得出坏 id」这种废话。
+    /// Build a structurally valid ULID. `Linker::plan` parses entity ids into
+    /// [`Id`], so using `"E1"` as an id would only prove the triviality that "the
+    /// parser can recognize a bad id".
     fn eid(n: usize) -> String {
         let s = format!("01JAAAAAAAAAAAAAAAAAA{n:05}");
-        assert_eq!(s.len(), 26, "ULID 必须是 26 位：{s}");
+        assert_eq!(s.len(), 26, "a ULID must be 26 characters: {s}");
         s
     }
 
-    /// 把 `"F1"` 这种便于阅读的短标签补成形状合法的 ULID。
+    /// Pad a readable short label like `"F1"` out into a structurally valid ULID.
     ///
-    /// 与 [`eid`] 同理，只是轮到 fact id 了：跨域边现在要把两端的**源事实**
-    /// 记进 `derived_from`（否则只 redact 右侧时这条边会带着右侧实体名活下来），
-    /// 于是 `Linker::plan` 也要解析 fact id。
+    /// Same reasoning as [`eid`], now for fact ids: a cross-domain edge now has to
+    /// record the **source facts** on both ends into `derived_from` (otherwise
+    /// redacting only the right side leaves the edge alive carrying the right-hand
+    /// entity's name), so `Linker::plan` parses fact ids too.
     fn fid(label: &str) -> String {
-        // Crockford base32 不含 I / L / O / U，短标签里出现就得换掉
+        // Crockford base32 excludes I / L / O / U, so any of those in a short label
+        // has to be swapped out
         let safe: String = label
             .to_ascii_uppercase()
             .chars()
@@ -1037,7 +1153,7 @@ mod tests {
             })
             .collect();
         let s = format!("01JFFFFFFFFFFFFFFFFFF{safe:0>5}");
-        assert_eq!(s.len(), 26, "ULID 必须是 26 位：{s}");
+        assert_eq!(s.len(), 26, "a ULID must be 26 characters: {s}");
         s
     }
 
@@ -1063,8 +1179,9 @@ mod tests {
         }
     }
 
-    /// 可编排的假语料。`neighbors` 对**任何**查询都返回同一份列表 ——
-    /// 这里测的是过滤逻辑，不是近邻算法。
+    /// A scriptable fake corpus. `neighbors` returns the same list for **any**
+    /// query — what is being tested here is the filtering logic, not the
+    /// nearest-neighbour algorithm.
     struct FakeCorpus {
         batch: Vec<Fact>,
         neighbors: Vec<(Fact, f64)>,
@@ -1107,7 +1224,7 @@ mod tests {
         }
 
         async fn out_edges(&self, subject_id: &str) -> Result<Vec<String>> {
-            *self.out_edge_calls.lock().expect("锁未中毒") += 1;
+            *self.out_edge_calls.lock().expect("lock not poisoned") += 1;
             Ok(self.edges.get(subject_id).cloned().unwrap_or_default())
         }
 
@@ -1120,16 +1237,24 @@ mod tests {
         Linker::new("test")
     }
 
-    // ── 候选预筛 ───────────────────────────────────────────
+    // ── Candidate pre-filtering ────────────────────────────
 
     #[tokio::test]
     async fn proposes_a_cross_domain_pair() {
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.30)]);
-        let (out, scanned) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, scanned) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert_eq!(scanned, 1);
-        assert_eq!(out.len(), 1, "一对跨域近邻应当成为候选，实际 {}", out.len());
+        assert_eq!(
+            out.len(),
+            1,
+            "a cross-domain neighbour pair should become a candidate, actual {}",
+            out.len()
+        );
         assert_eq!(out[0].pair_key(), ("E1".into(), "E2".into()));
     }
 
@@ -1138,24 +1263,31 @@ mod tests {
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("coding"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.30)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert!(
             out.is_empty(),
-            "同域对不该连 —— 这条边的全部理由就是跨域，实际产出 {} 对",
+            "a same-domain pair must not be linked — being cross-domain is this edge's entire justification, actually produced {} pairs",
             out.len()
         );
     }
 
     #[tokio::test]
     async fn near_duplicates_are_not_candidates() {
-        // 距离 0.02：两条说的其实是同一件事。连起来一个 bit 都不产生
+        // Distance 0.02: the two are really saying the same thing. Linking them
+        // produces not one bit
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.02)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert!(
             out.is_empty(),
-            "近乎重复的一对不该连，实际产出 {} 对",
+            "a near-duplicate pair must not be linked, actually produced {} pairs",
             out.len()
         );
     }
@@ -1165,66 +1297,96 @@ mod tests {
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.80)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
-        assert!(out.is_empty(), "距离超出带外不该连，实际 {} 对", out.len());
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
+        assert!(
+            out.is_empty(),
+            "a distance outside the band must not be linked, actual {} pairs",
+            out.len()
+        );
     }
 
     #[tokio::test]
     async fn facts_sharing_an_entity_need_no_new_edge() {
-        // 左侧的宾语就是右侧的主语 —— 图遍历本来就走得通
+        // The left side's object is the right side's subject — graph traversal
+        // already gets through
         let left = fact("F1", "E1", Some("E2"), Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.30)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert!(
             out.is_empty(),
-            "已共享实体的两条事实再补一条边只是噪声，实际 {} 对",
+            "adding an edge between two facts that already share an entity is just noise, actual {} pairs",
             out.len()
         );
     }
 
     #[tokio::test]
     async fn existing_edge_makes_the_scan_idempotent() {
-        // 这条是 append-only + 不能加唯一约束下唯一的去重手段：
-        // 第二次扫描时上一晚写的边已经在 out_edges 里
+        // This is the only deduplication mechanism available under append-only
+        // storage with no unique constraint: on the second scan, the edge written
+        // the previous night is already in out_edges
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.30)]).with_edge("E1", "E2");
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert!(
             out.is_empty(),
-            "同一对不该被写第二遍，实际 {} 对",
+            "the same pair must not be written a second time, actual {} pairs",
             out.len()
         );
     }
 
     #[tokio::test]
     async fn existing_edge_is_detected_in_either_direction() {
-        // 边是无向的，只查一个方向会让「反向已存在」的对被重复写
+        // Edges are undirected, so checking only one direction would cause pairs
+        // that already exist in reverse to be written again
         let left = fact("F1", "E1", None, Some("coding"));
         let right = fact("F2", "E2", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(right, 0.30)]).with_edge("E2", "E1");
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert!(
             out.is_empty(),
-            "反向已连通也算已连通，实际 {} 对",
+            "connected in reverse counts as connected, actual {} pairs",
             out.len()
         );
     }
 
     #[tokio::test]
     async fn same_entity_pair_is_proposed_once_with_the_closest_evidence() {
-        // 同一对实体常被好几组事实同时撞上；写成几条边只是同一件事重复占预算
+        // The same entity pair is often hit by several sets of facts at once;
+        // writing them as several edges just makes one thing occupy the budget
+        // repeatedly
         let left = fact("F1", "E1", None, Some("coding"));
         let near = fact("F3", "E2", None, Some("office"));
         let far = fact("F2", "E2", None, Some("office"));
-        // 近的先来、远的后到：没有「留最近的那组」这道判断时，后到的会覆盖先到的
+        // The near one arrives first and the far one second: without the "keep the
+        // closest set" check, the later arrival would overwrite the earlier one
         let corpus = FakeCorpus::new(vec![left], vec![(near, 0.20), (far, 0.40)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
-        assert_eq!(out.len(), 1, "同一实体对只该出一次，实际 {} 对", out.len());
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
+        assert_eq!(
+            out.len(),
+            1,
+            "the same entity pair should be proposed only once, actual {} pairs",
+            out.len()
+        );
         assert!(
             (out[0].distance - 0.20).abs() < 1e-9,
-            "应留下更近的那组证据，实际距离 {}",
+            "the closer set of evidence should be the one kept, actual distance {}",
             out[0].distance
         );
         assert_eq!(out[0].right.fact_id, fid("F3"));
@@ -1232,25 +1394,36 @@ mod tests {
 
     #[tokio::test]
     async fn out_edges_are_cached_across_the_scan() {
-        // 每对候选都发两次查询的话，扫描的数据库往返会随候选数平方增长
+        // Issuing two queries per candidate pair would make the scan's database
+        // round trips grow with the square of the candidate count
         let left = fact("F1", "E1", None, Some("coding"));
         let r1 = fact("F2", "E2", None, Some("office"));
         let r2 = fact("F3", "E3", None, Some("office"));
         let corpus = FakeCorpus::new(vec![left], vec![(r1, 0.30), (r2, 0.35)]);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert_eq!(out.len(), 2);
-        let calls = *corpus.out_edge_calls.lock().expect("锁未中毒");
-        assert_eq!(calls, 3, "E1/E2/E3 各查一次即可，实际查了 {calls} 次");
+        let calls = *corpus.out_edge_calls.lock().expect("lock not poisoned");
+        assert_eq!(
+            calls, 3,
+            "one query each for E1/E2/E3 is enough, actually queried {calls} times"
+        );
     }
 
     #[tokio::test]
     async fn candidates_are_ordered_deterministically() {
-        // HashMap 的迭代序不稳定；扫描必须可复现，否则度数上限截掉谁全看运气
-        // 左侧的 id 刻意不叫 F*：它与近邻同名时会被「不跟自己连」那条挡掉，
-        // 于是少一条候选，看起来像排序错了
+        // HashMap iteration order is unstable, and the scan has to be reproducible,
+        // otherwise which pairs the degree cap cuts is pure luck.
+        // The left side's id is deliberately not named F*: when it collides with a
+        // neighbour's name it gets blocked by the "don't link to yourself" rule,
+        // producing one candidate fewer and making it look like the ordering broke
         let left = fact("L0", "E1", None, Some("coding"));
-        // 十条而不是两条：`HashMap` 的迭代序随 hash 种子逐进程变化，
-        // 两条时它有一半概率碰巧就是对的，测试会变成偶尔才红的哑弹
+        // Ten neighbours rather than two: `HashMap` iteration order varies per
+        // process with the hash seed, and with two there is a fifty-fifty chance it
+        // happens to come out correct anyway, turning this test into a dud that
+        // only goes red occasionally
         let neighbors: Vec<(Fact, f64)> = (0..10)
             .map(|i| {
                 (
@@ -1261,17 +1434,20 @@ mod tests {
             .collect();
         let want: Vec<String> = (0..10).rev().map(|i| fid(&format!("F{i}"))).collect();
         let corpus = FakeCorpus::new(vec![left], neighbors);
-        let (out, _) = linker().propose(&corpus).await.expect("预筛应当成功");
+        let (out, _) = linker()
+            .propose(&corpus)
+            .await
+            .expect("the pre-filter should succeed");
         assert_eq!(
             out.iter()
                 .map(|c| c.right.fact_id.clone())
                 .collect::<Vec<_>>(),
             want,
-            "候选必须按距离升序稳定排列 —— 否则度数上限截掉谁全看 hash 种子"
+            "candidates must be stably ordered ascending by distance — otherwise which ones the degree cap cuts depends entirely on the hash seed"
         );
     }
 
-    // ── 度数上限 ───────────────────────────────────────────
+    // ── Degree cap ─────────────────────────────────────────
 
     fn accepted(left: usize, right: usize, distance: f64) -> Accepted {
         let l = fact("FL", &eid(left), None, Some("coding"));
@@ -1288,29 +1464,41 @@ mod tests {
 
     #[tokio::test]
     async fn degree_cap_stops_hub_entities() {
-        // 枢纽实体是噪声在图里传染的主要途径：2 跳内它能带出 O(d²) 片子图
+        // Hub entities are the main route by which noise spreads through the graph:
+        // within two hops one can pull in O(d²) subgraphs
         let embedder = HashEmbedder::new();
         let links: Vec<Accepted> = (0..6).map(|i| accepted(1, 100 + i, 0.3)).collect();
         let (planned, capped) = linker()
             .with_degree_cap(2)
             .plan(&embedder, links, &HashMap::new())
             .await
-            .expect("计划应当成功");
-        assert_eq!(planned.len(), 2, "度数上限 2 只该放行两对");
-        assert_eq!(capped, 4, "其余四对应当被记为 degree_capped");
+            .expect("planning should succeed");
+        assert_eq!(
+            planned.len(),
+            2,
+            "a degree cap of 2 should let exactly two pairs through"
+        );
+        assert_eq!(
+            capped, 4,
+            "the remaining four pairs should be recorded as degree_capped"
+        );
     }
 
     #[tokio::test]
     async fn existing_degree_carries_over_between_scans() {
-        // 不带上历史度数的话，每晚都能把同一个实体再加满一轮上限
+        // Without carrying historical degrees over, every night could fill the same
+        // entity up to the cap all over again
         let embedder = HashEmbedder::new();
         let mut existing = HashMap::new();
         existing.insert(eid(1), 4usize);
         let (planned, capped) = linker()
             .plan(&embedder, vec![accepted(1, 9, 0.3)], &existing)
             .await
-            .expect("计划应当成功");
-        assert!(planned.is_empty(), "历史度数已满就不该再加");
+            .expect("planning should succeed");
+        assert!(
+            planned.is_empty(),
+            "once the historical degree is at the cap, nothing more should be added"
+        );
         assert_eq!(capped, 1);
     }
 
@@ -1322,12 +1510,16 @@ mod tests {
             .with_batch_cap(2)
             .plan(&embedder, links, &HashMap::new())
             .await
-            .expect("计划应当成功");
-        assert_eq!(planned.len(), 2, "单次扫描的总量必须有上界");
+            .expect("planning should succeed");
+        assert_eq!(
+            planned.len(),
+            2,
+            "the total volume of a single scan must have an upper bound"
+        );
         assert_eq!(capped, 3);
     }
 
-    // ── 落库计划 ───────────────────────────────────────────
+    // ── The persistence plan ───────────────────────────────
 
     #[tokio::test]
     async fn plans_both_directions() {
@@ -1335,13 +1527,13 @@ mod tests {
         let (planned, _) = linker()
             .plan(&embedder, vec![accepted(1, 2, 0.3)], &HashMap::new())
             .await
-            .expect("计划应当成功");
+            .expect("planning should succeed");
         let p = &planned[0];
         assert_eq!(p.forward.subject_id.to_string(), eid(1));
         assert_eq!(
             p.backward.subject_id.to_string(),
             eid(2),
-            "反向边缺失时，图遍历只能从一侧走到另一侧 —— 演示场景有一半是废的"
+            "without the reverse edge, graph traversal only walks one way — half the demo scenario is dead"
         );
         assert_eq!(
             p.forward.object_entity_id.map(|i| i.to_string()),
@@ -1356,40 +1548,45 @@ mod tests {
         let (planned, _) = linker()
             .plan(&embedder, vec![accepted(1, 2, 0.3)], &HashMap::new())
             .await
-            .expect("计划应当成功");
+            .expect("planning should succeed");
         let f = &planned[0].forward;
         assert_eq!(
             f.domain, None,
-            "给这条边任何一个 domain，域加权都会偏袒其中一个方向"
+            "give this edge any domain at all and domain weighting will favour one direction over the other"
         );
         assert!(
             f.confidence < 0.5,
-            "推断出来的边必须明显低于抽取器产物，实际 {}",
+            "an inferred edge must sit clearly below what the extractor produces, actual {}",
             f.confidence
         );
         assert_eq!(f.predicate, RELATES_TO);
-        assert!(f.valid_at.is_none(), "没有任何一刻「这两者开始相关」");
+        assert!(
+            f.valid_at.is_none(),
+            "there is no instant at which 'these two started being related'"
+        );
     }
 
     #[tokio::test]
     async fn links_are_traversable_but_not_searchable_by_default() {
-        // 这条挡的是「有人顺手把 tsv/embedding 补上」：边的 statement 把
-        // 两个实体名和一句摘要挤在一句话里，正是 BM25 的 ts_rank 最偏爱的
-        // 形状，建了索引它就会在任何提到两端的查询上霸榜。实测代价：
-        // 整体 R@5 0.923→0.907、MRR 0.817→0.799，掉的还全是跨域以外的题
+        // This guards against someone casually filling in tsv/embedding: an edge's
+        // statement packs two entity names and a one-line summary into a single
+        // sentence, precisely the shape BM25's ts_rank likes best, so once indexed
+        // it dominates the results of any query mentioning either end. Measured
+        // cost: overall R@5 0.923→0.907 and MRR 0.817→0.799, with every one of the
+        // regressions on questions unrelated to cross-domain linking
         let embedder = HashEmbedder::new();
         let (planned, _) = linker()
             .plan(&embedder, vec![accepted(1, 2, 0.3)], &HashMap::new())
             .await
-            .expect("计划应当成功");
+            .expect("planning should succeed");
         let f = &planned[0].forward;
         assert!(
             f.tsv_source.is_none() && f.embedding.is_none(),
-            "边默认不进 BM25 与向量索引 —— 它的用途是被遍历，不是被检索"
+            "by default an edge enters neither the BM25 nor the vector index — its purpose is to be traversed, not retrieved"
         );
         assert!(
             f.object_entity_id.is_some(),
-            "但它必须仍然是图上的一条边，否则整件事就没有意义了"
+            "but it must still be an edge in the graph, otherwise the whole exercise is pointless"
         );
     }
 
@@ -1400,11 +1597,11 @@ mod tests {
             .with_indexed(true)
             .plan(&embedder, vec![accepted(1, 2, 0.3)], &HashMap::new())
             .await
-            .expect("计划应当成功");
+            .expect("planning should succeed");
         let f = &planned[0].forward;
         assert!(
             f.tsv_source.as_ref().is_some_and(|s| !s.trim().is_empty()),
-            "开了索引就必须与主行同事务写入 tsv，不能留给异步补写"
+            "with indexing on, tsv must be written in the same transaction as the main row, never left to an asynchronous backfill"
         );
         assert!(f.embedding.is_some());
     }
@@ -1421,11 +1618,11 @@ mod tests {
         assert!(s.contains("融合模块") && s.contains("评测周会"));
         assert!(
             !s.contains("的事实 F1") && !s.contains("的事实 F2"),
-            "复述两侧原文会把两个领域的正文各抄一份进注入块：{s}"
+            "restating both sides' raw text would copy the body from both domains into the injection block: {s}"
         );
     }
 
-    // ── 判定 ───────────────────────────────────────────────
+    // ── Judgement ──────────────────────────────────────────
 
     fn two_candidates() -> Vec<Candidate> {
         vec![accepted(1, 2, 0.3).candidate, accepted(3, 4, 0.4).candidate]
@@ -1437,7 +1634,11 @@ mod tests {
             r#"{"links":[{"id":1,"reason":"预算限制选型"}]}"#,
             &two_candidates(),
         );
-        assert_eq!(out.len(), 1, "模型只接受一条时不该连另一条");
+        assert_eq!(
+            out.len(),
+            1,
+            "when the model accepts only one, the other must not be linked"
+        );
         assert_eq!(out[0].candidate.left.entity_id, eid(3));
         assert_eq!(out[0].reason, "预算限制选型");
     }
@@ -1448,7 +1649,12 @@ mod tests {
             r#"{"links":[{"id":99,"reason":"x"},{"id":0,"reason":"y"}]}"#,
             &two_candidates(),
         );
-        assert_eq!(out.len(), 1, "越界编号只该丢那一条，实际 {} 条", out.len());
+        assert_eq!(
+            out.len(),
+            1,
+            "an out-of-range index should drop only that entry, actual {} entries",
+            out.len()
+        );
     }
 
     #[test]
@@ -1457,7 +1663,11 @@ mod tests {
             r#"{"links":[{"id":0,"reason":"a"},{"id":0,"reason":"b"}]}"#,
             &two_candidates(),
         );
-        assert_eq!(out.len(), 1, "同一对被判两次不该写两条边");
+        assert_eq!(
+            out.len(),
+            1,
+            "the same pair judged twice must not produce two edges"
+        );
     }
 
     #[test]
@@ -1468,14 +1678,15 @@ mod tests {
         assert_eq!(
             out[0].reason.chars().count(),
             MAX_REASON_CHARS,
-            "reason 直接进 prompt，长度必须有硬上界"
+            "reason goes straight into the prompt, so its length must have a hard ceiling"
         );
     }
 
     #[test]
     fn unparseable_judgement_links_nothing_instead_of_failing() {
-        // 判定失败的正确行为是「这批不连」：少一条边只是少一点召回，
-        // 而让整个夜间扫描红掉要到第二天才有人发现
+        // The correct behaviour on a failed judgement is "link nothing in this
+        // batch": one missing edge is a little less recall, whereas turning the
+        // entire nightly scan red is something nobody notices until the next day
         let out = parse_judgements("模型今天不想输出 JSON", &two_candidates());
         assert!(out.is_empty());
     }
@@ -1484,14 +1695,17 @@ mod tests {
     fn judge_prompt_states_the_only_criterion() {
         assert!(
             JUDGE_SYSTEM.contains("帮忙") && JUDGE_SYSTEM.contains("宁可漏连"),
-            "判据与偏好方向必须写进 prompt，否则模型会把「话题相邻」也连上"
+            "the criterion and the direction of preference must be written into the prompt, or the model will start linking mere topical adjacency"
         );
     }
 
     #[tokio::test]
     async fn accept_all_is_the_prefilter_control_group() {
         let c = two_candidates();
-        let out = AcceptAll.judge(&c).await.expect("对照组不会失败");
+        let out = AcceptAll
+            .judge(&c)
+            .await
+            .expect("the control group cannot fail");
         assert_eq!(out.len(), c.len());
     }
 }

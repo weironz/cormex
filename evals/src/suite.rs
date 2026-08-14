@@ -1,49 +1,55 @@
-//! 题集的数据模型、加载与静态校验。
+//! The suite's data model, loading, and static validation.
 //!
-//! # 为什么是自建题集
+//! # Why a home-grown suite
 //!
-//! LoCoMo / LongMemEval 这类公开基准全是英文，且只测「问一句答一句」。
-//! Cortex 的差异化能力——jieba + tsvector 的中文 BM25、双时间轴回放、
-//! 出处追问、跨 domain 检索——**没有任何公开基准覆盖**。不自建就永远
-//! 无法证明卖点成立，也就永远只能凭感觉调 RRF 的 k 和四路的召回宽度。
+//! Public benchmarks like LoCoMo / LongMemEval are entirely in English and only
+//! test "ask one question, get one answer". Cortex's differentiating
+//! capabilities — Chinese BM25 via jieba + tsvector, bitemporal replay,
+//! provenance follow-ups, cross-domain retrieval — are **covered by no public
+//! benchmark at all**. Without building our own, the selling points can never
+//! be demonstrated, and RRF's k and the four paths' retrieval widths can only
+//! ever be tuned by feel.
 //!
-//! # 为什么用 JSON 而不是 YAML
+//! # Why JSON rather than YAML
 //!
-//! 工作区当前没有任何 YAML crate，为一个题集文件引入一个新依赖（且
-//! `serde_yaml` 已停止维护）不划算。JSON 冗长一点，但 `serde_json`
-//! 本来就在依赖里。
+//! The workspace currently has no YAML crate, and pulling in a new dependency
+//! for one suite file (with `serde_yaml` no longer maintained) is not worth it.
+//! JSON is a bit more verbose, but `serde_json` is already a dependency.
 //!
-//! # 格式
+//! # Format
 //!
 //! ```text
-//! scenarios[]        铺垫对话。按数组顺序灌进真实 ingest 管线
-//!   turns[]          一轮对话
-//!     text           原文，落成 episode；llm 模式下就是抽取器的输入
-//!     facts[]        seed 模式下手写的候选事实，走真实的消解 + 落库
-//!     checkpoint     可选。记下本轮提交后的**系统时间**，供时间回放题引用
-//!     tool_calls[]   本轮的工具轨迹，落成 episode_tool_calls（两种模式都落）
-//!     tool_expect[]  一个正确的抽取器应当从轨迹里得出的陈述（**不落库**）
-//!     tool_avoid[]   绝对不该从轨迹里抽出来的东西（**不落库**）
+//! scenarios[]        Setup conversations. Poured into the real ingest pipeline in array order
+//!   turns[]          One conversational turn
+//!     text           The raw text, landing as an episode; in llm mode it is also the extractor's input
+//!     facts[]        Handwritten candidate facts for seed mode, going through real resolution + write
+//!     checkpoint     Optional. Records the **system time** after this turn commits, for time-replay questions to reference
+//!     tool_calls[]   This turn's tool trace, landing as episode_tool_calls (in both modes)
+//!     tool_expect[]  Statements a correct extractor should derive from the trace (**not written to the store**)
+//!     tool_avoid[]   Things that must never be extracted from the trace (**not written to the store**)
 //! questions[]
-//!   gold[]           每个元素是一组子串，全部出现在某条事实的 statement 里才算命中
-//!   forbidden[]      同样的匹配规则，但**出现即扣分**
-//!   never_extracted[] 同样的匹配规则，但比对的是**语料快照**而非检索结果
-//!   as_of            引用某个 checkpoint，走系统时间回放而非四路召回
+//!   gold[]           Each element is a group of substrings; a hit requires all of them in one fact's statement
+//!   forbidden[]      The same matching rule, but **appearing costs points**
+//!   never_extracted[] The same matching rule, but compared against the **corpus snapshot** rather than the retrieval results
+//!   as_of            References a checkpoint, using system-time replay instead of the four retrieval paths
 //! ```
 //!
-//! # 为什么 tool_expect / tool_avoid 不落库
+//! # Why tool_expect / tool_avoid are not written to the store
 //!
-//! 落了就是自问自答：题目声明「应当抽出来这句」，评测把这句写进库，
-//! 然后宣布检索能召回它。它们唯一的用途是给 gold 与 never_extracted
-//! 当**锚点** —— 工具经验题的 gold 按定义匹配不到任何 `SeedFact`
-//! （匹配得到就说明这道题不用抽取器也能答），但也不能因此就允许它
-//! 凭空发明。完整的准入规程见 `evals/README.md`。
+//! Writing them would be answering our own question: the suite declares "this
+//! sentence should be extracted", the eval writes that sentence into the store,
+//! and then announces that retrieval can find it. Their only use is as
+//! **anchors** for gold and never_extracted — a tool-experience question's gold
+//! matches no `SeedFact` by definition (if it did, the question could be
+//! answered without the extractor), but that cannot become license to invent
+//! one out of thin air. The full admission procedure is in `evals/README.md`.
 //!
-//! # gold 为什么按子串匹配而不是按 fact id
+//! # Why gold matches by substring rather than by fact id
 //!
-//! 事实的 id 是落库时现生成的 ULID，题集写不出来。而 llm 模式下连
-//! statement 的措辞都由模型决定。子串匹配（「这几个关键词都得在同一条
-//! 事实里」）是唯一在两种模式下都成立的标识方式。
+//! A fact's id is a ULID generated at write time, which a suite cannot write
+//! down. And in llm mode even the statement's wording is decided by the model.
+//! Substring matching ("these keywords all have to be in the same fact") is the
+//! only identification scheme that holds in both modes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -52,51 +58,62 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-/// 题型。分组出数字的依据 —— 总分会掩盖问题，
-/// 「中文语义类 Recall@5 只有 0.3」才是可行动的信息。
+/// Question kinds. The basis for producing grouped numbers — a total score
+/// hides problems, while "Chinese-semantic Recall@5 is only 0.3" is actionable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionKind {
-    /// 中文语义：换个说法问同一件事，考验分词与语义相近
+    /// Chinese semantics: ask about the same thing in different words, testing
+    /// tokenization and semantic proximity
     ChineseSemantic,
-    /// 专有名词精确匹配：型号、端口、标识符、人名 —— BM25 的主场
+    /// Exact proper-noun matching: model numbers, ports, identifiers, personal
+    /// names — BM25's home turf
     ExactTerm,
-    /// 时间回放：「三个月前我以为什么」，走系统时间
+    /// Time replay: "what did I believe three months ago", going through system
+    /// time
     TemporalReplay,
-    /// 关系推理：从一个实体跳到它关联的事实 —— 图遍历的主场
+    /// Relational reasoning: hop from an entity to the facts linked to it —
+    /// graph traversal's home turf
     Relational,
-    /// 跨域：在 coding 里问 office 的事（或反之）
+    /// Cross-domain: ask about office matters while in coding (or vice versa)
     CrossDomain,
-    /// **工具经验**：答案只存在于工具轨迹里，对话原文一个字都没说。
+    /// **Tool experience**: the answer exists only in the tool trace, with the
+    /// conversation text saying not one word of it.
     ///
-    /// 与上面五类的根本差别：前五类考的是**检索**（事实已经在库里，问能不能
-    /// 排到前面），这一类考的是**抽取**（那条事实压根还不存在，问抽取器
-    /// 能不能从「命令 + 路径 + 成败」里把它造出来）。
+    /// The fundamental difference from the five kinds above: those five test
+    /// **retrieval** (the fact is already in the store; the question is whether
+    /// it ranks up front), while this one tests **extraction** (the fact does
+    /// not exist yet at all; the question is whether the extractor can
+    /// construct it from "command + path + success/failure").
     ///
-    /// 因此它是这套评测里唯一一个 `mode=seed` 下**必然全挂**的题型 ——
-    /// seed 喂的是手写的 `SeedFact`，而工具轨迹的题刻意不写任何 `facts`。
-    /// 挂法是 `Status::GoldMissing`（gold 没落库），不是「排太后」。
-    /// 见 `docs/memory-content.md` §二②。
+    /// It is therefore the only kind in this eval that **necessarily fails
+    /// entirely** under `mode=seed` — seed feeds handwritten `SeedFact`s, and
+    /// the tool-trace questions deliberately declare no `facts`. The failure
+    /// takes the form of `Status::GoldMissing` (the gold never landed), not
+    /// "ranked too low". See `docs/memory-content.md` §2②.
     ToolExperience,
-    /// **应当召回不到**：库里根本没有答案。
+    /// **Should retrieve nothing**: the store simply has no answer.
     ///
-    /// 这一类必须有。只测召回率会奖励「什么都召回」的退化策略：
-    /// 把召回宽度调到无穷大，Recall@k 永远是 1。
+    /// This kind is mandatory. Measuring recall alone rewards the degenerate
+    /// strategy of "retrieve everything": crank the retrieval width to infinity
+    /// and Recall@k is forever 1.
     Unanswerable,
 }
 
 impl QuestionKind {
-    /// 报告里的中文标签。
+    /// The label used in the report. It also becomes part of the gate-metric
+    /// key (`kind.<label>.recall@5`), so it has to stay in step with the row
+    /// names in `evals/README.md`.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::ChineseSemantic => "中文语义",
-            Self::ExactTerm => "专名精确",
-            Self::TemporalReplay => "时间回放",
-            Self::Relational => "关系推理",
-            Self::CrossDomain => "跨域检索",
-            Self::ToolExperience => "工具经验",
-            Self::Unanswerable => "应召不到",
+            Self::ChineseSemantic => "chinese_semantic",
+            Self::ExactTerm => "exact_term",
+            Self::TemporalReplay => "temporal_replay",
+            Self::Relational => "relational",
+            Self::CrossDomain => "cross_domain",
+            Self::ToolExperience => "tool_experience",
+            Self::Unanswerable => "unanswerable",
         }
     }
 
@@ -114,14 +131,16 @@ impl QuestionKind {
     }
 }
 
-/// 查询语种。中英双语是刚需：Cortex 的语料天然中英混排
-/// （中文叙述里嵌着 `RustFS` / `pg_advisory_xact_lock` 这类标识符）。
+/// The query's language. Chinese-English bilingualism is a hard requirement:
+/// Cortex's corpus is natively mixed (Chinese prose with identifiers like
+/// `RustFS` / `pg_advisory_xact_lock` embedded in it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lang {
     Zh,
     En,
-    /// 中英混排 —— 中文提问里带英文标识符
+    /// Mixed Chinese and English — a Chinese question carrying English
+    /// identifiers
     Mixed,
 }
 
@@ -129,9 +148,9 @@ impl Lang {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Zh => "中文",
-            Self::En => "英文",
-            Self::Mixed => "中英混排",
+            Self::Zh => "chinese",
+            Self::En => "english",
+            Self::Mixed => "mixed_zh_en",
         }
     }
 
@@ -155,60 +174,75 @@ pub struct Suite {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scenario {
     pub id: String,
-    /// coding / office / personal —— 落到 episode 与 fact 的 `domain` 列
+    /// coding / office / personal — lands in the `domain` column of episodes
+    /// and facts
     pub domain: String,
     pub turns: Vec<Turn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn {
-    /// 对话原文。落成 episode；llm 模式下同时是抽取器的输入
+    /// The conversation's raw text. Lands as an episode; in llm mode it is also
+    /// the extractor's input
     pub text: String,
-    /// 事件发生时间 `YYYY-MM-DD`
+    /// When the event occurred, `YYYY-MM-DD`
     pub occurred_at: String,
-    /// 记下本轮提交后的系统时间，供 `as_of` 引用
+    /// Records the system time after this turn commits, for `as_of` to
+    /// reference
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
-    /// seed 模式下手写的候选事实
+    /// Handwritten candidate facts for seed mode
     #[serde(default)]
     pub facts: Vec<SeedFact>,
-    /// 本轮的工具轨迹，按数组顺序落成 `episode_tool_calls`（`ordinal` 就是下标）。
+    /// This turn's tool trace, landing as `episode_tool_calls` in array order
+    /// (`ordinal` is just the index).
     ///
-    /// 它是**语料**不是**候选事实**：无论 seed 还是 llm 模式都照样落库。
-    /// 抽取器现在还不读这张表（`docs/memory-content.md` §二② 那条缺口），
-    /// 所以这段 fixture 目前只是「摆在那里等着被读」—— 这正是工具经验题
-    /// 现在必然挂掉的原因，也是将来接上之后不用改题集就能量到收益的原因。
+    /// It is **corpus**, not **candidate facts**: it is written to the store in
+    /// seed and llm mode alike. The extractor does not read this table yet (the
+    /// gap noted in `docs/memory-content.md` §2②), so for now this fixture is
+    /// simply "sitting there waiting to be read" — which is exactly why
+    /// tool-experience questions necessarily fail today, and also why the gain
+    /// will be measurable once it is wired up, with no suite change needed.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
-    /// 一个正确的抽取器**应当**从上面这段轨迹里得出的陈述。
+    /// The statements a correct extractor **should** derive from the trace
+    /// above.
     ///
-    /// 它不会被写进库（写了就成了自问自答）。它的唯一用途是给
-    /// `tool_experience` 题的 gold 当锚点：完整性检查要求每条 gold
-    /// 至少命中一条 `tool_expect`，否则那条 gold 就是凭空发明的。
+    /// They are never written to the store (writing them would be answering our
+    /// own question). Their only use is as anchors for `tool_experience`
+    /// questions' gold: the integrity check requires every gold to match at
+    /// least one `tool_expect`, otherwise that gold was invented out of thin
+    /// air.
     #[serde(default)]
     pub tool_expect: Vec<String>,
-    /// 从这段轨迹里**绝对不该**被抽出来的东西 —— 通常是命令的原始输出片段。
+    /// Things that **must never** be extracted from this trace — usually
+    /// fragments of a command's raw output.
     ///
-    /// 判据见 `docs/memory-content.md` §二③「工具输出原始字节明确不存」。
-    /// 同样只作锚点：题目的 `never_extracted` 必须命中其中一条。
+    /// The criterion is in `docs/memory-content.md` §2③, "raw bytes of tool
+    /// output are explicitly not stored". Likewise anchors only: a question's
+    /// `never_extracted` must match one of these.
     #[serde(default)]
     pub tool_avoid: Vec<String>,
 }
 
-/// 一次工具调用的 fixture，与 `cortex_store::NewEpisodeToolCall` 一一对应。
+/// A fixture for one tool call, corresponding one-to-one with
+/// `cortex_store::NewEpisodeToolCall`.
 ///
-/// 只有「命令 + 路径 + 成败 + 一行结论」四样，**没有原始 stdout** ——
-/// 形状照抄生产的 `episode_tool_calls`，评测里能表达的东西不能比生产多，
-/// 否则测出来的收益是假的。
+/// Only four things — command + path + success/failure + a one-line conclusion
+/// — and **no raw stdout**. The shape is copied from production's
+/// `episode_tool_calls`; the eval must not be able to express more than
+/// production can, or the gains it measures are fake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
-    /// 这次调用碰的路径；没碰文件的工具留空
+    /// The path this call touched; left empty for tools that touch no file
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// 这次调用成没成。**「失败→成功」的那个差值就是这一类题要考的知识**
+    /// Whether this call succeeded. **The delta from "failed" to "succeeded" is
+    /// precisely the knowledge this kind of question tests**
     pub ok: bool,
-    /// 一行结论。失败时按生产的做法带上工具输出的首行片段
+    /// A one-line conclusion. On failure, it carries the first line of the
+    /// tool's output, as production does
     pub summary: String,
 }
 
@@ -218,22 +252,25 @@ pub struct SeedFact {
     #[serde(default = "default_kind")]
     pub subject_kind: String,
     pub predicate: String,
-    /// 字面量宾语。与 `object_entity` 二选一
+    /// A literal object. Mutually exclusive with `object_entity`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
-    /// 实体宾语 —— 这才是知识图谱里的一条边，图遍历召回靠它
+    /// An entity object — this is what forms an edge in the knowledge graph,
+    /// and graph-traversal retrieval depends on it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_entity: Option<String>,
     #[serde(default = "default_kind")]
     pub object_entity_kind: String,
-    /// 自然语言表述。gold 的子串就是往这里匹配的
+    /// The natural-language phrasing. This is what gold's substrings match
+    /// against
     pub statement: String,
-    /// 【事件时间】`YYYY-MM-DD`。矛盾消解按它判先后
+    /// [Event time] `YYYY-MM-DD`. Contradiction resolution orders by it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_at: Option<String>,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
-    /// 覆盖场景的 domain（跨域题需要在一个场景里混两个 domain 时用）
+    /// Override the scenario's domain (for cross-domain questions that need two
+    /// domains mixed within one scenario)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
 }
@@ -253,27 +290,33 @@ pub struct Question {
     pub kind: QuestionKind,
     pub lang: Lang,
     pub query: String,
-    /// 当前对话领域，传给检索器做域加权
+    /// The current conversation's domain, passed to the retriever for domain
+    /// weighting
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
-    /// 引用某个 checkpoint —— 走 `retrieve_as_of`（系统时间回放）
+    /// References a checkpoint — uses `retrieve_as_of` (system-time replay)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
-    /// 应当被召回的事实。每个元素是一组子串（AND 关系）
+    /// The facts that should be retrieved. Each element is a group of
+    /// substrings (ANDed together)
     #[serde(default)]
     pub gold: Vec<Vec<String>>,
-    /// **不该**出现在结果里的事实。已被取代的旧值、话题相邻的干扰项
+    /// Facts that should **not** appear in the results. Superseded old values,
+    /// topically adjacent distractors
     #[serde(default)]
     pub forbidden: Vec<Vec<String>>,
-    /// **不该被抽出来**的东西 —— 与 `forbidden` 是两件事，别混。
+    /// Things that **should never have been extracted** — a different matter
+    /// from `forbidden`; do not conflate them.
     ///
-    /// `forbidden` 判的是「检索有没有把它排进前 k」，前提是它**已经在库里**；
-    /// `never_extracted` 判的是「它根本就不该在库里」，比对的是**语料快照**
-    /// 而不是检索结果。
+    /// `forbidden` judges "did retrieval rank it into the top k", which
+    /// presupposes it is **already in the store**; `never_extracted` judges "it
+    /// should not be in the store at all", and compares against the **corpus
+    /// snapshot** rather than the retrieval results.
     ///
-    /// 为什么必须分开：抽取 prompt 里「绝对不抽」那一节，改了之后
-    /// 检索侧的十八项指标一动不动 —— 因为该不该抽根本不是检索能看见的事。
-    /// 这一列是那一节唯一的尺子。
+    /// Why they must be separate: after the "never extract this" section of the
+    /// extraction prompt was rewritten, all eighteen retrieval-side metrics did
+    /// not move — because whether something should be extracted is simply not
+    /// something retrieval can see. This column is that section's only ruler.
     #[serde(default)]
     pub never_extracted: Vec<Vec<String>>,
     #[serde(default)]
@@ -290,7 +333,8 @@ impl Suite {
         Ok(suite)
     }
 
-    /// 静态校验。**不需要数据库** —— CI 里可以先跑这一步快速挡住坏题。
+    /// Static validation. **No database needed** — CI can run this step first
+    /// to stop bad questions quickly.
     pub fn validate(&self) -> Result<()> {
         let mut seen = HashSet::new();
         let mut checkpoints = HashSet::new();
@@ -383,7 +427,8 @@ impl Suite {
             }
         }
 
-        // 题型覆盖：少一类就是评测有盲区
+        // Question-kind coverage: one kind missing means the eval has a blind
+        // spot
         let counts = self.count_by_kind();
         for kind in QuestionKind::all() {
             if counts.get(&kind).copied().unwrap_or(0) == 0 {
@@ -391,9 +436,11 @@ impl Suite {
             }
         }
 
-        // 有工具经验题却一条轨迹都没有 = 这一类题目**注定**无解，
-        // 而它挂掉的样子（gold 没落库）与「抽取器还没接工具轨迹」一模一样，
-        // 从报告里根本分不出是缺 fixture 还是缺实现
+        // Tool-experience questions with not a single trace = that kind of
+        // question is **doomed** to be unanswerable, and the way it fails (the
+        // gold never landed) looks exactly like "the extractor is not wired to
+        // tool traces yet" — from the report there is no way to tell a missing
+        // fixture from a missing implementation
         if counts
             .get(&QuestionKind::ToolExperience)
             .copied()
@@ -425,7 +472,8 @@ impl Suite {
         out
     }
 
-    /// 题集里一共写了多少条铺垫事实（seed 模式下的语料规模）。
+    /// How many setup facts the suite declares in total (the corpus size under
+    /// seed mode).
     #[must_use]
     pub fn seed_fact_count(&self) -> usize {
         self.scenarios
@@ -440,20 +488,22 @@ impl Suite {
         self.scenarios.iter().map(|s| s.turns.len()).sum()
     }
 
-    /// 题集里一共写了多少次工具调用。
+    /// How many tool calls the suite declares in total.
     #[must_use]
     pub fn tool_call_count(&self) -> usize {
         self.turns().map(|t| t.tool_calls.len()).sum()
     }
 
-    /// 全部轮次，按场景顺序。
+    /// Every turn, in scenario order.
     pub fn turns(&self) -> impl Iterator<Item = &Turn> {
         self.scenarios.iter().flat_map(|s| &s.turns)
     }
 }
 
-/// 工具轨迹的结构校验。长度上限与 `cortex_store` 的 CHECK 对齐 ——
-/// 对不上的症状是灌语料灌到一半整个写事务回滚，而报错信息在 Postgres 那头。
+/// Structural validation of a tool trace. The length limits align with
+/// `cortex_store`'s CHECKs — the symptom of a mismatch is the whole write
+/// transaction rolling back halfway through loading the corpus, with the error
+/// message stuck over on the Postgres side.
 fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<()> {
     for (i, c) in turn.tool_calls.iter().enumerate() {
         let at = format!("场景 {scenario} 第 {turn_idx} 轮第 {} 次调用", i + 1);
@@ -523,7 +573,7 @@ fn validate_fact(scenario: &str, turn: usize, f: &SeedFact) -> Result<()> {
     Ok(())
 }
 
-/// `YYYY-MM-DD` → UTC 零点。
+/// `YYYY-MM-DD` → midnight UTC.
 pub fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     let d = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
         .with_context(|| format!("「{s}」不是 YYYY-MM-DD"))?;
@@ -606,15 +656,17 @@ mod tests {
 
     #[test]
     fn minimal_suite_passes() {
-        minimal().validate().expect("最小题集应当合法");
+        minimal()
+            .validate()
+            .expect("the minimal suite should be valid");
     }
 
     #[test]
     fn duplicate_question_ids_are_rejected() {
         let mut s = minimal();
         s.questions[1].id = s.questions[0].id.clone();
-        let err = s.validate().expect_err("重复 id 应当报错");
-        assert!(err.to_string().contains("重复"), "实际错误：{err}");
+        let err = s.validate().expect_err("a duplicate id should be an error");
+        assert!(err.to_string().contains("重复"), "actual error: {err}");
     }
 
     #[test]
@@ -624,11 +676,12 @@ mod tests {
             .questions
             .iter()
             .position(|q| q.kind == QuestionKind::Unanswerable)
-            .expect("应有应召不到题");
+            .expect("there should be a should-retrieve-nothing question");
         s.questions[i].gold = vec![vec!["甲".into()]];
         assert!(
             s.validate().is_err(),
-            "「应当召回不到」题带 gold 是自相矛盾的，必须挡住"
+            "a should-retrieve-nothing question carrying gold is \
+             self-contradictory and must be blocked"
         );
     }
 
@@ -636,10 +689,12 @@ mod tests {
     fn missing_kind_coverage_is_rejected() {
         let mut s = minimal();
         s.questions.retain(|q| q.kind != QuestionKind::Unanswerable);
-        let err = s.validate().expect_err("缺题型应当报错");
+        let err = s
+            .validate()
+            .expect_err("a missing question kind should be an error");
         assert!(
-            err.to_string().contains("应召不到"),
-            "错误信息要点名缺哪一类：{err}"
+            err.to_string().contains("unanswerable"),
+            "the error must name which kind is missing: {err}"
         );
     }
 
@@ -650,11 +705,12 @@ mod tests {
             .questions
             .iter()
             .position(|q| q.kind == QuestionKind::TemporalReplay)
-            .expect("应有时间回放题");
+            .expect("there should be a time-replay question");
         s.questions[i].as_of = None;
         assert!(
             s.validate().is_err(),
-            "时间回放题没有 as_of 就退化成了普通检索题"
+            "a time-replay question without as_of degenerates into an ordinary \
+             retrieval question"
         );
     }
 
@@ -662,7 +718,11 @@ mod tests {
     fn empty_matcher_group_is_rejected() {
         let mut s = minimal();
         s.questions[0].gold = vec![vec!["  ".into()]];
-        assert!(s.validate().is_err(), "空串匹配一切，等于这道题恒定满分");
+        assert!(
+            s.validate().is_err(),
+            "an empty string matches everything, which makes this question \
+             score full marks unconditionally"
+        );
     }
 
     #[test]
@@ -671,7 +731,8 @@ mod tests {
         s.scenarios[0].turns[0].facts[0].object_entity = Some("丙".into());
         assert!(
             s.validate().is_err(),
-            "字面量宾语与实体宾语同时给，落库时无法判定"
+            "giving both a literal object and an entity object leaves the write \
+             path unable to decide"
         );
     }
 
@@ -681,12 +742,13 @@ mod tests {
         s.scenarios[0].turns[0].tool_calls.clear();
         s.scenarios[0].turns[0].tool_expect.clear();
         s.scenarios[0].turns[0].tool_avoid.clear();
-        let err = s
-            .validate()
-            .expect_err("没有轨迹语料时工具经验题应当被挡住");
+        let err = s.validate().expect_err(
+            "a tool-experience question should be blocked when there is no trace corpus",
+        );
         assert!(
             err.to_string().contains("tool_calls"),
-            "错误要点名缺的是轨迹语料，否则会被误读成「抽取器还没接」：{err}"
+            "the error must name the missing trace corpus, otherwise it gets \
+             misread as \"the extractor is not wired up yet\": {err}"
         );
     }
 
@@ -696,10 +758,10 @@ mod tests {
         s.scenarios[0].turns[0].tool_calls.clear();
         let err = s
             .validate()
-            .expect_err("声明了 tool_expect 却没有轨迹应当报错");
+            .expect_err("declaring tool_expect with no trace should be an error");
         assert!(
             err.to_string().contains("凭空写的"),
-            "「应当抽出来」必须有轨迹作依据：{err}"
+            "a \"should be extracted\" claim must rest on a trace: {err}"
         );
     }
 
@@ -709,7 +771,9 @@ mod tests {
         s.scenarios[0].turns[0].tool_calls[0].summary = "   ".into();
         assert!(
             s.validate().is_err(),
-            "只有命令名没有结论的轨迹，抽取器无从下手，等于没写这段语料"
+            "a trace with a command name but no conclusion gives the extractor \
+             nothing to work with, which is the same as not writing the corpus \
+             at all"
         );
     }
 
@@ -720,11 +784,12 @@ mod tests {
             .questions
             .iter()
             .position(|q| q.kind == QuestionKind::ToolExperience)
-            .expect("应有工具经验题");
+            .expect("there should be a tool-experience question");
         s.questions[i].as_of = Some("cp".into());
         assert!(
             s.validate().is_err(),
-            "带 as_of 的工具经验题量到的是快照内容，不是抽取能力"
+            "a tool-experience question carrying as_of measures snapshot \
+             contents, not extraction capability"
         );
     }
 
@@ -735,11 +800,12 @@ mod tests {
             .questions
             .iter()
             .position(|q| q.kind == QuestionKind::ToolExperience)
-            .expect("应有工具经验题");
+            .expect("there should be a tool-experience question");
         s.questions[i].never_extracted = vec![vec!["  ".into()]];
         assert!(
             s.validate().is_err(),
-            "空串匹配一切 —— 这条「不该抽」会永远判定为泄漏"
+            "an empty string matches everything — this \"should never be \
+             extracted\" entry would forever be judged a leak"
         );
     }
 

@@ -1,45 +1,54 @@
--- 会话的**执行归属**：这段对话在哪儿跑。
+-- The session's **execution home**: where this conversation runs.
 --
--- # 为什么需要它
+-- # Why it is needed
 --
--- 同一个会话在两端各自静默跑，而两端指着**完全不同的文件系统**：
--- Web 走云端容器的 /workspace，桌面端走 workspaces.json 里那个本机目录。
--- 界面上没有任何东西说明这件事，于是用户在 A 端让 agent 写了个文件、
--- 到 B 端接着聊，agent 说「没有这个文件」——而它说的是实话，只是换了个世界。
+-- One and the same session runs quietly on both clients while the two point at
+-- **completely different filesystems**: the web client goes to /workspace in the cloud
+-- container, the desktop client goes to that local directory in workspaces.json. Nothing in
+-- the UI says so, so the user has the agent write a file on client A, carries the
+-- conversation on to client B, and the agent says "there is no such file" -- and it is
+-- telling the truth, it has merely changed worlds.
 --
--- 更糟的一半是桌面端：会话没有本地绑定时 agent 走 `Turn::sealed()`，
--- **一个文件工具都没有，而且不报错**。用户只会觉得它突然变笨了。
+-- The worse half is the desktop client: with no local binding on the session the agent
+-- takes `Turn::sealed()`, which has **not one file tool, and reports no error**. All the
+-- user notices is that it suddenly went stupid.
 --
--- 调研过的四家（Claude Code / Codex / Cursor / OpenHands）没有一家允许
--- 「同一个会话在两端各跑各的」——执行环境是会话身份的一部分。这一列就是
--- 把那件事写下来。
+-- Not one of the four products studied (Claude Code / Codex / Cursor / OpenHands) allows
+-- "the same session running separately on two clients" -- the execution environment is part
+-- of a session's identity. This column is that fact, written down.
 --
--- # 为什么只有两个值，而不是「哪一台设备」
+-- # Why only two values, instead of "which machine"
 --
--- 想写 `local:<device_id>` 的话得先有客户端设备身份，而链路上没有：
--- `session_events.device_id` 盖的是 **cortexd 自己**的章（`config.device_id`），
--- 不是发起那台机器的。
+-- Writing `local:<device_id>` would require a client device identity first, and this path
+-- has none: `session_events.device_id` carries **cortexd's own** stamp (`config.device_id`),
+-- not that of the machine that started it.
 --
--- 但那个身份**不必引入**：本地绑定存在 `workspaces.json`，它天然只存在于
--- 那一台机器上。于是「这台机器有没有这个会话的绑定」本身就是设备检查，
--- 而且判据比一个 id 更硬——id 会在重装/克隆后骗人，绑定不会。
+-- But that identity **does not need to be introduced**: the local binding lives in
+-- `workspaces.json`, which by its nature exists only on that one machine. So "does this
+-- machine have a binding for this session" is itself the device check, and its criterion is
+-- harder than an id -- an id will lie to you after a reinstall or a clone, a binding will not.
 --
--- 代价是说不出「在哪一台」，只能说「绑的是另一台机器上的目录」。
--- 将来真有了设备身份，这一列换成 `local:<id>` 即可，语义不变。
+-- The price is being unable to say "on which machine", only "it is bound to a directory on
+-- some other machine". If a real device identity ever arrives, this column becomes
+-- `local:<id>` and the meaning is unchanged.
 --
--- # 为什么 NULL 就是 cloud
+-- # Why NULL is cloud
 --
--- 存量会话一条都没有这个事件，而它们**绝大多数**要么是纯聊天、要么是
--- Web 会话——两者都该是 cloud。反过来（NULL 当 local）会让每一条老会话
--- 在桌面端变成「绑的是别的机器」，那是一次凭空的全量失效。
+-- Not one existing session has this event, and **the overwhelming majority** of them are
+-- either pure chat or web sessions -- both of which ought to be cloud. The other way round
+-- (NULL taken as local) would turn every old session on the desktop client into "bound to
+-- some other machine", which is a wholesale invalidation conjured out of nothing.
 --
--- 桌面端上那些真的绑了本机目录的老会话，第一次在本机打开时由客户端
--- 补写一条 set_runtime='local'（它此刻正好握着 workspaces.json）。
+-- Those old sessions on a desktop client that really are bound to a local directory get a
+-- set_runtime='local' appended by the client the first time they are opened on that machine
+-- (the moment at which it happens to be holding workspaces.json).
 
 ALTER TABLE session_events ADD COLUMN runtime TEXT;
 
--- 老的白名单容不下这个新动作。**不加 IF EXISTS**：名字对不上就该当场失败，
--- 静默保留旧约束的后果是这个 op 在运行时被数据库拒，而那时代码早已发布
+-- The old allowlist has no room for this new action. **No IF EXISTS**: if the name does not
+-- match it should fail right there; the consequence of silently keeping the old constraint
+-- is that this op gets rejected by the database at runtime, by which time the code has long
+-- since been released
 ALTER TABLE session_events DROP CONSTRAINT session_events_op_check;
 ALTER TABLE session_events ADD CONSTRAINT session_events_op_check CHECK (op IN (
     'rename', 'archive', 'unarchive',
@@ -47,7 +56,8 @@ ALTER TABLE session_events ADD CONSTRAINT session_events_op_check CHECK (op IN (
     'move_to_project', 'remove_from_project',
     'set_runtime'));
 
--- 每个 op 只带自己那一个载荷，两侧都写（同表其余 CHECK 的理由）
+-- Each op carries only its own payload, stated in both directions (the reason given for the
+-- other CHECKs in this table)
 ALTER TABLE session_events ADD CONSTRAINT session_events_runtime_required
     CHECK (op <> 'set_runtime' OR runtime IS NOT NULL);
 ALTER TABLE session_events ADD CONSTRAINT session_events_runtime_absent
@@ -56,14 +66,16 @@ ALTER TABLE session_events ADD CONSTRAINT session_events_runtime_value
     CHECK (runtime IS NULL OR runtime IN ('cloud', 'local'));
 
 COMMENT ON COLUMN session_events.runtime IS
-    'set_runtime 的载荷：cloud（云端容器工作区，处处可续）或 local
-     （钉在某台机器的本机目录上）。NULL = 没有这个 op。';
+    'The payload of set_runtime: cloud (the cloud container workspace, resumable anywhere)
+     or local (pinned to a local directory on one particular machine).
+     NULL = this op is absent.';
 
 -- ══════════════════════════════════════════════════════════
---  session_state —— 重建，加上第五台状态机
+--  session_state -- rebuilt, with the fifth state machine added
 --
---  五个维度仍然互相独立：[set_runtime, archive] 之后会话既有执行归属
---  也在归档中。整表最后一条依旧不是任何一个维度的末态。
+--  The five dimensions remain mutually independent: after [set_runtime, archive] the
+--  session both has an execution home and is archived. The last row in the whole table is
+--  still not the final state of any single dimension.
 -- ══════════════════════════════════════════════════════════
 
 DROP VIEW session_state;
@@ -101,20 +113,23 @@ SELECT k.session_id,
        t.title,
        coalesce(a.op = 'archive', false)                            AS archived,
        CASE WHEN w.op = 'bind_workspace' THEN w.workspace END       AS workspace,
-       -- 指向**已删除项目**的绑定按未分组处理。
+       -- A binding that points at a **deleted project** is treated as ungrouped.
        --
-       -- 判定放在视图里而不是每个调用方各写一遍：删项目刻意不级联改写会话
-       -- （见 project_events 表头），于是「悬挂的 project_id」是常态而非异常。
+       -- The judgement lives in the view instead of being written out again by every
+       -- caller: deleting a project deliberately does not cascade into rewriting the
+       -- sessions (see the header of project_events), so a "dangling project_id" is the
+       -- normal case rather than an anomaly.
        CASE WHEN p.op = 'move_to_project'
              AND EXISTS (SELECT 1 FROM project_state ps
                           WHERE ps.project_id = p.project_id)
             THEN p.project_id END                                   AS project_id,
-       -- **缺省在视图里定死，不留给每个调用方**。留给调用方的话，
-       -- 「NULL 算 cloud 还是算 local」会在 cortexd、cortex-local、
-       -- 两个客户端里各判一遍，而其中一处判反就是「老会话全部失效」
+       -- **The default is nailed down in the view, not left to each caller.** Left to the
+       -- callers, "does NULL count as cloud or as local" gets decided all over again in
+       -- cortexd, in cortex-local and in the two clients, and getting it backwards in any
+       -- one of them means "every old session stops working"
        coalesce(r.runtime, 'cloud')                                 AS runtime,
-       -- GREATEST 在 Postgres 里忽略 NULL，因此只有五个维度都没事件时才为 NULL，
-       -- 而那种会话根本不会出现在 known 里
+       -- GREATEST ignores NULL in Postgres, so this is NULL only when all five dimensions
+       -- have no events at all -- and such a session never appears in known
        greatest(t.created_at, a.created_at, w.created_at,
                 p.created_at, r.created_at)                         AS decided_at
   FROM known k

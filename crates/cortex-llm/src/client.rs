@@ -1,11 +1,14 @@
-//! 统一的 LLM 调用入口。
+//! The single entry point for calling an LLM.
 //!
-//! [`LlmClient`] 只做三件事：按配置挑一个 goose `Provider`、记住主/廉价两个
-//! [`ModelConfig`]、把流式结果原样交出去。
+//! [`LlmClient`] does only three things: pick a goose `Provider` per the
+//! configuration, remember the main and cheap [`ModelConfig`]s, and hand the
+//! streamed result out untouched.
 //!
-//! 刻意**不**定义自己的消息类型。goose 的 [`Message`] 已经无损承载了
-//! thinking / redacted-thinking 不透明块、工具调用与响应、prompt caching 标记；
-//! 在这里再包一层只会在转换中丢掉这些东西（见 `cortex-core` 的 lib.rs 注释）。
+//! It deliberately does **not** define a message type of its own. goose's
+//! [`Message`] already carries thinking / redacted-thinking opaque blocks, tool
+//! calls and responses, and prompt caching markers losslessly; wrapping another
+//! layer here would only lose those in conversion (see the lib.rs comments in
+//! `cortex-core`).
 
 use std::sync::Arc;
 
@@ -21,12 +24,14 @@ use crate::error::{LlmError, Result};
 use crate::provider;
 use crate::vision::{VisionSupport, image_count};
 
-/// 纯文本增量流。每一项是模型新吐出的一段文本（不含 thinking、不含工具调用）。
+/// A stream of plain-text deltas. Each item is a new chunk of text the model
+/// emitted (no thinking, no tool calls).
 pub type TextStream = futures::stream::BoxStream<'static, Result<String>>;
 
-/// 一个绑定了供应商与模型的 LLM 客户端。
+/// An LLM client bound to a provider and its models.
 ///
-/// 克隆代价很低（内部 `Arc`），可以随手塞进各个 handler。
+/// Cloning is cheap (an `Arc` inside), so it can be dropped into handlers
+/// freely.
 #[derive(Clone)]
 pub struct LlmClient {
     provider: Arc<dyn Provider>,
@@ -36,9 +41,10 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    /// 按配置构造。`api_key` 由调用方解析（环境变量、密钥托管……随意）。
+    /// Build from configuration. The caller resolves `api_key` however it likes
+    /// (environment variable, secret manager, whatever).
     ///
-    /// 免鉴权的供应商（Ollama）传空串即可。
+    /// For providers needing no authentication (Ollama), pass an empty string.
     pub fn from_config(cfg: &LlmConfig, api_key: &str) -> Result<Self> {
         let provider = provider::build_with(&cfg.provider, api_key, cfg.base_url.as_deref())?;
         Ok(Self {
@@ -49,19 +55,21 @@ impl LlmClient {
         })
     }
 
-    /// 从环境变量构造，供 example、CLI 与测试用。
+    /// Build from the environment, for examples, the CLI, and tests.
     ///
-    /// 读 `CORTEX_LLM_PROVIDER` / `CORTEX_LLM_MODEL` / `CORTEX_LLM_CHEAP_MODEL`，
-    /// 密钥读该供应商定义里声明的变量（deepseek → `DEEPSEEK_API_KEY`）。
-    /// 模型没配就取定义里的默认值。
+    /// Reads `CORTEX_LLM_PROVIDER` / `CORTEX_LLM_MODEL` /
+    /// `CORTEX_LLM_CHEAP_MODEL`, and takes the key from the variable declared
+    /// in that provider's definition (deepseek → `DEEPSEEK_API_KEY`). An
+    /// unconfigured model falls back to the default in the definition.
     ///
-    /// 服务端不该走这条路 —— `cortexd` 有完整的 [`cortex_core::Config`]，
-    /// 用 [`Self::from_config`]。
+    /// The server should not take this path — `cortexd` has a full
+    /// [`cortex_core::Config`], so it uses [`Self::from_config`].
     pub fn from_env() -> Result<Self> {
-        // 空串按「没设」处理。`env::var` 对空串返回 `Ok("")`，直接 `.ok()`
-        // 会让一个空串顶掉默认模型名 —— 详见 cortex_core::config 里
-        // `non_empty` 的注释（那是同一个 bug 的另一半，第一次上生产时
-        // 两处一起炸的）
+        // Treat the empty string as unset. `env::var` returns `Ok("")` for an
+        // empty string, so a bare `.ok()` lets an empty string knock out the
+        // default model name — see the comments on `non_empty` in
+        // cortex_core::config (that is the other half of the same bug; both
+        // sites blew up together on the first production deploy)
         let non_empty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
 
         let provider_id =
@@ -79,15 +87,17 @@ impl LlmClient {
             model: pick("CORTEX_LLM_MODEL", default_model)?,
             cheap_model: pick("CORTEX_LLM_CHEAP_MODEL", default_cheap)?,
             provider: provider_id.clone(),
-            // 本地 agent 直连时也要能指向自建端点 —— 与服务端读的是同一个变量，
-            // 两侧配法一致，不必记两套名字
+            // A directly-connected local agent must also be able to point at a
+            // self-hosted endpoint — it reads the same variable the server
+            // does, so both sides are configured identically and nobody has to
+            // remember two sets of names
             base_url: std::env::var("CORTEX_LLM_BASE_URL")
                 .ok()
                 .map(|v| v.trim().to_owned())
                 .filter(|v| !v.is_empty()),
         };
 
-        // api_key_env 为空 = 该供应商免鉴权。
+        // An empty api_key_env = this provider needs no authentication.
         let key_var = provider::api_key_env(&provider_id)?;
         let api_key = if key_var.is_empty() {
             String::new()
@@ -101,16 +111,20 @@ impl LlmClient {
         Self::from_config(&cfg, &api_key)
     }
 
-    /// 用一个现成的 [`Provider`] 组装，不经供应商注册表。
+    /// Assemble from an existing [`Provider`], bypassing the provider registry.
     ///
-    /// # 为什么需要这条路
+    /// # Why this path is needed
     ///
-    /// agent 循环搬到本地后，本地进程默认**不直连**任何供应商，而是把请求
-    /// 打到 cortexd 的 `/llm/stream`（key 只在服务端一处，多设备不用每台配一遍）。
-    /// 那条路上的「供应商」是一个讲 HTTP 的 `Provider` 实现，注册表里没有它。
+    /// Once the agent loop moved local, the local process by default does
+    /// **not** connect directly to any provider; it sends requests to cortexd's
+    /// `/llm/stream` (the key lives in one place on the server, so multi-device
+    /// setups need not configure each machine). The "provider" on that path is
+    /// a `Provider` implementation that speaks HTTP, and the registry does not
+    /// have it.
     ///
-    /// 走这条路进来的 `provider_id` 与两个 `ModelConfig` 由调用方负责 ——
-    /// 它们只用于展示与上下文窗口估算，不参与路由。
+    /// The `provider_id` and the two `ModelConfig`s that come in this way are
+    /// the caller's responsibility — they are used only for display and context
+    /// window estimation, and take no part in routing.
     #[must_use]
     pub fn from_provider(
         provider: Arc<dyn Provider>,
@@ -126,70 +140,75 @@ impl LlmClient {
         }
     }
 
-    /// 供应商标识，如 `deepseek`。
+    /// The provider identifier, e.g. `deepseek`.
     #[must_use]
     pub fn provider_id(&self) -> &str {
         &self.provider_id
     }
 
-    /// 主对话模型。
+    /// The main conversation model.
     #[must_use]
     pub fn model(&self) -> &ModelConfig {
         &self.model
     }
 
-    /// 抽取、摘要等后台任务用的廉价模型。
+    /// The cheap model for background work like extraction and summarization.
     #[must_use]
     pub fn cheap_model(&self) -> &ModelConfig {
         &self.cheap_model
     }
 
-    /// 底层 goose `Provider`，留给需要 goose 原生能力的调用方（列模型、查上限……）。
+    /// The underlying goose `Provider`, for callers that need goose's native
+    /// capabilities (listing models, querying limits, …).
     #[must_use]
     pub fn provider(&self) -> &dyn Provider {
         self.provider.as_ref()
     }
 
-    /// 为本供应商下的任意模型组装 [`ModelConfig`]。
+    /// Assemble a [`ModelConfig`] for any model under this provider.
     ///
-    /// 转录 pipeline 需要它：vision 模型未必是对话主模型
-    /// （DeepSeek 一个 vision 模型都没有，转录只能指到别家去）。
+    /// The transcription pipeline needs it: the vision model is not necessarily
+    /// the main conversation model (DeepSeek has no vision model at all, so
+    /// transcription has to point at another vendor).
     ///
     /// # Errors
     ///
-    /// 供应商定义解析失败。模型名不在定义里**不算错**——
-    /// 上下文上限会回落到 goose 的 canonical 表，这正是 Ollama 那类
-    /// 动态模型列表所需要的。
+    /// The provider definition fails to parse. A model name absent from the
+    /// definition is **not** an error — the context limit falls back to goose's
+    /// canonical table, which is exactly what dynamic model lists like Ollama's
+    /// need.
     pub fn model_config(&self, model: &str) -> Result<ModelConfig> {
         provider::model_config(&self.provider_id, model)
     }
 
-    /// 某个模型能不能看图。见 [`VisionSupport`]。
+    /// Whether a given model can see images. See [`VisionSupport`].
     #[must_use]
     pub fn vision_support(&self, model: &ModelConfig) -> VisionSupport {
         provider::vision_support(&self.provider_id, &model.model_name)
     }
 
-    /// 主模型能不能看图。
+    /// Whether the main model can see images.
     #[must_use]
     pub fn supports_vision(&self) -> bool {
         self.vision_support(&self.model).allows_images()
     }
 
-    /// 带图的请求发出去之前的最后一道闸。
+    /// The last gate before an image-carrying request goes out.
     ///
-    /// # 为什么要拦
+    /// # Why block at all
     ///
-    /// 不拦的结局不是报错，是**静默丢失**：goose 会照常把 image 块序列化
-    /// 出去，不支持 vision 的端点要么忽略它、要么回一个含糊的 400，
-    /// 而用户看到的是助手说「我没有看到你附上任何图片」。
-    /// 这类问题没有任何一处日志会指向真正的原因。
+    /// Not blocking does not produce an error, it produces **silent loss**:
+    /// goose serializes the image block out as usual, and an endpoint without
+    /// vision support either ignores it or returns a vague 400, while what the
+    /// user sees is the assistant saying "I don't see any image attached". For
+    /// this class of problem, no log line anywhere points at the real cause.
     ///
-    /// 只在**显式声明**不支持时拒绝；未声明一律放行（见 [`VisionSupport`]）。
+    /// It only refuses when support is **explicitly declared** absent; anything
+    /// undeclared is let through (see [`VisionSupport`]).
     ///
     /// # Errors
     ///
-    /// [`LlmError::VisionUnsupported`]。
+    /// [`LlmError::VisionUnsupported`].
     pub fn ensure_can_see(&self, model: &ModelConfig, messages: &[Message]) -> Result<()> {
         let images = image_count(messages);
         if images == 0 {
@@ -198,8 +217,10 @@ impl LlmClient {
         let support = self.vision_support(model);
         if support.allows_images() {
             if support == VisionSupport::Unknown {
-                // 放行了，但要留痕：将来排查「图发过去没反应」时，
-                // 这一行是判断「我们放行 vs 我们拦下」的分界
+                // Let through, but leave a trace: when someone later
+                // investigates "the image was sent and nothing happened", this
+                // line is what distinguishes "we let it through" from "we
+                // blocked it"
                 tracing::debug!(
                     provider = %self.provider_id,
                     model = %model.model_name,
@@ -215,10 +236,12 @@ impl LlmClient {
         })
     }
 
-    /// 用主模型流式对话。
+    /// Stream a conversation with the main model.
     ///
-    /// 流里既有文本增量，也有**完整**的工具调用（goose 保证工具调用只在拼完后
-    /// 才 yield，不会吐半截 JSON），末尾附带 token 用量。agent 循环用这个。
+    /// The stream carries both text deltas and **complete** tool calls (goose
+    /// guarantees a tool call is yielded only once fully assembled, never as
+    /// half a JSON document), with token usage attached at the end. The agent
+    /// loop uses this one.
     pub async fn stream(
         &self,
         system: &str,
@@ -228,7 +251,7 @@ impl LlmClient {
         self.stream_with(&self.model, system, messages, tools).await
     }
 
-    /// 用廉价模型流式对话。
+    /// Stream a conversation with the cheap model.
     pub async fn stream_cheap(
         &self,
         system: &str,
@@ -239,9 +262,10 @@ impl LlmClient {
             .await
     }
 
-    /// 指定模型流式对话。重试与限流退避由 goose 在内部处理。
+    /// Stream a conversation with a specified model. Retries and rate-limit
+    /// backoff are handled by goose internally.
     ///
-    /// 带图的消息会先过 [`Self::ensure_can_see`]。
+    /// Image-carrying messages pass through [`Self::ensure_can_see`] first.
     pub async fn stream_with(
         &self,
         model: &ModelConfig,
@@ -253,9 +277,11 @@ impl LlmClient {
         Ok(self.provider.stream(model, system, messages, tools).await?)
     }
 
-    /// 只要文本增量的简化流：丢掉用量、工具调用与 thinking 块。
+    /// A simplified stream of text deltas only: usage, tool calls, and thinking
+    /// blocks are discarded.
     ///
-    /// 适合「让模型写一段话」这类场景。要走 agent 循环请用 [`Self::stream`]。
+    /// Suits "have the model write a passage" style uses. For the agent loop,
+    /// use [`Self::stream`].
     pub async fn stream_text(
         &self,
         model: &ModelConfig,
@@ -273,9 +299,10 @@ impl LlmClient {
             .boxed())
     }
 
-    /// 非流式：把整轮响应收完再返回，附带 token 用量。
+    /// Non-streaming: collect the whole turn's response before returning, with
+    /// token usage attached.
     ///
-    /// 带图的消息会先过 [`Self::ensure_can_see`]。
+    /// Image-carrying messages pass through [`Self::ensure_can_see`] first.
     pub async fn complete(
         &self,
         model: &ModelConfig,
@@ -293,8 +320,8 @@ impl LlmClient {
 
 impl std::fmt::Debug for LlmClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 手写而非 derive：Provider 是 trait object，没有 Debug；
-        // 而且它内部握着 API 密钥，绝不能进日志。
+        // Hand-written rather than derived: Provider is a trait object with no
+        // Debug; and it holds the API key inside, which must never reach a log.
         f.debug_struct("LlmClient")
             .field("provider", &self.provider_id)
             .field("model", &self.model.model_name)
@@ -318,7 +345,7 @@ mod tests {
 
     #[test]
     fn builds_from_config_with_explicit_key() {
-        let client = LlmClient::from_config(&config(), "test-key").expect("应构造成功");
+        let client = LlmClient::from_config(&config(), "test-key").expect("should build");
         assert_eq!(client.provider_id(), "deepseek");
         assert_eq!(client.model().model_name, "deepseek-v4-pro");
         assert_eq!(client.cheap_model().context_limit(), 128_000);
@@ -326,11 +353,11 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_the_key() {
-        let client = LlmClient::from_config(&config(), "super-secret").expect("应构造成功");
+        let client = LlmClient::from_config(&config(), "super-secret").expect("should build");
         assert!(!format!("{client:?}").contains("super-secret"));
     }
 
-    /// 最小合法 PNG：1×1 全透明。
+    /// The smallest valid PNG: 1×1, fully transparent.
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
@@ -344,7 +371,7 @@ mod tests {
         Message::user()
             .with_text("这张图里有什么")
             .with_image_bytes(PNG_1X1, "image/png")
-            .expect("合法 PNG")
+            .expect("a valid PNG")
     }
 
     #[test]
@@ -352,16 +379,19 @@ mod tests {
         let client = LlmClient::from_config(&config(), "k").unwrap();
         assert!(
             !client.supports_vision(),
-            "deepseek 定义里已明写 vision:false —— 这条断言在 DeepSeek 出 vision 模型时会失败，那正是该更新定义的时刻"
+            "the deepseek definition explicitly says vision:false — this \
+             assertion will fail the day DeepSeek ships a vision model, and \
+             that is exactly the moment to update the definition"
         );
         let err = client
             .ensure_can_see(client.model(), &[with_image()])
-            .expect_err("带图必须被拦下");
+            .expect_err("an image must be blocked");
         assert!(matches!(err, LlmError::VisionUnsupported { .. }));
         let msg = err.to_string();
         assert!(
             msg.contains("deepseek-v4-pro") && msg.contains("CORTEX_VISION"),
-            "错误必须同时说清是哪个模型、以及怎么改；实际：{msg}"
+            "the error must state both which model it was and how to fix it; \
+             got: {msg}"
         );
     }
 
@@ -370,7 +400,7 @@ mod tests {
         let client = LlmClient::from_config(&config(), "k").unwrap();
         client
             .ensure_can_see(client.model(), &[Message::user().with_text("纯文本")])
-            .expect("不带图就不该受 vision 能力影响");
+            .expect("with no image, vision capability should not matter");
     }
 
     #[test]
@@ -385,13 +415,14 @@ mod tests {
         assert!(client.supports_vision());
         client
             .ensure_can_see(client.model(), &[with_image()])
-            .expect("Claude 全系支持图像");
+            .expect("the whole Claude line supports images");
     }
 
     #[test]
     fn undeclared_capability_is_not_a_hard_stop() {
-        // Ollama 的模型列表由本机决定，定义里 models 为空 → Unknown → 放行。
-        // 在这里拦下等于「用户装了 llava 也用不了」。
+        // Ollama's model list is decided by the local machine, so `models` is
+        // empty in the definition → Unknown → let through. Blocking here would
+        // mean "the user installed llava and still cannot use it".
         let cfg = LlmConfig {
             provider: "ollama".to_string(),
             model: "gemma4:latest".to_string(),
@@ -405,7 +436,7 @@ mod tests {
         );
         client
             .ensure_can_see(client.model(), &[with_image()])
-            .expect("未声明能力应放行，由 Ollama 自己报错");
+            .expect("undeclared capability should be let through and left for Ollama to reject");
     }
 
     #[test]

@@ -1,54 +1,67 @@
-//! 内容寻址：哈希计算、校验与 storage key 派生。
+//! Content addressing: computing hashes, validating them, and deriving storage
+//! keys.
 //!
-//! # 为什么是 SHA-256 而不是更快的 BLAKE3
+//! # Why SHA-256 rather than the faster BLAKE3
 //!
-//! 不为速度，为**契约对齐**：migration 里的 `sha256` domain 是
-//! `^[0-9a-f]{64}$`，S3 生态（`x-amz-checksum-sha256`）也原生支持它。
-//! 换 BLAKE3 要同时改 schema 与外部接口，省下的那点 CPU 不值这个价。
+//! Not for speed, but for **contract alignment**: the `sha256` domain in the
+//! migrations is `^[0-9a-f]{64}$`, and the S3 ecosystem
+//! (`x-amz-checksum-sha256`) supports it natively. Switching to BLAKE3 would
+//! mean changing the schema and the external interface at once, and the CPU
+//! saved is not worth that price.
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{BlobError, Result};
 
-/// 十六进制哈希的字符数。与 migration 的 `sha256` domain 一致。
+/// The number of characters in a hex hash. Matches the migrations' `sha256`
+/// domain.
 pub const HASH_HEX_LEN: usize = 64;
 
-/// 租户前缀之后、哈希分桶之前的那一段。留出命名空间，
-/// 将来同一租户名下放别的东西（导出包、缩略图）不会和字节撞在一起。
+/// The segment that comes after the tenant prefix and before the hash buckets.
+/// It reserves a namespace, so that putting other things under the same tenant
+/// later (export bundles, thumbnails) will not collide with the bytes.
 const KEY_PREFIX: &str = "blobs";
 
-/// 租户前缀的长度上限，取 Postgres 的 `NAMEDATALEN - 1`。
+/// The upper bound on a tenant prefix's length, taken from Postgres's
+/// `NAMEDATALEN - 1`.
 ///
-/// 不是随手定的余量：超过这个长度的名字**做不成 schema**（Postgres 会静默
-/// 截断），于是两个「不同」的租户可能落在同一个 schema 上。既然它不可能对应
-/// 一个真实租户，就不该被允许拼进 key。
+/// Not an arbitrary margin: a name longer than this **cannot become a schema**
+/// (Postgres truncates it silently), so two "different" tenants may land on the
+/// same schema. Since such a name cannot correspond to a real tenant, it must
+/// not be allowed into a key either.
 const MAX_TENANT_LEN: usize = 63;
 
-/// 计算内容哈希（小写十六进制）。
+/// Compute the content hash (lowercase hex).
 ///
-/// 这是内容寻址的**唯一**入口：同字节必得同 key，
-/// 于是「上传」天然幂等、「去重」天然免费、对象天然不可变
-/// —— 也正是 RustFS 不支持对象版本控制却无妨的原因：
-/// 一个 key 的内容永远是同一份字节，「旧版本」这个概念根本不存在。
+/// This is the **one** entry point of content addressing: identical bytes must
+/// yield an identical key, which makes "upload" idempotent for free,
+/// "deduplication" free for free, and objects immutable for free — and is also
+/// why RustFS not supporting object versioning does not matter: the content
+/// under a key is forever the same bytes, so the notion of an "older version"
+/// does not exist at all.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// 校验哈希形如 64 位小写十六进制。
+/// Validate that a hash is 64 lowercase hex digits.
 ///
-/// # 这是安全边界，不是格式洁癖
+/// # This is a security boundary, not format fastidiousness
 ///
-/// 哈希是唯一由外部（客户端 URL 路径、同步队列、数据库行）流入存储路径的值。
-/// [`LocalFsBlobStore`](crate::LocalFsBlobStore) 要拿它拼文件路径，
-/// S3 要拿它拼 object key。放进来一个 `../../../etc/passwd`，前者就是任意文件读写。
+/// The hash is the only value that flows in from outside (a client's URL path,
+/// the sync queue, a database row) and into a storage path.
+/// [`LocalFsBlobStore`](crate::LocalFsBlobStore) uses it to assemble a file
+/// path, and S3 uses it to assemble an object key. Let a
+/// `../../../etc/passwd` through and the former becomes arbitrary file read and
+/// write.
 ///
-/// 十六进制字符集里没有 `.`、`/`、`\`、`%`、NUL，所以**这一条检查
-/// 就把全部路径遍历向量堵死了**——不需要在下游再做一次转义，
-/// 也不该做：两处独立的检查必然有一天不一致。
+/// The hex character set contains no `.`, `/`, `\`, `%` or NUL, so **this one
+/// check seals off every path traversal vector** — no downstream escaping is
+/// needed, and none should be added: two independent checks are guaranteed to
+/// disagree one day.
 ///
 /// # Errors
-/// 不合形制时返回 [`BlobError::InvalidHash`]。
+/// Returns [`BlobError::InvalidHash`] when the shape is wrong.
 pub fn validate_hash(hash: &str) -> Result<()> {
     let well_formed = hash.len() == HASH_HEX_LEN
         && hash
@@ -61,27 +74,31 @@ pub fn validate_hash(hash: &str) -> Result<()> {
     }
 }
 
-/// 一段已经过校验的租户前缀。
+/// A tenant prefix that has already been validated.
 ///
-/// # 为什么是 newtype，而不是像哈希那样每次用之前再校验一遍
+/// # Why a newtype, rather than revalidating before each use as hashes do
 ///
-/// 哈希非那样不可：它**逐次**从外部流入（URL 路径、同步队列、数据库行），
-/// 每一次都是新的一份不可信输入。租户前缀不是——它在建 store 时入场一次，
-/// 之后每个 key 都复用同一份。若也走「每次再查一遍」，这道检查就会散布到
-/// 两个后端的十来个方法里，而 [`validate_hash`] 的文档已经写明为什么那是错的：
-/// 两处独立的检查必然有一天不一致。
+/// Hashes have no choice: they flow in from outside **each and every time** (a
+/// URL path, the sync queue, a database row), and each time is a fresh piece of
+/// untrusted input. A tenant prefix is not like that — it arrives once when the
+/// store is constructed, and every key thereafter reuses the same copy. Were it
+/// also to go the "check again each time" route, the check would be scattered
+/// across a dozen methods in two backends, and [`validate_hash`]'s
+/// documentation already spells out why that is wrong: two independent checks
+/// are guaranteed to disagree one day.
 ///
-/// 所以改成「构造即校验、类型即证明」：内部字段私有，唯一入口是
-/// [`TenantPrefix::new`]，因此**拿到一个 `TenantPrefix` 就等于拿到了
-/// 它已过校验的证明**，下游既不必再问，也无法绕过去伪造一个。
+/// So instead: **construction is validation, and the type is the proof**. The
+/// inner field is private and [`TenantPrefix::new`] is the only way in, so
+/// **holding a `TenantPrefix` is holding proof that it has been validated** —
+/// downstream neither has to ask again nor has any way to forge one around it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TenantPrefix(String);
 
 impl TenantPrefix {
-    /// 校验并构造。规则见 [`validate_tenant`]。
+    /// Validate and construct. For the rules see [`validate_tenant`].
     ///
     /// # Errors
-    /// 不合形制时返回 [`BlobError::InvalidTenant`]。
+    /// Returns [`BlobError::InvalidTenant`] when the shape is wrong.
     pub fn new(prefix: impl Into<String>) -> Result<Self> {
         let prefix = prefix.into();
         validate_tenant(&prefix)?;
@@ -100,52 +117,65 @@ impl std::fmt::Display for TenantPrefix {
     }
 }
 
-/// 校验租户前缀，只放行「Postgres 标识符」这一形状：
-/// 首字符是 ASCII 字母或 `_`，其后为字母 / 数字 / `_`，
-/// 长度不超过 [`MAX_TENANT_LEN`]。
+/// Validate a tenant prefix, admitting only the "Postgres identifier" shape:
+/// the first character is an ASCII letter or `_`, the rest are letters, digits
+/// or `_`, and the length does not exceed [`MAX_TENANT_LEN`].
 ///
-/// # 这与哈希那道校验是同一条防线
+/// # This is the same line of defence as the hash check
 ///
-/// 多租户下前缀是**第二个**直通存储路径的外部输入：它会成为
-/// [`LocalFsBlobStore`](crate::LocalFsBlobStore) 文件路径的一段，也会成为
-/// S3 object key 的首段。放进来一个 `../../..`，后果与放进来一个坏哈希完全相同。
+/// Under multi-tenancy the prefix is the **second** external input that goes
+/// straight into a storage path: it becomes a segment of
+/// [`LocalFsBlobStore`](crate::LocalFsBlobStore)'s file path, and the leading
+/// segment of the S3 object key. Let a `../../..` through and the consequences
+/// are exactly those of letting a bad hash through.
 ///
-/// 因此这里沿用同一种做法：**靠字符集放行，而不是靠黑名单拦截**。
-/// 允许的字符里没有 `.`、`/`、`\`、`%`、NUL、空白，于是 `..`、`a/../b`、
-/// `..%2f..`、`\..\windows` 这些载荷一条都不必单独列举就已被拒——
-/// 黑名单永远少写一条，白名单不会。
+/// It therefore follows the same approach: **admit by character set rather than
+/// block by blacklist**. The permitted characters include no `.`, `/`, `\`,
+/// `%`, NUL or whitespace, so payloads like `..`, `a/../b`, `..%2f..` and
+/// `\..\windows` are all already rejected without any of them being enumerated
+/// — a blacklist is always one entry short, a whitelist never is.
 ///
-/// # 大小写：这里**两种都收**，但上游只铸小写
+/// # Case: **both are accepted here**, but upstream only mints lowercase
 ///
-/// `cortex_store::SchemaName` 现在只产出 `public` 与 `u_` 加 **26 位小写**
-/// ULID。小写是被一次实测逼出来的：`search_path` 里未加引号的标识符会被
-/// Postgres 折成小写，而 schema 是用 `CREATE SCHEMA "u_ABC"` 建的、保留大写 ——
-/// 两者对不上时 `search_path` 指向一个**不存在**的 schema，而 Postgres
-/// 对此是**静默跳过**的，于是所有写入落进 `public`（也就是 1 号用户的库），
-/// 且 `migrate()` 返回 `Ok`。
+/// `cortex_store::SchemaName` currently produces only `public` and `u_` plus a
+/// **26-character lowercase** ULID. Lowercase was forced by a real observation:
+/// an unquoted identifier in `search_path` gets folded to lowercase by
+/// Postgres, while the schema was created by `CREATE SCHEMA "u_ABC"` and kept
+/// its uppercase — and when the two disagree, `search_path` points at a schema
+/// that **does not exist**, which Postgres **skips silently**, so every write
+/// lands in `public` (i.e. user number one's database) and `migrate()` returns
+/// `Ok`.
 ///
-/// 那这里为什么还收大写？因为**这一层不该替上游做规范化**。它的职责是
-/// 「拒掉能穿越目录、能变成两个 key 的东西」，而大写不在其中。
+/// So why accept uppercase here? Because **this layer should not do upstream's
+/// normalization for it**. Its job is to reject things that can traverse
+/// directories or turn into two keys, and uppercase is neither.
 ///
-/// 残留的隐患是真的：NTFS / APFS 大小写不敏感，`Ab/` 与 `ab/` 是同一个目录，
-/// 而 S3 的 key 大小写敏感，是两个对象——同一份代码在两个后端上行为不同。
-/// 它在这里不咬人，只因为上游铸出来的形状永远不会「仅大小写不同」。
+/// The residual hazard is real: NTFS and APFS are case-insensitive, so `Ab/`
+/// and `ab/` are the same directory, whereas S3 keys are case-sensitive and
+/// they are two objects — the same code behaving differently on two backends.
+/// It does not bite here only because the shapes upstream mints never differ by
+/// case alone.
 ///
-/// **由此推出一条禁令**：绝不要在这里加一步「统一转小写」的归一化。那会让
-/// 任何已经按大写存下的对象在一次升级之后集体查无此 key——而且不报错，
-/// 只是「历史附件全没了」。
+/// **From which follows a prohibition**: never add a "fold everything to
+/// lowercase" normalization step here. That would make every object already
+/// stored under an uppercase key collectively unfindable after one upgrade —
+/// with no error, just "all the historical attachments are gone".
 ///
-/// # 另外三条规则，各自换掉一类静默故障
+/// # Three further rules, each replacing a class of silent failure
 ///
-/// - **拒 `-` 与 `$`**。带连字符的 schema 名在 SQL 里处处都得加双引号，而
-///   store 层有约 77 条查询。挡在这里，比指望每一条都记得加引号可靠得多。
-/// - **拒数字开头**。Postgres 未加引号的标识符不许，同样是「不加引号就用不了」。
-/// - **拒空串**。空前缀会让 key 退化成 `/blobs/…`（首段为空），本地后端上
-///   `root.join("/blobs/…")` 在 Unix 上会被当成绝对路径而**丢弃 root**——
-///   这是 `Path::join` 一个真实存在、且不报错的行为。
+/// - **Reject `-` and `$`.** A schema name containing a hyphen needs double
+///   quotes everywhere in SQL, and the store layer has around 77 queries.
+///   Blocking it here is far more reliable than hoping every one of them
+///   remembers to quote.
+/// - **Reject a leading digit.** Postgres does not permit it in an unquoted
+///   identifier — again "unusable without quoting".
+/// - **Reject the empty string.** An empty prefix degenerates the key into
+///   `/blobs/…` (an empty leading segment), and on the local backend
+///   `root.join("/blobs/…")` is treated as an absolute path on Unix and
+///   **discards root** — a real, and silent, behaviour of `Path::join`.
 ///
 /// # Errors
-/// 不合形制时返回 [`BlobError::InvalidTenant`]。
+/// Returns [`BlobError::InvalidTenant`] when the shape is wrong.
 fn validate_tenant(prefix: &str) -> Result<()> {
     let mut bytes = prefix.bytes();
     let head_ok = matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_');
@@ -158,35 +188,46 @@ fn validate_tenant(prefix: &str) -> Result<()> {
     }
 }
 
-/// 由租户前缀与哈希派生对象 key：`<tenant>/blobs/ab/cd/<64 位哈希>`。
+/// Derive the object key from a tenant prefix and a hash:
+/// `<tenant>/blobs/ab/cd/<64-char hash>`.
 ///
-/// 两级哈希分桶不是为了好看：
-/// - `LocalFsBlobStore` 若把百万个文件平铺进一个目录，ext4 的 htree
-///   与 NTFS 的目录索引都会明显退化，`ls` 更是直接卡死
-/// - S3 侧前缀影响分区，而哈希前缀天然均匀
+/// The two levels of hash bucketing are not decoration:
+/// - if `LocalFsBlobStore` laid a million files flat into one directory, both
+///   ext4's htree and NTFS's directory index would degrade noticeably, and `ls`
+///   would simply hang
+/// - on the S3 side the prefix affects partitioning, and a hash prefix is
+///   naturally uniform
 ///
-/// 两个后端**必须共用这个函数**，key 才在后端之间可移植——
-/// 从 LocalFs 迁到 RustFS 时 `blobs.storage_key` 那一列不用重写。
+/// Both backends **must share this function** for keys to be portable between
+/// them — so that migrating from LocalFs to RustFS does not require rewriting
+/// the `blobs.storage_key` column.
 ///
-/// # 为什么租户在最外层，而 `blobs/` 留在它里面
+/// # Why the tenant is outermost, with `blobs/` kept inside it
 ///
-/// 租户在最外层，「抹掉一个用户的全部字节」才是一次前缀删除
-/// （`aws s3 rm --recursive s3://bucket/<tenant>/`、本地 `rm -rf root/<tenant>`），
-/// 按用户统计用量也才是一次前缀聚合。掉个个儿写成 `blobs/<tenant>/…`，
-/// 这两件事都要变成全桶扫描。
+/// With the tenant outermost, "erase all of one user's bytes" is a single
+/// prefix delete (`aws s3 rm --recursive s3://bucket/<tenant>/`, or locally
+/// `rm -rf root/<tenant>`), and per-user usage accounting is a single prefix
+/// aggregation. Turn it around into `blobs/<tenant>/…` and both of those become
+/// full-bucket scans.
 ///
-/// `blobs/` 不去掉：它原本的作用（同一个桶里放别的东西不会撞）现在退到租户
-/// 内部继续生效——将来的 `<tenant>/exports/` 之类不该和字节混在一层。
+/// `blobs/` is not dropped: its original purpose (other things in the same
+/// bucket not colliding) now applies one level down, inside the tenant — a
+/// future `<tenant>/exports/` should not be mixed in the same layer as the
+/// bytes.
 ///
-/// # 代价是跨租户不再去重，这是买来的而不是漏掉的
+/// # The price is no cross-tenant deduplication, and that was bought, not
+/// overlooked
 ///
-/// 同一份字节被两个租户引用会存两份。换回来的是 GC 重新变成 schema 内部的
-/// 问题：A 删掉最后一条引用时不必去问「B 还引用着吗」——而在 schema 隔离下
-/// 那个问题根本无从查起，A 的连接池的 `search_path` 里看不见 B 的表。
-/// 多占的磁盘有界且可估，跨 schema 的引用计数无解。
+/// The same bytes referenced by two tenants are stored twice. What that buys
+/// back is GC becoming a problem internal to one schema again: when A deletes
+/// its last reference it does not have to ask "is B still referencing this" —
+/// and under schema isolation that question cannot be answered at all, since
+/// B's tables are not visible in the `search_path` of A's connection pool. The
+/// extra disk is bounded and estimable; cross-schema reference counting is not
+/// solvable.
 ///
 /// # Errors
-/// 哈希非法时返回 [`BlobError::InvalidHash`]。
+/// Returns [`BlobError::InvalidHash`] when the hash is illegal.
 pub fn storage_key(tenant: &TenantPrefix, hash: &str) -> Result<String> {
     validate_hash(hash)?;
     Ok(format!(
@@ -201,7 +242,9 @@ mod tests {
     use super::*;
 
     fn tenant(s: &str) -> TenantPrefix {
-        TenantPrefix::new(s).unwrap_or_else(|e| panic!("{s:?} 本该是合法租户前缀，却被拒了：{e}"))
+        TenantPrefix::new(s).unwrap_or_else(|e| {
+            panic!("{s:?} should have been a legal tenant prefix, but was rejected: {e}")
+        })
     }
 
     #[test]
@@ -210,12 +253,14 @@ mod tests {
         assert_eq!(
             a,
             sha256_hex(b"cortex"),
-            "内容寻址的根基：同字节必须得到同一个 key，否则去重与幂等全部失效"
+            "the foundation of content addressing: identical bytes must yield an identical key, \
+             or deduplication and idempotence both stop working"
         );
         assert_ne!(
             a,
             sha256_hex(b"cortey"),
-            "一字之差就该是完全不同的 key，否则去重会张冠李戴"
+            "one character of difference should give an entirely different key, otherwise \
+             deduplication hands back the wrong content"
         );
     }
 
@@ -225,29 +270,35 @@ mod tests {
         assert_eq!(
             h.len(),
             HASH_HEX_LEN,
-            "长度须与 migration 的 sha256 domain 一致，否则入库时被 CHECK 拒绝"
+            "the length has to match the migrations' sha256 domain, or the CHECK rejects it on \
+             insert"
         );
         assert!(
             h.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "出现非小写十六进制字符，会被 Postgres 的 sha256 domain 拒绝：{h}"
+            "a character outside lowercase hex appeared, which Postgres's sha256 domain will \
+             reject: {h}"
         );
-        // 空串的 SHA-256 是公认常量，用它兜住「算法确实是 SHA-256」这条
+        // The SHA-256 of the empty string is a well-known constant; use it to
+        // pin down that the algorithm really is SHA-256.
         assert_eq!(
             h, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "空输入的摘要与 SHA-256 标准值不符，说明算法或十六进制编码搞错了"
+            "the digest of empty input does not match the SHA-256 standard value, so either the \
+             algorithm or the hex encoding is wrong"
         );
     }
 
     #[test]
     fn traversal_payloads_are_rejected() {
-        // 每一条都可能真实出现在 URL 路径或离线同步队列里
+        // Every one of these could genuinely turn up in a URL path or in the
+        // offline sync queue.
         let payloads = [
             "../../../etc/passwd",
             "..",
             "a/../b",
             "..%2f..%2fetc",
-            // 长度恰好 64 但塞了斜杠 —— 只查长度的实现会在这里失守
+            // Exactly 64 characters long but with slashes stuffed in — an
+            // implementation that only checks the length falls here.
             "../../../../../../../../../../../../../../../../../etc/passwd/aaa",
             "\\..\\..\\windows\\system32",
             "0000000000000000000000000000000000000000000000000000000000000/..",
@@ -256,11 +307,13 @@ mod tests {
         for h in payloads {
             assert!(
                 validate_hash(h).is_err(),
-                "路径遍历载荷未被拦截，LocalFsBlobStore 将出现任意文件读写：{h:?}"
+                "a path traversal payload was not blocked; LocalFsBlobStore would get arbitrary \
+                 file read and write: {h:?}"
             );
             assert!(
                 storage_key(&tenant("public"), h).is_err(),
-                "storage_key 未复用校验，非法哈希漏进了对象 key：{h:?}"
+                "storage_key did not reuse the validation, so an illegal hash leaked into an \
+                 object key: {h:?}"
             );
         }
     }
@@ -268,21 +321,26 @@ mod tests {
     #[test]
     fn malformed_hashes_are_rejected() {
         let valid = sha256_hex(b"x");
-        assert!(validate_hash(&valid).is_ok(), "合法哈希被误拒：{valid}");
+        assert!(
+            validate_hash(&valid).is_ok(),
+            "a legal hash was wrongly rejected: {valid}"
+        );
 
         assert!(
             validate_hash(&valid.to_uppercase()).is_err(),
-            "大写十六进制必须拒 —— 放行会让同一份内容产生两个 key，去重直接失效"
+            "uppercase hex must be refused — admitting it makes one piece of content produce two \
+             keys, and deduplication stops working outright"
         );
         assert!(
             validate_hash(&valid[..HASH_HEX_LEN - 1]).is_err(),
-            "截断的哈希必须拒，否则前缀碰撞会让不同内容映射到同一对象"
+            "a truncated hash must be refused, otherwise prefix collisions map different content \
+             onto the same object"
         );
         assert!(
             validate_hash(&format!("{valid}0")).is_err(),
-            "超长的哈希必须拒"
+            "an overlong hash must be refused"
         );
-        assert!(validate_hash("").is_err(), "空哈希必须拒");
+        assert!(validate_hash("").is_err(), "an empty hash must be refused");
     }
 
     #[test]
@@ -291,66 +349,79 @@ mod tests {
         assert_eq!(
             storage_key(&tenant("public"), hash).unwrap(),
             format!("public/blobs/e3/b0/{hash}"),
-            "key 布局是两个后端共享的契约，改动会让已入库的 storage_key 全部指错地方"
+            "the key layout is a contract shared by both backends; changing it makes every \
+             storage_key already in the database point at the wrong place"
         );
     }
 
     #[test]
     fn tenant_is_the_outermost_segment() {
-        // 「抹掉一个用户的全部字节」要能退化成一次前缀删除，租户就必须在首段。
-        // 若哪天被改成 blobs/<tenant>/…，这条会红。
+        // For "erase all of one user's bytes" to degenerate into a single
+        // prefix delete, the tenant has to be the leading segment. If this is
+        // ever changed to blobs/<tenant>/…, this test goes red.
         let hash = sha256_hex(b"tenancy");
         let key = storage_key(&tenant("cortex_u7"), &hash).unwrap();
         assert!(
             key.starts_with("cortex_u7/"),
-            "租户必须是 key 的首段，否则按用户删除与按用户统计都要全桶扫描，实际是 {key}"
+            "the tenant has to be the key's leading segment, otherwise per-user deletion and \
+             per-user accounting both need a full-bucket scan; got {key}"
         );
         assert_eq!(
             key,
             format!("cortex_u7/blobs/{}/{}/{hash}", &hash[0..2], &hash[2..4]),
-            "租户前缀之后必须仍是 blobs/两级哈希分桶 —— 两个后端共享这套布局"
+            "after the tenant prefix it still has to be blobs/ plus two levels of hash bucketing \
+             — both backends share this layout"
         );
     }
 
     #[test]
     fn different_tenants_never_share_an_object() {
-        // 这正是这次改动买下的东西：放弃跨租户去重，换掉「A 删掉最后一条引用时
-        // 字节还被 B 引用着」这一整类跨 schema 的 GC bug。
+        // This is exactly what that change bought: giving up cross-tenant
+        // deduplication in exchange for eliminating the whole cross-schema GC
+        // bug class of "A deletes its last reference while the bytes are still
+        // referenced by B".
         let hash = sha256_hex(b"same bytes, two owners");
         let a = storage_key(&tenant("public"), &hash).unwrap();
         let b = storage_key(&tenant("cortex_u2"), &hash).unwrap();
         assert_ne!(
             a, b,
-            "同一份字节在两个租户下必须落到不同 key —— 相同即意味着 GC 又变回跨 schema 问题"
+            "the same bytes under two tenants have to land on different keys — the same key \
+             means GC has turned back into a cross-schema problem"
         );
     }
 
     #[test]
     fn realistic_schema_names_are_accepted() {
-        // 误拒的代价同样具体：这几个名字都已经在仓库里真实存在，
-        // 拒掉任何一个都会让对应的部署或测试直接起不来。
+        // The cost of wrongly rejecting is just as concrete: every one of these
+        // names already exists in the repository, and refusing any of them
+        // stops the corresponding deployment or test from starting at all.
         for ok in [
-            "public",                       // 1 号用户的 schema 就叫这个（roadmap R9）
-            "u_01bx5zzkbkactav9wevgemmvrz", // cortex_store::SchemaName 现在铸的形状（小写）
-            "u_01BX5ZZKBKACTAV9WEVGEMMVRZ", // 大写也收 —— 这一层不替上游做规范化
-            "cortex_auth",                  // 认证表所在的 schema
-            "cortex_test_1_2_3",            // cortex-store 测试 harness 生成的临时 schema
-            "_leading_underscore",          // Postgres 允许下划线开头
-            "t",                            // 单字符
-            "u2026",                        // 数字结尾
-            &"a".repeat(MAX_TENANT_LEN),    // 恰好 63，边界之内
+            "public", // user number one's schema is called exactly this (roadmap R9)
+            "u_01bx5zzkbkactav9wevgemmvrz", // the shape cortex_store::SchemaName mints today (lowercase)
+            "u_01BX5ZZKBKACTAV9WEVGEMMVRZ", // uppercase accepted too — this layer does not normalize for upstream
+            "cortex_auth",                  // the schema the authentication tables live in
+            "cortex_test_1_2_3", // the temporary schema generated by the cortex-store test harness
+            "_leading_underscore", // Postgres permits a leading underscore
+            "t",                 // a single character
+            "u2026",             // ending in digits
+            &"a".repeat(MAX_TENANT_LEN), // exactly 63, inside the boundary
         ] {
             assert!(
                 TenantPrefix::new(ok).is_ok(),
-                "{ok:?} 是合法的 Postgres schema 名，误拒会让对应租户完全无法读写对象"
+                "{ok:?} is a legal Postgres schema name; rejecting it wrongly leaves that tenant \
+                 completely unable to read or write objects"
             );
         }
     }
 
-    /// 把「哪些形态漏过去了」一次报全，而不是撞上第一条就 panic。
+    /// Report every shape that slipped through in one go, rather than panicking
+    /// on the first one hit.
     ///
-    /// 逐条 `assert!` 在这里是有害的：校验一旦被改坏，测试只会报出**第一个**
-    /// 漏网的载荷，修完再跑又报下一个 —— 而真正该看到的是「一共漏了哪几类」。
+    /// A sequence of individual `assert!`s would be harmful here: once the
+    /// validation is broken, the test would report only the **first** payload
+    /// that got through, and after fixing it another run reports the next one —
+    /// whereas what one actually needs to see is "which categories leaked in
+    /// total".
     fn assert_all_rejected(payloads: &[(&str, &str)]) {
         let escaped: Vec<String> = payloads
             .iter()
@@ -359,7 +430,7 @@ mod tests {
             .collect();
         assert!(
             escaped.is_empty(),
-            "以下 {} 种前缀本该被拒却放行了：\n{}",
+            "the following {} prefixes should have been refused but were admitted:\n{}",
             escaped.len(),
             escaped.join("\n")
         );
@@ -367,20 +438,36 @@ mod tests {
 
     #[test]
     fn traversal_prefixes_are_rejected() {
-        // 每一条都对应「前缀逃出 root」的一种走法。校验一旦失守，
-        // LocalFsBlobStore 就是任意路径读写 —— 与坏哈希的后果完全相同。
+        // Each entry corresponds to one way for a prefix to escape root. Once
+        // this validation falls, LocalFsBlobStore means arbitrary path read and
+        // write — exactly the consequence of a bad hash.
         assert_all_rejected(&[
-            ("..", "上一级目录"),
-            (".", "当前目录：会让两个租户的 key 归一"),
-            ("../..", "多级上跳"),
-            ("../etc", "上跳后指向系统目录"),
-            ("a/b", "内嵌斜杠：凭空多切一层前缀"),
-            ("/abs", "绝对路径：Unix 上 root.join 会直接丢掉 root"),
-            ("acme/", "尾随斜杠"),
-            ("..\\..", "Windows 分隔符"),
-            ("a\\b", "内嵌反斜杠"),
-            ("..%2f..", "URL 编码的斜杠：只拦字面 / 的实现在这里失守"),
-            ("a\0b", "嵌入 NUL：C 层截断后剩下的路径与看到的不是同一个"),
+            ("..", "the parent directory"),
+            (
+                ".",
+                "the current directory: would collapse two tenants onto one key",
+            ),
+            ("../..", "several levels up"),
+            ("../etc", "up a level and into a system directory"),
+            (
+                "a/b",
+                "an embedded slash: conjures one extra prefix level out of nothing",
+            ),
+            (
+                "/abs",
+                "an absolute path: on Unix root.join simply discards root",
+            ),
+            ("acme/", "a trailing slash"),
+            ("..\\..", "Windows separators"),
+            ("a\\b", "an embedded backslash"),
+            (
+                "..%2f..",
+                "a URL-encoded slash: an implementation blocking only a literal / falls here",
+            ),
+            (
+                "a\0b",
+                "an embedded NUL: after truncation at the C layer the remaining path is not the one you saw",
+            ),
         ]);
     }
 
@@ -388,57 +475,72 @@ mod tests {
     fn empty_prefix_is_rejected() {
         assert!(
             TenantPrefix::new("").is_err(),
-            "空前缀必须拒：key 会退化成 /blobs/… 首段为空，本地后端上 root 会被 join 丢掉"
+            "an empty prefix must be refused: the key degenerates into /blobs/… with an empty \
+             leading segment, and on the local backend join discards root"
         );
     }
 
-    /// 大写必须**放行**，且这条要钉死：`cortex_store::SchemaName` 铸出来的
-    /// 用户 schema 是 `u_` 加 26 位大写 ULID。若哪天有人「顺手收严成只收小写」，
-    /// 后果是除 1 号用户（`public`）外没有任何租户能建出 store。
+    /// Uppercase must be **admitted**, and this has to be pinned down:
+    /// the user schemas `cortex_store::SchemaName` mints are `u_` plus a
+    /// 26-character uppercase ULID. If somebody ever "tightens it to lowercase
+    /// only" in passing, the consequence is that no tenant other than user
+    /// number one (`public`) can construct a store at all.
     ///
-    /// 同理也钉死「不做转小写归一化」：那会让已按大写 ULID 存下的对象
-    /// 在升级后集体查无此 key —— 不报错，只是历史附件全不见了。
+    /// It equally pins down "no lowercase normalization": that would make every
+    /// object already stored under an uppercase ULID collectively unfindable
+    /// after an upgrade — with no error, just all the historical attachments
+    /// gone.
     #[test]
     fn uppercase_ulid_schemas_are_accepted_verbatim() {
         let ulid = "u_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let t = TenantPrefix::new(ulid)
-            .unwrap_or_else(|e| panic!("cortex-store 真实铸出的 schema 名被拒了：{e}"));
+        let t = TenantPrefix::new(ulid).unwrap_or_else(|e| {
+            panic!("a schema name cortex-store really mints was rejected: {e}")
+        });
         assert_eq!(
             t.as_str(),
             ulid,
-            "租户前缀必须原样保留大小写；做了转小写归一化，已入库的对象就再也取不回来"
+            "a tenant prefix must preserve case verbatim; apply lowercase normalization and the \
+             objects already stored can never be retrieved again"
         );
         assert!(
             storage_key(&t, &sha256_hex(b"x"))
                 .unwrap()
                 .starts_with(ulid),
-            "大写 ULID 必须原样出现在 key 首段"
+            "an uppercase ULID must appear verbatim as the key's leading segment"
         );
     }
 
-    /// 这些字符做 schema 名时在 SQL 里处处都得加双引号，
-    /// 而 store 层有约 77 条查询 —— 漏一条就是运行期报错。挡在源头更可靠。
+    /// These characters, used in a schema name, need double quotes everywhere
+    /// in SQL, and the store layer has around 77 queries — one missed is a
+    /// runtime error. Blocking them at the source is more reliable.
     #[test]
     fn punctuation_that_would_need_sql_quoting_is_rejected() {
         assert_all_rejected(&[
-            ("acme-corp", "连字符"),
-            ("acme$1", "美元符：Postgres 标识符允许，但 shell 会展开它"),
-            ("acme.corp", "点号：同时也是路径遍历的原料"),
-            ("acme corp", "空格"),
-            ("1acme", "数字开头：Postgres 未加引号的标识符不许"),
+            ("acme-corp", "a hyphen"),
+            (
+                "acme$1",
+                "a dollar sign: Postgres identifiers allow it, but the shell expands it",
+            ),
+            ("acme.corp", "a dot: also raw material for path traversal"),
+            ("acme corp", "a space"),
+            (
+                "1acme",
+                "a leading digit: not permitted in an unquoted Postgres identifier",
+            ),
         ]);
     }
 
-    /// 非 ASCII 必须拒：文件系统的 Unicode 规范化各不相同（APFS 做 NFD，
-    /// 多数 Linux 文件系统原样存），同一个名字在不同机器上可能落到不同目录，
-    /// 而 S3 侧又是按字节比较的第三套行为。
+    /// Non-ASCII must be refused: filesystems normalize Unicode differently
+    /// (APFS applies NFD, most Linux filesystems store it verbatim), so the
+    /// same name can land in different directories on different machines, and
+    /// the S3 side compares bytes, which is a third behaviour again.
     #[test]
     fn non_ascii_is_rejected() {
         assert_all_rejected(&[
-            ("租户", "中文"),
+            ("租户", "Chinese characters"),
             (
                 "café",
-                "带变音符号的拉丁字母：NFC/NFD 两种编码看起来一模一样",
+                "a Latin letter with a diacritic: the NFC and NFD encodings look identical",
             ),
         ]);
     }
@@ -448,8 +550,8 @@ mod tests {
         let too_long = "a".repeat(MAX_TENANT_LEN + 1);
         assert!(
             TenantPrefix::new(&too_long).is_err(),
-            "超过 {MAX_TENANT_LEN} 字节必须拒：Postgres 会静默截断 schema 名，\
-             于是两个「不同」的租户可能落到同一个 schema 上"
+            "beyond {MAX_TENANT_LEN} bytes must be refused: Postgres truncates schema names \
+             silently, so two \"different\" tenants may land on the same schema"
         );
     }
 }

@@ -1,29 +1,35 @@
-//! 评测执行环境：隔离的数据库、真实 ingest 管线、真实检索器。
+//! The eval execution environment: an isolated database, the real ingest
+//! pipeline, the real retriever.
 //!
-//! # 隔离：临时 schema
+//! # Isolation: a temporary schema
 //!
-//! 评测会灌进上百条事实。**绝不能污染开发库** —— 一次评测跑完，
-//! 开发时的 `memory search` 就全是评测语料了。
+//! An eval pours in hundreds of facts. **It must never contaminate the
+//! development database** — one eval run and `memory search` during development
+//! returns nothing but eval corpus.
 //!
-//! 做法与 `crates/cortex-store/tests/common/mod.rs` 同款：连接串不变，
-//! 只把 `search_path` 指到一个新建的 schema，在其中跑一遍 migration，
-//! 结束 `DROP SCHEMA ... CASCADE`。
+//! The approach is the same as `crates/cortex-store/tests/common/mod.rs`: the
+//! connection string is unchanged, only `search_path` is pointed at a freshly
+//! created schema, migrations are run inside it, and it ends with
+//! `DROP SCHEMA ... CASCADE`.
 //!
-//! # 为什么要走真实 ingest 而不是直接 INSERT facts
+//! # Why go through the real ingest rather than INSERT facts directly
 //!
-//! 直接塞 facts 会绕过 jieba 分词（`tsv` 列）、绕过 embedding、绕过实体消解、
-//! 绕过矛盾消解。而这四样恰恰决定了检索能不能召回：
-//! `tsv` 不对，BM25 那一路就是死的；实体没消解，图遍历就跳不动。
-//! 评测评的是**整条链路**，不是四条 SQL。
+//! Stuffing facts in directly bypasses jieba tokenization (the `tsv` column),
+//! bypasses embedding, bypasses entity resolution, and bypasses contradiction
+//! resolution. Those four are exactly what decide whether retrieval can find
+//! anything: if `tsv` is wrong the BM25 path is dead; if entities are
+//! unresolved graph traversal cannot hop. The eval evaluates **the whole
+//! chain**, not four SQL queries.
 //!
-//! # 两种抽取模式
+//! # Two extraction modes
 //!
-//! | 模式 | 抽取 | 用途 |
+//! | Mode | Extraction | Purpose |
 //! |---|---|---|
-//! | `seed` | 用题集里手写的候选事实，走 `write_candidates` | 默认。语料确定，跑一百遍结果一致，能进 CI |
-//! | `llm` | 真调廉价模型，走 `ingest` | 连抽取质量一起测，但结果随模型漂移，不适合做回归门 |
+//! | `seed` | Uses the handwritten candidate facts from the suite, via `write_candidates` | The default. The corpus is fixed, a hundred runs agree, and it can go into CI |
+//! | `llm` | Really calls the cheap model, via `ingest` | Measures extraction quality too, but the results drift with the model and are unsuited to a regression gate |
 //!
-//! 两种模式**共用**消解、向量化、分词与落库 —— 差别只在候选事实从哪来。
+//! Both modes **share** resolution, vectorization, tokenization, and the write
+//! path — the only difference is where the candidate facts come from.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -48,17 +54,18 @@ use crate::suite::{Scenario, SeedFact, Suite, parse_date};
 
 const SCHEMA_PREFIX: &str = "cortex_eval_";
 
-/// 崩溃残留的 schema 超过这个岁数就顺手清掉。
-/// 不做无差别清扫 —— 那会删掉兄弟进程正在用的 schema。
+/// Schemas left behind by a crash get swept once they are older than this.
+/// No indiscriminate sweep — that would delete a schema a sibling process is
+/// still using.
 const STALE_SCHEMA_AGE_MS: u128 = 30 * 60 * 1000;
 
 pub const DEVICE: &str = "eval-harness";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractMode {
-    /// 用题集里手写的候选事实
+    /// Use the handwritten candidate facts from the suite
     Seed,
-    /// 真调 LLM 抽取
+    /// Really call the LLM to extract
     Llm,
 }
 
@@ -72,20 +79,21 @@ impl std::fmt::Display for ExtractMode {
 }
 
 // ══════════════════════════════════════════════════════════
-//  隔离的数据库
+//  The isolated database
 // ══════════════════════════════════════════════════════════
 
 pub struct EvalDb {
     pub store: Store,
-    /// 自己留一份池子做诊断查询 —— `Store` 的 pool 是 crate 私有的，
-    /// 而评测需要「把库里全部事实拉出来核对 gold」这种越界能力
+    /// Keeps its own pool for diagnostic queries — `Store`'s pool is
+    /// crate-private, while the eval needs the out-of-band ability to "pull
+    /// every fact in the store out and check the golds against them"
     pool: PgPool,
     admin: PgPool,
     schema: String,
 }
 
 impl EvalDb {
-    /// 建一个隔离的评测库。
+    /// Create an isolated eval database.
     pub async fn create(database_url: &str) -> Result<Self> {
         let admin = PgPoolOptions::new()
             .max_connections(2)
@@ -102,8 +110,9 @@ impl EvalDb {
             .await
             .context("建不出临时 schema —— 当前用户可能没有 CREATE 权限")?;
 
-        // `public` 留在 search_path 里是为了让 `vector` 扩展的类型可见；
-        // 建表建视图一律落到第一个 schema，也就是本次评测专属的那个
+        // `public` stays in search_path so the `vector` extension's types
+        // remain visible; tables and views are all created in the first schema,
+        // i.e. the one dedicated to this eval run
         let options = PgConnectOptions::from_str(database_url)
             .context("DATABASE_URL 不是合法的连接串")?
             .options([("search_path", format!("{schema},public"))]);
@@ -133,11 +142,12 @@ impl EvalDb {
         &self.schema
     }
 
-    /// 数据库当前时间。
+    /// The database's current time.
     ///
-    /// checkpoint 必须取**库的**时钟而不是本机时钟：`facts.created_at` 的默认值是
-    /// `clock_timestamp()`，两边时钟哪怕差几十毫秒，时间回放题就会随机地
-    /// 多召回或少召回一条。
+    /// A checkpoint must take **the database's** clock, not the local machine's:
+    /// the default for `facts.created_at` is `clock_timestamp()`, and even a few
+    /// dozen milliseconds of skew between the two clocks makes time-replay
+    /// questions randomly retrieve one fact too many or too few.
     pub async fn db_now(&self) -> Result<DateTime<Utc>> {
         let (now,): (DateTime<Utc>,) = sqlx::query_as("SELECT clock_timestamp()")
             .fetch_one(&self.pool)
@@ -146,7 +156,8 @@ impl EvalDb {
         Ok(now)
     }
 
-    /// 库里全部事实（含已失效的），供 gold 存在性核对。
+    /// Every fact in the store (invalidated ones included), for checking gold
+    /// existence.
     pub async fn snapshot_facts(&self) -> Result<Vec<FactRow>> {
         let rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
             "SELECT f.id, f.statement, f.domain, (a.id IS NOT NULL) AS active
@@ -176,11 +187,13 @@ impl EvalDb {
         Ok(n)
     }
 
-    /// 真正落进 `episode_tool_calls` 的行数。
+    /// How many rows actually landed in `episode_tool_calls`.
     ///
-    /// 与题集里声明的条数对不上，就说明轨迹在写入路径上被吞了 ——
-    /// 而那会让工具经验题「因为语料没进去」而挂，与「抽取器没接」
-    /// 的表现一模一样。这个数字是把两者分开的唯一依据。
+    /// A mismatch with the count declared in the suite means the trace was
+    /// swallowed somewhere on the write path — which makes tool-experience
+    /// questions fail "because the corpus never got in", looking exactly like
+    /// "the extractor is not wired up". This number is the only basis for
+    /// telling the two apart.
     pub async fn count_tool_calls(&self) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM episode_tool_calls")
             .fetch_one(&self.pool)
@@ -188,7 +201,8 @@ impl EvalDb {
         Ok(n)
     }
 
-    /// 删掉临时 schema。`keep` 为真时保留（便于事后手工查 bad case）。
+    /// Drop the temporary schema. With `keep` true it is retained (so bad cases
+    /// can be inspected by hand afterwards).
     pub async fn cleanup(self, keep: bool) {
         self.store.close().await;
         if keep {
@@ -214,7 +228,7 @@ pub struct FactRow {
 fn unique_schema_name() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
     format!("{SCHEMA_PREFIX}{millis}_{}", std::process::id())
 }
@@ -222,7 +236,7 @@ fn unique_schema_name() -> String {
 async fn sweep_stale_schemas(admin: &PgPool) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
 
     let names: Vec<(String,)> = sqlx::query_as(
@@ -245,17 +259,19 @@ async fn sweep_stale_schemas(admin: &PgPool) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  灌语料
+//  Loading the corpus
 // ══════════════════════════════════════════════════════════
 
-/// 一次灌库的统计。这些数字本身就是抽取管线的体检报告。
+/// Statistics from one load. These numbers are themselves a health report on
+/// the extraction pipeline.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IngestStats {
     pub episodes: usize,
-    /// 落进 `episode_tool_calls` 的工具调用数。
+    /// How many tool calls landed in `episode_tool_calls`.
     ///
-    /// 它与 `candidates` 的落差就是**当前这条缺口的宽度**：轨迹全落库了，
-    /// 但一条候选事实都不是从轨迹来的（抽取器还不读那张表）
+    /// Its gap against `candidates` is **the width of the current gap**: every
+    /// trace landed in the store, yet not one candidate fact came from a trace
+    /// (the extractor does not read that table yet)
     pub tool_calls: usize,
     pub candidates: usize,
     pub written: usize,
@@ -265,13 +281,14 @@ pub struct IngestStats {
     pub entities: usize,
 }
 
-/// checkpoint 名 → 该轮提交后的系统时间。
+/// Checkpoint name → the system time after that turn committed.
 pub type Checkpoints = HashMap<String, DateTime<Utc>>;
 
-/// 造一个抽取器。
+/// Build an extractor.
 ///
-/// seed 模式下 `LlmClient` 只是被构造出来占位（`write_candidates` 不碰它），
-/// 拿一个假密钥即可 —— 这正是抽取与落库被拆成两个方法的原因。
+/// In seed mode the `LlmClient` is constructed purely as a placeholder
+/// (`write_candidates` never touches it), so a fake key will do — which is
+/// exactly why extraction and writing were split into two methods.
 pub fn build_extractor(
     embedder: SharedEmbedder,
     mode: ExtractMode,
@@ -283,7 +300,9 @@ pub fn build_extractor(
                 provider: "deepseek".to_owned(),
                 model: "deepseek-v4-pro".to_owned(),
                 cheap_model: "deepseek-v4-flash".to_owned(),
-                // 评测也要能打到自建端点：换模型评测常常就是换一个兼容服务
+                // The eval must be able to hit a self-hosted endpoint too:
+                // evaluating a different model often just means pointing at a
+                // different compatible service
                 base_url: std::env::var("CORTEX_LLM_BASE_URL")
                     .ok()
                     .filter(|v| !v.trim().is_empty()),
@@ -303,7 +322,7 @@ pub fn build_extractor(
     Ok(extractor)
 }
 
-/// 按题集顺序灌进真实 ingest 管线。
+/// Pour the suite into the real ingest pipeline, in suite order.
 pub async fn ingest_suite(
     db: &EvalDb,
     suite: &Suite,
@@ -314,7 +333,9 @@ pub async fn ingest_suite(
     let mut checkpoints = Checkpoints::new();
 
     for scenario in &suite.scenarios {
-        // 场景内已出现过的实体名，提示模型复用既有称呼（llm 模式下压制别名爆炸）
+        // Entity names already seen in this scenario, hinting to the model that
+        // it should reuse existing names (suppressing an alias explosion in llm
+        // mode)
         let known = known_entity_names(scenario);
 
         for turn in &scenario.turns {
@@ -353,7 +374,8 @@ pub async fn ingest_suite(
             stats.entities += report.new_entities.len();
 
             if let Some(name) = &turn.checkpoint {
-                // 取库的时钟，且必须在本轮提交之后 —— 见 `db_now` 的注释
+                // Take the database's clock, and it must be after this turn
+                // committed — see the comments on `db_now`
                 checkpoints.insert(name.clone(), db.db_now().await?);
             }
         }
@@ -387,16 +409,19 @@ async fn insert_episode(
         role: Role::User,
         content: serde_json::json!({ "role": "user", "text": turn.text }),
         text: Some(turn.text.clone()),
-        // 与生产同款：jieba 分词后的空格串，与主行同事务落库
+        // Same as production: the space-separated string after jieba
+        // tokenization, written in the same transaction as the main row
         tsv_source: Some(tokenize::to_tsvector_input(&turn.text)),
         domain: Some(scenario.domain.clone()),
         device_id: DEVICE.to_owned(),
         occurred_at,
     };
 
-    // 工具轨迹与 episode **同事务**落库，与生产的 `live.rs` 一致。
-    // 拆成两个事务会让「episode 已提交、轨迹还没提交」成为一个可观测的中间态，
-    // 而抽取器将来正是在 episode 提交之后被触发的 —— 那时轨迹必须已经在
+    // The tool trace and the episode land in **the same transaction**, matching
+    // production's `live.rs`. Splitting them into two transactions would make
+    // "episode committed, trace not yet committed" an observable intermediate
+    // state, and the extractor is precisely what gets triggered after the
+    // episode commits — at which point the trace must already be there
     let calls: Vec<NewEpisodeToolCall> = turn
         .tool_calls
         .iter()
@@ -450,19 +475,23 @@ fn candidate_of(f: &SeedFact, scenario_domain: &str) -> Result<CandidateFact> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  跨域连接（relates_to）
+//  Cross-domain links (relates_to)
 // ══════════════════════════════════════════════════════════
 
-/// 谁来判「这一对值不值得连」。
+/// Who decides "is this pair worth linking".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JudgeKind {
-    /// 不判，预筛过的全接受。**确定性**，可进 CI。
+    /// No judging; accept everything the prefilter yields.
+    /// **Deterministic**, CI-safe.
     ///
-    /// 它不是「关掉判定」而是**对照组**：预筛已经做了跨域、未连通、距离带
-    /// 三道过滤，这一档量的正是那三道过滤单独的精度。没有它就没法回答
-    /// 「模型判定到底买到了什么」。
+    /// This is not "judging turned off" but a **control group**: the prefilter
+    /// has already applied three filters (cross-domain, not already connected,
+    /// distance band), and this setting measures exactly those three filters'
+    /// precision on their own. Without it there is no way to answer "what did
+    /// the model's judgement actually buy".
     Prefilter,
-    /// 真调廉价模型。质量高但随模型漂移，不适合做回归门。
+    /// Really call the cheap model. Higher quality, but it drifts with the
+    /// model and is unsuited to a regression gate.
     Cheap,
 }
 
@@ -475,7 +504,8 @@ impl std::fmt::Display for JudgeKind {
     }
 }
 
-/// 跨域连接扫描的配置。`enabled` 为假时整个环节跳过，报告里也不出现。
+/// Configuration for the cross-domain link scan. With `enabled` false the whole
+/// stage is skipped and it does not appear in the report either.
 #[derive(Debug, Clone, Copy)]
 pub struct CrossLinkOptions {
     pub enabled: bool,
@@ -483,7 +513,8 @@ pub struct CrossLinkOptions {
     pub min_distance: f64,
     pub max_distance: f64,
     pub degree_cap: usize,
-    /// 边的 statement 进不进 BM25/向量索引。默认与生产一致（不进）
+    /// Whether an edge's statement enters the BM25/vector index. The default
+    /// matches production (it does not)
     pub indexed: bool,
 }
 
@@ -500,8 +531,9 @@ impl Default for CrossLinkOptions {
     }
 }
 
-/// 扫描的结果，连同每条边的 statement —— 光看条数判断不了噪声，
-/// 得把边本身打出来给人读。
+/// The scan's results, together with each edge's statement — a count alone
+/// cannot decide whether they are noise; the edges themselves have to be
+/// printed for a person to read.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CrossLinkStats {
     pub judge: String,
@@ -509,16 +541,17 @@ pub struct CrossLinkStats {
     pub candidates: usize,
     pub accepted: usize,
     pub degree_capped: usize,
-    /// 写入的行数（每对关联两行，见 `crosslink::Linker::plan`）
+    /// Rows written (two rows per linked pair; see `crosslink::Linker::plan`)
     pub written: usize,
-    /// 正向那一条的 statement，按写入顺序
+    /// The forward direction's statement, in write order
     pub links: Vec<String>,
 }
 
-/// 在语料灌完之后跑一遍跨域连接扫描。
+/// Run a cross-domain link scan once the corpus is loaded.
 ///
-/// 时机很重要：必须在 ingest **之后**、检索**之前**。夜间扫描在生产里也是
-/// 这个位置 —— 它是离线批处理，不在写入路径上，也不在检索路径上。
+/// The timing matters: it must be **after** ingest and **before** retrieval. The
+/// nightly scan sits in the same position in production — it is offline batch
+/// work, on neither the write path nor the retrieval path.
 pub async fn build_cross_links(
     db: &EvalDb,
     embedder: &SharedEmbedder,
@@ -526,9 +559,11 @@ pub async fn build_cross_links(
 ) -> Result<CrossLinkStats> {
     use cortex_memory::crosslink::{AcceptAll, CheapModelJudge, LinkJudge, Linker, StoreCorpus};
 
-    // 回看窗口开到十年：评测语料是刚灌进去的，但 `occurred_at` 跨了好几个月，
-    // 而 `recall_recent` 按 `created_at` 过滤 —— 窗口开大不会多捞到东西，
-    // 只是免得将来有人改了灌库方式之后这里静默扫不到任何事实
+    // The lookback window is opened to ten years: the eval corpus was just
+    // loaded, but its `occurred_at` values span several months, while
+    // `recall_recent` filters on `created_at` — widening the window pulls in
+    // nothing extra, it merely prevents this from silently scanning zero facts
+    // after somebody changes how the corpus is loaded
     let corpus = StoreCorpus::new(&db.store).with_window(3650, 200);
     let linker = Linker::new(DEVICE)
         .with_distance_band(opts.min_distance, opts.max_distance)
@@ -571,35 +606,42 @@ pub async fn build_cross_links(
 }
 
 // ══════════════════════════════════════════════════════════
-//  跑检索
+//  Running retrieval
 // ══════════════════════════════════════════════════════════
 
-/// 检索侧的配置。与生产默认值一致时，跑出来的就是「当前实现的基线」。
+/// The retrieval-side configuration. When it matches the production defaults,
+/// what comes out is "the current implementation's baseline".
 #[derive(Debug, Clone, Copy)]
 pub struct RetrievalConfig {
     pub width: RecallWidth,
     pub budget: Budget,
     pub context_window: usize,
-    /// 时间回放取多少条。
+    /// How many entries time replay takes.
     ///
-    /// 取存储层的上限 200：回放的三路都在同一份快照上排序，限得小了，
-    /// 测出来的是「快照够不够大」而不是「排序对不对」。
+    /// Set to the storage layer's ceiling of 200: replay's three paths all rank
+    /// within one and the same snapshot, and limiting it too tightly measures
+    /// "is the snapshot big enough" rather than "is the ordering right".
     pub replay_limit: i64,
-    /// 回放走带查询的排序版还是纯时间倒序的全貌版。A/B 用。
+    /// Whether replay uses the query-ranked version or the pure
+    /// reverse-chronological full-picture version. For A/B.
     pub replay_ranked: bool,
-    /// 弃权阈值。`None` 用生产默认值（阈值扫描用）
+    /// The abstention threshold. `None` uses the production default (for
+    /// threshold sweeps)
     pub abstain_below: Option<f64>,
     pub recency: RecencyMode,
     pub episode_channel: bool,
     pub peak_bonus: f64,
-    /// 语义地板（余弦距离上限）。`None` = 用生产默认值
+    /// The semantic floor (an upper bound on cosine distance). `None` = use the
+    /// production default
     pub semantic_floor: Option<f64>,
-    /// 跨域桥的域惩罚豁免。默认与生产一致（开）
+    /// The cross-domain bridge's exemption from the domain penalty. The default
+    /// matches production (on)
     pub bridge_exemption: bool,
-    /// 强制关掉语义地板。
+    /// Force the semantic floor off.
     ///
-    /// 与 `semantic_floor: None` 不是一回事：`None` 是「按生产默认走」，
-    /// 这个是「明确不要」。A/B 里两种意图都得表达得出来
+    /// Not the same thing as `semantic_floor: None`: `None` means "follow the
+    /// production default", this means "explicitly do not want it". An A/B has
+    /// to be able to express both intentions
     pub no_semantic_floor: bool,
 }
 
@@ -658,13 +700,15 @@ impl EvalRetriever {
         self.embedder.model_id().to_owned()
     }
 
-    /// 实际生效的语义地板（默认值随 embedding 后端而变，得问出来）。
+    /// The semantic floor actually in effect (the default varies with the
+    /// embedding backend, so it has to be asked for).
     #[must_use]
     pub fn semantic_floor(&self) -> Option<f64> {
         self.retriever.semantic_floor()
     }
 
-    /// 走生产路径的四路召回 + RRF + 域加权 + 预算截断。
+    /// The production path: four-way retrieval + RRF + domain weighting +
+    /// budget truncation.
     pub async fn retrieve(
         &self,
         store: &Store,
@@ -679,10 +723,12 @@ impl EvalRetriever {
         Ok(zip_items(out))
     }
 
-    /// 按系统时间回放：在 `as_of` 那一刻，Cortex 认为哪些事实为真。
+    /// Replay by system time: which facts Cortex held to be true at the moment
+    /// `as_of`.
     ///
-    /// `replay_ranked` 决定走带查询的排序版还是纯时间倒序的全貌版 ——
-    /// 这个开关的存在本身就是那次 A/B 的证据。
+    /// `replay_ranked` decides between the query-ranked version and the pure
+    /// reverse-chronological full-picture version — the existence of this
+    /// switch is itself the evidence from that A/B.
     pub async fn replay(
         &self,
         store: &Store,
@@ -713,12 +759,14 @@ impl EvalRetriever {
         Ok(zip_items(out))
     }
 
-    /// 四路的**原始**召回，各自按自身相关性排序，不融合。
+    /// The four paths' **raw** retrievals, each sorted by its own relevance,
+    /// unfused.
     ///
-    /// 复刻了 `Retriever::recall_all` 的编排 —— 那个方法是私有的，而逐路
-    /// 归因需要每一路的完整排名（融合结果的 `Attribution` 只留了通道名，
-    /// 丢掉了路内名次）。融合侧的主指标仍然走真实的 `retrieve`，
-    /// 这里只用于诊断。
+    /// This replicates `Retriever::recall_all`'s orchestration — that method is
+    /// private, and per-path attribution needs each path's complete ranking (the
+    /// fused result's `Attribution` keeps only the channel names and discards
+    /// the within-path rank). The main metrics on the fusion side still go
+    /// through the real `retrieve`; this is for diagnostics only.
     pub async fn per_channel(&self, store: &Store, query: &str) -> Result<Vec<ChannelRun>> {
         let tsquery = tokenize::to_tsquery_input(query);
         let qvec = self
@@ -743,9 +791,11 @@ impl EvalRetriever {
             store.recall_via_episodes(&tsquery, w.episode_docs, w.episode),
         );
 
-        // 逐路诊断**永远发全部五路**，与融合侧是否启用它们无关：
-        // 「关掉这一路之后它本来能捞到什么」正是 A/B 时最想看的那个数字，
-        // 跟着开关一起关掉就只剩一列零，什么都判断不了
+        // Per-path diagnostics **always issue all five paths**, regardless of
+        // whether the fusion side has them enabled: "what this path would have
+        // found once it is switched off" is precisely the number you most want
+        // during an A/B, and switching it off along with the flag leaves
+        // nothing but a column of zeros, from which nothing can be judged
         Ok(vec![
             ChannelRun {
                 name: "bm25",
@@ -787,23 +837,28 @@ fn zip_items(out: cortex_memory::retrieval::Retrieved) -> Vec<ScoredItem> {
         .collect()
 }
 
-/// 默认的向量化后端 —— **跟生产同一条选择逻辑**。
+/// The default vectorization backend — **the same selection logic as
+/// production**.
 ///
-/// 走 `Backend::from_env()`（`CORTEX_EMBED_BACKEND`，默认 `api`），
-/// 而不是写死 `HashEmbedder`。写死过一版，代价是基线数字全都是在
-/// 「向量那一路只是第二条词法通道」的前提下测出来的 —— 换成真实语义模型后
-/// 逐路结论要整体推翻，白调了一轮参数。
+/// It goes through `Backend::from_env()` (`CORTEX_EMBED_BACKEND`, defaulting to
+/// `api`) rather than hardcoding `HashEmbedder`. There was a version that
+/// hardcoded it, and the price was that every baseline number had been measured
+/// on the premise that "the vector path is just a second lexical channel" —
+/// switching to a real semantic model overturned the per-path conclusions
+/// wholesale, wasting a round of parameter tuning.
 ///
-/// 设 `CORTEX_EMBED_BACKEND=hash` 可切回散列桩做对照（也是无网 CI 的走法）。
+/// Set `CORTEX_EMBED_BACKEND=hash` to switch back to the hash stub as a control
+/// (also the way to run CI without network access).
 ///
-/// ⚠️ **基线是按具体模型标定的。** `scripts/evals-baseline.*.json` 里记着
-/// `embedding_model`，回归门会核对它 —— 换后端（哪怕是「同一个 bge-m3、
-/// 只是从进程内换成远端」）之后拿旧基线撞新分数是没有意义的，
-/// 那道核对存在的理由正是这个。
+/// ⚠️ **Baselines are calibrated against a specific model.**
+/// `scripts/evals-baseline.*.json` records `embedding_model` and the regression
+/// gate checks it — after changing backends (even "the same bge-m3, just moved
+/// from in-process to remote"), throwing an old baseline at new scores is
+/// meaningless, and that check exists for exactly this reason.
 ///
 /// # Errors
 ///
-/// 环境变量非法，或模型加载/下载失败。
+/// The environment variable is invalid, or the model fails to load/download.
 pub async fn default_embedder() -> Result<SharedEmbedder> {
     let backend = Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     build_embedder(backend)
@@ -833,21 +888,21 @@ mod tests {
 
     #[test]
     fn literal_object_becomes_literal_ref() {
-        let c = candidate_of(&seed(Some("RustFS"), None), "coding").expect("应能转换");
+        let c = candidate_of(&seed(Some("RustFS"), None), "coding").expect("should convert");
         assert_eq!(c.object, ObjectRef::Literal("RustFS".into()));
         assert_eq!(
             c.domain.as_deref(),
             Some("coding"),
-            "未指定时应继承场景 domain"
+            "when unspecified it should inherit the scenario's domain"
         );
     }
 
     #[test]
     fn entity_object_becomes_graph_edge() {
-        let c = candidate_of(&seed(None, Some("RustFS")), "coding").expect("应能转换");
+        let c = candidate_of(&seed(None, Some("RustFS")), "coding").expect("should convert");
         match c.object {
             ObjectRef::Entity(e) => assert_eq!(e.kind, "tool"),
-            other => panic!("实体宾语才是图里的一条边，实际 {other:?}"),
+            other => panic!("only an entity object forms an edge in the graph, got {other:?}"),
         }
     }
 
@@ -855,20 +910,24 @@ mod tests {
     fn ambiguous_object_is_rejected() {
         assert!(
             candidate_of(&seed(Some("a"), Some("b")), "coding").is_err(),
-            "两种宾语同时给，落库时无从判定"
+            "giving both object forms leaves the write path unable to decide"
         );
     }
 
     #[test]
     fn schema_names_are_unique_and_prefixed() {
         let a = unique_schema_name();
-        assert!(a.starts_with(SCHEMA_PREFIX), "清扫逻辑靠前缀识别：{a}");
+        assert!(
+            a.starts_with(SCHEMA_PREFIX),
+            "the sweep logic identifies schemas by this prefix: {a}"
+        );
     }
 
     #[test]
     fn default_retrieval_config_matches_production() {
         let c = RetrievalConfig::default();
-        // 基线数字必须是「生产默认值跑出来的」，否则对照组毫无意义
+        // Baseline numbers must come from a run at the production defaults,
+        // otherwise the control group is meaningless
         assert_eq!(c.width.bm25, RecallWidth::default().bm25);
         assert_eq!(
             c.budget.absolute_max_tokens,

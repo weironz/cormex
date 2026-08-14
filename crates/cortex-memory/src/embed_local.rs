@@ -1,28 +1,32 @@
-//! 进程内 ONNX 推理的 embedding 后端 —— **可选 feature `local-embed`**。
+//! The embedding backend that does in-process ONNX inference —
+//! **optional feature `local-embed`**.
 //!
-//! 这一整个文件在默认构建里**不编译**。它从 `embed.rs` 里拆出来正是为了
-//! 让那个 cfg 只写一次：原来 fastembed 是硬依赖，后果不只是「重」——
+//! This entire file is **not compiled** in a default build. It was split out
+//! of `embed.rs` precisely so that cfg is written exactly once: fastembed used
+//! to be a hard dependency, and the consequence was more than just "heavy" —
 //!
-//!   1. Intel Mac 上 `ort-sys` 没有预编译产物，**构建期**就失败，
-//!      连 `CORTEX_EMBED_BACKEND=hash` 都救不了
-//!   2. 每台机器都要能拿到那 590 MB 权重；拿不到时 cortexd 会
-//!      **照常启动、`/health` 返回 ok**，只在日志里留一行「回落到 mock」
-//!   3. 冷启动 12 秒、常驻 1.0 GiB
+//!   1. On Intel Macs `ort-sys` has no prebuilt artifacts and fails at
+//!      **build time**, and not even `CORTEX_EMBED_BACKEND=hash` saves you
+//!   2. Every machine has to be able to fetch those 590 MB of weights; when it
+//!      cannot, cortexd **starts up as usual and returns ok from `/health`**,
+//!      leaving a single line in the log saying it "fell back to mock"
+//!   3. 12 second cold start, 1.0 GiB resident
 //!
-//! 默认后端改成了 [`crate::embed_api`]（HTTP，OpenAI 兼容）。
-//! 需要「一个进程搞定、不依赖任何外部服务」时才打开这个 feature：
+//! The default backend became [`crate::embed_api`] (HTTP, OpenAI-compatible).
+//! Turn this feature on only when you need "one process handles everything,
+//! depending on no external service":
 //!
 //! ```bash
 //! cargo build -p cortexd --features cortex-memory/local-embed
 //! ```
 //!
-//! # 环境变量
+//! # Environment variables
 //!
-//! | 变量 | 取值 | 默认 |
+//! | Variable | Values | Default |
 //! |---|---|---|
-//! | `CORTEX_EMBED_MODEL` | 见 [`FastModel::parse`] | `bge-m3-int8` |
-//! | `CORTEX_MODEL_CACHE` | 模型缓存目录 | 用户 cache 目录下的 `cortex/models` |
-//! | `CORTEX_EMBED_BATCH` | 后台回填批大小 | [`DEFAULT_BACKFILL_BATCH`] |
+//! | `CORTEX_EMBED_MODEL` | see [`FastModel::parse`] | `bge-m3-int8` |
+//! | `CORTEX_MODEL_CACHE` | model cache directory | `cortex/models` under the user cache directory |
+//! | `CORTEX_EMBED_BATCH` | background backfill batch size | [`DEFAULT_BACKFILL_BATCH`] |
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,46 +38,60 @@ use fastembed::{
 
 use crate::embed::{EMBEDDING_DIM, Embedder, normalize};
 
-/// 后台回填的批大小。
+/// Batch size for background backfill.
 ///
-/// 远小于 fastembed 自己的 256：BGE-M3 的 ColBERT 输出是
-/// `[batch, seq_len, 1024]` 的 f32，256×512 那一档就要 500 MB 以上的临时张量，
-/// 在 architecture.md 划定的 8 GB 内存预算里直接 OOM。
+/// Far smaller than fastembed's own 256: BGE-M3's ColBERT output is
+/// `[batch, seq_len, 1024]` of f32, and the 256×512 tier alone needs more than
+/// 500 MB of temporary tensors, which OOMs outright inside the 8 GB memory
+/// budget drawn up in architecture.md.
 pub const DEFAULT_BACKFILL_BATCH: usize = 32;
 
-/// 序列截断长度。
+/// Sequence truncation length.
 ///
-/// BGE-M3 本身支持 8192，但记忆里存的是**单条事实陈述**（几十字量级），
-/// 放大窗口只会让 padding 与注意力开销线性上涨而召回毫无变化。
+/// BGE-M3 itself supports 8192, but what memory stores is **a single fact
+/// statement** (on the order of tens of characters); enlarging the window only
+/// grows padding and attention cost linearly while recall does not move at
+/// all.
 pub const DEFAULT_MAX_LENGTH: usize = 512;
 
-/// 可选的本地模型。**三个都是 1024 维**——这不是巧合，是硬约束：
-/// migration 写死 `VECTOR(1024)`，维度不同的模型根本存不进去。
+/// The available local models. **All three are 1024-dimensional** — that is
+/// not a coincidence but a hard constraint: the migration hardcodes
+/// `VECTOR(1024)`, and a model of a different dimension simply cannot be
+/// stored.
 ///
-/// 三个都支持中文。fastembed 里其余 1024 维模型（`BGELargeENV15`、
-/// `MxbaiEmbedLargeV1`、`GTELargeENV15`…）全是纯英文的，对本项目不可用。
+/// All three support Chinese. The remaining 1024-dimensional models in
+/// fastembed (`BGELargeENV15`, `MxbaiEmbedLargeV1`, `GTELargeENV15`…) are all
+/// English-only and therefore unusable for this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FastModel {
-    /// BAAI/bge-m3 的 int8 量化版（约 600 MB）。
+    /// The int8 quantized build of BAAI/bge-m3 (about 600 MB).
     ///
-    /// 默认值。architecture.md 的部署预算写明「8 GB 内存机器上 int8 是必选项」，
-    /// fp32 的 2.2 GB 会让最低配 VPS 直接跑不起来。
+    /// The default. The deployment budget in architecture.md states plainly
+    /// that "on an 8 GB machine int8 is mandatory"; fp32's 2.2 GB would make
+    /// the minimum-spec VPS unable to run at all.
     #[default]
     BgeM3Int8,
-    /// BAAI/bge-m3 原始 fp32（约 2.2 GB）。量化损失不可接受时再用。
+    /// The original fp32 BAAI/bge-m3 (about 2.2 GB). Use it only when the
+    /// quantization loss is unacceptable.
     BgeM3Fp32,
-    /// intfloat/multilingual-e5-large。
+    /// intfloat/multilingual-e5-large.
     ///
-    /// 留作对照与逃生门：万一 bge-m3 的中文表现不及预期，
-    /// 换它不需要动 schema（同为 1024 维），可直接走渐进回填。
+    /// Kept as a control and an escape hatch: should bge-m3's Chinese
+    /// performance fall short of expectations, switching to it requires no
+    /// schema change (also 1024-dimensional) and can go straight through
+    /// progressive backfill.
     MultilingualE5Large,
 }
 
 impl FastModel {
-    /// 写进各表 `embedding_model` 列的标识。
+    /// The identifier written into the `embedding_model` column of every
+    /// table.
     ///
-    /// 带上 HF 仓库名而不是简称，因为**量化版与原版是不同的权重**，
-    /// 产出的向量不在同一空间。渐进回填靠这个字段区分新旧，简称区分不开。
+    /// It carries the HF repository name rather than a short alias, because
+    /// **the quantized build and the original are different weights** and the
+    /// vectors they produce do not live in the same space. Progressive
+    /// backfill tells old from new by this field, and short aliases cannot
+    /// tell them apart.
     #[must_use]
     pub fn model_id(self) -> &'static str {
         match self {
@@ -83,12 +101,14 @@ impl FastModel {
         }
     }
 
-    /// 解析 `CORTEX_EMBED_MODEL`。
+    /// Parses `CORTEX_EMBED_MODEL`.
     ///
     /// # Errors
     ///
-    /// 名字不认识时报错而不是静默回落到默认值——回落会让人以为换模型生效了，
-    /// 但库里写的还是旧 `embedding_model`，几周后才在召回质量上暴露。
+    /// An unrecognized name errors instead of silently falling back to the
+    /// default — a fallback would make people believe the model switch took
+    /// effect while the database still records the old `embedding_model`, and
+    /// that only surfaces weeks later in the recall quality.
     pub fn parse(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "bge-m3-int8" | "bge-m3" => Ok(Self::BgeM3Int8),
@@ -101,7 +121,8 @@ impl FastModel {
         }
     }
 
-    /// fastembed 静态登记的维度。用于启动即校验，无需跑一次推理。
+    /// The dimension fastembed registers statically. Used to validate at
+    /// startup without having to run inference once.
     fn declared_dim(self) -> usize {
         match self {
             Self::BgeM3Int8 => Bgem3Embedding::get_model_info(&Bgem3Model::BGEM3Q).dim,
@@ -118,18 +139,21 @@ fn text_model_dim(model: &EmbeddingModel) -> usize {
         .map_or(0, |m| m.dim)
 }
 
-/// 已加载的 ONNX 会话。
+/// A loaded ONNX session.
 ///
-/// 两个变体不是为了兼容，是因为 fastembed 把 BGE-M3 拆成了两套 API：
-/// int8 版只在 `Bgem3Embedding`（dense+sparse+colbert 联合输出）里，
-/// `TextEmbedding` 那条路拿不到量化权重。我们只取 dense。
+/// The two variants are not there for compatibility; they exist because
+/// fastembed split BGE-M3 across two APIs: the int8 build only lives in
+/// `Bgem3Embedding` (joint dense+sparse+colbert output), and the
+/// `TextEmbedding` route cannot get at the quantized weights. We only take
+/// dense.
 enum Session {
     Joint(Box<Bgem3Embedding>),
     Dense(Box<TextEmbedding>),
 }
 
 impl Session {
-    /// 同步阻塞推理。调用方**必须**已经在 `spawn_blocking` 里。
+    /// Synchronous blocking inference. The caller **must** already be inside
+    /// `spawn_blocking`.
     fn run(&mut self, texts: &[String], batch: usize) -> Result<Vec<Vec<f32>>> {
         let raw = match self {
             Self::Joint(m) => m.embed(texts, Some(batch)).map(|o| o.dense),
@@ -139,11 +163,11 @@ impl Session {
     }
 }
 
-/// [`FastEmbedder`] 的构造参数。
+/// Construction parameters for [`FastEmbedder`].
 #[derive(Debug, Clone)]
 pub struct FastEmbedderConfig {
     pub model: FastModel,
-    /// 模型缓存目录。`None` 时按 [`default_cache_dir`] 推导。
+    /// Model cache directory. When `None`, derived via [`default_cache_dir`].
     pub cache_dir: Option<PathBuf>,
     pub backfill_batch: usize,
     pub max_length: usize,
@@ -161,24 +185,27 @@ impl Default for FastEmbedderConfig {
 }
 
 impl FastEmbedderConfig {
-    /// 从环境变量读取。
+    /// Reads from environment variables.
     ///
     /// # Errors
     ///
-    /// 模型名或批大小无法解析时报错。
+    /// Errors when the model name or the batch size cannot be parsed.
     pub fn from_env() -> Result<Self> {
-        // 空串按「没设」处理。**这不是防御性编程，是一个已经发生过两次的
-        // 生产故障**：compose 里的 `${VAR:-}` 把没写进 .env 的变量设成
-        // 空串而不是不设，而 `env::var` 对空串返回 `Ok("")`。
+        // An empty string is treated as "not set". **This is not defensive
+        // programming, it is a production incident that has already happened
+        // twice**: `${VAR:-}` in compose sets a variable that is absent from
+        // .env to the empty string rather than leaving it unset, and
+        // `env::var` returns `Ok("")` for an empty string.
         //
-        // 具体到这里：`CORTEX_EMBED_BATCH: ${CORTEX_EMBED_BATCH:-}` 会让
-        // `"".parse::<usize>()` 失败，于是 **cortexd 拒绝启动** ——
-        // 而运维那侧根本没配过这个变量。
+        // Concretely here: `CORTEX_EMBED_BATCH: ${CORTEX_EMBED_BATCH:-}` makes
+        // `"".parse::<usize>()` fail, and therefore **cortexd refuses to
+        // start** — while the ops side never configured that variable at all.
         //
-        // `cortex-core` 的 `non_empty`、`embed_api::from_env` 各有一份同样的
-        // 处理，这里是第三处。刻意不抽公共函数：`cortex-core` 的那个是
-        // 私有的，为一个三行闭包在 crate 之间开一个公共 API，
-        // 换来的耦合比省下的重复更贵。
+        // `non_empty` in `cortex-core` and `embed_api::from_env` each carry
+        // the same handling; this is the third copy. Deliberately not factored
+        // into a shared function: the one in `cortex-core` is private, and
+        // opening a public API across crates for a three-line closure buys
+        // coupling that costs more than the duplication it saves.
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 
         let mut cfg = Self::default();
@@ -199,7 +226,8 @@ impl FastEmbedderConfig {
         Ok(cfg)
     }
 
-    /// 阻塞地加载模型（首次会下载几百 MB）。
+    /// Loads the model, blocking (the first time this downloads several
+    /// hundred MB).
     fn load(self) -> Result<Session> {
         let cache = self.cache_dir.unwrap_or_else(default_cache_dir);
         let map =
@@ -210,8 +238,9 @@ impl FastEmbedderConfig {
                 Bgem3InitOptions::new(Bgem3Model::BGEM3Q)
                     .with_cache_dir(cache)
                     .with_max_length(self.max_length)
-                    // 下载进度条是 stdout 的裸写入，会打乱 CLI 的 SSE 输出；
-                    // 首次下载的可见性由下面的 tracing 事件负责
+                    // The download progress bar is a raw write to stdout and
+                    // would scramble the CLI's SSE output; visibility for the
+                    // first download is handled by the tracing event below
                     .with_show_download_progress(false),
             )
             .map(|m| Session::Joint(Box::new(m)))
@@ -236,14 +265,17 @@ fn text_session(model: EmbeddingModel, cache: PathBuf, max_length: usize) -> Res
     .map_err(|e| CortexError::Memory(format!("加载 embedding 模型失败：{e}")))
 }
 
-/// 模型缓存目录。
+/// The model cache directory.
 ///
-/// fastembed 的默认是 CWD 下的 `./.fastembed_cache`——那意味着从不同目录
-/// 启动 cortexd 就各下一份 600 MB，而且换个工作目录就「模型不见了」。
-/// 统一落到用户级 cache 目录，全机共享一份。
+/// fastembed's default is `./.fastembed_cache` under the CWD — which means
+/// starting cortexd from a different directory downloads its own 600 MB copy,
+/// and changing working directory makes "the model disappear". We put it
+/// uniformly under the user-level cache directory, one copy shared
+/// machine-wide.
 #[must_use]
 pub fn default_cache_dir() -> PathBuf {
-    // 尊重 fastembed 自己的变量，方便与其它用了 fastembed 的工具共用缓存
+    // Respect fastembed's own variable, so the cache can be shared with other
+    // tools that use fastembed
     if let Ok(v) = std::env::var("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(v);
     }
@@ -258,24 +290,32 @@ pub fn default_cache_dir() -> PathBuf {
     )
 }
 
-/// 真实语义向量化器。
+/// The real semantic vectorizer.
 ///
-/// # 为什么整个模型被一把 `Mutex` 锁住
+/// # Why the whole model sits behind a single `Mutex`
 ///
-/// fastembed 的 `embed` 取 `&mut self`（内部 ONNX session 复用输入缓冲），
-/// 而 [`Embedder::embed`] 只有 `&self`。可选做法有三：
+/// fastembed's `embed` takes `&mut self` (the internal ONNX session reuses its
+/// input buffers), while [`Embedder::embed`] only has `&self`. There were
+/// three options:
 ///
-/// 1. 每次调用新建 session —— 每次几百 MB 加载，绝对不可行
-/// 2. 每条并发路径一份模型 —— int8 也要 600 MB × N，8 GB 机器上放不下
-/// 3. **一份模型 + 互斥** —— 采用
+/// 1. A new session per call — several hundred MB of loading each time,
+///    absolutely not viable
+/// 2. One model per concurrent path — even int8 is 600 MB × N, which does not
+///    fit on an 8 GB machine
+/// 3. **One model plus a mutex** — adopted
 ///
-/// 互斥让并发 embed 串行化，但这**本来就是想要的**：ONNX Runtime 已经把
-/// 单次推理并行到了所有核上，再叠加并发只会让线程互相抢核而总吞吐下降。
+/// The mutex serializes concurrent embeds, but that is **what we wanted
+/// anyway**: ONNX Runtime already parallelizes a single inference across all
+/// cores, and layering concurrency on top only makes threads fight each other
+/// for cores while total throughput drops.
 ///
-/// 代价是一次回填会挡住交互 query，且 **fastembed 内部按 `batch_size` 分块时
-/// 锁并不释放**——一次 `embed` 调用无论传多少条都独占到底。
-/// 所以「让 query 插队」不可能在这一层解决，只能靠上层纪律：
-/// 回填任务要自己把几千条切成一批批多次调用，给 query 留出缝隙。
+/// The cost is that a backfill blocks interactive queries, and **the lock is
+/// not released while fastembed chunks internally by `batch_size`** — a
+/// single `embed` call holds it to the end no matter how many items were
+/// passed in. So "let queries jump the line" cannot be solved at this layer;
+/// it takes discipline one level up: a backfill job has to slice its several
+/// thousand items into batches across multiple calls itself, leaving gaps for
+/// queries.
 pub struct FastEmbedder {
     session: Arc<Mutex<Session>>,
     model_id: &'static str,
@@ -283,30 +323,34 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// 按环境变量加载。
+    /// Loads according to environment variables.
     ///
     /// # Errors
     ///
-    /// 配置非法、模型下载失败、ONNX session 创建失败。
+    /// Invalid configuration, model download failure, ONNX session creation
+    /// failure.
     pub async fn from_env() -> Result<Self> {
         Self::new(FastEmbedderConfig::from_env()?).await
     }
 
-    /// 加载模型。**构造即加载**，不做惰性初始化。
+    /// Loads the model. **Construction is loading**, there is no lazy
+    /// initialization.
     ///
-    /// 惰性会把几十秒的加载推迟到第一次 query，表现为「第一条消息卡住」；
-    /// 更糟的是模型缺失/损坏要到那时才暴露，而不是启动时。
+    /// Laziness would defer tens of seconds of loading to the first query,
+    /// presenting as "the first message hangs"; worse, a missing or corrupted
+    /// model would only surface then rather than at startup.
     ///
     /// # Errors
     ///
-    /// 模型下载失败或 ONNX session 创建失败。
+    /// The model fails to download, or the ONNX session fails to be created.
     pub async fn new(config: FastEmbedderConfig) -> Result<Self> {
         let model_id = config.model.model_id();
         let backfill_batch = config.backfill_batch;
         let declared = config.model.declared_dim();
 
-        // 维度不符时**加载前就失败**：加载要几十秒，没必要为一个注定写不进
-        // VECTOR(1024) 的模型白等
+        // On a dimension mismatch, **fail before loading**: loading takes tens
+        // of seconds, and there is no point waiting them out for a model that
+        // is destined never to fit into VECTOR(1024)
         if declared != EMBEDDING_DIM {
             return Err(CortexError::Config(format!(
                 "模型 {model_id} 是 {declared} 维，但 schema 写死 VECTOR({EMBEDDING_DIM})；\
@@ -317,8 +361,10 @@ impl FastEmbedder {
         tracing::info!(model = model_id, "加载 embedding 模型（首次会下载数百 MB）");
         let started = std::time::Instant::now();
 
-        // 加载是纯阻塞的磁盘 IO + ONNX 图构建，几十秒起步。
-        // 放在 async 上下文里直裸跑会让整个 tokio runtime 在这期间不调度任何任务。
+        // Loading is pure blocking disk IO plus ONNX graph construction, tens
+        // of seconds at minimum. Running it bare inside an async context would
+        // stop the entire tokio runtime from scheduling any task for that
+        // whole time.
         let session = tokio::task::spawn_blocking(move || config.load())
             .await
             .map_err(|e| CortexError::Memory(format!("加载模型的阻塞任务 panic：{e}")))??;
@@ -336,26 +382,32 @@ impl FastEmbedder {
         })
     }
 
-    /// 指定批大小的推理。
+    /// Inference with an explicit batch size.
     ///
-    /// 交互路径与回填路径的取舍相反：query 只有一条、要的是最低延迟；
-    /// 回填有成千上万条、要的是吞吐。ONNX 会把整批 padding 到批内最长序列，
-    /// 所以把一条短 query 塞进大 batch 反而更慢——两条路必须分开。
+    /// The interactive path and the backfill path make opposite trade-offs: a
+    /// query is a single item and wants minimum latency; a backfill has tens
+    /// of thousands of items and wants throughput. ONNX pads the whole batch
+    /// to the longest sequence in it, so stuffing one short query into a large
+    /// batch is actually slower — the two paths have to be kept separate.
     ///
-    /// # 分开的代价：约 0.013 的余弦漂移
+    /// # The cost of separating them: about 0.013 of cosine drift
     ///
-    /// int8 GEMM 在 batch 维度变化时走不同的 kernel（tiling 与累加顺序不同），
-    /// 实测 batch=1 与 batch≥2 的同一条文本相差 0.012–0.015，
-    /// 与批内其它文本的长度无关，同一批次重复调用则逐位一致。
-    /// 也就是说：**回填写进库的向量与查询向量之间有一个固定的小偏差**。
+    /// int8 GEMM takes different kernels as the batch dimension changes
+    /// (different tiling and accumulation order); measured, the same text at
+    /// batch=1 versus batch≥2 differs by 0.012–0.015, independent of the
+    /// length of the other texts in the batch, while repeated calls within the
+    /// same batch shape are bit-for-bit identical. Which is to say: **there is
+    /// a fixed small offset between the vectors backfill writes into the
+    /// database and the query vectors**.
     ///
-    /// 之所以不为此把回填也降到 batch=1：语义信号量级是它的 30 倍
-    /// （实测同义 0.81 / 无关 0.38），而 batch=32 的吞吐收益是数倍。
-    /// 见 `tests/fastembed.rs` 的 `MAX_BATCH_DRIFT`。
+    /// The reason we do not drop backfill to batch=1 over this: the semantic
+    /// signal is 30 times larger (measured, synonymous 0.81 / unrelated 0.38),
+    /// while the throughput gain of batch=32 is several-fold. See
+    /// `MAX_BATCH_DRIFT` in `tests/fastembed.rs`.
     ///
     /// # Errors
     ///
-    /// 推理失败，或产出的向量维度/模长非法。
+    /// Inference fails, or a produced vector has an invalid dimension or norm.
     pub async fn embed_with_batch(
         &self,
         texts: &[String],
@@ -372,9 +424,11 @@ impl FastEmbedder {
         let owned = texts.to_vec();
 
         let mut vectors = tokio::task::spawn_blocking(move || {
-            // 锁中毒说明上一次推理 panic 了。ONNX session 的内部状态在
-            // `run` 失败后仍是自洽的，为一次瞬时 panic 把 embedder 永久废掉
-            // 会连带废掉整个记忆写入路径，代价远大于收益 —— 恢复它。
+            // A poisoned lock means the previous inference panicked. The ONNX
+            // session's internal state is still self-consistent after `run`
+            // fails, and permanently killing the embedder over one transient
+            // panic would take the entire memory write path down with it — a
+            // cost far larger than the benefit. So recover it.
             let mut guard = session.lock().unwrap_or_else(PoisonError::into_inner);
             guard.run(&owned, batch_size)
         })
@@ -403,7 +457,8 @@ impl Embedder for FastEmbedder {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        // 单条即交互路径，batch=1 不做任何 padding 浪费
+        // A single item means the interactive path; batch=1 wastes nothing on
+        // padding
         let batch = if texts.len() == 1 {
             1
         } else {
@@ -419,8 +474,9 @@ mod tests {
 
     #[test]
     fn every_fast_model_matches_schema_dimension() {
-        // 这条断言是 migration 的护栏：往 FastModel 里加一个非 1024 维的模型，
-        // 在这里就炸，而不是等到运行时 INSERT 被 Postgres 拒绝
+        // This assertion is the migration's guardrail: add a model that is not
+        // 1024-dimensional to FastModel and it blows up right here, rather
+        // than waiting for Postgres to reject the INSERT at runtime
         for m in [
             FastModel::BgeM3Int8,
             FastModel::BgeM3Fp32,
@@ -429,7 +485,7 @@ mod tests {
             assert_eq!(
                 m.declared_dim(),
                 EMBEDDING_DIM,
-                "{} 是 {} 维，写不进 VECTOR({EMBEDDING_DIM})",
+                "{} is {}-dimensional and cannot be written into VECTOR({EMBEDDING_DIM})",
                 m.model_id(),
                 m.declared_dim()
             );
@@ -438,12 +494,16 @@ mod tests {
 
     #[test]
     fn model_ids_are_distinct() {
-        // embedding_model 列是渐进回填唯一的判据，撞名等于新旧向量混在一个
-        // 坐标系里算距离——结果无意义且无人察觉。
+        // The embedding_model column is progressive backfill's only criterion;
+        // a name collision means old and new vectors having their distances
+        // computed inside one coordinate system — a meaningless result that
+        // nobody notices.
         //
-        // 跨后端也必须不同：远端跑的 bge-m3（`api:bge-m3`）与本地 int8
-        // （`fastembed:gpahal/bge-m3-onnx-int8`）虽然是「同一个模型」，
-        // 量化与池化实现并不逐位一致，混在一张表里是静默的质量损失
+        // They must also differ across backends: bge-m3 run remotely
+        // (`api:bge-m3`) and the local int8
+        // (`fastembed:gpahal/bge-m3-onnx-int8`) may be "the same model", but
+        // the quantization and pooling implementations are not bit-for-bit
+        // identical, and mixing them into one table is a silent quality loss
         let hash = crate::embed::HashEmbedder::new();
         let ids = [
             FastModel::BgeM3Int8.model_id(),
@@ -455,7 +515,7 @@ mod tests {
         assert_eq!(
             unique.len(),
             ids.len(),
-            "model_id 必须两两不同，实际 {ids:?}"
+            "every model_id must be pairwise distinct, actual {ids:?}"
         );
     }
 
@@ -463,7 +523,7 @@ mod tests {
     fn unknown_names_are_rejected_not_defaulted() {
         assert!(
             FastModel::parse("bge-m4").is_err(),
-            "无法识别的模型名必须报错；静默回落到默认模型会让人以为换模型生效了"
+            "an unrecognizable model name must error; silently falling back to the default model makes people believe the model switch took effect"
         );
         assert_eq!(
             FastModel::parse("BGE-M3-Int8").unwrap(),
@@ -473,12 +533,13 @@ mod tests {
 
     #[test]
     fn cache_dir_is_not_cwd_relative() {
-        // fastembed 默认 ./.fastembed_cache 会随启动目录漂移，
-        // 表现为「换个目录跑就重新下 600 MB」
+        // fastembed's default ./.fastembed_cache drifts with the startup
+        // directory, presenting as "run it from another directory and it
+        // re-downloads 600 MB"
         let dir = default_cache_dir();
         assert!(
             dir.is_absolute() || std::env::var_os("FASTEMBED_CACHE_DIR").is_some(),
-            "默认缓存目录应是绝对路径，实际 {dir:?}"
+            "the default cache directory should be an absolute path, actual {dir:?}"
         );
     }
 }

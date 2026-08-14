@@ -1,46 +1,52 @@
--- active_facts 挡住了 facts 上的每一个索引 —— 尤其是 HNSW
+-- active_facts was blocking every index on facts -- the HNSW above all
 --
--- ── 病灶 ──
+-- ── The lesion ──
 --
--- 原定义是 `facts LEFT JOIN fact_status`，而 fact_status 是 fact_events 上的
--- 一个 DISTINCT ON。planner 必须**先把 join 做完**才能按距离排序，于是
--- `ORDER BY embedding <=> $1 LIMIT 24` 拿到的是一堆已经落地的行，
--- idx_facts_vec 从来没被用上过。EXPLAIN（5 万条事实）：
+-- The original definition was `facts LEFT JOIN fact_status`, and fact_status is a
+-- DISTINCT ON over fact_events. The planner has to **finish the join** before it can sort
+-- by distance, so `ORDER BY embedding <=> $1 LIMIT 24` gets handed a pile of rows that
+-- have already been materialized, and idx_facts_vec was never used once. EXPLAIN
+-- (50,000 facts):
 --
---   Limit                                    ← 289.7 ms, 19.8 万次缓冲访问
+--   Limit                                    ← 289.7 ms, 198k buffer accesses
 --     Sort (top-N heapsort)
---       Hash Left Join  rows=43842           ← 算了 4.3 万次 1024 维距离
+--       Hash Left Join  rows=43842           ← 43.8k 1024-dimensional distances computed
 --         Seq Scan on facts        rows=50092
 --         Hash ← Seq Scan on fact_events
 --
--- 库小的时候完全看不出来，所以这个洞从 init migration 起就一直在。
--- 它暴露的时机恰好是「用户把几年历史导进来」的那一天。
+-- On a small database it is entirely invisible, which is how this hole survived from the
+-- init migration onwards. The moment it does surface is precisely the day "the user
+-- imports several years of history".
 --
--- ── 为什么换成两层反连接就好了 ──
+-- ── Why switching to a two-level anti-join fixes it ──
 --
--- 关键**不是** NOT EXISTS 本身，而是**没有 LIMIT**：带 LIMIT 1 的相关子查询
--- 会被按死成逐行子计划，行少时飞快、行多时灾难。写成两层反连接之后
--- planner 有得选 —— 行少走嵌套循环 + 索引探测，行多走哈希反连接。
--- 三种写法都实测过（5 万事实 / 1.17 万状态事件 / 12.2% 已失效）：
+-- The decisive part is **not** NOT EXISTS itself but the **absence of a LIMIT**: a
+-- correlated subquery with LIMIT 1 is pinned down into a row-by-row subplan -- blazing
+-- with few rows, catastrophic with many. Written as a two-level anti-join, the planner
+-- gets choices: few rows take a nested loop + index probe, many rows take a hash anti-join.
+-- All three formulations were actually measured (50k facts / 11.7k status events /
+-- 12.2% already invalidated):
 --
---   定义                     向量 ANN   BM25 窄   BM25 宽   全量 count   按 subject
---   老 LEFT JOIN              289.7ms    8.1ms    46.6ms      17.3ms       8.5ms
---   NOT EXISTS + LIMIT 1        1.2ms    0.0ms   109.1ms      67.4ms       0.1ms  ← 宽查询崩了
---   NOT EXISTS(fact_status)    12.5ms    4.6ms    30.4ms      10.9ms      11.3ms  ← 点查变慢
---   两层反连接（本次）           0.5ms    0.0ms    25.2ms      13.1ms       0.1ms  ← 五项全胜
+--   definition                   vector ANN  BM25 narrow  BM25 wide  full count  by subject
+--   old LEFT JOIN                  289.7ms      8.1ms      46.6ms      17.3ms      8.5ms
+--   NOT EXISTS + LIMIT 1             1.2ms      0.0ms     109.1ms      67.4ms      0.1ms  ← the wide query collapses
+--   NOT EXISTS(fact_status)         12.5ms      4.6ms      30.4ms      10.9ms     11.3ms  ← point lookups get slower
+--   two-level anti-join (this one)   0.5ms      0.0ms      25.2ms      13.1ms      0.1ms  ← wins all five
 --
--- ── 语义与老定义严格等价 ──
+-- ── Strictly equivalent in meaning to the old definition ──
 --
--- 老：{invalidate, revoke} 里**最后**那条是 invalidate → 无效。
--- 新：存在一条 invalidate，且它之后没有任何 revoke → 无效。
+-- Old: the **last** of the {invalidate, revoke} events is an invalidate → invalid.
+-- New: an invalidate exists and no revoke comes after it → invalid.
 --
--- 逐种时序对过：只 invalidate / invalidate→revoke / invalidate→revoke→invalidate
--- / 只 revoke / 无事件。两个定义的行集在 5 万条数据上双向差集都是 0。
+-- Checked ordering by ordering: invalidate only / invalidate→revoke /
+-- invalidate→revoke→invalidate / revoke only / no events at all. On 50,000 rows the two
+-- definitions produce row sets whose difference is 0 in both directions.
 --
--- 排序键 `(created_at, id)` 与 fact_status 的 `ORDER BY created_at DESC, id DESC`
--- 一致 —— created_at 是 clock_timestamp() 微秒级，id 只在极端同刻做确定性
--- tiebreaker。**这两处必须同时改**，不然「同一微秒内 revoke 与 invalidate
--- 各一条」会被两个定义判成相反的结果。
+-- The sort key `(created_at, id)` agrees with fact_status's `ORDER BY created_at DESC,
+-- id DESC` -- created_at is clock_timestamp() at microsecond resolution, and id is only a
+-- deterministic tiebreaker at the extreme same instant. **The two places must be changed
+-- together**, otherwise "one revoke and one invalidate inside the same microsecond" gets
+-- judged in opposite ways by the two definitions.
 
 CREATE OR REPLACE VIEW active_facts AS
 SELECT f.*
@@ -59,15 +65,17 @@ WHERE NOT EXISTS (
        )
 );
 
--- 状态探测专用的偏索引。
+-- A partial index dedicated to state probing.
 --
--- 已有的 idx_fact_events (fact_id, created_at DESC) 也能用，但它覆盖**全部**
--- 事件（含 flag 那类批注，那些不参与状态判定）。带谓词的偏索引更小，
--- 而且 id 进了索引键之后连 tiebreaker 都不用回表。
+-- The existing idx_fact_events (fact_id, created_at DESC) would work too, but it covers
+-- **every** event (including annotations of the flag kind, which take no part in deciding
+-- state). A partial index with a predicate is smaller, and once id is part of the index
+-- key even the tiebreaker needs no heap fetch.
 CREATE INDEX IF NOT EXISTS idx_fact_events_status
     ON fact_events (fact_id, created_at DESC, id DESC)
  WHERE op IN ('invalidate', 'revoke');
 
--- ⚠️ 给 facts 加列时**仍然**要重建这个视图。
--- `SELECT f.*` 在建视图那一刻就被展开成固定列表，新列不会自动出现
--- （见 20260807000006 的同款告警）。换成反连接不改变这条。
+-- ⚠️ Adding a column to facts **still** requires rebuilding this view.
+-- `SELECT f.*` is expanded into a fixed column list at the moment the view is created, and
+-- new columns will not show up by themselves (see the identical warning in 20260807000006).
+-- Switching to an anti-join changes nothing about that.

@@ -1,8 +1,10 @@
-//! 会话生命周期：状态机、归档过滤、schema 约束、同步下发。
+//! Session lifecycle: the state machines, the archived filter, the schema
+//! constraints, and delivery over sync.
 //!
-//! 全部逻辑都在 SQL 里（`session_state` 视图的三次 DISTINCT ON、
-//! `session_digests` 的归档过滤、表上的 CHECK），单测一条都测不到 ——
-//! 只能真连库。数据库不可用时 skip 而非 fail。
+//! All of the logic lives in SQL (the three DISTINCT ONs in the `session_state`
+//! view, the archived filter in `session_digests`, the CHECKs on the table), and
+//! a unit test can reach none of it — only a real database connection can. Skip
+//! rather than fail when the database is unavailable.
 
 mod common;
 
@@ -32,18 +34,19 @@ async fn write_episode(store: &Store, ep: NewEpisode) {
     store
         .write_txn(async |t| t.insert_episode(&ep).await)
         .await
-        .expect("写 episode 不该失败");
+        .expect("writing the episode should not fail");
 }
 
-/// 追加一条生命周期事件，返回它在同步全序里的 seq。
+/// Append one lifecycle event and return its seq in the sync total order.
 async fn emit(store: &Store, e: NewSessionEvent) -> i64 {
     store
         .write_txn(async |t| t.insert_session_event(&e).await)
         .await
-        .expect("写 session_event 不该失败")
+        .expect("writing the session_event should not fail")
 }
 
-/// 末态由**最后一条同类事件**决定，不是撤销栈。
+/// The final state is decided by the **last event of the same kind**, not by an
+/// undo stack.
 #[tokio::test]
 async fn the_last_event_of_each_kind_wins() {
     let Some(db) = common::setup().await else {
@@ -65,23 +68,28 @@ async fn the_last_event_of_each_kind_wins() {
     emit(s, NewSessionEvent::archive("sess", Actor::User, DEV)).await;
     emit(s, NewSessionEvent::unarchive("sess", Actor::User, DEV)).await;
 
-    let state = s.session_state("sess").await.expect("查末态不该失败");
+    let state = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
 
-    let state = state.expect("写过事件的会话应当有末态");
+    let state = state.expect("a session that has had events should have a final state");
     assert_eq!(
         state.title.as_deref(),
         Some("标题 B"),
-        "[rename A, rename B] 之后应当是 B —— 末态由最后一条决定，不做撤销栈：{state:?}"
+        "after [rename A, rename B] the answer should be B -- the final state is decided by the \
+         last event, with no undo stack: {state:?}"
     );
     assert!(
         !state.archived,
-        "[archive, unarchive] 之后应当是未归档：{state:?}"
+        "after [archive, unarchive] it should be unarchived: {state:?}"
     );
 }
 
-/// 三个维度互相独立 —— 归档之后改名，不该把会话改出档。
+/// The three dimensions are independent — renaming after archiving must not
+/// unarchive the session.
 #[tokio::test]
 async fn the_three_dimensions_do_not_interfere() {
     let Some(db) = common::setup().await else {
@@ -91,8 +99,9 @@ async fn the_three_dimensions_do_not_interfere() {
     let dir = tempdir_path();
 
     emit(s, NewSessionEvent::archive("sess", Actor::User, DEV)).await;
-    // 归档之后再改名、再绑工作区。若视图用「整表最后一条事件」判定，
-    // 这两条会把归档态冲掉 —— 那正是这个测试要挡的实现错误
+    // Rename and bind a workspace after archiving. If the view decided by "the
+    // last event in the whole table", these two would wash the archived state
+    // away -- which is exactly the implementation error this test stops
     emit(s, NewSessionEvent::rename("sess", "档案", Actor::User, DEV)).await;
     emit(
         s,
@@ -100,20 +109,25 @@ async fn the_three_dimensions_do_not_interfere() {
     )
     .await;
 
-    let state = s.session_state("sess").await.expect("查末态不该失败");
+    let state = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
 
-    let state = state.expect("写过事件的会话应当有末态");
+    let state = state.expect("a session that has had events should have a final state");
     assert!(
         state.archived,
-        "归档之后改名 / 绑工作区不该让会话自动出档：{state:?}"
+        "renaming or binding a workspace after archiving must not unarchive the session \
+         automatically: {state:?}"
     );
     assert_eq!(state.title.as_deref(), Some("档案"));
     assert_eq!(state.workspace.as_deref(), Some(dir.as_str()));
 }
 
-/// 解绑之后 `workspace` 必须回到 `None`，而不是留着最后绑过的那个路径。
+/// After unbinding, `workspace` must go back to `None` rather than keeping the
+/// last path it was bound to.
 #[tokio::test]
 async fn unbinding_clears_the_workspace() {
     let Some(db) = common::setup().await else {
@@ -127,14 +141,20 @@ async fn unbinding_clears_the_workspace() {
         NewSessionEvent::bind_workspace("sess", &dir, Actor::User, DEV),
     )
     .await;
-    let bound = s.session_state("sess").await.expect("查末态不该失败");
+    let bound = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     emit(
         s,
         NewSessionEvent::unbind_workspace("sess", Actor::User, DEV),
     )
     .await;
-    let unbound = s.session_state("sess").await.expect("查末态不该失败");
+    let unbound = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
 
@@ -143,13 +163,14 @@ async fn unbinding_clears_the_workspace() {
         Some(dir.as_str())
     );
     assert_eq!(
-        unbound.expect("会话仍有事件").workspace,
+        unbound.expect("the session still has events").workspace,
         None,
-        "解绑后必须是 None —— 留着旧路径会让文件工具继续出现在纯聊天会话里"
+        "after unbinding it must be None -- keeping the old path would leave the file tools \
+         showing up in a pure chat session"
     );
 }
 
-/// 没有任何事件的会话查不到末态，这不是错误。
+/// A session with no events has no final state, and that is not an error.
 #[tokio::test]
 async fn a_session_without_events_has_no_state() {
     let Some(db) = common::setup().await else {
@@ -158,13 +179,20 @@ async fn a_session_without_events_has_no_state() {
     let s = &db.store;
     write_episode(s, episode("plain", "只发过消息，没改过名", 5)).await;
 
-    let state = s.session_state("plain").await.expect("查末态不该失败");
+    let state = s
+        .session_state("plain")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
-    assert!(state.is_none(), "从未有过生命周期事件的会话应当查不到末态");
+    assert!(
+        state.is_none(),
+        "a session that has never had a lifecycle event should have no final state"
+    );
 }
 
-/// 每个 op 只能带自己那一个载荷字段 —— 两侧的 CHECK 都要真的生效。
+/// Each op may carry only its own payload field — the CHECKs on both sides must
+/// genuinely take effect.
 #[tokio::test]
 async fn schema_rejects_mismatched_payloads() {
     let Some(db) = common::setup().await else {
@@ -172,27 +200,28 @@ async fn schema_rejects_mismatched_payloads() {
     };
     let s = &db.store;
 
-    // rename 没给 title
+    // rename with no title
     let mut no_title = NewSessionEvent::rename("sess", "x", Actor::User, DEV);
     no_title.title = None;
 
-    // archive 却带着 title —— 放过它的话，视图里会表现为「归档一下标题就变了」
+    // archive carrying a title -- letting this through would make the view
+    // behave as though archiving also changed the title
     let mut archive_with_title = NewSessionEvent::archive("sess", Actor::User, DEV);
     archive_with_title.title = Some("不该有的标题".into());
 
-    // unbind 却带着 workspace
+    // unbind carrying a workspace
     let mut unbind_with_path = NewSessionEvent::unbind_workspace("sess", Actor::User, DEV);
     unbind_with_path.workspace = Some("/tmp".into());
 
-    // 空标题
+    // an empty title
     let empty_title = NewSessionEvent::rename("sess", "", Actor::User, DEV);
 
     let mut outcome = Vec::new();
     for (label, e) in [
-        ("rename 缺 title", no_title),
-        ("archive 带 title", archive_with_title),
-        ("unbind 带 workspace", unbind_with_path),
-        ("空标题", empty_title),
+        ("rename missing its title", no_title),
+        ("archive carrying a title", archive_with_title),
+        ("unbind carrying a workspace", unbind_with_path),
+        ("an empty title", empty_title),
     ] {
         let r = s
             .write_txn(async |t| t.insert_session_event(&e).await)
@@ -203,11 +232,15 @@ async fn schema_rejects_mismatched_payloads() {
     db.cleanup().await;
 
     for (label, rejected) in outcome {
-        assert!(rejected, "「{label}」应当被 schema 的 CHECK 拒绝");
+        assert!(
+            rejected,
+            "\"{label}\" should be rejected by the schema's CHECK"
+        );
     }
 }
 
-/// 归档的会话默认不出现在列表里，`include_archived` 能取回来。
+/// Archived sessions do not appear in the list by default, and
+/// `include_archived` brings them back.
 #[tokio::test]
 async fn archived_sessions_are_hidden_by_default() {
     let Some(db) = common::setup().await else {
@@ -222,18 +255,18 @@ async fn archived_sessions_are_hidden_by_default() {
     let default = s
         .session_digests(10, false, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
     let all = s
         .session_digests(10, true, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
 
-    // 取消归档后必须重新出现 —— 归档不是删除
+    // It must reappear after unarchiving -- archiving is not deleting
     emit(s, NewSessionEvent::unarchive("gone", Actor::User, DEV)).await;
     let restored = s
         .session_digests(10, false, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
 
     db.cleanup().await;
 
@@ -243,30 +276,33 @@ async fn archived_sessions_are_hidden_by_default() {
     assert_eq!(
         ids(&default),
         vec!["keep"],
-        "归档的会话不该出现在默认列表里"
+        "archived sessions must not appear in the default list"
     );
     assert_eq!(
         ids(&all).len(),
         2,
-        "include_archived 应当把归档的也带回来：{:?}",
+        "include_archived should bring the archived ones back too: {:?}",
         ids(&all)
     );
     assert!(
         all.iter().any(|d| d.session_id == "gone" && d.archived),
-        "归档标记应当如实返回：{:?}",
+        "the archived flag should be reported faithfully: {:?}",
         ids(&all)
     );
     assert_eq!(
         ids(&restored).len(),
         2,
-        "取消归档后会话必须重新出现 —— 归档不是删除，数据一条没少"
+        "a session must reappear after unarchiving -- archiving is not deleting, and not one row \
+         was lost"
     );
 }
 
-/// 归档的会话不能**占用** limit 的配额。
+/// Archived sessions must not **consume** the limit's quota.
 ///
-/// 「先取 N 条再在内存里丢掉归档的」是最容易写出的实现，缺陷不报错：
-/// 归档二十个会话，列表里能看见的就少二十个。过滤必须在 LIMIT 之前。
+/// "Take N rows first and drop the archived ones in memory" is the easiest
+/// implementation to write, and its defect raises no error: archive twenty
+/// sessions and the list shows twenty fewer. The filter has to come before the
+/// LIMIT.
 #[tokio::test]
 async fn archived_sessions_do_not_consume_the_limit() {
     let Some(db) = common::setup().await else {
@@ -274,7 +310,8 @@ async fn archived_sessions_do_not_consume_the_limit() {
     };
     let s = &db.store;
 
-    // 三个归档的会话比未归档的都新，会排在前面
+    // Three archived sessions, all newer than the unarchived one, so they sort
+    // ahead of it
     for i in 0..3 {
         let id = format!("arch-{i}");
         write_episode(s, episode(&id, "归档会话", 1 + i)).await;
@@ -282,22 +319,25 @@ async fn archived_sessions_do_not_consume_the_limit() {
     }
     write_episode(s, episode("visible", "唯一该被看见的", 100)).await;
 
-    // limit=1：若过滤发生在 LIMIT 之后，这一条会被归档会话占掉，结果为空
+    // limit=1: if the filter happened after the LIMIT, an archived session
+    // would take that one slot and the result would be empty
     let got = s
         .session_digests(1, false, None)
         .await
-        .expect("查列表不该失败");
+        .expect("querying the list should not fail");
 
     db.cleanup().await;
 
     assert_eq!(
         got.iter().map(|d| d.session_id.clone()).collect::<Vec<_>>(),
         vec!["visible"],
-        "归档过滤必须发生在 LIMIT 之前，否则归档的会话会把可见配额吃掉"
+        "the archived filter must happen before the LIMIT, or archived sessions eat the visible \
+         quota"
     );
 }
 
-/// 用户改的标题优先于派生标题，且随 digest 一起回来。
+/// A user-set title takes precedence over the derived one, and rides along with
+/// the digest.
 #[tokio::test]
 async fn a_custom_title_rides_along_with_the_digest() {
     let Some(db) = common::setup().await else {
@@ -306,37 +346,53 @@ async fn a_custom_title_rides_along_with_the_digest() {
     let s = &db.store;
 
     write_episode(s, episode("sess", "首条用户消息", 5)).await;
-    let before = s.session_digest("sess").await.expect("查概览不该失败");
+    let before = s
+        .session_digest("sess")
+        .await
+        .expect("querying the digest should not fail");
     emit(
         s,
         NewSessionEvent::rename("sess", "我起的名字", Actor::User, DEV),
     )
     .await;
-    let after = s.session_digest("sess").await.expect("查概览不该失败");
-    let missing = s.session_digest("nope").await.expect("查概览不该失败");
+    let after = s
+        .session_digest("sess")
+        .await
+        .expect("querying the digest should not fail");
+    let missing = s
+        .session_digest("nope")
+        .await
+        .expect("querying the digest should not fail");
 
     db.cleanup().await;
 
     assert_eq!(
-        before.expect("会话有消息").title,
+        before.expect("the session has messages").title,
         None,
-        "从未改名时 title 应当是 None，由上层回落到派生标题"
+        "with no rename ever, title should be None and the layer above falls back to the derived \
+         title"
     );
-    let after = after.expect("会话有消息");
+    let after = after.expect("the session has messages");
     assert_eq!(after.title.as_deref(), Some("我起的名字"));
     assert_eq!(
         after.first_user_text.as_deref(),
         Some("首条用户消息"),
-        "派生标题的原料仍要带回来 —— 客户端要能显示「自动标题是什么」"
+        "the raw material for the derived title must still come back -- the client has to be \
+         able to show what the automatic title would be"
     );
-    assert!(missing.is_none(), "没有消息的会话应当查不到概览");
+    assert!(
+        missing.is_none(),
+        "a session with no messages should have no digest"
+    );
 }
 
-/// 新表必须进 `sync_log`，且 `/sync` 拉得回它的业务行。
+/// The new table must enter `sync_log`, and `/sync` must be able to pull its
+/// business row back.
 ///
-/// 漏掉 `load_payloads` 的那一支不是「会话改名同步不了」，而是**整条 /sync
-/// 断掉**：一条 session_events 日志会让整批拉取报 UnknownTable，
-/// 客户端的游标从此卡死在它前面。
+/// Missing the arm in `load_payloads` does not mean "session renames fail to
+/// sync", it means **the whole of /sync breaks**: one session_events log row
+/// makes the entire batch report UnknownTable, and the client's cursor is stuck
+/// in front of it from then on.
 #[tokio::test]
 async fn session_events_flow_through_the_sync_log() {
     let Some(db) = common::setup().await else {
@@ -344,23 +400,33 @@ async fn session_events_flow_through_the_sync_log() {
     };
     let s = &db.store;
 
-    let before = s.latest_seq().await.expect("查游标不该失败");
+    let before = s
+        .latest_seq()
+        .await
+        .expect("querying the cursor should not fail");
     let e = NewSessionEvent::rename("sess", "同步得到吗", Actor::User, DEV);
     let id = e.id.to_string();
     let seq = emit(s, e).await;
-    // 后面再跟一条别的表的写入，确认混排拉取不会翻车
+    // Follow it with a write to another table, confirming that an interleaved
+    // pull does not fall over
     write_episode(s, episode("sess", "一条普通消息", 1)).await;
 
-    let records = s.fetch_since(before, 100).await.expect("增量拉取不该失败");
-    let events = s.session_events("sess").await.expect("查时间线不该失败");
+    let records = s
+        .fetch_since(before, 100)
+        .await
+        .expect("the incremental pull should not fail");
+    let events = s
+        .session_events("sess")
+        .await
+        .expect("querying the timeline should not fail");
 
     db.cleanup().await;
 
-    assert!(seq > before, "session_event 必须推进同步游标");
+    assert!(seq > before, "a session_event must advance the sync cursor");
     let hit = records
         .iter()
         .find(|r| r.table_name == table::SESSION_EVENTS)
-        .unwrap_or_else(|| panic!("session_events 没有进 sync_log：{records:?}"));
+        .unwrap_or_else(|| panic!("session_events did not enter sync_log: {records:?}"));
     assert_eq!(hit.record_id, id);
     match hit.payload.as_ref() {
         Some(SyncPayload::SessionEvent(ev)) => {
@@ -368,12 +434,17 @@ async fn session_events_flow_through_the_sync_log() {
             assert_eq!(ev.title.as_deref(), Some("同步得到吗"));
             assert_eq!(ev.actor, Actor::User);
         }
-        other => panic!("载荷类型不对，/sync 会下发不出去：{other:?}"),
+        other => panic!("wrong payload type, so /sync cannot deliver it: {other:?}"),
     }
-    assert_eq!(events.len(), 1, "时间线应当恰好一条：{events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "the timeline should hold exactly one entry: {events:?}"
+    );
 }
 
-/// 一次 PATCH 里的多个改动写在同一个事务里 —— 别的设备不该看到中间态。
+/// The several changes in one PATCH are written in one transaction — other
+/// devices must never see an intermediate state.
 #[tokio::test]
 async fn multiple_changes_land_in_one_transaction() {
     let Some(db) = common::setup().await else {
@@ -382,7 +453,10 @@ async fn multiple_changes_land_in_one_transaction() {
     let s = &db.store;
     let dir = tempdir_path();
 
-    let before = s.latest_seq().await.expect("查游标不该失败");
+    let before = s
+        .latest_seq()
+        .await
+        .expect("querying the cursor should not fail");
     let batch = vec![
         NewSessionEvent::rename("sess", "一次改完", Actor::User, DEV),
         NewSessionEvent::archive("sess", Actor::User, DEV),
@@ -396,29 +470,42 @@ async fn multiple_changes_land_in_one_transaction() {
         Ok(last)
     })
     .await
-    .expect("批量写不该失败");
+    .expect("the batch write should not fail");
 
-    let logged = s.sync_log_since(before, 100).await.expect("查日志不该失败");
-    let state = s.session_state("sess").await.expect("查末态不该失败");
+    let logged = s
+        .sync_log_since(before, 100)
+        .await
+        .expect("querying the log should not fail");
+    let state = s
+        .session_state("sess")
+        .await
+        .expect("querying the final state should not fail");
 
     db.cleanup().await;
 
     let seqs: Vec<i64> = logged.iter().map(|l| l.seq).collect();
-    assert_eq!(seqs.len(), 3, "三条事件都该有各自的 sync_log 行：{seqs:?}");
+    assert_eq!(
+        seqs.len(),
+        3,
+        "all three events should have their own sync_log row: {seqs:?}"
+    );
     assert_eq!(
         seqs.last().unwrap() - seqs.first().unwrap(),
         2,
-        "同事务写入的三行应当连号 —— 中间插进别的写事务说明锁没起作用：{seqs:?}"
+        "three rows written in one transaction should have consecutive numbers -- another write \
+         transaction slipping in between means the lock is not working: {seqs:?}"
     );
 
-    let state = state.expect("应当有末态");
+    let state = state.expect("there should be a final state");
     assert_eq!(state.title.as_deref(), Some("一次改完"));
     assert!(state.archived);
     assert_eq!(state.workspace.as_deref(), Some(dir.as_str()));
 }
 
-/// 存储层不校验路径 —— 「什么算系统目录」是部署形态的知识，属于 cortexd。
-/// 这里只借临时目录取一个真实存在的绝对路径字符串。
+/// The storage layer does not validate paths — "what counts as a system
+/// directory" is knowledge about the deployment shape and belongs to cortexd.
+/// This just borrows the temp directory to get an absolute path string that
+/// genuinely exists.
 fn tempdir_path() -> String {
     std::env::temp_dir().to_string_lossy().into_owned()
 }

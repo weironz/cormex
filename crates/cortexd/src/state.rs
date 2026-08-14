@@ -1,15 +1,19 @@
-//! 应用状态与业务分派。
+//! Application state and business dispatch.
 //!
-//! 两个后端共用同一套契约：[`Backend::Live`] 接真实的存储层、供应商层与
-//! 记忆引擎；[`Backend::Mock`] 是一个**显式选择**的假数据源。
+//! Both backends share one contract: [`Backend::Live`] wires up the real storage
+//! layer, provider layer and memory engine; [`Backend::Mock`] is an
+//! **explicitly chosen** source of fake data.
 //!
-//! 保留 Mock 不是权宜之计 —— 客户端的 CI、离线开发、以及「后端挂了
-//! 界面还能不能看」这三件事都需要它，且它强制我们把契约的两个实现
-//! 对齐，避免真实实现悄悄偏离文档。
+//! Keeping Mock is not an expedient — the client's CI, offline development, and
+//! "can the UI still be looked at when the backend is down" all need it, and it
+//! forces us to keep the contract's two implementations aligned, preventing the
+//! real one from quietly drifting away from the documentation.
 //!
-//! **但它不再是回落。** Mock 曾经是「数据库或 API key 不可用时」自动接管的
-//! 降级路径，而那让 cortexd 能带着一库假记忆对外服务且看起来完全正常。
-//! 现在它只在 `CORTEX_BACKEND=mock` 时出现 —— 完整理由见 [`BackendChoice`]。
+//! **But it is no longer a fallback.** Mock used to be the degradation path that
+//! took over automatically whenever the database or the API key was unavailable,
+//! and that let cortexd serve traffic backed by a database of fabricated memory
+//! while looking completely normal. It now appears only under
+//! `CORTEX_BACKEND=mock` — full reasoning in [`BackendChoice`].
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -31,7 +35,7 @@ use cortex_llm::MessageStream;
 use cortex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
 use cortex_proto::llm::LlmStreamRequest;
 
-/// mock 后端的伪游标。见 [`AppState::new_mock`]。
+/// The mock backend's fake cursor. See [`AppState::new_mock`].
 static MOCK_CURSOR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 #[derive(Clone)]
@@ -44,62 +48,73 @@ struct Inner {
     config: Config,
     backend: Backend,
     bus: SyncBus,
-    /// 对象存储**两个后端共用**。
+    /// Object storage is **shared by both backends**.
     ///
-    /// 它与 Postgres 是各自独立的故障域：数据库没起来照样能把图存进 RustFS，
-    /// 反之亦然。把它塞进 `Backend::Live` 会让「mock 模式下传不了图」
-    /// 变成一条没有理由的限制 —— 而客户端 CI 恰恰要在 mock 上跑上传流程。
+    /// It is an independent failure domain from Postgres: an image can still be
+    /// stored in RustFS while the database is down, and vice versa. Putting it
+    /// inside `Backend::Live` would turn "images cannot be uploaded in mock
+    /// mode" into a restriction with no justification — and the client's CI
+    /// runs the upload flow precisely on mock.
     blobs: MediaStore,
-    /// 进程级、与后端无关的东西。见 [`Runtime`]。
+    /// Process-level things that are independent of the backend. See
+    /// [`Runtime`].
     rt: Runtime,
 }
 
-/// 与后端选择无关的进程级设施。
+/// Process-level facilities that are independent of the backend choice.
 ///
-/// 单独一个结构而不是三个字段散在 [`Inner`] 里：它们的共同点是
-/// **mock 与 live 必须共用同一份**。认证是全进程的形态，确认簿要能被
-/// 任何一条 HTTP 回执找到，票据本同理 —— 任何一个跟着 `Backend` 走，
-/// 都会变成「mock 模式下这条路测不了」，而客户端 CI 恰恰跑在 mock 上。
+/// A struct of its own rather than three fields scattered through [`Inner`]:
+/// what they have in common is that **mock and live must share one copy**.
+/// Authentication is a whole-process property, the confirmation ledger has to be
+/// findable from any HTTP response, and the ticket book likewise — any one of
+/// them following `Backend` would become "this path cannot be tested in mock
+/// mode", and the client's CI runs on mock.
 #[derive(Clone)]
 pub struct Runtime {
     pub auth: AuthMode,
     pub tickets: Arc<TicketBook>,
-    /// 账号那几张表的连接池（`cortex_auth`），以及租户池注册表。
+    /// The connection pool for the account tables (`cortex_auth`), plus the
+    /// tenant pool registry.
     ///
-    /// **与记忆库的池分开**：`cortex-store` 的每条查询都假设自己在某个
-    /// 租户的 schema 里，而账号是跨租户的。混用一个池意味着
-    /// `search_path` 要来回改，而那正是 [`cortex_store::TenantPools`]
-    /// 的文档里说「漏一次就是跨用户泄露」的那种改法。
+    /// **Separate from the memory database's pool**: every query in
+    /// `cortex-store` assumes it is inside some tenant's schema, while accounts
+    /// are cross-tenant. Sharing one pool would mean changing `search_path` back
+    /// and forth, and that is exactly the kind of change
+    /// [`cortex_store::TenantPools`]'s documentation calls "miss it once and you
+    /// have a cross-user leak".
     ///
-    /// `None` = 这个部署还没接数据库（mock 后端）。账号端点此时全部
-    /// 报 501 —— 假装能登录比明说不支持糟得多。
+    /// `None` = this deployment has no database attached (the mock backend). The
+    /// account endpoints all answer 501 in that state — pretending logins work
+    /// is far worse than saying plainly that they are unsupported.
     pub accounts: Option<Accounts>,
-    /// 已签发的 access token。见 [`crate::accounts::AccessBook`]。
+    /// Issued access tokens. See [`crate::accounts::AccessBook`].
     pub access: Arc<crate::accounts::AccessBook>,
-    /// 已签发的**沙箱**令牌。与上面两本簿子并列而不是合并：它是唯一一种
-    /// 带**语义作用域**的凭据（见 [`crate::delegated_token::DelegatedScope`]），
-    /// 合进 `AccessBook` 会让「这把 token 能干什么」变成一个要在调用点
-    /// 到处判断的问题。
+    /// Issued **sandbox** tokens. Alongside the two books above rather than
+    /// merged into them: it is the only credential carrying a **semantic scope**
+    /// (see [`crate::delegated_token::DelegatedScope`]), and folding it into
+    /// `AccessBook` would turn "what may this token do" into a question that has
+    /// to be answered all over the call sites.
     pub delegations: Arc<crate::delegated_token::DelegatedTokens>,
 }
 
-/// 账号相关的两个句柄。
+/// The two account-related handles.
 #[derive(Clone)]
 pub struct Accounts {
-    /// 直连 `cortex_auth` 的池
+    /// A pool connected directly to `cortex_auth`
     pub pool: sqlx::PgPool,
-    /// 按用户取记忆库
+    /// Memory databases, looked up per user
     pub tenants: Arc<cortex_store::TenantPools>,
 }
 
 impl Accounts {
-    /// 连 `cortex_auth`，并把全局那套 migration 跑上。
+    /// Connect to `cortex_auth` and apply the global migrations.
     ///
-    /// 池子只要两条连接：账号相关的查询都是「登录时一次、刷新时一次」，
-    /// 而记忆库那边的并发压力走的是租户池。
+    /// The pool needs only two connections: account-related queries are "once at
+    /// login, once at refresh", while concurrent pressure on the memory database
+    /// goes through the tenant pools.
     ///
     /// # Errors
-    /// 连不上，或者全局 migration 跑不过。
+    /// Cannot connect, or the global migration failed.
     pub async fn connect(database_url: &str) -> Result<Self> {
         cortex_store::Store::migrate_global(database_url)
             .await
@@ -107,8 +122,9 @@ impl Accounts {
 
         let options = std::str::FromStr::from_str(database_url)
             .map(|o: sqlx::postgres::PgConnectOptions| {
-                // 账号表在 cortex_auth 里，而这个池**只**碰它们。
-                // 不带 public 的话 `ulid` / `sha256` 两个 DOMAIN 解析不到
+                // The account tables live in cortex_auth, and this pool touches
+                // **only** them. Without public in the path, the two DOMAINs
+                // `ulid` and `sha256` cannot be resolved
                 o.options([("search_path", "cortex_auth,public")])
             })
             .map_err(|e: sqlx::Error| {
@@ -128,31 +144,37 @@ impl Accounts {
 }
 
 impl Runtime {
-    /// 从环境变量装配。任何一项配错都在这里失败，而不是等到第一次请求。
+    /// Assemble from the environment. Any misconfiguration fails here rather
+    /// than waiting for the first request.
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             auth: AuthMode::from_env()?,
             tickets: Arc::new(TicketBook::default()),
-            // 建池要 await，而 from_env 是同步的。由 main 在拿到配置之后
-            // 调 `with_accounts` 补上 —— 分两步是为了让「配置错了」
-            // 与「数据库连不上」在日志里是两条不同的失败
+            // Building the pool needs an await while from_env is synchronous.
+            // main fills it in once it has the configuration — splitting it in
+            // two keeps "the configuration is wrong" and "the database is
+            // unreachable" as two distinct failures in the log
             accounts: None,
             access: Arc::new(crate::accounts::AccessBook::default()),
-            // 纯内存、随进程走。**刻意不落库**：进程重启后所有委托凭据失效，
-            // 而那是对的 —— 拿着它的那些调用方也需要被重新接管
+            // Purely in memory, living and dying with the process. **Deliberately
+            // not persisted**: every delegated credential is void after a
+            // restart, and that is correct — the callers holding them need to be
+            // taken over again anyway
             delegations: Arc::new(crate::delegated_token::DelegatedTokens::default()),
         })
     }
 }
 
 impl AppState {
-    /// 账号相关的两个句柄。
+    /// The two account-related handles.
     ///
     /// # Errors
-    /// 这个部署没接数据库（mock 后端）。回 501 而不是 panic ——
-    /// 我一开始写的是 `expect`，理由是「路由层会先挡住」，
-    /// 但那道闸门当时并不存在，于是一次匿名 `GET /auth/me` 就能让
-    /// 这个 handler panic。**「调用方会先检查」不是一种保护。**
+    /// This deployment has no database attached (the mock backend). It answers
+    /// 501 rather than panicking — this was originally written as an `expect`,
+    /// justified by "the routing layer blocks it first", except that gate did
+    /// not exist at the time, so one anonymous `GET /auth/me` was enough to
+    /// panic this handler. **"The caller will check first" is not a
+    /// protection.**
     pub fn accounts(&self) -> Result<&Accounts, crate::routes::ApiError> {
         self.inner.rt.accounts.as_ref().ok_or_else(|| {
             crate::routes::ApiError::unsupported(
@@ -161,39 +183,47 @@ impl AppState {
         })
     }
 
-    /// 已签发的 access token 簿子。
+    /// The book of issued access tokens.
     pub fn access_book(&self) -> &crate::accounts::AccessBook {
         &self.inner.rt.access
     }
 }
 
 enum Backend {
-    /// 假数据源。契约与 Live 完全一致。
+    /// A source of fake data. Its contract is identical to Live's.
     Mock,
-    /// 真实后端：Postgres + LLM + 记忆引擎
+    /// The live backend: Postgres + LLM + the memory engine
     Live(Arc<Live>),
 }
 
-/// `CORTEX_BACKEND` —— 跑哪个后端。**默认 live，且不回落。**
+/// `CORTEX_BACKEND` — which backend to run. **Defaults to live, and never falls
+/// back.**
 ///
-/// # 为什么不能是「连不上就回落到 mock」
+/// # Why it cannot be "fall back to mock when the connection fails"
 ///
-/// 那正是它此前的样子，而它在生产上是这样发作的：cortexd 因为崩溃或 OOM
-/// **自动重启**（`restart: unless-stopped`）时，compose 的
-/// `depends_on: condition: service_healthy` **不生效** —— 那个条件只在
-/// `docker compose up` 那一刻管用。于是 Postgres 恢复期间的一次自动重启，
-/// 会让 cortexd 带着一库假记忆起来并对外服务。
+/// That is exactly what it used to be, and here is how it went off in
+/// production: when cortexd **restarts automatically** after a crash or OOM
+/// (`restart: unless-stopped`), compose's
+/// `depends_on: condition: service_healthy` **does not apply** — that condition
+/// only holds at the moment of `docker compose up`. So one automatic restart
+/// during Postgres recovery brings cortexd up with a database of fabricated
+/// memory and serves traffic from it.
 ///
-/// 而它看起来完全正常：HTTP 200、`status: "ok"`、对话照常、检索有结果。
-/// 只有 `/health` 里 `database: "not_wired"` 一个字段能看出区别，
-/// 而生产 compose 里 cortexd **根本没有配 healthcheck**。
+/// And it looks completely normal: HTTP 200, `status: "ok"`, conversation works,
+/// retrieval returns results. The only field distinguishing it is
+/// `database: "not_wired"` in `/health` — and the production compose file gives
+/// cortexd **no healthcheck at all**.
 ///
-/// 这与 0.1.2 那次「embeddings 找不到权重、静默变成假向量」是同一个失败
-/// 形状：**降级得太安静**。那次写进了 CHANGELOG，这次把它从形状上去掉 ——
-/// 起不来的容器会被 docker 反复重启，直到数据库真的回来，这正是想要的。
+/// This is the same failure shape as the 0.1.2 incident where embeddings could
+/// not find their weights and silently degraded to fake vectors: **degrading too
+/// quietly**. That one went into the CHANGELOG; this one is removed at the level
+/// of shape — a container that cannot come up gets restarted by docker
+/// repeatedly until the database genuinely returns, which is exactly what we
+/// want.
 ///
-/// mock 仍然保留，但必须**明说**。开发时想不带数据库跑就设
-/// `CORTEX_BACKEND=mock`，而那时 `/health` 会如实报 `status: "mock"`。
+/// Mock is still available, but it has to be **said out loud**. To run without a
+/// database during development, set `CORTEX_BACKEND=mock`, and `/health` will
+/// then honestly report `status: "mock"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendChoice {
     Live,
@@ -202,11 +232,12 @@ pub enum BackendChoice {
 
 impl BackendChoice {
     /// # Errors
-    /// 取值不认识时报错。
+    /// An unrecognised value is an error.
     pub fn from_env() -> cortex_core::Result<Self> {
-        // 空串按「没设」处理，与 `CORTEX_EMBED_BACKEND` 同一个理由：
-        // compose 的 `${VAR:-}` 会把没配的变量**设成空串**，而 `env::var`
-        // 对空串返回 `Ok("")`。这个坑在这个仓库里已经出现过三次
+        // An empty string is treated as "not set", for the same reason as
+        // `CORTEX_EMBED_BACKEND`: compose's `${VAR:-}` **sets** an unconfigured
+        // variable to the empty string, and `env::var` returns `Ok("")` for it.
+        // This trap has already sprung three times in this repository
         std::env::var("CORTEX_BACKEND")
             .ok()
             .as_deref()
@@ -216,11 +247,13 @@ impl BackendChoice {
     }
 
     /// # Errors
-    /// 取值不认识时报错 —— **不回落到默认值**。
+    /// An unrecognised value is an error — **it never falls back to the
+    /// default**.
     ///
-    /// 一个打错的 `CORTEX_BACKEND=moc` 悄悄跑成 live 还算幸运；
-    /// 反过来（`CORTEX_BACKEND=liv` 跑成 mock）就是这条修复本来要防的事
-    /// 又从另一个门进来了。
+    /// A mistyped `CORTEX_BACKEND=moc` quietly running as live would be the
+    /// lucky direction; the reverse (`CORTEX_BACKEND=liv` running as mock) is
+    /// the very thing this fix exists to prevent, walking back in through
+    /// another door.
     pub fn parse(s: &str) -> cortex_core::Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "live" | "real" => Ok(Self::Live),
@@ -237,10 +270,12 @@ impl AppState {
         let blobs = MediaStore::connect(&config).await;
         let bus = SyncBus::inert();
 
-        // 定期伪造一次游标推进。看着像多此一举，但没有它，Flutter/CLI 的
-        // 「收到 bump → 去 /sync 补拉 → 推进本地游标」这条主路径在离线开发
-        // 与客户端 CI 里根本跑不到，只能等接上数据库才第一次被执行。
-        // 与 mock_chat_stream 伪造记忆和工具事件是同一个理由。
+        // Fake a cursor advance periodically. It looks superfluous, but without
+        // it the Flutter/CLI main path — "receive a bump → backfill from /sync
+        // → advance the local cursor" — never runs at all during offline
+        // development or in the client's CI, and executes for the first time
+        // only once a database is attached. Same reasoning as mock_chat_stream
+        // fabricating memory and tool events.
         {
             let bus = bus.clone();
             tokio::spawn(async move {
@@ -264,14 +299,18 @@ impl AppState {
         }
     }
 
-    /// 接入真实后端。数据库连不上或缺 API key 都会失败，而**调用方不再降级** ——
-    /// 它把错误一路带到 `main` 并退出。理由见 [`BackendChoice`]。
+    /// Wire up the live backend. An unreachable database or a missing API key
+    /// both fail, and **the caller no longer degrades** — it carries the error
+    /// all the way to `main` and exits. Reasoning in [`BackendChoice`].
     pub async fn new_live(config: &Config, rt: Runtime) -> Result<Self> {
-        // 走进程内共享的那一份（`OnceCell`），而不是自己 new 一个：模型即使
-        // int8 也有近 600 MB，「daemon 而非嵌入式」这个架构决策的收益之一
-        // 就是模型常驻共享，各处各建一份等于把它退回去。
-        // 后端由 CORTEX_EMBED_BACKEND 决定，默认真实语义模型；
-        // CI 与离线开发显式设 hash。
+        // Use the process-wide shared instance (`OnceCell`) rather than
+        // constructing one here: the model is close to 600 MB even in int8, and
+        // one of the payoffs of the "daemon, not embedded" architectural
+        // decision is a resident shared model — building one per site gives that
+        // payoff straight back.
+        //
+        // The backend is chosen by CORTEX_EMBED_BACKEND, defaulting to the real
+        // semantic model; CI and offline development set hash explicitly.
         let embedder: SharedEmbedder = cortex_memory::embed::shared_embedder().await?;
         let live = Live::new(config, embedder).await?;
         let bus = SyncBus::spawn(live.store().clone());
@@ -289,21 +328,23 @@ impl AppState {
             }),
         };
 
-        // ── 已有租户的 migration ─────────────────────────────
+        // ── Migrating the tenants that already exist ─────────
         //
-        // 新注册的用户由 `provision` 迁移，而**已经存在的**租户此前一次
-        // 都没被迁过：`migrate_all` 写好了、导出了，没有任何一处调用它。
-        // 后果是加一条新 migration 之后，老用户的库停在旧结构上 ——
-        // 表现是零散的 SQL 错误，不是一条能读的启动失败。
+        // Newly registered users are migrated by `provision`, while tenants that
+        // **already exist** had never once been migrated: `migrate_all` was
+        // written and exported, with not a single call site. The consequence is
+        // that after adding a new migration, older users' databases stay on the
+        // old structure — manifesting as scattered SQL errors rather than one
+        // readable startup failure.
         //
-        // 坏掉的单独标出来，不拖垮整个服务：一个用户的库坏了，
-        // 其他人照常。
+        // Broken ones are called out individually and do not drag the service
+        // down: one user's database being broken leaves everyone else working.
         if let Ok(schemas) = st.tenant_schemas().await
             && let Ok(acc) = st.accounts()
         {
             let others: Vec<_> = schemas
                 .into_iter()
-                // public 上面刚迁过（`Live::new` 里那一句）
+                // public was migrated a moment ago (that line in `Live::new`)
                 .filter(|s| s.as_str() != cortex_store::SchemaName::public().as_str())
                 .collect();
             if !others.is_empty() {
@@ -317,31 +358,38 @@ impl AppState {
             }
         }
 
-        // 预签名直传那条路上服务端从没经手字节，转录无从触发 —— 大文件成了
-        // 纯归档。回扫器以 blobs 表为权威清单把它们捡回来。
-        // 未配 vision 模型时它自己不会启动。
+        // On the presigned direct-upload path the server never handles the bytes
+        // and transcription has nothing to trigger it — so large files become
+        // pure archive. The rescanner treats the blobs table as the
+        // authoritative inventory and picks them back up. It does not start
+        // itself when no vision model is configured.
         crate::backfill::spawn(st.clone(), blobs);
-        // 换过 embedding 模型时把旧事实的向量补出来。默认开着 ——
-        // 关掉的代价（旧记忆永久退出向量召回）没有任何症状，
-        // 而开着的代价（一次全库 embedding 调用）是可见的，
-        // 且它会先把数字报出来再动手。见 reembed 的模块注释
+        // Fill in the vectors for old facts after an embedding model change. On
+        // by default — the cost of turning it off (old memory permanently
+        // exiting vector retrieval) has no symptom at all, while the cost of
+        // leaving it on (one embedding call per row in the database) is visible,
+        // and it states the numbers before acting. See reembed's module comment
         crate::reembed::spawn(st.clone());
 
         Ok(st)
     }
 
-    /// 不碰网络、不碰文件系统的最小状态，专供 crate 内的 HTTP 测试。
+    /// A minimal state that touches neither the network nor the filesystem,
+    /// purely for the crate's own HTTP tests.
     ///
-    /// # 为什么不复用 `new_mock`
+    /// # Why `new_mock` is not reused
     ///
-    /// 它会 `MediaStore::connect`（一次真实的 S3 往返 + 失败后在工作目录里
-    /// 建回落目录），还会 spawn 一个每 10 秒推一次假游标的后台任务。
-    /// 一条「没带凭据要拿 401」的测试不该依赖这些东西 —— 这正是
-    /// 上一轮认为「路由测试做不了」的那个障碍，而它其实只是一个构造函数
-    /// 的问题，不是 bin crate 的问题。
+    /// It calls `MediaStore::connect` (a real S3 round trip, plus creating a
+    /// fallback directory in the working directory on failure) and spawns a
+    /// background task pushing a fake cursor every 10 seconds. A test asserting
+    /// "no credential means 401" should not depend on any of that — this was
+    /// precisely the obstacle behind the earlier belief that "route tests cannot
+    /// be done", and it turned out to be a constructor problem, not a bin-crate
+    /// problem.
     ///
-    /// 契约与 mock 后端完全一致（`Backend::Mock`），所以测试打到的仍然是
-    /// **真实的** [`crate::routes::router`] 与真实的处理器。
+    /// The contract is identical to the mock backend's (`Backend::Mock`), so
+    /// what the tests hit is still the **real** [`crate::routes::router`] and the
+    /// real handlers.
     #[cfg(test)]
     pub fn for_tests(rt: Runtime) -> Self {
         Self {
@@ -372,7 +420,7 @@ impl AppState {
         }
     }
 
-    // ───────────────────────── 认证 ─────────────────────────
+    // ─────────────────────── authentication ─────────────────
 
     #[must_use]
     pub fn auth_mode(&self) -> &AuthMode {
@@ -389,9 +437,9 @@ impl AppState {
         &self.inner.rt.delegations
     }
 
-    // ───────────────────────── 多租户 ─────────────────────────
+    // ─────────────────────── multi-tenancy ──────────────────
 
-    /// 真实后端的句柄。后台任务用它按租户绑定。
+    /// The live backend's handle. Background jobs use it to bind per tenant.
     #[must_use]
     pub fn live(&self) -> Option<&Arc<Live>> {
         match &self.inner.backend {
@@ -400,22 +448,24 @@ impl AppState {
         }
     }
 
-    /// 现在有哪些租户。**每次重新查**，不缓存。
+    /// Which tenants exist right now. **Re-queried every time**, never cached.
     ///
-    /// 后台任务靠它遍历。缓存一份的话，注册之后新用户要等到下次重启才被
-    /// 回填覆盖到 —— 而那是静默的：他只是觉得「语义召回好像差一点」。
+    /// Background jobs iterate over it. Cached, a newly registered user would
+    /// not be covered by the backfill until the next restart — silently: all
+    /// they notice is that "semantic retrieval seems a bit worse".
     ///
-    /// 没接账号体系时返回 `[public]` —— 单用户自托管的形态。
+    /// With no accounts system attached this returns `[public]` — the
+    /// single-user self-hosted shape.
     ///
     /// # Errors
-    /// 查不动 `cortex_auth.users`。
+    /// `cortex_auth.users` could not be queried.
     pub async fn tenant_schemas(&self) -> Result<Vec<cortex_store::SchemaName>> {
         let Ok(acc) = self.accounts() else {
             return Ok(vec![cortex_store::SchemaName::public()]);
         };
         let names: Vec<String> = sqlx::query_scalar(
-            // disabled 的账号不迁、不回填 —— 他登不进来，花在他身上的
-            // embedding 钱是纯浪费
+            // A disabled account is neither migrated nor backfilled — they
+            // cannot log in, so embedding money spent on them is pure waste
             "SELECT schema_name FROM cortex_auth.users WHERE disabled_at IS NULL",
         )
         .fetch_all(&acc.pool)
@@ -427,7 +477,8 @@ impl AppState {
             .filter_map(|n| match cortex_store::SchemaName::new(n) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    // 跳过而不是整批失败：一行坏数据不该让所有人的回填停摆
+                    // Skip rather than failing the whole batch: one bad row
+                    // must not halt everybody's backfill
                     tracing::error!(schema = n, error = %e, "跳过一个 schema 名不合法的租户");
                     None
                 }
@@ -435,10 +486,10 @@ impl AppState {
             .collect())
     }
 
-    /// 某个租户的 `Store`。后台任务用。
+    /// One tenant's `Store`. Used by background jobs.
     ///
     /// # Errors
-    /// mock 后端，或者那个 schema 的池建不起来。
+    /// The mock backend, or the pool for that schema cannot be created.
     pub async fn tenant_store(
         &self,
         schema: &cortex_store::SchemaName,
@@ -456,11 +507,13 @@ impl AppState {
             .map_err(|e| CortexError::Store(format!("连不上 {}：{e}", schema.as_str())))
     }
 
-    /// `public` 那个池 —— 启动时建的那一个。mock 后端下没有。
+    /// The `public` pool — the one built at startup. Absent under the mock
+    /// backend.
     ///
-    /// **不是「默认租户」**。它只在两种情况下被当作租户用：没接账号体系
-    /// （单用户自托管），以及 1 号用户（他的 schema 名就叫 `public`）。
-    /// 其余用户一律走 [`crate::request_tenant::Tenant`] 里那条查表的路。
+    /// **This is not a "default tenant".** It is used as a tenant in exactly two
+    /// situations: no accounts system attached (single-user self-hosting), and
+    /// user #1 (whose schema is literally named `public`). Every other user goes
+    /// through the table lookup in [`crate::request_tenant::Tenant`].
     #[must_use]
     pub fn public_store(&self) -> Option<std::sync::Arc<cortex_store::Store>> {
         match &self.inner.backend {
@@ -469,17 +522,18 @@ impl AppState {
         }
     }
 
-    // ───────────────────── 实时同步（/ws）─────────────────────
+    // ─────────────────── realtime sync (/ws) ────────────────
 
     #[must_use]
     pub fn subscribe_sync(&self) -> broadcast::Receiver<SyncEvent> {
         self.inner.bus.subscribe()
     }
 
-    /// 服务端当前的同步游标末端。
+    /// The server's current end of the sync cursor.
     ///
-    /// 读失败一律返回 0：客户端拿到偏小的游标只会多拉一次（无害），
-    /// 拿到偏大的才会永久漏行。
+    /// A failed read always returns 0: a client receiving too small a cursor
+    /// merely fetches once more (harmless), whereas too large a one loses rows
+    /// permanently.
     pub async fn latest_cursor(&self) -> i64 {
         match &self.inner.backend {
             Backend::Mock => MOCK_CURSOR.load(std::sync::atomic::Ordering::Relaxed),
@@ -487,14 +541,16 @@ impl AppState {
         }
     }
 
-    /// `/health` 顶上那一行。
+    /// The top line of `/health`.
     ///
-    /// mock 后端**不报 `ok`**：那个词在探针眼里意味着「这个服务可以承接
-    /// 流量」，而一个返回假数据的进程不可以。此前它报 `ok`，
-    /// 与「数据是真的」唯一的区别是下面 `database` 那一行。
+    /// The mock backend **does not report `ok`**: to a probe, that word means
+    /// "this service can take traffic", and a process returning fabricated data
+    /// cannot. It used to report `ok`, with the `database` line below as the
+    /// only thing distinguishing it from "the data is real".
     ///
-    /// 现在 mock 只能是显式选的（见 [`BackendChoice`]），所以这一行主要是
-    /// 给开发时一眼确认「我到底连没连上库」—— 但它值得如实说。
+    /// Mock can now only be chosen explicitly (see [`BackendChoice`]), so this
+    /// line mostly serves to confirm at a glance during development whether a
+    /// database is actually attached — but it deserves to say so honestly.
     #[must_use]
     pub fn status(&self) -> &'static str {
         match &self.inner.backend {
@@ -515,7 +571,8 @@ impl AppState {
         self.inner.blobs.backend()
     }
 
-    /// 向量化的覆盖情况，进 `/health`。mock 后端没有数据库可查，返回 `None`。
+    /// Vectorization coverage, reported in `/health`. The mock backend has no
+    /// database to query, so it returns `None`.
     pub async fn embedding_health(&self) -> Option<crate::dto::EmbeddingHealth> {
         match &self.inner.backend {
             Backend::Mock => None,
@@ -523,23 +580,26 @@ impl AppState {
         }
     }
 
-    /// 本部署能不能签 presigned URL。见 [`MediaStore::supports_presign`]。
+    /// Whether this deployment can sign presigned URLs. See
+    /// [`MediaStore::supports_presign`].
     #[must_use]
     pub fn supports_presign(&self) -> bool {
         self.inner.blobs.supports_presign()
     }
 
-    // ───────────────────────── 媒体 ─────────────────────────
+    // ────────────────────────── media ───────────────────────
 
-    /// 服务端中转上传：对象存储 → `blobs` 行。§九 三步顺序的前两步。
+    /// Server-relayed upload: object storage → the `blobs` row. The first two of
+    /// the three fixed steps in §9.
     pub async fn upload_blob(
         &self,
         tenant: &Tenant,
         bytes: Bytes,
         declared_mime: Option<&str>,
     ) -> Result<BlobDto> {
-        // 留一份给转录用。内容寻址下这份字节就是最终内容，
-        // 不必等落库后再从对象存储取回来一遍
+        // Keep a copy for transcription. Under content addressing these bytes
+        // are the final content, so there is no need to fetch them back from
+        // object storage after the row lands
         let for_transcribe = bytes.clone();
         let stored = self.inner.blobs.put(bytes, declared_mime).await?;
         self.register(
@@ -553,14 +613,14 @@ impl AppState {
         .await
     }
 
-    /// 一个用户的 `Store`，**入口是 user id 而不是请求头**。
+    /// A user's `Store`, **entered from a user id rather than request headers**.
     ///
-    /// 后台任务（快照）手上只有沙箱令牌里记着的 owner，没有 access token，
-    /// 所以走不了 [`Self::tenant`] 那条路。详见
-    /// [`Self::tenant_for_user`]。
+    /// Background jobs (snapshots) hold only the owner recorded in a sandbox
+    /// token and no access token, so [`Self::tenant`]'s path is unavailable to
+    /// them. Details in [`Self::tenant_for_user`].
     ///
     /// # Errors
-    /// 租户解析失败，或 mock 后端下没有库。
+    /// Tenant resolution failed, or the mock backend has no database.
     pub async fn tenant_store_for_user(
         &self,
         user_id: &str,
@@ -577,11 +637,13 @@ impl AppState {
         }
     }
 
-    /// 签一张直传 URL。客户端**先算好哈希**再来要 —— 内容寻址不存在
-    /// 「先传上去再定 key」。
+    /// Sign a direct-upload URL. The client **computes the hash first** and then
+    /// asks — content addressing has no "upload first and decide the key
+    /// afterwards".
     pub async fn presign_upload(&self, hash: &str) -> Result<BlobPresignResponse> {
-        // 先探一次：这份内容可能早就在了（转发同一张图、跨设备重传）。
-        // 告诉客户端「不用传了」是内容寻址在移动端上最直接的一笔收益
+        // Probe first: this content may well already be there (forwarding the
+        // same image, re-uploading across devices). Telling the client "no need
+        // to upload" is content addressing's most direct payoff on mobile
         let already_uploaded = self.inner.blobs.exists(hash).await?;
         let url = self.inner.blobs.presign_put(hash).await?;
         Ok(BlobPresignResponse {
@@ -592,22 +654,29 @@ impl AppState {
         })
     }
 
-    /// 直传完成后的登记。
+    /// Registration after a direct upload completes.
     ///
-    /// # 这里对客户端信到什么程度
+    /// # How far the client is trusted here
     ///
-    /// - **哈希**：不复核。复核要把整个对象拉下来重算一遍，那正好抵消掉
-    ///   直传省下的带宽 —— presign 这条路就白铺了。星型拓扑下上传者就是
-    ///   数据的主人，谎报哈希只会污染他自己的记忆库。
-    /// - **字节数**：不复核。`BlobStore` 没有 HEAD 能力，唯一的办法同样是整取。
-    ///   它只影响 `Content-Length` 与 range 的分母，报错了表现为播放器多要
-    ///   一次或少要一次，不会损坏内容。
-    /// - **MIME**：**不信**。只拉头几 KB 嗅探，与直传路径的规矩一致 ——
-    ///   把 `application/octet-stream` 写进 `blobs.mime`，这份内容对将来的
-    ///   转录 pipeline 就是黑洞，而那时它已经沉在库底了。
+    /// - **The hash**: not re-verified. Re-verifying would mean pulling the
+    ///   whole object down and recomputing, which exactly cancels the bandwidth
+    ///   direct upload saved — the presign path would have been laid for
+    ///   nothing. In a star topology the uploader is the owner of the data, so
+    ///   lying about the hash only pollutes their own memory database.
+    /// - **The byte count**: not re-verified. `BlobStore` has no HEAD
+    ///   capability, and the only alternative is again a full fetch. It affects
+    ///   only `Content-Length` and the denominator of a range, so getting it
+    ///   wrong shows up as a player asking once too many or too few times; it
+    ///   cannot corrupt content.
+    /// - **The MIME**: **not trusted**. Only the first few KB are pulled and
+    ///   sniffed, matching the rule on the direct-upload path — write
+    ///   `application/octet-stream` into `blobs.mime` and this content is a
+    ///   black hole for the future transcription pipeline, by which point it has
+    ///   already sunk to the bottom of the database.
     ///
-    /// 唯一硬性检查是**对象真的在**：不在就绝不写 `blobs` 行，否则会留下
-    /// 一条取不回内容的悬空引用，而那是无法自愈的。
+    /// The one hard check is that **the object really is there**: if it is not,
+    /// the `blobs` row is never written, or it would leave a dangling reference
+    /// whose content can never be fetched — and that cannot heal itself.
     pub async fn commit_blob(&self, tenant: &Tenant, req: BlobCommitRequest) -> Result<BlobDto> {
         if req.size_bytes < 0 {
             return Err(CortexError::Invalid(format!(
@@ -627,14 +696,18 @@ impl AppState {
             .blobs
             .sniff_mime(&req.hash, req.mime.as_deref())
             .await?;
-        // 这条路上服务端没经手字节，「有没有真的传」只有客户端知道 ——
-        // 所以去重与否完全交给 `register` 按 blobs 行的存在性判定
+        // On this path the server never handled the bytes, so only the client
+        // knows whether an upload actually happened — deduplication is
+        // therefore left entirely to `register`, deciding by the existence of a
+        // blobs row
         self.register(tenant, &req.hash, &mime, req.size_bytes, false, None)
             .await
     }
 
-    /// 登记 blob 行。`bytes` 只有直传那条路有 —— presign 直传时服务端
-    /// 根本没经手字节，转录要等将来的后台补扫（尚未实现，已记入 roadmap）。
+    /// Register the blob row. `bytes` is present only on the relayed path —
+    /// with presigned direct upload the server never handled the bytes at all,
+    /// and transcription has to wait for a future background rescan (not yet
+    /// implemented, recorded in the roadmap).
     async fn register(
         &self,
         tenant: &Tenant,
@@ -645,8 +718,9 @@ impl AppState {
         bytes: Option<bytes::Bytes>,
     ) -> Result<BlobDto> {
         let seq = match &self.inner.backend {
-            // mock 没有 blobs 表。伪造一次游标推进，让客户端的
-            // 「收到 bump → 补拉」这条路径在离线开发时也走得到
+            // mock has no blobs table. Fake a cursor advance so the client's
+            // "receive a bump → backfill" path is exercised during offline
+            // development too
             Backend::Mock => {
                 let cursor = MOCK_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 self.inner.bus.publish(SyncEvent::Bump { cursor });
@@ -659,11 +733,15 @@ impl AppState {
                         hash: hash.to_owned(),
                         mime: mime.to_owned(),
                         size_bytes,
-                        // 与 blobs::MediaStore 用的是同一个前缀 —— 那边写对象，
-                        // 这边写指向它的那一行，两者必须一致
-                        // 前缀跟着租户走。写死 "public" 会让所有人的对象
-                        // 挤在同一个前缀下 —— 那正是「加前缀换掉一类 GC bug」
-                        // 想避免的：A 删掉最后一条引用时字节还被 B 引用着
+                        // The same prefix blobs::MediaStore uses — that side
+                        // writes the object, this side writes the row pointing
+                        // at it, and the two must agree.
+                        //
+                        // The prefix follows the tenant. Hard-coding "public"
+                        // would crowd everybody's objects under one prefix —
+                        // which is exactly what "add a prefix to trade away a
+                        // class of GC bug" avoids: A deleting its last reference
+                        // while the bytes are still referenced by B
                         storage_key: cortex_blob::hash::storage_key(
                             &cortex_blob::TenantPrefix::new(tenant.schema()).map_err(|e| {
                                 CortexError::Invalid(format!("租户前缀不合法：{e}"))
@@ -673,8 +751,10 @@ impl AppState {
                     })
                     .await?;
 
-                // 只在**首次**登记时转录（seq.is_some()）：内容寻址下重复上传
-                // 是同一份字节，转录结果也会一模一样，重转纯属白烧模型钱
+                // Transcribe only on **first** registration (seq.is_some()):
+                // under content addressing a repeated upload is the same bytes,
+                // the transcription result would be identical, and redoing it
+                // burns model money for nothing
                 if let (Some(_), Some(b)) = (seq, bytes) {
                     l.spawn_transcription(hash.to_owned(), b, mime.to_owned());
                 }
@@ -686,26 +766,32 @@ impl AppState {
             hash: hash.to_owned(),
             mime: mime.to_owned(),
             size_bytes,
-            // register_blob 返回 None 即「早就登记过」，那比对象存储那一侧的
-            // 去重判定更权威 —— 它看的是 blobs 表，而不是「这次有没有传字节」
+            // register_blob returning None means "already registered", which is
+            // more authoritative than object storage's own deduplication
+            // verdict — it looks at the blobs table, not at "were bytes
+            // uploaded this time"
             deduplicated: deduplicated || seq.is_none(),
             seq,
         })
     }
 
-    /// 取回时要用的元信息：MIME 与总长度。
+    /// The metadata needed when fetching: MIME and total length.
     ///
-    /// 总长度是 `Content-Range` 的分母 —— 没有它就没法回 206，
-    /// 而没有 206 播放器就只能从头拉整个文件。
+    /// The total length is the denominator of `Content-Range` — without it a
+    /// 206 is impossible, and without a 206 a player can only pull the whole
+    /// file from the start.
     pub async fn blob_meta(&self, tenant: &Tenant, hash: &str) -> Result<(String, i64)> {
-        // 先校验形制再查库。不校验也不会不安全（存储层自己会拦），但畸形的
-        // 哈希会先撞上「blobs 表里没有这一行」而变成 404 —— 报给客户端的是
-        // 「找不到」，而真相是「你传的根本不是一个哈希」。
+        // Validate the shape before querying the database. Skipping it would not
+        // be unsafe (the storage layer stops it anyway), but a malformed hash
+        // would first run into "there is no such row in the blobs table" and
+        // become a 404 — what the client is told is "not found", while the truth
+        // is "what you sent is not a hash at all".
         cortex_blob::hash::validate_hash(hash)?;
 
         match &self.inner.backend {
-            // mock 没有 blobs 表，只能从对象本身现算。整取一次是可以接受的：
-            // 这条路只在离线开发与客户端 CI 上跑
+            // mock has no blobs table, so it can only compute from the object
+            // itself. One full fetch is acceptable: this path runs only during
+            // offline development and in the client's CI
             Backend::Mock => {
                 let bytes = self.inner.blobs.get(hash).await?;
                 let mime = cortex_blob::probe_media(&bytes).resolve_mime(None);
@@ -725,11 +811,13 @@ impl AppState {
         }
     }
 
-    /// 直下 URL。手机播视频走它，省掉经 cortexd 中转的那一半带宽。
+    /// A direct download URL. Phones playing video use it, saving the half of
+    /// the bandwidth that relaying through cortexd would cost.
     pub async fn blob_download_url(&self, tenant: &Tenant, hash: &str) -> Result<BlobUrlResponse> {
-        // 先确认这个 blob 是**登记过**的，再签 URL。
-        // 直接签会把「对象存储里恰好有这个 key」变成可探测的信息，
-        // 也会让客户端拿到一条数据库里根本不认识的内容
+        // Confirm this blob **was registered** before signing a URL. Signing
+        // directly would turn "object storage happens to hold this key" into
+        // probeable information, and would also hand the client content the
+        // database knows nothing about
         let _ = self.blob_meta(tenant, hash).await?;
         Ok(BlobUrlResponse {
             url: self.inner.blobs.presign_get(hash).await?,
@@ -737,12 +825,15 @@ impl AppState {
         })
     }
 
-    /// 本地 agent 把一轮对话写回记忆库。见 [`Live::write_episode`]。
+    /// The local agent writing one conversational turn back into the memory
+    /// database. See [`Live::write_episode`].
     ///
-    /// mock 后端下**不假装写成功**：本地 agent 会据此以为记忆已经落库，
-    /// 于是把队列里那一条划掉 —— 那才是真的丢数据。
-    /// `origin` 决定抽出来的 fact 落在哪个信任级 ——
-    /// 见 [`cortex_memory::extract::TurnOrigin`]。
+    /// Under the mock backend it **does not pretend the write succeeded**: the
+    /// local agent would take that to mean the memory landed and cross that
+    /// entry off its queue — and that really would lose data.
+    ///
+    /// `origin` decides which trust tier the extracted facts land in — see
+    /// [`cortex_memory::extract::TurnOrigin`].
     pub async fn write_episode(
         &self,
         tenant: &Tenant,
@@ -757,13 +848,17 @@ impl AppState {
         }
     }
 
-    /// LLM 代理 —— 把一次流式调用原样转给供应商。
+    /// The LLM proxy — forward one streaming call to the provider verbatim.
     ///
-    /// 本地 agent 默认走这条路：API key 只在服务端一处，多设备不用每台配一遍。
-    /// 它**不碰记忆、不写库**，纯转发。
+    /// The local agent takes this path by default: the API key lives in exactly
+    /// one place on the server, so it does not have to be configured on every
+    /// device. It **touches no memory and writes to no database**; it is pure
+    /// forwarding.
     ///
-    /// mock 后端下没有可转发的对象，返回 `Unavailable` 而不是伪造一段流：
-    /// 假的 token 流会让本地 agent 看着能跑，直到有人问它为什么答非所问。
+    /// Under the mock backend there is nothing to forward to, so it returns
+    /// `Unavailable` rather than fabricating a stream: a fake token stream would
+    /// leave the local agent looking functional right up until somebody asks why
+    /// its answers have nothing to do with the question.
     pub async fn llm_stream(
         &self,
         req: LlmStreamRequest,
@@ -777,7 +872,7 @@ impl AppState {
         }
     }
 
-    // ───────────────────────── 记忆 ─────────────────────────
+    // ────────────────────────── memory ──────────────────────
 
     pub async fn memory_search(
         &self,
@@ -789,14 +884,18 @@ impl AppState {
                 let facts = mock_facts()
                     .into_iter()
                     .filter(|f| q.q.is_empty() || f.statement.contains(&q.q))
-                    // 日常检索**看不到失效事实**（真实后端的四路召回只查
-                    // active_facts）；回放照样给，只是带上 invalidated=true。
-                    // 这个区别必须在 mock 上也成立，否则客户端 CI 里
-                    // 「不带 as_of 时不该出现已失效的事实」这条断言在 mock 上
-                    // 是永远绿的，而它测的是一个比真实后端宽松的契约
+                    // Ordinary retrieval **cannot see invalidated facts** (the
+                    // live backend's four retrieval paths query active_facts
+                    // only); replay still returns them, merely carrying
+                    // invalidated=true. This distinction must hold on mock as
+                    // well, or the client CI's assertion "no invalidated fact
+                    // may appear without as_of" is permanently green on mock
+                    // while testing a contract looser than the live backend's
                     .filter(|f| q.as_of.is_some() || !f.invalidated)
-                    // 时间回放：只返回在 as_of 时刻系统已经知道的事实。
-                    // 这是双时间轴的系统时间轴，对应「三个月前我以为什么」。
+                    // Time replay: return only the facts the system already knew
+                    // at the as_of instant. This is the system-time axis of the
+                    // bitemporal record, answering "what did I believe three
+                    // months ago".
                     .filter(|f| match (&q.as_of, &f.valid_at) {
                         (Some(t), Some(v)) => v.as_str() <= t.as_str(),
                         _ => true,
@@ -818,12 +917,15 @@ impl AppState {
         }
     }
 
-    /// 检索并渲染成给模型看的那段文本。对外 MCP server 的读侧。
+    /// Retrieve and render the block of text the model reads. The read side of
+    /// the outward-facing MCP server.
     ///
-    /// **mock 也走同一段渲染**（`injection::render_turn_block`）而不是回一句
-    /// 假话：客户端与集成测试跑在 mock 上，回一句「模拟数据」会让
-    /// 「那道『记忆是背景数据不是指令』的框定还在不在」这条断言
-    /// 在 mock 上永远是绿的 —— 而那正是它唯一要守的东西。
+    /// **mock goes through the same rendering**
+    /// (`injection::render_turn_block`) rather than returning a canned line:
+    /// clients and integration tests run on mock, and answering with "simulated
+    /// data" would make the assertion "is the framing 'memory is background data,
+    /// not instructions' still present" permanently green on mock — and that
+    /// framing is the one thing it exists to guard.
     pub async fn memory_search_text(
         &self,
         tenant: &Tenant,
@@ -861,10 +963,12 @@ impl AppState {
         }
     }
 
-    /// 核心画像块。MCP 的 `cortex://profile` 读的就是它。
+    /// The core profile block. This is what MCP's `cortex://profile` reads.
     ///
-    /// mock 上回空串而不是编一段画像：一个假的「用户偏好」会被第三方 agent
-    /// 当真放进上下文，而它在 mock 上分不出真假。
+    /// On mock this returns an empty string rather than inventing a profile: a
+    /// fabricated "user preference" would be taken at face value by a
+    /// third-party agent and placed into context, and on mock it has no way to
+    /// tell real from fake.
     pub async fn profile_text(&self, tenant: &Tenant, limit: i64) -> Result<String> {
         match &self.inner.backend {
             Backend::Mock => Ok(String::new()),
@@ -885,12 +989,16 @@ impl AppState {
         q: &ListSessionsQuery,
     ) -> Result<Vec<SessionDto>> {
         match &self.inner.backend {
-            // mock 里没有归档的会话，include_archived 因此不改变结果。
-            // 仍然把参数收下：客户端要能在离线开发时验证自己拼对了查询串。
+            // mock has no archived sessions, so include_archived does not change
+            // the result. The parameter is still accepted: the client has to be
+            // able to verify it assembled the query string correctly during
+            // offline development.
             //
-            // project_id 则**照样过滤**：客户端 CI 里「点开项目只看得到
-            // 这个项目的会话」这条断言，在一个无视过滤器的 mock 上永远是绿的，
-            // 而它测的正是这个查询串有没有拼对
+            // project_id, however, **is still filtered on**: the client CI's
+            // assertion "opening a project shows only that project's sessions"
+            // would be permanently green against a mock that ignores the filter,
+            // while what it tests is precisely whether that query string was
+            // assembled correctly
             Backend::Mock => Ok(mock_sessions()
                 .into_iter()
                 .filter(|s| q.project_id.is_none() || s.project_id == q.project_id)
@@ -899,7 +1007,7 @@ impl AppState {
         }
     }
 
-    // ───────────────────────── 项目 ─────────────────────────
+    // ────────────────────────── projects ────────────────────
 
     pub async fn list_projects(&self, tenant: &Tenant) -> Result<Vec<ProjectDto>> {
         match &self.inner.backend {
@@ -910,8 +1018,9 @@ impl AppState {
 
     pub async fn create_project(&self, tenant: &Tenant, name: &str) -> Result<ProjectDto> {
         match &self.inner.backend {
-            // mock 不落库，但**照样跑一遍校验**：客户端 CI 里「空名字会被拒」
-            // 这条断言必须在 mock 上也成立，否则它测的是一个比真实后端宽松的契约
+            // mock persists nothing, but it **still runs the validation**: the
+            // client CI's assertion "an empty name is rejected" has to hold on
+            // mock too, or it tests a contract looser than the live backend's
             Backend::Mock => Ok(ProjectDto {
                 id: Id::new().to_string(),
                 name: crate::live::validate_project_name(name)?,
@@ -959,9 +1068,10 @@ impl AppState {
         patch: SessionPatch,
     ) -> Result<SessionDto> {
         match &self.inner.backend {
-            // mock 不落库，但**照样跑一遍校验**：客户端 CI 里
-            // 「绑到 C:\Windows 会被拒」这条断言必须在 mock 上也成立，
-            // 否则它测的是一个比真实后端宽松的契约
+            // mock persists nothing, but it **still runs the validation**: the
+            // client CI's assertion "binding to C:\Windows is rejected" has to
+            // hold on mock too, or it tests a contract looser than the live
+            // backend's
             Backend::Mock => {
                 let mut s = mock_sessions()
                     .into_iter()
@@ -978,19 +1088,21 @@ impl AppState {
                 if let Some(a) = patch.archived {
                     s.archived = a;
                 }
-                // **走 live 那一份判断，不是自己写一遍。**
+                // **Use live's decision, do not write a second copy of it.**
                 //
-                // 原先这里是 `cortex_agent::workspace::validate` —— 也就是
-                // mock **接受**绑定，而 live 一律拒绝（见
-                // `live::workspace_patch` 的那段理由）。契约的两个实现就此
-                // 分岔：客户端 CI 跑在 mock 上，于是「服务端不接受绑定」这条
-                // 在 CI 里从来没被验证过，反而验证了它的反面。
+                // This used to be `cortex_agent::workspace::validate` — i.e.
+                // mock **accepted** the binding while live refused every one
+                // (see the reasoning in `live::workspace_patch`). That forked
+                // the contract's two implementations: the client CI runs on
+                // mock, so "the server does not accept the binding" was never
+                // verified in CI, and its opposite was verified instead.
                 if crate::live::workspace_patch(patch.workspace.as_ref().map(Option::as_deref))? {
                     s.workspace = None;
                 }
-                // 三态照搬：客户端 CI 要能验证「显式 null 是移出、字段缺席是
-                // 不动」这条契约，而那件事在一个不理会 project_id 的 mock 上
-                // 是测不出来的
+                // The three states are reproduced faithfully: the client CI has
+                // to be able to verify the contract "an explicit null removes,
+                // an absent field leaves it alone", and that cannot be tested
+                // against a mock that ignores project_id
                 if let Some(p) = &patch.project_id {
                     s.project_id = p.clone();
                 }
@@ -1015,9 +1127,10 @@ impl AppState {
                         kind: "session",
                         id: id.into(),
                     })?;
-                // mock 只有一条消息，翻不了页。但游标**照样校验** ——
-                // 客户端 CI 里「传了个坏游标会拿到 400」这条断言必须在 mock 上
-                // 也成立，否则它测的是一个比真实后端宽松的契约
+                // mock has only one message, so there is nothing to page
+                // through. But the cursor **is still validated** — the client
+                // CI's assertion "a bad cursor gets a 400" has to hold on mock
+                // too, or it tests a contract looser than the live backend's
                 if let Some(raw) = q.before.as_deref() {
                     let _ = crate::cursor::decode(raw)?;
                 }
@@ -1032,13 +1145,15 @@ impl AppState {
         }
     }
 
-    // ───────────────────────── 同步 ─────────────────────────
+    // ─────────────────────────── sync ───────────────────────
 
     pub async fn sync_since(&self, tenant: &Tenant, q: SyncQuery) -> Result<SyncResponse> {
         match &self.inner.backend {
             Backend::Mock => {
-                // 尚无真实 sync_log，但游标语义先跑通：客户端能验证
-                // 「拉到空即已追平」的收敛逻辑，而不是等接线后才发现协议误解。
+                // There is no real sync_log yet, but the cursor semantics are
+                // exercised first: the client can verify the convergence logic
+                // "an empty page means we have caught up", rather than
+                // discovering a protocol misunderstanding after wiring it up.
                 let _ = q.limit.clamp(1, 1000);
                 Ok(SyncResponse {
                     cursor: q.since,
@@ -1051,7 +1166,7 @@ impl AppState {
     }
 }
 
-// ─────────────────────── mock 数据源 ───────────────────────
+// ─────────────────────── the mock data source ──────────────
 
 fn mock_episode(id: &str) -> EpisodeDto {
     EpisodeDto {
@@ -1061,8 +1176,9 @@ fn mock_episode(id: &str) -> EpisodeDto {
         text: Some("对象存储先用 RustFS，第一版单卷即可。".into()),
         occurred_at: Utc::now().to_rfc3339(),
         attachments: vec![],
-        // 伪造一条注入归因，让客户端能在离线开发时把「为什么记得这个」
-        // 抽屉真的画出来 —— 与 mock_chat_stream 伪造记忆事件同一个理由
+        // Fabricate one injection attribution so the client can actually draw
+        // the "why do you remember this" drawer during offline development —
+        // same reasoning as mock_chat_stream fabricating memory events
         memories: vec![InjectedMemoryDto {
             fact_id: "01JFACT00000000000000001".into(),
             statement: Some("Cortex 的对象存储使用 RustFS".into()),
@@ -1076,9 +1192,11 @@ fn mock_episode(id: &str) -> EpisodeDto {
     }
 }
 
-/// 假项目。**刻意只有一个**，且 mock 的会话里恰好一个属于它、一个不属于 ——
-/// 客户端要能在离线开发时同时画出「项目里的会话」与「未分组」两种形态，
-/// 而两条样本都在同一个项目里的话，未分组那段 UI 一次都不会被执行到。
+/// The fake project. **Deliberately only one**, with exactly one of the mock
+/// sessions belonging to it and one not — the client has to be able to draw
+/// both "a session inside a project" and "ungrouped" during offline
+/// development, and if both samples were in the same project, the ungrouped
+/// branch of the UI would never be executed once.
 fn mock_projects() -> Vec<ProjectDto> {
     vec![ProjectDto {
         id: MOCK_PROJECT.into(),
@@ -1088,8 +1206,9 @@ fn mock_projects() -> Vec<ProjectDto> {
     }]
 }
 
-/// mock 里那个项目的 id。会话与项目两处都引它，写成字面量迟早对不上，
-/// 而对不上的表现是「mock 上项目永远是空的」。
+/// The id of that project in mock. Both the sessions and the projects reference
+/// it, and written as a literal in two places they would eventually disagree —
+/// the symptom of which is "projects are always empty on mock".
 const MOCK_PROJECT: &str = "01JPROJECT0000000000000001";
 
 fn mock_sessions() -> Vec<SessionDto> {
@@ -1117,23 +1236,27 @@ fn mock_sessions() -> Vec<SessionDto> {
             preview: Some("sync_log 用单游标，跨全部表。".into()),
             title_is_custom: false,
             archived: false,
-            // 刻意不编一个假路径：mock 的消费者是客户端 CI，那台机器上
-            // 任何编出来的路径都不存在，界面按「不存在即未绑定」渲染的话
-            // 反而看不出区别。要试绑定态就 PATCH 一个真实目录上去
+            // Deliberately no invented path: mock's consumer is the client's
+            // CI, and no invented path exists on that machine, so if the UI
+            // renders "nonexistent means unbound" there would be no visible
+            // difference anyway. To exercise the bound state, PATCH a real
+            // directory in
             workspace: None,
             runtime: cortex_proto::dto::SessionRuntimeDto::Cloud,
-            // 未分组的那一条，理由见 [`mock_projects`]
+            // The ungrouped one; reasoning in [`mock_projects`]
             project_id: None,
         },
     ]
 }
 
-/// 假数据里的**来源通道刻意各不相同**。
+/// The **source channels in the fake data are deliberately all different**.
 ///
-/// 理由与下面那条「已被推翻」的样本一样：来源角标是客户端要画的东西，
-/// 而四条都是 `user_stated` 的话，「亲述 / 推断 / 工具输出长得不一样」
-/// 这段 UI 在真实后端接上之前一次都不会被执行到。
-/// 最后一条给 `None`，覆盖加列之前的存量行（`unknown_legacy`）。
+/// Same reasoning as the "already overturned" sample below: the source badge is
+/// something the client has to draw, and if all four were `user_stated`, the
+/// branch of the UI that makes "stated by the user / inferred / tool output"
+/// look different would never be executed once before the live backend is wired
+/// up. The last entry is given `None`, covering rows that predate the column
+/// (`unknown_legacy`).
 fn mock_facts() -> Vec<FactDto> {
     vec![
         FactDto {
@@ -1162,10 +1285,12 @@ fn mock_facts() -> Vec<FactDto> {
             source_channel: Some("conversation".into()),
             trust_tier: Some(2),
         },
-        // 一条**已被推翻**的事实。与伪造记忆事件、伪造游标推进同一个理由：
-        // 「这条现在已经不成立了」那个角标是客户端要画的东西，
-        // 没有一条这样的样本，那段 UI 只能等接上真实后端并且真的
-        // redact / supersede 过一条事实之后才第一次被执行
+        // One **already overturned** fact. Same reasoning as fabricating memory
+        // events and fabricating cursor advances: the badge saying "this no
+        // longer holds" is something the client has to draw, and without a
+        // sample like this, that branch of the UI executes for the first time
+        // only after the live backend is wired up and a fact has actually been
+        // redacted or superseded
         FactDto {
             id: Id::new().to_string(),
             statement: "同步协议采用裸 BIGSERIAL 游标".into(),
@@ -1200,13 +1325,16 @@ fn mock_facts() -> Vec<FactDto> {
 mod backend_choice_tests {
     use super::BackendChoice;
 
-    /// 默认必须是 live，而认不出的取值必须**报错而不是回落**。
+    /// The default must be live, and an unrecognised value must **error rather
+    /// than fall back**.
     ///
-    /// 这条守的是一次修复的完整性。原来的行为是「连不上数据库就悄悄跑
-    /// mock」，其后果是 cortexd 可以带着一库假记忆对外服务而看起来完全正常。
-    /// 修法是把 mock 变成显式选择 —— 但如果打错的取值会回落到某个默认值，
-    /// 那扇门就等于没关：一个 `CORTEX_BACKEND=moc` 会以「我配了 mock」的
-    /// 心情跑成别的东西，反之亦然。
+    /// This guards the completeness of one fix. The original behaviour was
+    /// "silently run mock when the database is unreachable", whose consequence
+    /// was that cortexd could serve traffic backed by a database of fabricated
+    /// memory while looking completely normal. The fix was to make mock an
+    /// explicit choice — but if a mistyped value fell back to some default, that
+    /// door would still be open: a `CORTEX_BACKEND=moc` would run as something
+    /// else while its author believed they had configured mock, and vice versa.
     #[test]
     fn mock_must_be_asked_for_by_name() {
         assert_eq!(BackendChoice::parse("live").unwrap(), BackendChoice::Live);
@@ -1217,14 +1345,16 @@ mod backend_choice_tests {
             BackendChoice::Mock
         );
 
-        let err = BackendChoice::parse("moc").expect_err("打错的取值必须报错，不能回落");
+        let err = BackendChoice::parse("moc")
+            .expect_err("a mistyped value must error and must not fall back");
         assert!(
             err.to_string().contains("CORTEX_BACKEND"),
-            "报错要点名是哪个变量，实际：{err}"
+            "the error must name which variable is at fault; actual: {err}"
         );
 
-        // 空串在 from_env 那侧按「没设」处理（compose 的 `${VAR:-}`），
-        // 但直接调 parse 传空串是调用方的错，该报错
+        // An empty string is treated as "not set" on the from_env side
+        // (compose's `${VAR:-}`), but passing an empty string directly to parse
+        // is the caller's mistake and should error
         assert!(BackendChoice::parse("").is_err());
     }
 }

@@ -1,118 +1,155 @@
-//! 委托凭据 —— 记忆服务发给**不受信调用方**的短期钥匙。
+//! Delegated credentials — the short-lived keys the memory service hands to
+//! **untrusted callers**.
 //!
-//! 这不是沙箱基建，尽管沙箱是它至今唯一的调用方。这里回答的问题是
-//! 「**一个我不信任的东西，能在我身上干什么**」—— 那是记忆服务自己的
-//! 入站授权策略，与谁在外面跑容器无关。签发走 `POST /delegated-tokens`，
-//! 带的是**调用方自己那把 bearer**：没有服务凭据，也就没有越权面。
+//! This is not sandbox infrastructure, even though the sandbox is its only
+//! caller so far. The question answered here is "**what can something I do not
+//! trust do to me**" — which is the memory service's own inbound authorization
+//! policy, independent of who is running containers out there. Issuing goes
+//! through `POST /delegated-tokens`, carrying **the caller's own bearer**: with
+//! no service credential involved, there is no privilege-escalation surface.
 //!
-//! 下面的论证以沙箱为例，因为它是被真正验证过的那个场景。换成别的低信任
-//! 调用方（第三方 agent、CI 任务、一段临时脚本）每一条都照样成立。
+//! The reasoning below uses the sandbox as its example, because that is the
+//! scenario that has actually been validated. Every point holds equally for any
+//! other low-trust caller (a third-party agent, a CI job, a throwaway script).
 //!
-//! # 为什么不能把用户的登录 token 直接交出去
+//! # Why the user's login token cannot simply be handed over
 //!
-//! 那一侧跑的是**不可信代码**：模型的输出、用户装的依赖、被 prompt 注入的
-//! 工具调用，全在里面。拿到用户的 bearer token 等于拿到那个人的全部记忆、
-//! 全部会话、全部附件。
+//! What runs on that side is **untrusted code**: the model's output, the
+//! dependencies the user installed, prompt-injected tool calls — all of it.
+//! Holding the user's bearer token means holding that person's entire memory,
+//! every session, every attachment.
 //!
-//! OpenHands 在这一点上走的是另一条路（把 LLM api key 直接发进容器，容器
-//! 自己连供应商）。我们不 —— key 留在记忆服务这边，调用方经 `/llm/stream`
-//! 代理，顺带天然有了配额与计费的位置。
+//! OpenHands takes the other route here (shipping the LLM api key into the
+//! container so the container talks to the provider itself). We do not — the
+//! key stays on the memory service side and the caller proxies through
+//! `/llm/stream`, which incidentally gives quota and billing a natural home.
 //!
-//! # 这个凭据的作用域**不只是一张路由白名单**
+//! # This credential's scope is **more than a route allow-list**
 //!
-//! 这是本设计里最不显然的一处。四家云 agent（Codex / Claude web / Devin /
-//! Manus）都可以只做路由级隔离，因为**它们的沙箱没有可写的长期记忆**：
-//! 沙箱能碰的只有一个 clone 出来的 git 工作副本，坏了丢掉重来。
+//! This is the least obvious part of the design. All four cloud agents
+//! (Codex / Claude web / Devin / Manus) can get away with route-level isolation,
+//! because **their sandboxes have no writable long-term memory**: all the
+//! sandbox can touch is a cloned git working copy, and if it breaks you throw it
+//! away and start over.
 //!
-//! 我们不同。调用方要调 `POST /episodes`（写对话）与 `GET /memory/search`
-//! （查记忆），这两条是**穿透那道边界的持久通道**：
+//! We are different. The caller has to call `POST /episodes` (write the
+//! conversation) and `GET /memory/search` (query memory), and those two are
+//! **persistent channels that pierce that boundary**:
 //!
-//! - `/episodes` 的 `role` 若由请求体自由决定，被注入的 agent 可以伪装成
-//!   「用户亲口说的」写进抽取管线 —— 那条 fact 会在**未来所有会话、所有
-//!   设备**上被召回并注入 system prompt。**容器早就销毁了，记忆还在。**
-//!   这一条是记忆服务独有的：进程死了、容器删了，它写进来的东西不跟着走。
-//! - `/memory/search` 若按租户检索，调用方能把该用户**其他会话**里的敏感
-//!   记忆捞出来，再经出网通道送走。
+//! - If `/episodes`'s `role` were freely chosen by the request body, a
+//!   prompt-injected agent could impersonate "something the user said with their
+//!   own mouth" straight into the extraction pipeline — and that fact would be
+//!   retrieved and injected into the system prompt across **every future
+//!   session, on every device**. **The container was destroyed long ago; the
+//!   memory is still there.** This point is unique to a memory service: when the
+//!   process dies and the container is deleted, what it wrote does not go with
+//!   it.
+//! - If `/memory/search` retrieved across the whole tenant, the caller could
+//!   dredge up sensitive memories from that user's **other sessions** and ship
+//!   them out through an egress channel.
 //!
-//! 所以「爆炸半径已被容器限住」这句话对两家成立，对我们不成立。作用域必须
-//! 下沉到**语义**：见 [`DelegatedScope`]。
+//! So "the blast radius is already bounded by the container" holds for those
+//! four and does not hold for us. The scope has to descend to the **semantic**
+//! level: see [`DelegatedScope`].
 //!
-//! # 凭据与 session 绑定，不只与 owner 绑定
+//! # The credential is bound to a session, not merely to an owner
 //!
-//! 一个用户可能有多个会话。调用方只该看得见自己那一个 —— 否则「隔离」只隔
-//! 到了用户这一层，而同一个用户的两段工作之间同样需要边界（一段在处理公司
-//! 合同、另一段在跑一个从网上抄来的脚本）。
+//! One user may have several sessions. The caller should only be able to see its
+//! own — otherwise "isolation" stops at the user level, while two pieces of
+//! work belonging to the same user need a boundary just as much (one handling
+//! company contracts, the other running a script copied off the internet).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// 沙箱令牌的有效期。
+/// Lifetime of a sandbox token.
 ///
-/// 比票据（60 秒）长得多：这把是长连接用的，容器一活可能几小时。
-/// 但仍然有限 —— 容器被回收后令牌应当自然失效，而不是永远留在表里。
-/// 每次 [`DelegatedTokens::touch`] 会续期，所以活跃的沙箱不会被误杀。
+/// Far longer than a ticket (60 seconds): this one is for long-lived
+/// connections, and a container may live for hours. Still bounded, though — a
+/// token should expire naturally once its container has been reaped, rather than
+/// sitting in the table forever. Every [`DelegatedTokens::touch`] renews it, so
+/// an active sandbox is never killed by mistake.
 const TTL: Duration = Duration::from_secs(6 * 3600);
 
-/// 沙箱能做什么。**按语义授权，不是按路由**。
+/// What the sandbox may do. **Authorized semantically, not by route.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedScope {
-    /// 令牌属于谁。租户隔离仍然由它决定 —— 这一层是既有的。
+    /// Who the token belongs to. Tenant isolation is still decided by this —
+    /// that layer already existed.
     pub owner: String,
-    /// 绑定的会话。沙箱只能读写这一个会话的东西。
+    /// The session it is bound to. The sandbox may only read and write things
+    /// belonging to this one session.
     pub session_id: String,
-    /// 这个会话属于哪个项目。`None` = 未分组。
+    /// Which project this session belongs to. `None` = ungrouped.
     ///
-    /// **它决定容器与卷**（见 [`Self::key`]），不参与 [`Self::allows`] ——
-    /// 令牌能干什么仍然只看会话。
+    /// **It determines the container and the volume** (see [`Self::key`]) and
+    /// plays no part in [`Self::allows`] — what the token may do still depends
+    /// on the session alone.
     pub project: Option<String>,
 }
 
 impl DelegatedScope {
-    /// 容器与卷按这个键分。
+    /// Containers and volumes are partitioned by this key.
     ///
-    /// # 为什么按项目而不是按用户
+    /// # Why by project rather than by user
     ///
-    /// 上一版一个用户只有一个 `/workspace`。于是「客户合同」与「从网上抄来的
-    /// 脚本」两段工作的文件混在同一个目录里 —— 装依赖互相踩、`ls` 一屏全是
-    /// 别的项目的东西，而这两件事用户自己是分开的（他建了两个项目）。
+    /// In the previous version each user had exactly one `/workspace`. So the
+    /// files of two pieces of work — "the client contract" and "a script copied
+    /// off the internet" — sat mixed together in one directory: dependency
+    /// installs trampling each other, `ls` filling the screen with another
+    /// project's things, while the user themselves had already separated the two
+    /// (they created two projects).
     ///
-    /// 按项目分之后，切项目会重建容器（冷启动 913 ms，用户感知不到），
-    /// 同一个项目的多个会话共用一个容器。
+    /// Partitioned by project, switching projects rebuilds the container (a
+    /// 913 ms cold start, imperceptible to the user), and several sessions in the
+    /// same project share one container.
     ///
-    /// # 为什么未分组仍然用裸 owner
+    /// # Why ungrouped still uses the bare owner
     ///
-    /// 恒等映射 = **生产上不用做数据迁移**。现有那些卷叫 `cortex-ws-<owner>`，
-    /// 它们的会话都还没有项目，所以照旧命中；一旦被移进项目才会拿到新卷，
-    /// 而那时用户是明确在「新建一个项目」，空工作区是他预期的。
+    /// The identity mapping means **no data migration in production**. The
+    /// existing volumes are named `cortex-ws-<owner>`, and none of their sessions
+    /// have a project yet, so they keep matching as before. A new volume is only
+    /// obtained once a session is moved into a project — and at that moment the
+    /// user is explicitly "creating a new project", so an empty workspace is what
+    /// they expect.
     ///
-    /// # 项目那一段为什么是哈希而不是 id 本身
+    /// # Why the project segment is a hash rather than the id itself
     ///
-    /// **容器名会当 DNS 名用**（cortexd 与沙箱同网段时直连 `http://<容器名>`），
-    /// 而 DNS 标签的硬上限是 **63 字节**。两个 ULID 直接拼起来：
+    /// **The container name is used as a DNS name** (when cortexd and the
+    /// sandbox share a network, it connects directly to `http://<container
+    /// name>`), and the hard limit on a DNS label is **63 bytes**. Two ULIDs
+    /// concatenated directly:
     ///
     /// ```text
     /// cortex-sbx- + 26 + --p- + 26 = 67  ✗
     /// ```
     ///
-    /// 真机上撞到过，症状很误导：容器 `Up (healthy)`、里面的 agent 日志写着
-    /// 「已就绪」，而 cortexd 报「30 秒没应答」—— 因为它连名字都解析不出来。
+    /// This was hit on a real machine, and the symptom is thoroughly misleading:
+    /// the container is `Up (healthy)` and the agent inside logs "ready", while
+    /// cortexd reports "no response for 30 seconds" — because it cannot even
+    /// resolve the name.
     ///
-    /// 12 位十六进制（48 bit）之后是 11+26+4+12 = **53**，留足余量。
-    /// 碰撞概率在「一个用户的项目数」这个量级上可以忽略。
+    /// With 12 hex characters (48 bits) it comes to 11+26+4+12 = **53**, leaving
+    /// ample headroom. The collision probability is negligible at the scale of
+    /// "how many projects one user has".
     ///
-    /// 代价是容器名读不出项目 id。反查的路子是 cortexd 每轮那条日志
-    /// （`本轮走云沙箱 owner=… project=… sandbox=…`）—— 它把三者印在一行。
-    /// **不给 runner 加一个 project 入参**：那条 trait 只收作用域与 spec hash
-    /// 是刻意的（有测试守着「调用方塞不进第二个挂载」），为了一行日志
-    /// 松掉它不划算。
+    /// The price is that the project id cannot be read back out of the container
+    /// name. The way to look it up is cortexd's per-turn log line
+    /// (`本轮走云沙箱 owner=… project=… sandbox=…`) — it prints all three on one
+    /// line. **Do not add a project parameter to the runner**: that trait taking
+    /// only a scope and a spec hash is deliberate (a test guards "the caller
+    /// cannot slip in a second mount"), and loosening it for the sake of one log
+    /// line does not pay.
     ///
-    /// # 分隔符为什么不用管注入
+    /// # Why the separator needs no injection defence
     ///
-    /// owner 由服务端从凭据解析（`current_user`），永远在最前；
-    /// project 由客户端给，但它只能改变**自己名下**的后半段 ——
-    /// 拼出的键无论如何都以自己的 owner 开头，够不到别人的键。
-    /// 哈希顺带把「客户端能塞多长的 id 进来」这件事也钉死了。
+    /// The owner is resolved server-side from the credential (`current_user`)
+    /// and always comes first; the project is supplied by the client, but it can
+    /// only alter the second half **under its own name** — the assembled key
+    /// begins with its own owner no matter what, so it cannot reach anyone
+    /// else's key. The hash incidentally also pins down how long an id a client
+    /// can push in.
     #[must_use]
     pub fn key(&self) -> String {
         match &self.project {
@@ -125,72 +162,90 @@ impl DelegatedScope {
         }
     }
 
-    /// 这条路径 + 方法允许吗。
+    /// Is this path + method allowed?
     ///
-    /// # 为什么是白名单而不是黑名单
+    /// # Why an allow-list rather than a deny-list
     ///
-    /// 与 `WORKSPACE_FREE_TOOLS` 同一个论证：黑名单漏掉一条新路由 = 沙箱
-    /// 悄悄多了一样能力（静默、危险）；白名单漏掉一条 = 沙箱少一样能力
-    /// （响亮、当场可见）。**失败方向不同，选会往安全那边倒的那个。**
+    /// Same argument as `WORKSPACE_FREE_TOOLS`: a deny-list missing a new route
+    /// = the sandbox quietly gains a capability (silent, dangerous); an
+    /// allow-list missing one = the sandbox lacks a capability (loud,
+    /// immediately visible). **The failure directions differ, so choose the one
+    /// that tips towards safety.**
     ///
-    /// 清单是代码审计出来的**实际调用**，不是猜的。少一条的后果已经量化过：
-    /// 漏掉 `GET /sessions/{id}` 的话，`load_history` 会静默降级为空历史，
-    /// 云端会话**逐轮失忆且没有任何报错**。
+    /// The list is the **actual calls** found by auditing the code, not
+    /// guesswork. The consequence of omitting one has already been quantified:
+    /// leave out `GET /sessions/{id}` and `load_history` silently degrades to an
+    /// empty history, so a cloud session **loses its memory every turn with no
+    /// error whatsoever**.
     #[must_use]
     pub fn allows(&self, method: &axum::http::Method, path: &str) -> bool {
         use axum::http::Method;
         match (method, path) {
-            // 每轮一次到多次。LLM key 不进容器的代价与收益都在这条上
+            // Once or several times per turn. Both the cost and the benefit of
+            // keeping the LLM key out of the container ride on this one
             (&Method::POST, "/llm/stream") => true,
-            // 写 user / assistant episode，以及 outbox 重放
+            // Writing user / assistant episodes, plus outbox replay
             (&Method::POST, "/episodes") => true,
-            // memory_search 工具
+            // The memory_search tool
             (&Method::GET, "/memory/search") => true,
-            // 每轮拉会话历史。**漏掉这条 = 逐轮失忆且静默**
+            // Pulling session history each turn. **Omitting this = amnesia every
+            // turn, silently**
             (&Method::GET, p) if is_session_path(p) => true,
-            // 启动时问「这把凭据属于谁」。漏掉的话状态目录永远落在 _pending
+            // Asking "who does this credential belong to" at startup. Without
+            // it, the state directory stays in _pending forever
             (&Method::GET, "/auth/me") => true,
             _ => false,
         }
     }
 }
 
-/// `/sessions/{id}` 形状（不含 `/sessions` 本身 —— 那是列全部会话）。
+/// The `/sessions/{id}` shape (excluding `/sessions` itself — that lists every
+/// session).
 fn is_session_path(path: &str) -> bool {
     match path.strip_prefix("/sessions/") {
-        // 只认一层：`/sessions/abc` 是，`/sessions/abc/xxx` 不是。
-        // 多一层就是另一个端点，而这里的清单是逐条审计出来的
+        // Exactly one level: `/sessions/abc` matches, `/sessions/abc/xxx` does
+        // not. One more level is a different endpoint, and this list was audited
+        // entry by entry
         Some(rest) => !rest.is_empty() && !rest.contains('/'),
         None => false,
     }
 }
 
-/// 已签发的沙箱令牌。
+/// The sandbox tokens that have been issued.
 ///
-/// 与 `TicketBook` 同形（内存、随进程走）。cortexd 重启后所有沙箱令牌失效，
-/// 而那是**对的**：那些容器也需要被重新接管，让它们带着一把还能用的凭据
-/// 继续跑才是问题。
+/// Same shape as `TicketBook` (in memory, living and dying with the process).
+/// After a cortexd restart every sandbox token is void, and that is **correct**:
+/// those containers need to be taken over again anyway, and letting them keep
+/// running with a still-valid credential is the actual problem.
 #[derive(Default)]
 pub struct DelegatedTokens {
     inner: Mutex<HashMap<String, (DelegatedScope, Instant)>>,
 }
 
 impl DelegatedTokens {
-    /// 签一把。调用方必须**已经**确认了 owner 的身份。
+    /// Issue one. The caller must **already** have confirmed the owner's
+    /// identity.
     pub fn issue(&self, scope: DelegatedScope) -> String {
         let mut buf = [0u8; 32];
-        getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝签发可预测的令牌");
+        getrandom::fill(&mut buf).expect(
+            "the kernel entropy source is unavailable; refusing to issue a predictable token",
+        );
         let token = hex::encode(buf);
-        let mut guard = self.inner.lock().expect("令牌表的锁不该中毒");
-        // 顺手清过期的。同 TicketBook：签发是唯一让这个表长大的动作，
-        // 在这里清就不可能「只涨不清」
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("the token table's lock should never be poisoned");
+        // Prune the expired ones while we are here. As with TicketBook: issuing
+        // is the only action that grows this map, so pruning here makes "grows
+        // and never shrinks" impossible
         let now = Instant::now();
         guard.retain(|_, (_, at)| now.duration_since(*at) < TTL);
         guard.insert(token.clone(), (scope, now));
         token
     }
 
-    /// 认这把令牌吗，认的话它的作用域是什么。顺带续期。
+    /// Do we recognise this token, and if so what is its scope? Renews it along
+    /// the way.
     #[must_use]
     pub fn resolve(&self, token: &str) -> Option<DelegatedScope> {
         let mut guard = self.inner.lock().ok()?;
@@ -204,20 +259,24 @@ impl DelegatedTokens {
         Some(scope.clone())
     }
 
-    /// 这个作用域（用户 + 项目）手上那把还有效的令牌（如果有）。
+    /// The still-valid token held by this scope (user + project), if any.
     ///
-    /// # 为什么需要「复用」而不是每轮签一把新的
+    /// # Why reuse is needed instead of issuing a fresh one each turn
     ///
-    /// 容器的**入站**认证用的是它启动时 env 里那把（`cortex-local` 的入站与
-    /// 出站共用一个 token，刻意不引入第二个秘密）。每轮换新的话，第二轮反代
-    /// 过去就是 401 —— 而那条错误读起来像「沙箱坏了」。
+    /// The container's **inbound** authentication uses the token in its startup
+    /// env (`cortex-local` shares one token between inbound and outbound,
+    /// deliberately avoiding a second secret). Rotate it each turn and the
+    /// second turn's proxied request is a 401 — and that error reads like "the
+    /// sandbox is broken".
     ///
-    /// 真机第一轮通、第二轮 401，就是这个。**令牌的生命周期跟着容器走**，
-    /// 不跟着轮次走。
+    /// The real-machine symptom "first turn works, second turn 401s" was exactly
+    /// this. **A token's lifetime follows the container**, not the turn.
     ///
-    /// 按 [`DelegatedScope::key`] 而不是按 owner 找：一个用户可以同时有几个
-    /// 项目的沙箱活着，拿错那把的后果是**把 A 项目的令牌塞给 B 项目的容器**
-    /// —— 而容器起来之后照常应答，只是它认的是另一把，第二轮才 401。
+    /// Looked up by [`DelegatedScope::key`] rather than by owner: one user can
+    /// have sandboxes for several projects alive at once, and picking the wrong
+    /// one means **handing project A's token to project B's container** — the
+    /// container then comes up and answers normally, it simply recognises a
+    /// different token, and only the second turn 401s.
     #[must_use]
     pub fn find_by_key(&self, key: &str) -> Option<String> {
         let guard = self.inner.lock().ok()?;
@@ -227,10 +286,11 @@ impl DelegatedTokens {
         })
     }
 
-    /// 把一把已有的令牌改绑到另一个会话上。
+    /// Rebind an existing token to a different session.
     ///
-    /// 同一个容器服务这个用户的下一个会话时用。**不是放宽作用域** ——
-    /// 改完之后它仍然只对得上一个会话，只是换了一个。
+    /// Used when the same container serves this user's next session. **This does
+    /// not widen the scope** — afterwards it still matches exactly one session,
+    /// just a different one.
     pub fn rebind(&self, token: &str, session_id: &str) {
         if let Ok(mut g) = self.inner.lock()
             && let Some((scope, at)) = g.get_mut(token)
@@ -240,7 +300,7 @@ impl DelegatedTokens {
         }
     }
 
-    /// 作废（沙箱停掉时调）。
+    /// Revoke (called when the sandbox stops).
     pub fn revoke(&self, token: &str) {
         if let Ok(mut g) = self.inner.lock() {
             g.remove(token);
@@ -274,14 +334,17 @@ mod tests {
         }
     }
 
-    /// 白名单**正好**是审计出来的那五条，一条不多。
+    /// The allow-list is **exactly** the five audited entries and nothing more.
     ///
-    /// 每一条都有代价：多放一条就是沙箱多一样穿透容器边界的能力。
+    /// Each one has a price: one extra entry is one more capability the sandbox
+    /// has for piercing the container boundary.
     ///
-    /// `/confirmations` 那条从来没进过这张单子，而现在它连**存不存在**都
-    /// 不成立了：cortexd 不跑 agent，也就没有那本簿子（见 `routes.rs` 里
-    /// 路由清单上那段注释）。这条否定用例因此从「防一个无界递归」变成
-    /// 「防有人把一个已经不存在的端点当成还在」—— 两者都该让它红。
+    /// `/confirmations` never made it onto this list, and by now even its
+    /// **existence** no longer holds: cortexd does not run an agent, so it has
+    /// no such ledger (see the comment on the route list in `routes.rs`). This
+    /// negative case therefore shifts from "prevent an unbounded recursion" to
+    /// "prevent someone treating an endpoint that no longer exists as if it
+    /// still did" — both of which should make it go red.
     #[test]
     fn the_allowlist_is_exactly_what_the_agent_actually_calls() {
         let s = scope();
@@ -294,45 +357,52 @@ mod tests {
         ] {
             assert!(
                 s.allows(&m, p),
-                "{m} {p} 是每轮都要打的，漏了整个沙箱不可用"
+                "{m} {p} is called every turn; omitting it makes the whole sandbox unusable"
             );
         }
 
         for (m, p) in [
-            // 确认回路：加进来会让那个回环复活
+            // The confirmation loop: adding it back would resurrect that cycle
             (Method::POST, "/confirmations"),
             (Method::GET, "/confirmations"),
-            // 列全部会话 —— 沙箱只该看得见自己那一个
+            // Listing every session — the sandbox should only see its own
             (Method::GET, "/sessions"),
-            // 改会话（含换工作区）不该由沙箱自己决定
+            // Modifying a session (including changing its workspace) is not the
+            // sandbox's decision to make
             (Method::PATCH, "/sessions/01ABC"),
-            // 项目、附件、同步：都不是 agent 循环需要的
+            // Projects, attachments, sync: none of these are needed by the agent
+            // loop
             (Method::GET, "/projects"),
             (Method::POST, "/blobs"),
             (Method::GET, "/sync"),
             (Method::POST, "/auth/ticket"),
-            // 写 episode 是 POST；GET 那条是回放别人的对话
+            // Writing an episode is a POST; the GET is replaying somebody's
+            // conversation
             (Method::GET, "/episodes/01ABC"),
-            // 多一层路径就是另一个端点
+            // One more path level is a different endpoint
             (Method::GET, "/sessions/01ABC/messages"),
         ] {
             assert!(
                 !s.allows(&m, p),
-                "{m} {p} 不在审计出来的调用清单里，放行等于给沙箱一样它不需要的能力"
+                "{m} {p} is not on the audited call list, and admitting it hands the sandbox a \
+                 capability it does not need"
             );
         }
     }
 
-    /// **被攻陷的容器碰不到自己的备份。**
+    /// **A compromised container cannot reach its own backups.**
     ///
-    /// 这条单独立出来，是因为它守的不是「少给一点权限」这种程度问题，
-    /// 而是数据兜底第一层**整层的前提**：快照由宿主驱动、写进容器够不着的
-    /// 地方，所以一个能在容器里执行任意命令的攻击者删不掉它。
+    /// This stands on its own because what it guards is not a matter of degree
+    /// ("grant slightly less"), but the **entire premise of the first layer of
+    /// data protection**: snapshots are driven by the host and written where the
+    /// container cannot reach, so an attacker with arbitrary command execution
+    /// inside the container cannot delete them.
     ///
-    /// 那条性质完全来自这里的**拓扑**（令牌白名单里没有这几条路由），
-    /// 不来自任何运行期判断。谁哪天顺手把 `/sandbox/snapshots` 加进
-    /// `allows`，整层兜底就一起没了 —— 而那**不会有任何症状**，
-    /// 直到有人真的需要恢复的那一天。
+    /// That property comes entirely from the **topology** here (those routes are
+    /// absent from the token allow-list), not from any runtime check. The day
+    /// someone casually adds `/sandbox/snapshots` to `allows`, that whole layer
+    /// of protection goes with it — and **there will be no symptom at all**,
+    /// until the day somebody actually needs to restore.
     #[test]
     fn the_sandbox_cannot_reach_its_own_backups() {
         let s = scope();
@@ -343,9 +413,9 @@ mod tests {
         ] {
             assert!(
                 !s.allows(&m, p),
-                "{m} {p} 被放行了 —— 数据兜底的第一层就此失效：\
-                 一个被攻陷的容器可以列出、覆盖、并（将来 purge 落地后）\
-                 删掉自己的全部备份，而这件事没有任何症状"
+                "{m} {p} was admitted —— the first layer of data protection is void as of now: a \
+                 compromised container can list, overwrite and (once purge lands) delete all of \
+                 its own backups, and this has no symptom whatsoever"
             );
         }
     }
@@ -357,7 +427,7 @@ mod tests {
         assert_eq!(book.resolve(&t).as_ref(), Some(&scope()));
         assert!(
             book.resolve("deadbeef").is_none(),
-            "没签发过的令牌必须认不出来"
+            "a token that was never issued must not be recognised"
         );
     }
 
@@ -368,82 +438,96 @@ mod tests {
         book.revoke(&t);
         assert!(
             book.resolve(&t).is_none(),
-            "沙箱停掉后它那把令牌必须当场失效 —— 容器可能还活着（stop 之前的\
-             最后一瞬），而它此刻已经不该再写记忆了"
+            "once the sandbox stops, its token must be void on the spot —— the container may \
+             still be alive (the last instant before stop), and it must no longer be writing \
+             memory"
         );
     }
 
-    /// 未分组的键**恒等于 owner** —— 生产上那些卷靠这条不用迁移。
+    /// An ungrouped key is **identically the owner** — this is what saves the
+    /// production volumes from needing a migration.
     #[test]
-    fn 未分组的作用域键就是裸的_owner() {
+    fn an_ungrouped_scope_key_is_just_the_bare_owner() {
         assert_eq!(
             scope().key(),
             "u1",
-            "改掉这条等于让生产上每个用户的 cortex-ws-<owner> 卷当场失联：\
-             容器会挂一个空卷起来，而用户看到的是「我的文件全没了」"
+            "changing this instantly orphans every user's cortex-ws-<owner> volume in \
+             production: the container comes up with an empty volume mounted, and what the user \
+             sees is \"all my files are gone\""
         );
         assert_ne!(
             in_project("u1", "p1").key(),
             scope().key(),
-            "项目里的沙箱必须是另一个卷，否则这次改动等于没做"
+            "a sandbox inside a project must be a different volume, or this whole change did \
+             nothing"
         );
         assert_ne!(
             in_project("u1", "p1").key(),
             in_project("u1", "p2").key(),
-            "两个项目之间也要分开 —— 这才是用户真正抱怨的那件事"
+            "two projects must be separated from each other as well —— that is the thing users \
+             actually complained about"
         );
     }
 
-    /// 容器名会当 **DNS 名**用，所以它必须 ≤ 63 字节。
+    /// The container name is used as a **DNS name**, so it must be ≤ 63 bytes.
     ///
-    /// 这条是补写的：第一版把两个 ULID 直接拼起来，得到 67 字节的容器名。
-    /// 真机上的症状极具误导性 —— 容器 `Up (healthy)`、里面的 agent 日志写着
-    /// 「本地 agent 已就绪」，而 cortexd 报「30 秒没应答，可能是崩了」。
-    /// 实际是 `getent hosts <容器名>` 直接解析失败。
+    /// This test was written after the fact: the first version concatenated two
+    /// ULIDs directly, producing a 67-byte container name. The symptom on a real
+    /// machine is deeply misleading — the container is `Up (healthy)` and the
+    /// agent inside logs "local agent ready", while cortexd reports "no response
+    /// for 30 seconds, it may have crashed". What is actually happening is that
+    /// `getent hosts <container name>` fails to resolve outright.
     ///
-    /// 上限写死 63 而不是引用某个常量：这是 DNS 标签的**协议**上限
-    /// （RFC 1035），不是我们选的。
+    /// The limit is hard-coded as 63 rather than referencing some constant: this
+    /// is the **protocol** limit on a DNS label (RFC 1035), not a number we
+    /// chose.
     #[test]
-    fn 作用域键拼出来的容器名不超过_dns_标签上限() {
-        // 最长的现实输入：两个 26 字符的 ULID
+    fn a_container_name_built_from_a_scope_key_stays_within_the_dns_label_limit() {
+        // The longest realistic input: two 26-character ULIDs
         let worst = DelegatedScope {
             owner: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             session_id: "s".into(),
             project: Some("01BX5ZZKBKACTAV9WEVGEMMVRZ".into()),
         };
-        // `cortex-sbx-` 是编排那一侧（另一个仓库）给容器起名用的前缀。
-        // **它在这里是硬编码的常量，不是从那边 import 的** —— 两个仓库之间
-        // 只有 HTTP，没有共享的库。所以这条断言防的是「那边把前缀加长了而
-        // 这里不知道」：真炸在那边，但先在这里红
+        // `cortex-sbx-` is the prefix the orchestration side (a different
+        // repository) uses to name containers. **It is a hard-coded constant
+        // here, not imported from there** — the two repositories share only
+        // HTTP, no library. So what this assertion guards against is "they
+        // lengthened the prefix and this side does not know": the real explosion
+        // happens over there, but it goes red here first
         let name_len = "cortex-sbx-".len() + worst.key().len();
         assert!(
             name_len <= 63,
-            "容器名 {name_len} 字节，超过 DNS 标签上限 63。\
-             症状不是「建容器失败」，而是容器起来了、健康检查也过了，\
-             cortexd 却连它的名字都解析不出来 —— 报出来的是「30 秒没应答」"
+            "the container name is {name_len} bytes, over the DNS label limit of 63. The symptom \
+             is not \"creating the container failed\" —— the container comes up, the health check \
+             passes, and cortexd cannot even resolve its name; what gets reported is \"no \
+             response for 30 seconds\""
         );
     }
 
-    /// 同一个项目 id 每次都要算出**同一个**键。
+    /// The same project id must compute **the same** key every time.
     #[test]
-    fn 项目哈希是确定的() {
+    fn the_project_hash_is_deterministic() {
         assert_eq!(
             in_project("u1", "p1").key(),
             in_project("u1", "p1").key(),
-            "键不稳定的话，每一轮对话都会去找一个不存在的容器 —— \
-             于是每轮建一个新的，旧的那些带着文件留在原地"
+            "if the key were unstable, every conversational turn would go looking for a \
+             container that does not exist —— so every turn creates a new one, while the old ones \
+             sit where they were with the files still in them"
         );
     }
 
-    /// 项目 id 由客户端给，但它**改不动别人的键**。
+    /// The project id comes from the client, but it **cannot alter anyone else's
+    /// key**.
     #[test]
-    fn 客户端给的项目_id_够不到别人的沙箱() {
-        // 一个想撞到 u2 名下去的项目 id
+    fn a_client_supplied_project_id_cannot_reach_another_users_sandbox() {
+        // A project id trying to collide into u2's namespace
         let evil = in_project("u1", "--p-x/../u2");
         assert!(
             evil.key().starts_with("u1"),
-            "键必然以服务端解析出来的 owner 开头（current_user，不来自请求体），\
-             所以无论项目 id 长成什么样都只能改动自己名下那一段"
+            "the key necessarily begins with the owner resolved server-side (current_user, never \
+             from the request body), so whatever shape the project id takes it can only alter the \
+             segment under its own name"
         );
     }
 
@@ -459,7 +543,11 @@ mod tests {
         }
         assert_eq!(book.len(), 1);
         let fresh = book.issue(scope());
-        assert_eq!(book.len(), 1, "过期令牌应当在签新令牌时被清掉");
+        assert_eq!(
+            book.len(),
+            1,
+            "expired tokens should be swept when a new one is issued"
+        );
         assert!(book.resolve(&fresh).is_some());
     }
 }

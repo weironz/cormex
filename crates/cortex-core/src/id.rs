@@ -1,77 +1,90 @@
-//! 标识符。
+//! Identifiers.
 //!
-//! 全系统统一使用 ULID：26 字符，毫秒时间戳 + 随机位。
-//! 客户端可离线生成，无需中心发号器，且天然按时间有序 ——
-//! 这是 append-only 数据模型下多端无冲突写入的前提。
+//! ULIDs everywhere: 26 characters, millisecond timestamp + random bits.
+//! Clients can generate them offline with no central issuer, and they sort by
+//! time for free — that is the precondition for conflict-free writes from
+//! multiple devices under an append-only data model.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// 一个 ULID 标识符。
+/// A ULID identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id(ulid::Ulid);
 
 impl Id {
-    /// 基于当前时间生成一个新 ID。
+    /// Generate a new ID from the current time.
     #[must_use]
     pub fn new() -> Self {
         Self(ulid::Ulid::generate())
     }
 
-    /// 由「时刻 + 种子」**确定地**派生一个 ID。同样的输入永远得到同样的结果。
+    /// **Deterministically** derive an ID from a moment plus a seed. The same
+    /// inputs always produce the same result.
     ///
-    /// # 它是为导入准备的
+    /// # This exists for import
     ///
-    /// 把三年的 ChatGPT / Claude 历史灌进来，这件事必然会被中断：关电脑、
-    /// 断网、Ctrl-C、进程被杀。而 `POST /episodes` 已经按 id 判重了 ——
-    /// 只要重跑能算出**同一批 id**，断点续传就是免费的，不需要任何进度文件。
+    /// Pouring three years of ChatGPT / Claude history in is a job that *will*
+    /// get interrupted: the machine shuts down, the network drops, Ctrl-C, the
+    /// process gets killed. And `POST /episodes` already deduplicates by id —
+    /// so as long as a re-run computes **the same batch of ids**, resuming is
+    /// free and needs no progress file at all.
     ///
-    /// 用 [`Self::new`] 则做不到：它每次都是新的随机数，重跑一次就是把
-    /// 整份历史再导一遍。
+    /// [`Self::new`] cannot do that: it draws fresh random bits every time, so
+    /// re-running means importing the entire history a second time.
     ///
-    /// # 时间段取的是**消息的原始时刻**，不是现在
+    /// # The time part is the message's **original moment**, not now
     ///
-    /// ULID 的高 48 位是毫秒时间戳，而系统里到处依赖这个顺序：episodes 按它
-    /// 排序、recency 那一路召回按它算新鲜度。用 `Id::new()` 的话，三年前的
-    /// 对话会全部带上今天的时间戳 —— 于是「最近聊过什么」永远是那三年的历史。
+    /// The high 48 bits of a ULID are a millisecond timestamp, and that
+    /// ordering is relied on all over the system: episodes sort by it, and the
+    /// recency retrieval path computes freshness from it. With `Id::new()`, a
+    /// conversation from three years ago would carry today's timestamp — and
+    /// then "what did I talk about recently" would forever return that
+    /// three-year-old history.
     ///
-    /// # 种子怎么给
+    /// # How to pick a seed
     ///
-    /// 调用方拼一个**在本用途内唯一**的串，例如
-    /// `"chatgpt:{conversation_id}:{message_id}"`。前缀是必要的：
-    /// 不带来源的话，两个平台里恰好同号的消息会撞成同一个 id。
+    /// The caller assembles a string that is **unique within this use**, e.g.
+    /// `"chatgpt:{conversation_id}:{message_id}"`. The prefix is necessary:
+    /// without a source, two messages that happen to share a number across two
+    /// platforms would collide into the same id.
     ///
-    /// # 越界的时刻会被夹住，而不是绕回去
+    /// # Out-of-range moments clamp rather than wrap
     ///
-    /// 1970 年之前（负数）与公元 10889 年之后都超出 48 位能表示的范围。
-    /// 直接转换会**静默绕回**成一个看起来正常的时间。这里显式夹到边界：
-    /// 顺序会不对，但 id 仍然确定、仍然唯一，而且不会伪装成另一个年份。
+    /// Anything before 1970 (negative) or after the year 10889 falls outside
+    /// what 48 bits can represent. A straight conversion **silently wraps** to
+    /// a timestamp that looks perfectly normal. Here we clamp to the boundary
+    /// explicitly: the ordering will be wrong, but the id stays deterministic,
+    /// stays unique, and does not masquerade as some other year.
     #[must_use]
     pub fn derived(at: chrono::DateTime<chrono::Utc>, seed: &str) -> Self {
         use sha2::{Digest as _, Sha256};
 
-        /// ULID 时间段是 48 位毫秒。
+        /// The ULID time part is 48 bits of milliseconds.
         const MAX_TIME_MS: i64 = (1 << 48) - 1;
 
         let ms = at.timestamp_millis().clamp(0, MAX_TIME_MS) as u64;
 
-        // 域分隔前缀：这个函数以后可能被别的用途调用，而两个用途用同一个
-        // 种子串算出同一个 id，是那种要到数据对不上时才发现的事
+        // Domain-separation prefix: this function may get called for other
+        // purposes later, and two purposes computing the same id from the same
+        // seed string is the kind of thing you only discover once the data
+        // stops adding up
         let mut h = Sha256::new();
         h.update(b"cortex/id/derived/v1\0");
         h.update(seed.as_bytes());
         let digest = h.finalize();
 
-        // 取前 16 字节当 u128，`from_parts` 自己会掩到 80 位
+        // Take the first 16 bytes as a u128; `from_parts` masks it down to 80
+        // bits itself
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&digest[..16]);
         Self(ulid::Ulid::from_parts(ms, u128::from_be_bytes(buf)))
     }
 
-    /// 该 ID 编码的生成时刻。
+    /// The generation moment encoded in this ID.
     #[must_use]
     pub fn timestamp(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from(self.0.datetime())
@@ -108,7 +121,7 @@ mod tests {
         let parsed: Id = id
             .to_string()
             .parse()
-            .expect("生成的 ID 应当可以被解析回来");
+            .expect("a generated ID should parse back");
         assert_eq!(id, parsed);
     }
 
@@ -117,7 +130,7 @@ mod tests {
         let first = Id::new();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let second = Id::new();
-        assert!(first < second, "ULID 应当按生成时间有序");
+        assert!(first < second, "ULIDs should sort by generation time");
     }
 
     #[test]
@@ -126,33 +139,43 @@ mod tests {
     }
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
-        s.parse().expect("测试用的时间常量")
+        s.parse().expect("time constant used by the test")
     }
 
-    /// **同样的输入永远得到同样的 id。** 导入的断点续传全靠这一条。
+    /// **The same inputs always yield the same id.** Resumable import rests
+    /// entirely on this one property.
     ///
-    /// 它比看起来脆：只要有人把哈希换成 `DefaultHasher`（那是最顺手的选择），
-    /// 这条测试在**同一次运行里**仍然是绿的 —— 因为 `DefaultHasher` 的
-    /// 随机化是按进程的。真正的失败要等到换一个 Rust 版本编译之后，
-    /// 表现是「重跑导入把三年历史又灌了一遍」。
+    /// It is more fragile than it looks: if somebody swaps the hash for
+    /// `DefaultHasher` (the most convenient choice at hand), this test stays
+    /// green **within a single run** — because `DefaultHasher`'s randomization
+    /// is per process. The real failure only shows up after compiling with a
+    /// different Rust version, and it shows up as "re-running the import
+    /// poured three years of history in a second time".
     ///
-    /// 所以这里还钉死了一个**字面量**：算法一旦变了，它当场就变红。
+    /// So this also pins a **literal**: the moment the algorithm changes, it
+    /// goes red on the spot.
     #[test]
     fn the_same_seed_always_yields_the_same_id() {
         let t = at("2023-04-15T08:30:00Z");
         let a = Id::derived(t, "chatgpt:conv-1:msg-7");
         let b = Id::derived(t, "chatgpt:conv-1:msg-7");
-        assert_eq!(a, b, "同输入必须同输出，否则重跑导入会整份重来");
+        assert_eq!(
+            a, b,
+            "same input must give same output, otherwise re-running an import \
+             redoes the whole thing"
+        );
 
         assert_eq!(
             a.to_string(),
             "01GY20J4T0X1CZNXCWNNQX3E72",
-            "派生算法变了。这不是一个可以顺手改的实现细节 —— 已经导入过的\
-             用户重跑一次会得到一整份重复的历史"
+            "the derivation algorithm changed. This is not an implementation \
+             detail you can casually adjust — users who already imported will \
+             get an entire duplicate history on their next run"
         );
     }
 
-    /// 不同的种子必须给出不同的 id，而且**只差一个字符也算不同**。
+    /// Different seeds must give different ids, and **differing by a single
+    /// character counts as different**.
     #[test]
     fn different_seeds_do_not_collide() {
         let t = at("2023-04-15T08:30:00Z");
@@ -160,17 +183,24 @@ mod tests {
             Id::derived(t, "chatgpt:conv-1:msg-7"),
             Id::derived(t, "chatgpt:conv-1:msg-8"),
             Id::derived(t, "chatgpt:conv-2:msg-7"),
-            // 同一条消息号，不同平台。不带来源前缀的话这两个会撞
+            // Same message number, different platform. Without the source
+            // prefix these two would collide
             Id::derived(t, "claude:conv-1:msg-7"),
         ];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "种子不同却撞了 id");
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "seeds differed yet the ids collided"
+        );
     }
 
-    /// 时间段必须是**消息的原始时刻**，而且顺序要对。
+    /// The time part must be the message's **original moment**, and the
+    /// ordering must come out right.
     ///
-    /// 用 `Id::new()` 的话三年前的对话会全带上今天的时间戳 ——
-    /// 于是「最近聊过什么」这一路召回永远返回那三年的历史。
+    /// With `Id::new()` a conversation from three years ago would carry
+    /// today's timestamp — and then the "what did I talk about recently"
+    /// retrieval path would forever return that three-year-old history.
     #[test]
     fn the_time_part_is_the_original_moment() {
         let old = at("2023-04-15T08:30:00Z");
@@ -180,20 +210,23 @@ mod tests {
         assert_eq!(
             a.timestamp().timestamp_millis(),
             old.timestamp_millis(),
-            "时间段没保住原始时刻"
+            "the time part did not preserve the original moment"
         );
 
         assert!(
             a < Id::derived(recent, "x"),
-            "ULID 必须按原始时间有序 —— episodes 排序与 recency 召回都靠它"
+            "ULIDs must sort by the original time — episode ordering and \
+             recency retrieval both depend on it"
         );
     }
 
-    /// 越界的时刻夹到边界，**不绕回**。
+    /// Out-of-range moments clamp to the boundary and **do not wrap**.
     ///
-    /// 直接 `as u64` 的话，1970 年之前的负数会变成一个巨大的正数，
-    /// 再被掩到 48 位 —— 得到的是一个看起来完全正常、却指向另一个年份的
-    /// 时间戳。导出文件里出现 `created_at: 0` 或者一个错误的负数并不稀奇。
+    /// With a plain `as u64`, a negative value from before 1970 turns into a
+    /// huge positive number and is then masked to 48 bits — yielding a
+    /// timestamp that looks entirely normal while pointing at a different
+    /// year. Export files containing `created_at: 0`, or a bogus negative
+    /// value, are not rare.
     #[test]
     fn out_of_range_moments_clamp_instead_of_wrapping() {
         let ancient = at("1900-01-01T00:00:00Z");
@@ -201,9 +234,10 @@ mod tests {
         assert_eq!(
             id.timestamp().timestamp_millis(),
             0,
-            "1970 之前应当夹到纪元，而不是绕成某个未来时刻"
+            "anything before 1970 should clamp to the epoch rather than \
+             wrapping to some moment in the future"
         );
-        // 仍然确定、仍然唯一
+        // Still deterministic, still unique
         assert_eq!(id, Id::derived(ancient, "x"));
         assert_ne!(id, Id::derived(ancient, "y"));
     }

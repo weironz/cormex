@@ -1,54 +1,65 @@
-//! 图像内容块：让 [`Message`] 带图，并在发出去之前判断模型是否真能看图。
+//! Image content blocks: let a [`Message`] carry images, and determine whether
+//! the model can actually see them before anything goes out.
 //!
-//! # 这一层为什么这么薄
+//! # Why this layer is so thin
 //!
-//! 各家的图像格式并不一样 —— Anthropic 要
-//! `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`，
-//! OpenAI 兼容那一系要 `{"type":"image_url","image_url":{"url":"data:…"}}`。
-//! 但这个差异**在取件的 goose 里已经解决了**：
-//! `goose_provider_types::images::convert_image` 按 `ImageFormat` 分派，
-//! anthropic 引擎传 `ImageFormat::Anthropic`，openai / ollama 引擎传
-//! `ImageFormat::OpenAi`，而声明式配置的 `engine` 字段决定走哪个引擎。
+//! The vendors' image formats differ — Anthropic wants
+//! `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`,
+//! while the OpenAI-compatible family wants
+//! `{"type":"image_url","image_url":{"url":"data:…"}}`. But that difference
+//! **is already solved in the vendored goose**:
+//! `goose_provider_types::images::convert_image` dispatches on `ImageFormat`,
+//! the anthropic engine passes `ImageFormat::Anthropic`, the openai / ollama
+//! engines pass `ImageFormat::OpenAi`, and the declarative configuration's
+//! `engine` field decides which engine is used.
 //!
-//! 也就是说：**只要把图塞进 `Message`，格式转换就是免费的**。
-//! 本模块因此只做 goose 没做的三件事：
+//! In other words: **get the image into a `Message` and the format conversion
+//! is free**. So this module does only the three things goose does not:
 //!
-//! 1. 从**字节**造图（goose 的 [`Message::with_image`] 只收 base64 字符串，
-//!    而上传管线拿到的是 `&[u8]`）；
-//! 2. MIME 归一化与体积上限 —— 各家 vision API 只认几种格式，
-//!    传错的表现是一个含糊的 400，不如在本地就说清楚；
-//! 3. **能力判定** —— goose 的 `ModelInfo` 没有 vision 字段，
-//!    而 DeepSeek 当前完全没有 vision 能力。没有这一步，用户传的图会
-//!    以「模型说它没看到图片」的形式静默丢失，这是最难查的一类问题。
+//! 1. Build an image from **bytes** (goose's [`Message::with_image`] only takes
+//!    a base64 string, while the upload pipeline holds a `&[u8]`);
+//! 2. MIME normalization and a size ceiling — the vendors' vision APIs accept
+//!    only a handful of formats, and sending the wrong one surfaces as a vague
+//!    400, so it is better to say so locally;
+//! 3. **Capability determination** — goose's `ModelInfo` has no vision field,
+//!    and DeepSeek currently has no vision capability at all. Without this step
+//!    a user's image is silently lost in the form of "the model says it did not
+//!    see an image", which is the hardest class of problem to track down.
 
 use base64::Engine as _;
 use goose_providers::conversation::message::{Message, MessageContent};
 
 use crate::error::{LlmError, Result};
 
-/// 各家 vision API 都认的图像 MIME 交集。
+/// The intersection of image MIME types every vendor's vision API accepts.
 ///
-/// 取交集而非并集：并集里的格式（BMP、TIFF、AVIF…）只有个别供应商支持，
-/// 让它通过这一层只会把错误推迟到一个含糊的远端 400。
+/// The intersection rather than the union: formats in the union (BMP, TIFF,
+/// AVIF, …) are supported by only a few providers, and letting one through this
+/// layer merely defers the error to a vague 400 from the remote end.
 pub const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// 单张图的字节上限（**原始字节**，不是 base64 之后）。
+/// The byte ceiling for a single image (**raw bytes**, not post-base64).
 ///
-/// 5 MiB 是 Anthropic 对单张图的硬上限，也是各家里最严的一档；
-/// base64 会再涨 4/3，所以按原始字节卡住就同时满足了所有人。
+/// 5 MiB is Anthropic's hard limit for one image and the strictest among the
+/// vendors; base64 inflates by another 4/3, so capping on raw bytes satisfies
+/// everyone at once.
 ///
-/// 超限不做自动缩放：解码 + 重编码要拖进图像处理依赖，而正确的做法是
-/// 在**上传时**就生成缩略图（那时本来就要解一次），不是在发请求时补救。
+/// Nothing is auto-downscaled when over the limit: decoding and re-encoding
+/// would drag in an image-processing dependency, and the right move is to
+/// generate a thumbnail **at upload time** (when a decode has to happen anyway)
+/// rather than patching it up as the request goes out.
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-/// 把 MIME 归一化成 [`SUPPORTED_IMAGE_MIMES`] 里的规范值。
+/// Normalize a MIME type into one of the canonical values in
+/// [`SUPPORTED_IMAGE_MIMES`].
 ///
-/// 处理三种现实里天天遇到的写法：带参数（`image/jpeg; charset=binary`）、
-/// 大小写不一致（`IMAGE/PNG`）、以及 `image/jpg` 这个从来不合法却到处都在用的拼法。
+/// Handles three spellings encountered daily in the real world: with parameters
+/// (`image/jpeg; charset=binary`), inconsistent case (`IMAGE/PNG`), and
+/// `image/jpg`, which has never been valid yet is used everywhere.
 ///
 /// # Errors
 ///
-/// 归一化之后仍不在支持列表里。
+/// Still not on the supported list after normalization.
 pub fn normalize_image_mime(mime: &str) -> Result<&'static str> {
     let bare = mime
         .split(';')
@@ -56,7 +67,8 @@ pub fn normalize_image_mime(mime: &str) -> Result<&'static str> {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    // image/jpg 不是注册过的 MIME，但浏览器与移动端就是这么发的
+    // image/jpg is not a registered MIME type, but browsers and mobile clients
+    // send it exactly like that
     let bare = if bare == "image/jpg" {
         "image/jpeg"
     } else {
@@ -72,14 +84,16 @@ pub fn normalize_image_mime(mime: &str) -> Result<&'static str> {
         })
 }
 
-/// 把图像字节编成 `data:` URL。
+/// Encode image bytes into a `data:` URL.
 ///
-/// 供需要自己拼 payload 的调用方（例如把图交给非 goose 的 HTTP 端点）使用；
-/// 走 [`Message`] 的正常路径**不需要**它 —— goose 会自己拼。
+/// For callers that assemble a payload themselves (e.g. handing an image to a
+/// non-goose HTTP endpoint); the normal [`Message`] path does **not** need it —
+/// goose assembles it itself.
 ///
 /// # Errors
 ///
-/// MIME 不支持或字节数超过 [`MAX_IMAGE_BYTES`]。
+/// The MIME type is unsupported, or the byte count exceeds
+/// [`MAX_IMAGE_BYTES`].
 pub fn to_data_url(bytes: &[u8], mime: &str) -> Result<String> {
     let mime = normalize_image_mime(mime)?;
     check_size(bytes.len())?;
@@ -89,14 +103,17 @@ pub fn to_data_url(bytes: &[u8], mime: &str) -> Result<String> {
     ))
 }
 
-/// 解析 `data:image/png;base64,…`，还原出规范 MIME 与 base64 载荷。
+/// Parse `data:image/png;base64,…` back into a canonical MIME type and the
+/// base64 payload.
 ///
-/// 只接受 `;base64` 的形式：`data:` URL 也允许 percent-encoding 的裸字节，
-/// 但没有任何供应商会那样发图，支持它只是给自己找解析 bug。
+/// Only the `;base64` form is accepted: `data:` URLs also permit
+/// percent-encoded raw bytes, but no provider sends images that way, and
+/// supporting it would just be inviting parsing bugs.
 ///
 /// # Errors
 ///
-/// 不是 `data:` URL、不是 base64 编码、MIME 不支持，或解码后超过体积上限。
+/// Not a `data:` URL, not base64-encoded, an unsupported MIME type, or over the
+/// size ceiling once decoded.
 pub fn parse_data_url(url: &str) -> Result<(&'static str, String)> {
     let rest = url
         .strip_prefix("data:")
@@ -112,8 +129,9 @@ pub fn parse_data_url(url: &str) -> Result<(&'static str, String)> {
     }
     let mime = normalize_image_mime(&meta_lower[..meta_lower.len() - ";base64".len()])?;
 
-    // 解一次只为验证载荷合法且体积没超 —— 把一段坏 base64 发出去，
-    // 换回来的是供应商一句「invalid image」，比在这里说清楚难查得多
+    // Decode once purely to verify the payload is valid and within the size
+    // limit — sending bad base64 out gets back a bare "invalid image" from the
+    // provider, which is far harder to trace than saying so right here
     let decoded = base64::prelude::BASE64_STANDARD
         .decode(payload.trim())
         .map_err(|e| LlmError::InvalidImage(format!("base64 解码失败：{e}")))?;
@@ -135,49 +153,49 @@ fn check_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// 给 [`Message`] 补上「从字节带图」的便捷构造。
+/// Give [`Message`] a convenient "attach an image from bytes" construction.
 ///
-/// goose 自带的 [`Message::with_image`] 收的是 base64 字符串且不校验任何东西；
-/// 这里的几个方法都返回 [`Result`]，把「格式不对 / 图太大 / base64 是坏的」
-/// 挡在发请求之前。
+/// goose's own [`Message::with_image`] takes a base64 string and validates
+/// nothing; the methods here all return a [`Result`], keeping "wrong format /
+/// image too large / broken base64" out of the request.
 ///
 /// ```no_run
 /// # fn demo(png: &[u8]) -> cortex_llm::Result<()> {
 /// use cortex_llm::{Message, MessageImageExt};
 ///
 /// let msg = Message::user()
-///     .with_text("这张截图里的报错是什么？")
+///     .with_text("What is the error in this screenshot?")
 ///     .with_image_bytes(png, "image/png")?;
 /// assert_eq!(msg.image_count(), 1);
 /// # Ok(())
 /// # }
 /// ```
 pub trait MessageImageExt: Sized {
-    /// 追加一张图（原始字节，内部做 base64）。
+    /// Append an image (raw bytes; base64 is applied internally).
     ///
     /// # Errors
     ///
-    /// MIME 不支持、字节为空，或超过 [`MAX_IMAGE_BYTES`]。
+    /// Unsupported MIME type, empty bytes, or over [`MAX_IMAGE_BYTES`].
     fn with_image_bytes(self, bytes: &[u8], mime: &str) -> Result<Self>;
 
-    /// 追加一张图（已经是 base64 的载荷）。
+    /// Append an image (a payload that is already base64).
     ///
     /// # Errors
     ///
-    /// MIME 不支持，或 base64 非法 / 解码后超限。
+    /// Unsupported MIME type, or invalid base64 / over the limit once decoded.
     fn with_image_base64(self, data: &str, mime: &str) -> Result<Self>;
 
-    /// 追加一张图（`data:image/png;base64,…`）。
+    /// Append an image (`data:image/png;base64,…`).
     ///
     /// # Errors
     ///
-    /// 见 [`parse_data_url`]。
+    /// See [`parse_data_url`].
     fn with_image_data_url(self, data_url: &str) -> Result<Self>;
 
-    /// 这条消息里有几张图。
+    /// How many images this message carries.
     fn image_count(&self) -> usize;
 
-    /// 这条消息是否带图。
+    /// Whether this message carries an image.
     fn has_image(&self) -> bool {
         self.image_count() > 0
     }
@@ -213,35 +231,38 @@ impl MessageImageExt for Message {
     }
 }
 
-/// 一次对话里总共带了几张图。
+/// How many images a whole conversation carries in total.
 #[must_use]
 pub fn image_count(messages: &[Message]) -> usize {
     messages.iter().map(MessageImageExt::image_count).sum()
 }
 
-// ───────────────────────────── 能力判定 ─────────────────────────────
+// ──────────────────── capability determination ────────────────────
 
-/// 某个模型能不能看图。
+/// Whether a given model can see images.
 ///
-/// 三态而非 bool，因为**「不知道」和「不行」必须区分开**：
-/// goose 自带目录里有近 40 家供应商，我们没有能力也没有义务去逐一考据
-/// 它们每个模型的 vision 能力；把未知一律当成「不行」会让那些其实能看图的
-/// 供应商在本层被无理由拒绝。
+/// Three states rather than a bool, because **"unknown" and "no" must be kept
+/// apart**: goose's own catalog holds nearly 40 providers, and we have neither
+/// the means nor the obligation to research the vision capability of every one
+/// of their models; treating unknown as "no" would have this layer reject, for
+/// no reason, providers that can in fact see images.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionSupport {
-    /// 定义 JSON 里显式声明 `"vision": true`。
+    /// The definition JSON explicitly declares `"vision": true`.
     Supported,
-    /// 定义 JSON 里显式声明 `"vision": false`。带图请求会被本层拦下。
+    /// The definition JSON explicitly declares `"vision": false`. Requests with
+    /// images get blocked by this layer.
     Unsupported,
-    /// 定义里没说。可能是 goose 目录里的供应商，也可能是 Ollama 这类
-    /// 模型列表由服务端动态决定的。**按放行处理**，让远端自己报错。
+    /// The definition says nothing. It may be a provider from goose's catalog,
+    /// or one like Ollama whose model list is decided dynamically by the
+    /// server. **Let it through** and leave the remote end to complain.
     Unknown,
 }
 
 impl VisionSupport {
-    /// 是否允许把带图的消息发出去。
+    /// Whether messages carrying images may be sent.
     ///
-    /// [`Self::Unknown`] 放行 —— 理由见类型文档。
+    /// [`Self::Unknown`] is let through — see the type's docs for why.
     #[must_use]
     pub fn allows_images(self) -> bool {
         !matches!(self, Self::Unsupported)
@@ -252,7 +273,7 @@ impl VisionSupport {
 mod tests {
     use super::*;
 
-    /// 最小合法 PNG：1×1 全透明。
+    /// The smallest valid PNG: 1×1, fully transparent.
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
@@ -271,22 +292,26 @@ mod tests {
         assert_eq!(
             normalize_image_mime("image/jpg").unwrap(),
             "image/jpeg",
-            "image/jpg 不是合法 MIME，但浏览器与移动端就是这么发的，必须归一化"
+            "image/jpg is not a valid MIME type, but browsers and mobile \
+             clients send exactly that, so it must be normalized"
         );
         assert_eq!(normalize_image_mime(" image/webp ").unwrap(), "image/webp");
     }
 
     #[test]
     fn unsupported_mime_names_the_alternatives() {
-        let err = normalize_image_mime("image/bmp").expect_err("BMP 不在交集里，应被拒绝");
+        let err = normalize_image_mime("image/bmp")
+            .expect_err("BMP is not in the intersection and should be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("image/png"),
-            "报错必须列出可用格式，否则调用方只能去翻源码；实际：{msg}"
+            "the error must list the usable formats, otherwise the caller has \
+             to go read the source; got: {msg}"
         );
         assert!(
             normalize_image_mime("application/pdf").is_err(),
-            "非图片 MIME 必须拒绝，否则会被当成图发出去换回一个含糊的 400"
+            "a non-image MIME type must be rejected, otherwise it goes out as \
+             an image and comes back as a vague 400"
         );
     }
 
@@ -295,10 +320,11 @@ mod tests {
         let msg = Message::user()
             .with_text("这是什么")
             .with_image_bytes(PNG_1X1, "image/png")
-            .expect("合法 PNG 应能挂上");
+            .expect("a valid PNG should attach");
         assert_eq!(msg.image_count(), 1);
         assert!(msg.has_image());
-        // 文本块必须还在 —— 图不能把提问顶掉
+        // The text block must still be there — the image must not displace the
+        // question
         assert!(msg.as_concat_text().contains("这是什么"));
     }
 
@@ -308,12 +334,13 @@ mod tests {
             .with_image_bytes(PNG_1X1, "image/png")
             .unwrap();
         let MessageContent::Image(img) = &msg.content[0] else {
-            panic!("第一个内容块应该是 Image");
+            panic!("the first content block should be an Image");
         };
         let decoded = base64::prelude::BASE64_STANDARD.decode(&img.data).unwrap();
         assert_eq!(
             decoded, PNG_1X1,
-            "编码必须无损：多一个字节少一个字节都会让远端拒图"
+            "the encoding must be lossless: one byte more or one byte less and \
+             the remote end rejects the image"
         );
         assert_eq!(img.mime_type, "image/png");
     }
@@ -326,11 +353,12 @@ mod tests {
                 Message::user().with_image_bytes(&huge, "image/png"),
                 Err(LlmError::ImageTooLarge { .. })
             ),
-            "超限必须在本地拦下：发出去只会浪费一次上行带宽再换回 400"
+            "going over the limit must be caught locally: sending it merely \
+             wastes a round of upstream bandwidth and comes back a 400"
         );
         assert!(
             Message::user().with_image_bytes(&[], "image/png").is_err(),
-            "空字节不是图片"
+            "empty bytes are not an image"
         );
     }
 
@@ -353,15 +381,15 @@ mod tests {
     #[test]
     fn broken_data_urls_are_rejected_with_a_reason() {
         for (bad, why) in [
-            ("https://example.com/a.png", "不是 data: URL"),
-            ("data:image/png;base64", "缺少逗号"),
-            ("data:image/png,rawbytes", "不是 base64 形式"),
-            ("data:image/png;base64,!!!!", "base64 非法"),
-            ("data:text/plain;base64,aGk=", "MIME 不是图片"),
+            ("https://example.com/a.png", "not a data: URL"),
+            ("data:image/png;base64", "missing comma"),
+            ("data:image/png,rawbytes", "not the base64 form"),
+            ("data:image/png;base64,!!!!", "invalid base64"),
+            ("data:text/plain;base64,aGk=", "MIME is not an image"),
         ] {
             assert!(
                 parse_data_url(bad).is_err(),
-                "{why} 的 data URL 应被拒绝：{bad}"
+                "a data URL that is {why} should be rejected: {bad}"
             );
         }
     }
@@ -372,7 +400,8 @@ mod tests {
             Message::user()
                 .with_image_base64("not base64 at all!!", "image/png")
                 .is_err(),
-            "坏 base64 必须当场报错，否则错误会以远端的 invalid image 出现在很远的地方"
+            "broken base64 must fail on the spot, otherwise the error shows up \
+             far away as the remote end's invalid image"
         );
         let ok = base64::prelude::BASE64_STANDARD.encode(PNG_1X1);
         assert!(Message::user().with_image_base64(&ok, "image/png").is_ok());
@@ -394,8 +423,9 @@ mod tests {
 
     #[test]
     fn unknown_capability_is_permissive() {
-        // 这条是刻意的取舍：goose 目录里近 40 家供应商我们不逐一考据，
-        // 未知一律拒绝会误伤真的能看图的那些
+        // This is a deliberate tradeoff: we do not research each of the nearly
+        // 40 providers in goose's catalog, and rejecting everything unknown
+        // would wrongly hit the ones that really can see images
         assert!(VisionSupport::Unknown.allows_images());
         assert!(VisionSupport::Supported.allows_images());
         assert!(!VisionSupport::Unsupported.allows_images());

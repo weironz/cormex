@@ -1,13 +1,18 @@
-//! 回放保真：存进去的东西，回放时还在不在。
+//! Replay fidelity: whether what went in is still there when it is replayed.
 //!
-//! 三组断言，对应三个「不会报错的静默损坏」：
+//! Three groups of assertions, corresponding to three silent corruptions that
+//! raise no error:
 //!
-//! 1. 长会话分页 —— 之前 `ORDER BY occurred_at ASC LIMIT 500` 丢的是**最新**
-//!    那些消息，用户看到一段没有结尾的对话；
-//! 2. 注入归因 —— 之前只活在 SSE 流里，刷新一次抽屉就空了；
-//! 3. 转录回扫候选 —— 之前预签名直传上来的大文件永远不会被转录。
+//! 1. Long-session pagination — the old `ORDER BY occurred_at ASC LIMIT 500`
+//!    dropped the **newest** messages, leaving the user with a conversation that
+//!    has no ending;
+//! 2. Injection attribution — it used to live only in the SSE stream, and one
+//!    refresh emptied the drawer;
+//! 3. Transcription rescan candidates — large files uploaded via presigned
+//!    direct upload used to never be transcribed at all.
 //!
-//! 全部只能真连库测：正确性都在 SQL 里。
+//! All of these can only be tested against a real database: the correctness is
+//! in the SQL.
 
 mod common;
 
@@ -33,13 +38,16 @@ fn episode_at(session: &str, text: &str, seconds_ago: i64) -> NewEpisode {
 }
 
 // ══════════════════════════════════════════════════════════
-//  R1 —— 长会话丢的是最新的话
+//  R1 -- what a long session drops is the newest messages
 // ══════════════════════════════════════════════════════════
 
-/// 超过一页的会话，默认那一页里必须有**最后一句**。
+/// For a session longer than one page, the default page must contain the **last
+/// message**.
 ///
-/// 这是本次改动最要紧的一条：旧实现是升序 + LIMIT，超长会话截掉的是结尾，
-/// 而响应里没有任何字段说明发生过截断 —— 用户只会觉得「我的历史怪怪的」。
+/// This is the most important assertion in this change: the old implementation
+/// was ascending + LIMIT, so an over-long session was truncated at the end, and
+/// no field in the response indicated that truncation had occurred — the user
+/// simply feels "my history looks odd".
 #[tokio::test]
 async fn the_default_page_contains_the_newest_message_not_the_oldest() {
     let Some(db) = common::setup().await else {
@@ -47,46 +55,50 @@ async fn the_default_page_contains_the_newest_message_not_the_oldest() {
     };
     let s = &db.store;
 
-    // 600 条 > 旧实现那个 500 的上限
+    // 600 rows > the old implementation's cap of 500
     const TOTAL: i64 = 600;
     for i in 0..TOTAL {
-        // seconds_ago 递减 = 时间递增，最后写的那条最新
+        // A decreasing seconds_ago = increasing time, so the last one written
+        // is the newest
         let ep = episode_at("long", &format!("第 {i} 句"), TOTAL - i);
         s.write_txn(async |t| t.insert_episode(&ep).await)
             .await
-            .expect("写 episode 不该失败");
+            .expect("writing the episode should not fail");
     }
 
     let page = s
         .episodes_by_session_page("long", 200, None)
         .await
         .expect("分页查询不该失败");
-    // 旧实现的形态：升序 + LIMIT
+    // The shape of the old implementation: ascending + LIMIT
     let old = s
         .episodes_by_session("long", 200)
         .await
-        .expect("升序查询不该失败");
+        .expect("the ascending query should not fail");
 
     db.cleanup().await;
 
-    assert_eq!(page.len(), 200, "应当恰好取回一页");
+    assert_eq!(page.len(), 200, "exactly one page should come back");
     assert_eq!(
         page[0].text.as_deref(),
         Some(format!("第 {} 句", TOTAL - 1)).as_deref(),
-        "分页是降序，第一条必须是**最新**那句；拿到别的说明取的仍是开头那一段"
+        "pagination is descending, so the first row must be the **newest** message; getting \
+         anything else means it is still fetching the opening stretch"
     );
     assert_eq!(
         old.last().and_then(|e| e.text.clone()),
         Some("第 199 句".to_owned()),
-        "旧的升序实现在这里停在第 199 句 —— 这正是「丢掉最新的话」的形状，\
-         留着它是为了让这条改动的收益一眼可见"
+        "the old ascending implementation stops at message 199 here -- that is exactly the shape \
+         of \"dropping the newest messages\", and it is kept so the benefit of this change is \
+         visible at a glance"
     );
 }
 
-/// 游标必须落在 `(occurred_at, id)` 两列上。
+/// The cursor must span both `(occurred_at, id)` columns.
 ///
-/// 全部消息压在**同一个** `occurred_at` 上：只用时间做游标的实现在这里
-/// 要么翻不动（第二页与第一页完全相同），要么直接跳过一整批。
+/// Every message is crammed onto the **same** `occurred_at`: an implementation
+/// using time alone as its cursor either cannot advance here (the second page is
+/// identical to the first) or skips an entire batch outright.
 #[tokio::test]
 async fn paging_never_skips_or_repeats_rows_sharing_a_timestamp() {
     let Some(db) = common::setup().await else {
@@ -101,17 +113,17 @@ async fn paging_never_skips_or_repeats_rows_sharing_a_timestamp() {
         ep.occurred_at = same_instant;
         s.write_txn(async |t| t.insert_episode(&ep).await)
             .await
-            .expect("写 episode 不该失败");
+            .expect("writing the episode should not fail");
     }
 
-    // 每页 7 条，翻到底，把 id 全收起来
+    // 7 per page, paged to the end, collecting every id
     let mut seen: Vec<String> = Vec::new();
     let mut cursor: Option<EpisodeCursor> = None;
     for _ in 0..10 {
         let page = s
             .episodes_by_session_page("tie", 7, cursor.as_ref())
             .await
-            .expect("分页查询不该失败");
+            .expect("the paginated query should not fail");
         if page.is_empty() {
             break;
         }
@@ -128,18 +140,20 @@ async fn paging_never_skips_or_repeats_rows_sharing_a_timestamp() {
     assert_eq!(
         seen.len(),
         TOTAL,
-        "翻完全部页应当恰好看到 {TOTAL} 条，实际 {} 条 —— \
-         少了是漏行，多了是重复，两者都说明游标没落在 (occurred_at, id) 上",
+        "paging through everything should show exactly {TOTAL} rows; it showed {} -- fewer means \
+         dropped rows, more means duplicates, and either way the cursor is not spanning \
+         (occurred_at, id)",
         seen.len()
     );
     assert_eq!(
         unique.len(),
         TOTAL,
-        "同一条消息被翻出来两次 —— 游标只用了 occurred_at"
+        "the same message was paged out twice -- the cursor used occurred_at alone"
     );
 }
 
-/// 翻页拼起来的顺序必须与一次性升序取回完全一致。
+/// The order stitched back together from the pages must match a single
+/// ascending fetch exactly.
 #[tokio::test]
 async fn pages_stitch_back_into_the_original_order() {
     let Some(db) = common::setup().await else {
@@ -151,7 +165,7 @@ async fn pages_stitch_back_into_the_original_order() {
         let ep = episode_at("stitch", &format!("第 {i} 句"), 30 - i);
         s.write_txn(async |t| t.insert_episode(&ep).await)
             .await
-            .expect("写 episode 不该失败");
+            .expect("writing the episode should not fail");
     }
 
     let mut stitched: Vec<String> = Vec::new();
@@ -160,7 +174,7 @@ async fn pages_stitch_back_into_the_original_order() {
         let page = s
             .episodes_by_session_page("stitch", 8, cursor.as_ref())
             .await
-            .expect("分页查询不该失败");
+            .expect("the paginated query should not fail");
         if page.is_empty() {
             break;
         }
@@ -170,12 +184,12 @@ async fn pages_stitch_back_into_the_original_order() {
         });
         stitched.extend(page.into_iter().map(|e| e.id));
     }
-    stitched.reverse(); // 降序翻页 → 正序渲染
+    stitched.reverse(); // descending pagination → forward-order rendering
 
     let straight: Vec<String> = s
         .episodes_by_session("stitch", 1000)
         .await
-        .expect("升序查询不该失败")
+        .expect("the ascending query should not fail")
         .into_iter()
         .map(|e| e.id)
         .collect();
@@ -184,20 +198,22 @@ async fn pages_stitch_back_into_the_original_order() {
 
     assert_eq!(
         stitched, straight,
-        "把各页反转拼起来必须与一次性升序取回逐条相同，否则客户端渲染出的\
-         对话顺序会与真实顺序不一致"
+        "reversing the pages and stitching them together must match a single ascending fetch row \
+         for row, or the conversation order the client renders will differ from the real one"
     );
 }
 
 // ══════════════════════════════════════════════════════════
-//  R2 —— 回放的历史轮次要有记忆抽屉
+//  R2 -- replayed historical turns need their memory drawer
 // ══════════════════════════════════════════════════════════
 
-/// 注入归因写进去、查回来，且**失效之后照样能查回来**并带标记。
+/// Injection attribution goes in, comes back out, and **still comes back after
+/// invalidation**, carrying a marker.
 ///
-/// 存 fact id 而不是快照的代价就在这里：回放看到的是事实的现状。
-/// 那正是要的 —— 「当时依据的这条现在已经不成立了」是审计最想看到的信息，
-/// 把它藏起来等于篡改回放。
+/// This is where storing fact ids rather than snapshots costs something: replay
+/// sees the fact's present state. And that is exactly what we want — "the thing
+/// this was based on no longer holds" is the information an audit most wants to
+/// see, and hiding it would be falsifying the replay.
 #[tokio::test]
 async fn the_memory_drawer_survives_a_reload_and_marks_invalidated_facts() {
     let Some(db) = common::setup().await else {
@@ -221,9 +237,9 @@ async fn the_memory_drawer_survives_a_reload_and_marks_invalidated_facts() {
         t.insert_fact(&gone_stale).await
     })
     .await
-    .expect("造数据不该失败");
+    .expect("manufacturing the data should not fail");
 
-    // 两条记忆按融合分顺序注入
+    // Two memories injected in fused-score order
     for (ordinal, fact_id, channels, score) in [
         (0, kept, vec!["bm25".to_owned(), "vector".to_owned()], 0.032),
         (1, stale, vec!["graph".to_owned()], 0.016),
@@ -239,51 +255,55 @@ async fn the_memory_drawer_survives_a_reload_and_marks_invalidated_facts() {
         };
         s.write_txn(async |t| t.insert_episode_memory(&row).await)
             .await
-            .expect("写注入归因不该失败");
+            .expect("writing the injection attribution should not fail");
     }
 
-    // 注入之后，第二条被新事实取代
+    // After injection, the second one is superseded by a new fact
     let ev = NewFactEvent::superseded(stale, kept, Utc::now(), common::DEVICE);
     s.write_txn(async |t| t.insert_fact_event(&ev).await)
         .await
-        .expect("写失效事件不该失败");
+        .expect("writing the invalidation event should not fail");
 
     let drawer = s
         .injected_memories(&turn_id.to_string())
         .await
-        .expect("查抽屉不该失败");
+        .expect("querying the drawer should not fail");
 
     db.cleanup().await;
 
     assert_eq!(
         drawer.len(),
         2,
-        "两条注入记忆都该回放出来，失效的那条**不能**被过滤掉：{drawer:?}"
+        "both injected memories should be replayed, and the invalidated one **must not** be \
+         filtered out: {drawer:?}"
     );
     assert_eq!(
         drawer.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
         vec![0, 1],
-        "必须按注入顺序还原 —— 靠 score 重排是不行的，它可空：{drawer:?}"
+        "injection order must be restored -- re-sorting by score will not do, since it is \
+         nullable: {drawer:?}"
     );
     assert_eq!(
         drawer[0].channels.as_deref(),
         Some(["bm25".to_owned(), "vector".to_owned()].as_slice()),
-        "命中的召回路要原样带回，bad case 时它是唯一能定位问题的东西：{drawer:?}"
+        "the retrieval channels that hit must come back verbatim; in a bad case they are the \
+         only thing that can localize the problem: {drawer:?}"
     );
     assert!(
         drawer[0].statement.is_some(),
-        "statement 应当从 facts JOIN 出来 —— 表里只存 id 是为了让 redact \
-         一处清除处处生效：{drawer:?}"
+        "statement should be JOINed out of facts -- the table stores only ids so that redact \
+         clearing it in one place takes effect everywhere: {drawer:?}"
     );
     assert!(
         !drawer[0].invalidated && drawer[1].invalidated,
-        "只有被 superseded 的那条该带失效标记：{drawer:?}"
+        "only the superseded one should carry the invalidation marker: {drawer:?}"
     );
 }
 
-/// 工具调用的 `path` 必须是**独立一列**。
+/// A tool call's `path` must be **its own column**.
 ///
-/// 之前客户端从渲染后的 summary 里正则抠文件名，参数格式一变就静默显示错文件。
+/// Clients used to regex the filename out of the rendered summary, so a change
+/// in the wording silently displayed the wrong file.
 #[tokio::test]
 async fn tool_calls_replay_with_a_separate_path_column() {
     let Some(db) = common::setup().await else {
@@ -295,12 +315,12 @@ async fn tool_calls_replay_with_a_separate_path_column() {
     let turn_id = turn.id;
     s.write_txn(async |t| t.insert_episode(&turn).await)
         .await
-        .expect("写 episode 不该失败");
+        .expect("writing the episode should not fail");
 
     let calls = [
         (0, "read_file", Some("README.md"), true),
         (1, "write_file", Some("README.md"), true),
-        // 不碰文件的工具 —— path 必须能为空
+        // A tool that touches no file -- path must be nullable
         (2, "memory_search", None, true),
         (3, "read_file", Some("../etc/passwd"), false),
     ];
@@ -318,20 +338,21 @@ async fn tool_calls_replay_with_a_separate_path_column() {
         };
         s.write_txn(async |t| t.insert_episode_tool_call(&row).await)
             .await
-            .expect("写工具归因不该失败");
+            .expect("writing the tool attribution should not fail");
     }
 
     let replay = s
         .episode_tool_calls(&turn_id.to_string())
         .await
-        .expect("查工具归因不该失败");
+        .expect("querying the tool attribution should not fail");
 
     db.cleanup().await;
 
     assert_eq!(
         replay.iter().map(|c| c.ordinal).collect::<Vec<_>>(),
         vec![0, 1, 2, 3],
-        "工具调用之间有因果（先 list_dir 再 read_file），必须按调用顺序回放：{replay:?}"
+        "tool calls have causal relationships between them (list_dir before read_file), so they \
+         must be replayed in call order: {replay:?}"
     );
     assert_eq!(
         replay.iter().map(|c| c.path.as_deref()).collect::<Vec<_>>(),
@@ -341,25 +362,29 @@ async fn tool_calls_replay_with_a_separate_path_column() {
             None,
             Some("../etc/passwd")
         ],
-        "路径必须原样回放，且不碰文件的工具为 NULL：{replay:?}"
+        "the path must be replayed verbatim, and NULL for tools that touch no file: {replay:?}"
     );
     assert!(
         !replay[3].ok,
-        "失败的调用要如实标出来 —— 「哪几次失败了」是回放时一眼要看到的：{replay:?}"
+        "a failed call must be marked faithfully -- \"which ones failed\" is what you need to see \
+         at a glance during replay: {replay:?}"
     );
 }
 
-/// diff 存进去之后回放时还在。
+/// A diff that went in is still there when replayed.
 ///
-/// # 为什么单独测这一列
+/// # Why this one column gets its own test
 ///
-/// 「写进去了但读不出来」在这个仓库栽过一次（`FactDto` 少了两列，
-/// 落库正常、界面永远空着，隔了很久才发现）。diff 的形状一模一样：
-/// 三条读路各自手写 SELECT 列名，漏掉一列不会有任何报错 ——
-/// 只是重开会话后那次改动"就没改过"。
+/// "It was written but cannot be read back" has bitten this repository once
+/// before (`FactDto` was missing two columns; persistence worked fine, the UI
+/// stayed empty forever, and it went unnoticed for a long time). diff has
+/// exactly the same shape: three read paths each hand-write their SELECT column
+/// list, and missing one raises no error whatsoever — the change simply
+/// "never happened" once you reopen the session.
 ///
-/// 顺带把 8192 那条 CHECK 也真踩一次。它是最后一道栅栏（agent 侧已经截断
-/// 过一次），而一道从没被踩过的栅栏和一条注释没有区别。
+/// It also actually trips the 8192 CHECK along the way. That CHECK is the last
+/// fence (the agent side has already truncated once), and a fence nobody has
+/// ever tripped is indistinguishable from a comment.
 #[tokio::test]
 async fn tool_call_diff_survives_replay_and_the_length_guard_bites() {
     let Some(db) = common::setup().await else {
@@ -371,7 +396,7 @@ async fn tool_call_diff_survives_replay_and_the_length_guard_bites() {
     let turn_id = turn.id;
     s.write_txn(async |t| t.insert_episode(&turn).await)
         .await
-        .expect("写 episode 不该失败");
+        .expect("writing the episode should not fail");
 
     let diff = " line one\n-line two\n+line TWO\n line three\n";
     let row = |ordinal: i32, name: &str, diff: Option<&str>| NewEpisodeToolCall {
@@ -389,12 +414,13 @@ async fn tool_call_diff_survives_replay_and_the_length_guard_bites() {
     for r in [row(0, "read_file", None), row(1, "write_file", Some(diff))] {
         s.write_txn(async |t| t.insert_episode_tool_call(&r).await)
             .await
-            .expect("写工具归因不该失败");
+            .expect("writing the tool attribution should not fail");
     }
 
-    // 超一个字符就该被数据库挡下来。agent 侧已经截断过一次，走到这里说明
-    // 那次截断失效了 —— 这时宁可写入失败，也不要让一份没有上限的文本
-    // 顺着 sync_log 广播到每一台设备
+    // One character over and the database should stop it. The agent side has
+    // already truncated once, so reaching here means that truncation failed --
+    // at which point we would rather the write fail than let an unbounded piece
+    // of text broadcast to every device along sync_log
     let oversized = row(
         2,
         "write_file",
@@ -407,15 +433,22 @@ async fn tool_call_diff_survives_replay_and_the_length_guard_bites() {
     let replay = s
         .episode_tool_calls(&turn_id.to_string())
         .await
-        .expect("查工具归因不该失败");
+        .expect("querying the tool attribution should not fail");
 
-    // 第四条读路：`/sync` 下发给**别的设备**的那份。它在 `sync.rs` 里另有一句
-    // 手写的 SELECT，与上面三句各自独立 —— 补列时漏掉它不会有任何编译错误，
-    // 症状是整批 /sync 500，客户端游标从此卡死（比少显示一段 diff 严重得多）。
+    // The fourth read path: the copy `/sync` delivers to **other devices**. It
+    // has its own hand-written SELECT in `sync.rs`, independent of the three
+    // above -- missing it when adding a column produces no compile error at
+    // all, and the symptom is a batch-wide /sync 500 with the client's cursor
+    // jammed from then on (far worse than one diff going undisplayed).
     //
-    // `sync_coverage` 那条测试挡不住这个：它塞的是**不存在的行 id**，
-    // SELECT 永远返回空集，而 sqlx 只在真要解码一行时才发现少了列
-    let synced = s.fetch_since(0, 1000).await.expect("拉同步不该失败");
+    // The `sync_coverage` test does not stop this: what it inserts are ids of
+    // rows that **do not exist**, so the SELECT always returns an empty set,
+    // and sqlx only notices a missing column when it actually has to decode a
+    // row
+    let synced = s
+        .fetch_since(0, 1000)
+        .await
+        .expect("the sync pull should not fail");
 
     db.cleanup().await;
 
@@ -428,31 +461,37 @@ async fn tool_call_diff_survives_replay_and_the_length_guard_bites() {
     assert_eq!(
         synced_diff,
         Some(Some(diff.to_owned())),
-        "同步下发的那份也要带上 diff —— 否则这次改动在别的设备上「就没改过」：{synced:?}"
+        "the copy delivered over sync must carry the diff too -- otherwise this change \
+         \"never happened\" on other devices: {synced:?}"
     );
 
     assert!(
         rejected.is_err(),
-        "超过 {} 字符的 diff 必须被 CHECK 挡下 —— 这一列会随 sync_log 下发到所有设备，\
-         没有上限就是一条谁都没预算过的流量",
+        "a diff over {} characters must be stopped by the CHECK -- this column ships to every \
+         device via sync_log, and no cap means traffic nobody ever budgeted for",
         cortex_store::TOOL_DIFF_MAX_CHARS
     );
     assert_eq!(
         replay.iter().map(|c| c.diff.as_deref()).collect::<Vec<_>>(),
         vec![None, Some(diff)],
-        "diff 必须一字不差地回放，且不改文件的工具为 NULL（不是空串 —— \
-         空串会让界面画出一个空的 diff 框，看着像「改了但什么都没改」）：{replay:?}"
+        "the diff must be replayed character for character, and NULL for tools that change no \
+         file (not an empty string -- an empty string makes the UI draw an empty diff box that \
+         looks like \"it was changed but nothing changed\"): {replay:?}"
     );
 }
 
 // ══════════════════════════════════════════════════════════
-//  R5 —— 预签名直传的媒体要能被回扫补上
+//  R5 -- media from presigned direct upload must be
+//  catchable by the rescanner
 // ══════════════════════════════════════════════════════════
 
-/// 候选清单：只要没转过的，且**绝不**包含已抹除的。
+/// The candidate list: everything not yet transcribed, and **never** anything
+/// already redacted.
 ///
-/// 已抹除的若被选中，回扫器会周期性地把它从对象存储拉回内存、送上网 ——
-/// 即使管线那侧的复检最终丢弃结果，秘密也已经出过一次进程。
+/// If a redacted blob were selected, the rescanner would periodically pull it
+/// from object storage into memory and send it over the network — and even
+/// though the pipeline's own recheck eventually discards the result, the secret
+/// has by then left the process once.
 #[tokio::test]
 async fn the_backfill_queue_skips_transcribed_and_redacted_blobs() {
     let Some(db) = common::setup().await else {
@@ -466,10 +505,10 @@ async fn the_backfill_queue_skips_transcribed_and_redacted_blobs() {
         size_bytes: 4096,
         storage_key: format!("blobs/{c}{c}"),
     };
-    let pending = blob('a', "image/png"); // 该被选中
-    let done = blob('b', "image/jpeg"); // 已经转过
-    let erased = blob('c', "image/png"); // 已抹除
-    let text = blob('d', "text/plain"); // 类型不在粗筛里
+    let pending = blob('a', "image/png"); // should be selected
+    let done = blob('b', "image/jpeg"); // already transcribed
+    let erased = blob('c', "image/png"); // already redacted
+    let text = blob('d', "text/plain"); // type not in the coarse filter
 
     let transcript = cortex_store::NewBlobTranscript {
         id: Id::new(),
@@ -501,12 +540,12 @@ async fn the_backfill_queue_skips_transcribed_and_redacted_blobs() {
         t.insert_redaction(&tombstone).await
     })
     .await
-    .expect("造数据不该失败");
+    .expect("manufacturing the data should not fail");
 
     let queue = s
         .blobs_missing_transcript(&["image/%".to_owned()], 100)
         .await
-        .expect("查回扫候选不该失败");
+        .expect("querying the rescan candidates should not fail");
     let hashes: Vec<String> = queue.into_iter().map(|b| b.hash).collect();
 
     db.cleanup().await;
@@ -514,15 +553,18 @@ async fn the_backfill_queue_skips_transcribed_and_redacted_blobs() {
     assert_eq!(
         hashes,
         vec![pending.hash.clone()],
-        "候选清单应当只剩没转过、没被抹除、类型对得上的那一个：{hashes:?}"
+        "the candidate list should hold only the one that is untranscribed, unredacted, and of a \
+         matching type: {hashes:?}"
     );
     assert!(
         !hashes.contains(&erased.hash),
-        "已抹除的 blob 绝不能进回扫队列 —— 那会让秘密被周期性地拉回内存并送上网"
+        "a redacted blob must never enter the rescan queue -- that would have the secret pulled \
+         periodically back into memory and sent over the network"
     );
 }
 
-/// 回扫是幂等的：补完转录之后，同一个 blob 不该再出现在队列里。
+/// The rescan is idempotent: once the transcript is backfilled, the same blob
+/// must not appear in the queue again.
 #[tokio::test]
 async fn a_backfilled_blob_leaves_the_queue() {
     let Some(db) = common::setup().await else {
@@ -533,12 +575,12 @@ async fn a_backfilled_blob_leaves_the_queue() {
     let blob = NewBlob {
         hash: "e".repeat(64),
         mime: "image/png".to_owned(),
-        size_bytes: 40 * 1024 * 1024, // 直传那一档
+        size_bytes: 40 * 1024 * 1024, // the direct-upload size tier
         storage_key: "blobs/ee".to_owned(),
     };
     s.write_txn(async |t| t.insert_blob(&blob).await)
         .await
-        .expect("写 blob 不该失败");
+        .expect("writing the blob should not fail");
 
     let before = queue_len(s, &blob.hash).await;
 
@@ -556,23 +598,28 @@ async fn a_backfilled_blob_leaves_the_queue() {
     };
     s.write_txn(async |t| t.insert_blob_transcript(&transcript).await)
         .await
-        .expect("写转录不该失败");
+        .expect("writing the transcript should not fail");
 
     let after = queue_len(s, &blob.hash).await;
 
     db.cleanup().await;
 
-    assert_eq!(before, 1, "直传上来、从未转录过的大文件必须进队列");
+    assert_eq!(
+        before, 1,
+        "a large file that arrived by direct upload and has never been transcribed must enter \
+         the queue"
+    );
     assert_eq!(
         after, 0,
-        "补上转录之后必须离开队列，否则回扫器会每轮重转同一个对象"
+        "it must leave the queue once the transcript is backfilled, or the rescanner \
+         re-transcribes the same object every round"
     );
 }
 
 async fn queue_len(s: &Store, hash: &str) -> usize {
     s.blobs_missing_transcript(&["image/%".to_owned()], 100)
         .await
-        .expect("查回扫候选不该失败")
+        .expect("querying the rescan candidates should not fail")
         .into_iter()
         .filter(|b| b.hash == hash)
         .count()

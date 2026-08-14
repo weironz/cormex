@@ -1,24 +1,28 @@
-//! 转录冒烟测试：给一张图跑一遍完整的 [`TranscribePipeline`]，
-//! 把最终会写进 `blob_transcripts` 的那一行原样打出来。
+//! Transcription smoke test: runs one image through the complete
+//! [`TranscribePipeline`] and prints, verbatim, the row that would eventually
+//! be written into `blob_transcripts`.
 //!
-//! 这是「不转成文本的媒体是检索黑洞」这条判断的验收现场 —— 看的不是
-//! 「模型说了话」，而是**产出的文字里有没有足够多能被检索命中的信号**：
-//! 图里的文字、可识别实体、结构类型。
+//! This is the acceptance site for the judgement "media that is not turned
+//! into text is a retrieval black hole" — what we look at is not "the model
+//! said something", but **whether the produced text carries enough signal for
+//! retrieval to hit**: the text inside the image, recognizable entities,
+//! structural type.
 //!
 //! ```bash
-//! # 本机 Ollama，不需要任何密钥（模型需先 ollama pull）
+//! # Local Ollama, no key of any kind needed (the model must be ollama pull'd first)
 //! CORTEX_VISION_PROVIDER=ollama CORTEX_VISION_MODEL=gemma4:latest \
 //!   cargo run -p cortex-memory --example vision_caption
 //!
-//! # 换一张图
-//! ... --example vision_caption -- 路径/图.png
+//! # Use a different image
+//! ... --example vision_caption -- path/to/image.png
 //! ```
 //!
-//! 没设 `CORTEX_VISION_PROVIDER` 时会退到 [`StubTranscriber`]，
-//! 用来验证流水线本身（分词、向量化、抹除防护）在离线环境下也走得通。
+//! With `CORTEX_VISION_PROVIDER` unset it falls back to [`StubTranscriber`],
+//! which verifies that the pipeline itself (tokenization, vectorization,
+//! redaction protection) also works in an offline environment.
 //!
-//! embedding 固定用 [`HashEmbedder`]：本例要验的是转录，
-//! 不该顺带下载 600 MB 的 bge-m3。
+//! The embedding is fixed to [`HashEmbedder`]: what this example verifies is
+//! transcription, and it should not download 600 MB of bge-m3 along the way.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +34,8 @@ use cortex_memory::transcribe::{
 
 const DEFAULT_IMAGE: &str = "crates/cortex-memory/tests/fixtures/console_screenshot.png";
 
-/// 一个假的 blob hash。真实链路里它来自 `blobs.hash`（内容的 SHA-256）。
+/// A fake blob hash. On the real path it comes from `blobs.hash` (the SHA-256
+/// of the content).
 const DEMO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 #[tokio::main]

@@ -1,8 +1,10 @@
-//! 读路径。
+//! The read path.
 //!
-//! 全部 SQL 都是字面量（sqlx 0.9 的 `SqlSafeStr` 在类型层面就拒绝拼接出来的
-//! 查询串），列名逐个写全而不用 `SELECT *` —— `tsv` 是纯派生列，
-//! 没有 Rust 类型也没有读回来的必要，不该白白占用带宽。
+//! Every piece of SQL here is a literal (sqlx 0.9's `SqlSafeStr` rejects
+//! concatenated query strings at the type level), and column names are written
+//! out one by one rather than using `SELECT *` — `tsv` is a purely derived
+//! column with no Rust type and no reason to be read back, and should not eat
+//! bandwidth for nothing.
 
 use chrono::{DateTime, Utc};
 
@@ -15,15 +17,18 @@ use crate::model::{
 use crate::recall::MAX_LIMIT;
 use crate::store::Store;
 
-/// 会话消息分页的游标：`(occurred_at, id)`。
+/// The pagination cursor for session messages: `(occurred_at, id)`.
 ///
-/// # 为什么不能只用 `occurred_at`
+/// # Why `occurred_at` alone will not do
 ///
-/// `occurred_at` 来自客户端时钟，同一微秒落两行是常态（一次工具调用连着落
-/// user + tool 就够了）。单列游标在同刻的那几行上要么跳过、要么重复 ——
-/// 两种症状在界面上都只表现为「历史看着怪怪的」，没人会去怀疑分页。
+/// `occurred_at` comes from the client's clock, and two rows landing in the
+/// same microsecond is routine (one tool call writing a user row and a tool row
+/// back to back is enough). A single-column cursor either skips or repeats the
+/// rows sharing that instant — and both symptoms show up in the UI merely as
+/// "the history looks a bit off", with nobody suspecting pagination.
 ///
-/// `id` 是 ULID（`COLLATE "C"` 逐字节可比），做同刻的确定性 tiebreaker。
+/// `id` is a ULID (`COLLATE "C"`, byte-comparable), serving as a deterministic
+/// tiebreaker within the same instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeCursor {
     pub occurred_at: DateTime<Utc>,
@@ -31,7 +36,7 @@ pub struct EpisodeCursor {
 }
 
 impl Store {
-    // ── L0：episodes ───────────────────────────────────────
+    // ── L0: episodes ───────────────────────────────────────
 
     pub async fn episode(&self, id: &str) -> Result<Option<Episode>> {
         let row = sqlx::query_as::<_, Episode>(
@@ -44,11 +49,14 @@ impl Store {
         Ok(row)
     }
 
-    /// 一次会话内的消息，按发生时间升序（走 `idx_episodes_sess`）。
+    /// The messages within one session, ascending by occurrence time (uses
+    /// `idx_episodes_sess`).
     ///
-    /// **只适合确定条数有限的场合**（测试、导出小会话）。会话详情那条路
-    /// 一律走 [`Self::episodes_by_session_page`] —— 升序 + LIMIT 在长会话上
-    /// 截掉的是**最新**那些消息，用户看到一段没有结尾的对话，而且看不出被截断了。
+    /// **Only suitable where the row count is known to be bounded** (tests,
+    /// exporting a small session). The session-detail path always goes through
+    /// [`Self::episodes_by_session_page`] — on a long session, ascending +
+    /// LIMIT truncates the **newest** messages, so the user sees a conversation
+    /// with no ending and cannot tell it was truncated.
     pub async fn episodes_by_session(&self, session_id: &str, limit: i64) -> Result<Vec<Episode>> {
         let rows = sqlx::query_as::<_, Episode>(
             "SELECT id, session_id, role, content, text, domain, device_id, occurred_at, created_at
@@ -63,19 +71,24 @@ impl Store {
         Ok(rows)
     }
 
-    /// 会话消息的一页，**从新到旧**（走 `idx_episodes_sess_desc`）。
+    /// One page of session messages, **newest to oldest** (uses
+    /// `idx_episodes_sess_desc`).
     ///
-    /// `before` 为 `None` 时取最新的一页；否则取严格早于该游标的一页。
-    /// 返回顺序是**降序**（最新在前）—— 这是分页的自然方向，调用方要正序
-    /// 渲染就自己反转（cortexd 就是这么做的，理由见那边的注释）。
+    /// When `before` is `None` this returns the newest page; otherwise the page
+    /// strictly earlier than that cursor. The returned order is **descending**
+    /// (newest first) — the natural direction for pagination; a caller that
+    /// wants to render in forward order reverses it itself (which is what
+    /// cortexd does; see the comments over there for why).
     ///
-    /// # 为什么游标要落在两列上
+    /// # Why the cursor spans two columns
     ///
-    /// 见 [`EpisodeCursor`]。这里的比较写成
-    /// `occurred_at < $2 OR (occurred_at = $2 AND id < $3)` 而不是行比较
-    /// `(occurred_at, id) < ($2, $3)`：后者要求两侧的排序规则可确定，而 `id`
-    /// 是 `COLLATE "C"` 的域、绑定参数却是默认排序规则，Postgres 会在
-    /// 某些版本上直接拒绝这个比较。拆开写让排序规则只由列那一侧决定。
+    /// See [`EpisodeCursor`]. The comparison here is written as
+    /// `occurred_at < $2 OR (occurred_at = $2 AND id < $3)` rather than the row
+    /// comparison `(occurred_at, id) < ($2, $3)`: the latter requires the
+    /// collation on both sides to be determinable, and `id` is a domain with
+    /// `COLLATE "C"` while the bind parameter carries the default collation, so
+    /// on some Postgres versions the comparison is rejected outright. Splitting
+    /// it up leaves the collation determined by the column side alone.
     pub async fn episodes_by_session_page(
         &self,
         session_id: &str,
@@ -101,7 +114,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 时间近因那一路召回：最近 N 条（走 `idx_episodes_time`）。
+    /// The temporal recency retrieval channel: the most recent N (uses
+    /// `idx_episodes_time`).
     pub async fn recent_episodes(&self, limit: i64) -> Result<Vec<Episode>> {
         let rows = sqlx::query_as::<_, Episode>(
             "SELECT id, session_id, role, content, text, domain, device_id, occurred_at, created_at
@@ -113,7 +127,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// 按事件时间开区间回溯，升序返回。
+    /// Look back over a half-open interval of event time, returned ascending.
     pub async fn episodes_in_range(
         &self,
         from: DateTime<Utc>,
@@ -135,7 +149,7 @@ impl Store {
         Ok(rows)
     }
 
-    // ── L0：blobs ──────────────────────────────────────────
+    // ── L0: blobs ──────────────────────────────────────────
 
     pub async fn blob(&self, hash: &str) -> Result<Option<Blob>> {
         let row = sqlx::query_as::<_, Blob>(
@@ -147,11 +161,13 @@ impl Store {
         Ok(row)
     }
 
-    /// 一条消息的附件，**连同内容元信息**（mime / 大小）。
+    /// One message's attachments, **along with their content metadata** (mime /
+    /// size).
     ///
-    /// 内连 `blobs` 而不是左连：`episode_blobs.blob_hash` 有外键指向
-    /// `blobs.hash`，缺行是不可能的；写成 LEFT JOIN 只会让调用方为一个
-    /// 永远不会出现的 `Option` 写分支。
+    /// An inner join on `blobs` rather than a left join:
+    /// `episode_blobs.blob_hash` has a foreign key onto `blobs.hash`, so a
+    /// missing row is impossible; writing it as a LEFT JOIN would only make
+    /// callers write a branch for an `Option` that can never occur.
     pub async fn episode_attachments(&self, episode_id: &str) -> Result<Vec<EpisodeAttachment>> {
         let rows = sqlx::query_as::<_, EpisodeAttachment>(
             "SELECT eb.episode_id, eb.blob_hash, eb.kind, eb.filename, b.mime, b.size_bytes
@@ -165,7 +181,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// blob 是否还被别的 episode 引用 —— purge 前必须问这一句。
+    /// Whether the blob is still referenced by another episode — a question
+    /// that must be asked before purging.
     pub async fn blob_reference_count(&self, blob_hash: &str) -> Result<i64> {
         let (count,): (i64,) =
             sqlx::query_as("SELECT count(*) FROM episode_blobs WHERE blob_hash = $1")
@@ -175,7 +192,8 @@ impl Store {
         Ok(count)
     }
 
-    /// 媒体转录，按片段偏移升序（图片 / OCR 的偏移为 NULL，排在最后）。
+    /// Media transcripts, ascending by segment offset (images / OCR have a NULL
+    /// offset and sort last).
     pub async fn blob_transcripts(&self, blob_hash: &str) -> Result<Vec<BlobTranscript>> {
         let rows = sqlx::query_as::<_, BlobTranscript>(
             "SELECT id, blob_hash, kind, text, embedding, span_start_ms, span_end_ms,
@@ -189,21 +207,28 @@ impl Store {
         Ok(rows)
     }
 
-    /// 待补转录的 blob：MIME 前缀匹配、且还没有任何 `blob_transcripts` 行。
+    /// Blobs awaiting transcription: MIME prefix matches and no
+    /// `blob_transcripts` row exists yet.
     ///
-    /// 预签名直传那条路上服务端从不经手字节，因此上传时无从触发转录 ——
-    /// 大文件成了纯归档，检索一条也命中不了。后台回扫器以 `blobs` 表为
-    /// 权威清单，把这批捡回来补跑。
+    /// On the presigned direct-upload path the server never handles the bytes,
+    /// so there is no way to trigger transcription at upload time — large files
+    /// become pure archive that retrieval can never hit. A background rescanner
+    /// treats the `blobs` table as the authoritative inventory and picks this
+    /// batch back up to run them.
     ///
-    /// # 为什么已被抹除的必须在 SQL 里排掉
+    /// # Why already-redacted blobs must be excluded in SQL
     ///
-    /// 不排的话，回扫器会**周期性地**把已 redact 的 blob 从对象存储拉回内存、
-    /// 送进 vision 模型 —— 即使管线那侧的 [`crate::Store::is_redacted`] 复检
-    /// 最终会丢弃结果，秘密也已经出过一次进程、上过一次网。redact 的销毁承诺
-    /// 经不起这个。
+    /// Without the exclusion, the rescanner would **periodically** pull
+    /// redacted blobs out of object storage into memory and feed them to the
+    /// vision model — and even though the pipeline's own
+    /// [`crate::Store::is_redacted`] recheck eventually discards the result, the
+    /// secret has by then left the process once and gone over the network once.
+    /// Redact's promise of destruction does not survive that.
     ///
-    /// `mime_prefixes` 是 SQL `LIKE` 模式（如 `image/%`）。它只是**粗筛**，
-    /// 真正认领与否由转录管线决定 —— 粗筛存在的理由是不要把全表拉进内存。
+    /// `mime_prefixes` are SQL `LIKE` patterns (e.g. `image/%`). They are only a
+    /// **coarse filter**; whether a blob is actually claimed is decided by the
+    /// transcription pipeline — the coarse filter exists so that the whole table
+    /// is not pulled into memory.
     pub async fn blobs_missing_transcript(
         &self,
         mime_prefixes: &[String],
@@ -228,17 +253,20 @@ impl Store {
         Ok(rows)
     }
 
-    // ── 回放抽屉 ───────────────────────────────────────────
+    // ── the replay drawer ──────────────────────────────────
 
-    /// 一轮对话注入过的记忆，按注入顺序。
+    /// The memories injected on one conversational turn, in injection order.
     ///
-    /// 表里只有 `fact_id`，`statement` 是这里 JOIN 出来的**现状** ——
-    /// 于是一条事实被 redact 之后抽屉里跟着变成占位符，不需要再清一遍这张表。
-    /// 代价是失去逐字保真，换来的是 redact 不必在多处清同一个秘密。
+    /// The table holds only `fact_id`; `statement` is the **present state**
+    /// joined in here — so once a fact is redacted the drawer follows suit and
+    /// shows a placeholder, with no need to sweep this table too. The price is
+    /// losing verbatim fidelity; what it buys is that redact does not have to
+    /// erase the same secret in several places.
     ///
-    /// 失效的事实**照样返回**，只是带上 `invalidated = true`：
-    /// 「当时依据的这条现在已经不成立了」正是审计最想看到的东西，
-    /// 把它藏起来等于篡改回放。
+    /// Invalidated facts are **still returned**, merely carrying
+    /// `invalidated = true`: "the thing this was based on no longer holds" is
+    /// exactly what an audit most wants to see, and hiding it would be
+    /// falsifying the replay.
     pub async fn injected_memories(&self, episode_id: &str) -> Result<Vec<InjectedMemory>> {
         let rows = sqlx::query_as::<_, InjectedMemory>(
             "SELECT m.episode_id, m.fact_id, m.ordinal, m.channels, m.score,
@@ -256,7 +284,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 批量版本。会话详情一次要给一整页消息挂抽屉，逐条查就是 N+1。
+    /// The bulk version. Session detail has to hang drawers off a whole page of
+    /// messages at once, and querying one at a time is N+1.
     pub async fn injected_memories_bulk(
         &self,
         episode_ids: &[String],
@@ -280,7 +309,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// 一轮对话的工具调用，按调用顺序。
+    /// The tool calls of one conversational turn, in call order.
     pub async fn episode_tool_calls(&self, episode_id: &str) -> Result<Vec<EpisodeToolCall>> {
         let rows = sqlx::query_as::<_, EpisodeToolCall>(
             "SELECT id, episode_id, ordinal, name, path, summary, ok, device_id, diff, created_at
@@ -292,7 +321,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 批量版本，同 [`Self::injected_memories_bulk`] 的理由。
+    /// The bulk version, for the same reason as
+    /// [`Self::injected_memories_bulk`].
     pub async fn episode_tool_calls_bulk(
         &self,
         episode_ids: &[String],
@@ -311,14 +341,17 @@ impl Store {
         Ok(rows)
     }
 
-    /// 最近的工具调用（跨 episode，最新的在前）。
+    /// The most recent tool calls (across episodes, newest first).
     ///
-    /// 轨迹抽取判「同一命令反复出现 = 这是这个项目的惯例」需要越过本轮的
-    /// 视野，而那条判据在单轮内是算不出来的。
+    /// For trajectory extraction to judge "the same command keeps recurring =
+    /// this is a convention of this project", it needs a view beyond the
+    /// current turn, and that criterion simply cannot be computed within one
+    /// turn.
     ///
-    /// **按 `id` 倒序而不是 `created_at`**：`id` 是 ULID，字典序即时间序，
-    /// 而它是主键、天然有索引；`created_at` 上一个索引都没有，按它排序在
-    /// 这张只增不减的表上就是一次全表扫描 + 排序。
+    /// **Descending by `id` rather than `created_at`**: `id` is a ULID, so
+    /// lexicographic order is time order, and it is the primary key with an
+    /// index by nature; `created_at` has no index at all, so sorting by it on
+    /// this append-only table means a full table scan plus a sort.
     pub async fn recent_tool_calls(&self, limit: i64) -> Result<Vec<EpisodeToolCall>> {
         let rows = sqlx::query_as::<_, EpisodeToolCall>(
             "SELECT id, episode_id, ordinal, name, path, summary, ok, device_id, diff, created_at
@@ -330,7 +363,7 @@ impl Store {
         Ok(rows)
     }
 
-    // ── L1：entities ───────────────────────────────────────
+    // ── L1: entities ───────────────────────────────────────
 
     pub async fn entity(&self, id: &str) -> Result<Option<Entity>> {
         let row = sqlx::query_as::<_, Entity>(
@@ -343,7 +376,8 @@ impl Store {
         Ok(row)
     }
 
-    /// 实体消解热路径：按 (kind, name) 精确匹配（走 `idx_entities_kn`）。
+    /// The entity resolution hot path: exact match on (kind, name) (uses
+    /// `idx_entities_kn`).
     pub async fn entities_named(&self, kind: &str, name: &str) -> Result<Vec<Entity>> {
         let rows = sqlx::query_as::<_, Entity>(
             "SELECT id, kind, name, summary, embedding, embedding_model, device_id, created_at
@@ -356,10 +390,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// 沿别名合并链走到底的最终归属。链式合并 A→B→C 解析为 A→C。
+    /// The final owner reached by walking the alias merge chain to its end. A
+    /// chained merge A→B→C resolves to A→C.
     ///
-    /// 写 `entity_merges` 前用它做成环检测：若目标的归属终点就是待合并的源，
-    /// 这条边会成环，必须拒绝。
+    /// Use it for cycle detection before writing `entity_merges`: if the
+    /// target's owner resolves back to the source being merged, this edge would
+    /// form a cycle and must be rejected.
     pub async fn canonical_entity(&self, id: &str) -> Result<Option<String>> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT canonical FROM canonical_entities WHERE id = $1")
@@ -369,7 +405,7 @@ impl Store {
         Ok(row.map(|(canonical,)| canonical))
     }
 
-    /// 批量解析归属。
+    /// Resolve owners in bulk.
     pub async fn canonical_entities(&self, ids: &[String]) -> Result<Vec<CanonicalEntity>> {
         let rows = sqlx::query_as::<_, CanonicalEntity>(
             "SELECT id, canonical FROM canonical_entities WHERE id = ANY($1) ORDER BY id ASC",
@@ -380,7 +416,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// 某实体的出边（至多一条 —— `UNIQUE(from_entity)`）。
+    /// An entity's outgoing edge (at most one — `UNIQUE(from_entity)`).
     pub async fn entity_merge_from(&self, from_entity: &str) -> Result<Option<EntityMerge>> {
         let row = sqlx::query_as::<_, EntityMerge>(
             "SELECT id, from_entity, into_entity, reason, source_episode_id, device_id, created_at
@@ -392,9 +428,10 @@ impl Store {
         Ok(row)
     }
 
-    // ── L1：facts ──────────────────────────────────────────
+    // ── L1: facts ──────────────────────────────────────────
 
-    /// 按主键取事实，**不过滤失效**（审计视图要看得见已删除的）。
+    /// Fetch a fact by primary key, **without filtering out invalidated ones**
+    /// (the audit view has to be able to see what was deleted).
     pub async fn fact(&self, id: &str) -> Result<Option<Fact>> {
         let row = sqlx::query_as::<_, Fact>(concat!(
             "SELECT ",
@@ -407,7 +444,7 @@ impl Store {
         Ok(row)
     }
 
-    /// 当前有效的事实 —— 日常检索的入口。
+    /// The currently valid facts — the entry point for everyday retrieval.
     pub async fn active_facts_by_subject(&self, subject_id: &str, limit: i64) -> Result<Vec<Fact>> {
         let rows = sqlx::query_as::<_, Fact>(concat!(
             "SELECT ",
@@ -422,7 +459,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 矛盾检测热路径：同一 (主语, 谓词) 下现存的有效事实（走 `idx_facts_sp`）。
+    /// The contradiction detection hot path: the valid facts that currently
+    /// exist under one (subject, predicate) pair (uses `idx_facts_sp`).
     pub async fn active_facts_by_subject_predicate(
         &self,
         subject_id: &str,
@@ -441,7 +479,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// 图遍历的反向一跳：指向该实体的有效事实（走 `idx_facts_object`）。
+    /// The reverse hop of graph traversal: valid facts pointing at this entity
+    /// (uses `idx_facts_object`).
     pub async fn active_facts_by_object(
         &self,
         object_entity_id: &str,
@@ -460,7 +499,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// redact 级联：按出处定位派生事实（走 `idx_facts_source`）。
+    /// Redact cascade: locate derived facts by their provenance (uses
+    /// `idx_facts_source`).
     pub async fn facts_by_source_episode(&self, episode_id: &str) -> Result<Vec<Fact>> {
         let rows = sqlx::query_as::<_, Fact>(concat!(
             "SELECT ",
@@ -473,8 +513,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// 一条事实最近一次**状态**事件（`flag` 是批注，不参与判定）。
-    /// 返回 `None` 表示从未被失效过。
+    /// A fact's most recent **status** event (`flag` is an annotation and takes
+    /// no part in the decision).
+    /// Returning `None` means it has never been invalidated.
     pub async fn fact_status(&self, fact_id: &str) -> Result<Option<FactStatus>> {
         let row = sqlx::query_as::<_, FactStatus>(
             "SELECT fact_id, op, kind, invalid_at, superseded_by, actor, decided_at
@@ -486,7 +527,8 @@ impl Store {
         Ok(row)
     }
 
-    /// 一条事实的完整生命周期时间线，含 `flag`。界面的「它是怎么变的」。
+    /// A fact's complete lifecycle timeline, including `flag`. The UI's "how
+    /// did this change over time".
     pub async fn fact_events(&self, fact_id: &str) -> Result<Vec<FactEvent>> {
         let rows = sqlx::query_as::<_, FactEvent>(
             "SELECT id, fact_id, op, kind, invalid_at, superseded_by, actor, reason,
@@ -499,7 +541,7 @@ impl Store {
         Ok(rows)
     }
 
-    // ── L2：summaries ──────────────────────────────────────
+    // ── L2: summaries ──────────────────────────────────────
 
     pub async fn summary(&self, id: &str) -> Result<Option<Summary>> {
         let row = sqlx::query_as::<_, Summary>(
@@ -533,7 +575,7 @@ impl Store {
         Ok(rows)
     }
 
-    // ── 抹除墓碑 ───────────────────────────────────────────
+    // ── redaction tombstones ───────────────────────────────
 
     pub async fn redactions_for_target(
         &self,
@@ -552,9 +594,10 @@ impl Store {
         Ok(rows)
     }
 
-    /// 在途任务防护：抽取 / 转录 pipeline 在写入任何派生行**之前**必须问这一句，
-    /// 否则 redact 执行时在途的异步任务会把已抹除的内容重新写回来
-    /// （docs/memory.md §十一）。
+    /// In-flight task protection: the extraction / transcription pipeline must
+    /// ask this **before** writing any derived row, or an async task that was
+    /// already in flight when redact ran will write the erased content straight
+    /// back (docs/memory.md §11).
     pub async fn is_redacted(&self, target_kind: RedactionTarget, target_id: &str) -> Result<bool> {
         let (exists,): (bool,) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM redactions WHERE target_kind = $1 AND target_id = $2)",
@@ -566,25 +609,31 @@ impl Store {
         Ok(exists)
     }
 
-    // ─────────────── 换 embedding 模型：普查与待办 ───────────────
+    // ─────── switching embedding models: census and backlog ───────
 
-    /// 库里现有哪些 embedding 模型、各覆盖多少条**有效**事实。
+    /// Which embedding models exist in the database, and how many **valid**
+    /// facts each covers.
     ///
-    /// # 为什么需要它
+    /// # Why this is needed
     ///
-    /// 换模型之后旧向量还在，但四条向量查询全部按 `embedding_model` 过滤
-    /// （见 [`Store::recall_vector`]），于是旧事实**当天就退出向量召回**。
-    /// 而 BM25 / 图 / recency 三路照常，所以它看起来不像坏了，
-    /// 只像「语义召回好像变差了点」—— 没有任何人被告知。
+    /// After a model switch the old vectors are still there, but all four
+    /// vector queries filter by `embedding_model` (see
+    /// [`Store::recall_vector`]), so the old facts **drop out of vector
+    /// retrieval that same day**. Meanwhile BM25 / graph / recency carry on as
+    /// usual, so it does not look broken, only like "semantic retrieval seems a
+    /// bit worse lately" — and nobody was told.
     ///
-    /// 这个查询是 cortexd 启动时那声告警的依据。**它只负责数数，
-    /// 不负责判断**：当前模型是哪个由调用方决定。
+    /// This query is the basis for that warning cortexd prints at startup. **It
+    /// only counts; it does not judge**: which model is the current one is up
+    /// to the caller.
     ///
-    /// 统计的是 `facts` 原列与 `fact_embeddings` 旁表的**并集**：
-    /// 同一条事实在两个模型下各算一次，这正是想要的 ——
-    /// 「模型 M 覆盖了多少条」问的就是这个。
+    /// What it counts is the **union** of the `facts` column and the
+    /// `fact_embeddings` side table: one fact counts once under each of two
+    /// models, which is exactly what we want — "how many rows does model M
+    /// cover" is asking precisely that.
     ///
-    /// 按覆盖数降序，让最大的那一档排在最前面（告警只印得下几行）。
+    /// Descending by coverage count, so the largest tier comes first (the
+    /// warning only has room for a few lines).
     pub async fn embedding_census(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT embedding_model, count(DISTINCT fact_id) AS n
@@ -605,18 +654,22 @@ impl Store {
         Ok(rows)
     }
 
-    /// 当前模型覆盖了多少条有效事实、还有多少条覆盖不到。
+    /// How many valid facts the current model covers, and how many it does not.
     ///
-    /// # 为什么不能拿 [`Store::embedding_census`] 相减
+    /// # Why you cannot just subtract using [`Store::embedding_census`]
     ///
-    /// 回填期间一条事实**同时**在两个模型下有向量，普查里它被数了两次。
-    /// 用「总数 − 当前模型数」算出来的 stale 会偏小，而且偏小的幅度正好
-    /// 等于已回填的条数 —— 也就是说回填跑得越多，这个数字越接近 0，
-    /// 看起来「快好了」，实际与真实进度无关。
+    /// During a backfill, one fact has vectors under two models **at the same
+    /// time**, so the census counts it twice. A stale count computed as "total
+    /// − current model's count" comes out too small, and it is too small by
+    /// exactly the number of rows already backfilled — meaning the further the
+    /// backfill runs, the closer the number gets to 0, so it looks "nearly
+    /// done" while bearing no relation to actual progress.
     ///
-    /// `covered` 的判据与 [`Store::recall_vector`] 的并集**逐字一致**：
-    /// 原列在当前模型下且非空，**或**旁表里有当前模型的行。
-    /// 两处判据漂开的症状是 `/health` 报「全覆盖」而召回依然是空的。
+    /// The `covered` predicate is **word-for-word identical** to the union in
+    /// [`Store::recall_vector`]: the column is non-null and under the current
+    /// model, **or** the side table has a row for the current model. The
+    /// symptom of the two predicates drifting apart is `/health` reporting
+    /// "fully covered" while retrieval still comes back empty.
     pub async fn embedding_coverage(&self, model: &str) -> Result<(i64, i64)> {
         let (covered, stale): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE ok), count(*) FILTER (WHERE NOT ok)
@@ -635,22 +688,30 @@ impl Store {
         Ok((covered, stale))
     }
 
-    /// 还没有 `model` 这个空间下向量的**有效**事实，供回填器取一批。
+    /// The **valid** facts that have no vector in `model`'s space yet, for the
+    /// backfiller to take a batch of.
     ///
-    /// 按 `created_at DESC`：**新的先补**。近期记忆被检索到的概率高得多，
-    /// 从旧的补起意味着回填跑了一半时，用户最可能问到的那些反而还没回来。
+    /// Ordered by `created_at DESC`: **newest first**. Recent memories are far
+    /// more likely to be retrieved, so starting from the oldest means that
+    /// halfway through the backfill, the very ones the user is most likely to
+    /// ask about are still missing.
     ///
-    /// 返回 `(id, statement)` 而不是整行 [`Fact`]：回填只需要文本，
-    /// 把 1024 维向量与 tsv 一起搬回来是白费带宽 —— 而这条查询会被跑很多轮。
+    /// Returns `(id, statement)` rather than a whole [`Fact`] row: the backfill
+    /// only needs the text, and hauling back a 1024-dimensional vector and the
+    /// tsv alongside it is wasted bandwidth — and this query runs for many
+    /// rounds.
     ///
-    /// # 判据是「没有可用向量」，不是「模型名不同」
+    /// # The predicate is "has no usable vector", not "has a different model
+    /// name"
     ///
-    /// 写成 `embedding_model <> $1` 会漏掉一类：模型名**就是**当前这个、
-    /// 但 `embedding` 是 NULL 的行（写入时向量化失败过）。那种事实同样
-    /// 进不了向量召回，而且永远不会被回填器捡起来 —— 它在待办里不存在，
-    /// 却在 [`Store::embedding_coverage`] 的 stale 里算一条，
-    /// 于是 `/health` 上那个数字会**卡在一个下不去的值**，
-    /// 看起来像回填坏了。两处必须用同一个判据。
+    /// Writing it as `embedding_model <> $1` misses a category: rows whose
+    /// model name **is** the current one but whose `embedding` is NULL
+    /// (vectorization failed at write time). Such facts likewise cannot enter
+    /// vector retrieval, and the backfiller would never pick them up — they do
+    /// not exist in the backlog, yet they count toward the stale figure in
+    /// [`Store::embedding_coverage`], so the number on `/health` would **stick
+    /// at a value that never goes down**, looking as though the backfill were
+    /// broken. Both places must use the same predicate.
     pub async fn facts_missing_embedding(
         &self,
         model: &str,
@@ -674,9 +735,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// 同上，实体侧。实体向量不参与四路召回，只用于**抽取期的实体消解** ——
-    /// 但它失效的方式更隐蔽：消解不上就会给同一个人建出第二个实体，
-    /// 从此他的事实分裂在两个节点上，图遍历再也走不通。
+    /// The same, on the entity side. Entity vectors take no part in four-way
+    /// retrieval and are used only for **entity resolution during
+    /// extraction** — but the way they fail is more insidious: a failed
+    /// resolution creates a second entity for the same person, that person's
+    /// facts are split across two nodes from then on, and graph traversal can
+    /// no longer get through.
     pub async fn entities_missing_embedding(
         &self,
         model: &str,
@@ -686,8 +750,10 @@ impl Store {
             "SELECT e.id, e.name
                FROM entities e
               WHERE NOT (e.embedding IS NOT NULL AND e.embedding_model = $1)
-                -- 从没有过向量的实体不补：实体向量是抽取期消解用的，
-                -- 没有过就说明当初那条路没走到，补一个也没有对应的语义
+                -- Entities that never had a vector are not backfilled: entity
+                -- vectors are for resolution during extraction, and never
+                -- having had one means that path was never taken back then, so
+                -- adding one now has no corresponding semantics
                 AND e.embedding IS NOT NULL
                 AND NOT EXISTS (
                         SELECT 1 FROM entity_embeddings ee

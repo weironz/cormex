@@ -1,72 +1,90 @@
-//! 工具轨迹 → 候选事实。
+//! Tool traces → candidate facts.
 //!
 //! ```text
-//! episode_tool_calls（name / path / ok / ordinal / summary）
+//! episode_tool_calls (name / path / ok / ordinal / summary)
 //!     │
-//!     ├─① 硬信号定位候选   确定性，不问模型
-//!     ├─② 剪掉原始输出     「失败：」之后那一截不进事实
-//!     └─③ 合成 statement   逐字引用轨迹里已有的字
+//!     ├─① locate candidates from hard signals   deterministic; the model is not asked
+//!     ├─② cut away the raw output               everything after 「失败：」 stays out of the fact
+//!     └─③ synthesize the statement              quoting, word for word, what the trace already contains
 //! ```
 //!
-//! # 为什么这一格要另立判据
+//! # Why this slot needs its own criterion
 //!
-//! 对话的判据是「下次不知道这条，会不会做错决定？」——它需要模型去权衡。
-//! 工具轨迹不一样：**值不值得记，从 `ok` 的真假序列和出现次数上就能算出来**
-//! （docs/memory-content.md §二②）。三条硬信号：
+//! The criterion for conversation is "if the next turn didn't know this, would it
+//! make a wrong decision?" — which requires a model to weigh it up. Tool traces
+//! are different: **whether something is worth remembering can be computed from
+//! the true/false sequence of `ok` and from occurrence counts**
+//! (docs/memory-content.md §2②). Three hard signals:
 //!
-//! | 信号 | 怎么算 | 为什么值钱 |
+//! | Signal | How it's computed | Why it's valuable |
 //! |---|---|---|
-//! | 失败后成功 | 同一工具连续 `ok=false` 之后出现 `ok=true` | 差异就是知识 |
-//! | 同一命令反复出现 | 跨轮次数 ≥ [`TraceRules::habit_threshold`] | 这是这个项目的惯例 |
-//! | 用户确认过的高风险操作 | `ok=true` 且摘要里有确认标记 | 它批准过什么 |
+//! | Success after failure | `ok=true` appearing after a run of `ok=false` for the same tool | The difference is the knowledge |
+//! | The same command recurring | Cross-turn count ≥ [`TraceRules::habit_threshold`] | This is how this project does things |
+//! | A high-risk operation the user confirmed | `ok=true` and a confirmation marker in the summary | What it was authorized to do |
 //!
-//! 「失败后成功」这条来自 Manus 的一手复盘：**保留错误记录不清洗，
-//! 失败痕迹是模型改错的依据**。所以那条事实里必须把**试过但没走通的做法**
-//! 一起写上，而不是只留最后成功的那一条 —— 只抽成功路径的抽取器答不出
-//! 「那条路我们试过了，不通」。
+//! "Success after failure" comes from Manus's first-hand retrospective:
+//! **keep the error records, don't scrub them; traces of failure are what the
+//! model uses to correct itself**. That is why the fact must also record **the
+//! approaches that were tried and didn't work**, rather than keeping only the one
+//! that finally succeeded — an extractor that captures only the successful path
+//! cannot answer "we tried that route, it doesn't work".
 //!
-//! # 为什么不把整段轨迹丢给模型自己找
+//! # Why not just hand the whole trace to the model and let it find things
 //!
-//! 灵活，但三样东西一起丢掉：
+//! Flexible, but it throws away three things at once:
 //!
-//! 1. **可测**。硬信号是纯函数，能在没有数据库也没有模型的情况下断言到位；
-//!    交给模型之后，「这段轨迹该不该出事实」就再没有确定性的答案。
-//! 2. **可省**。轨迹跟着每一轮走，模型判定就是每轮多一次跨网络调用 ——
-//!    而绝大多数轮次的轨迹里一条硬信号都没有，那次调用注定空手而归。
-//! 3. **可控**。模型「自由发挥」出来的结论会引入轨迹里根本没有的字，
-//!    而这一格的全部价值就在于它逐字来自真实执行过的东西。
+//! 1. **Testability.** Hard signals are pure functions and can be asserted on
+//!    fully without a database or a model; hand it to the model and "should this
+//!    trace produce a fact" no longer has a deterministic answer.
+//! 2. **Frugality.** Traces come with every turn, so a model judgement means one
+//!    extra network round trip per turn — and the overwhelming majority of turns
+//!    have no hard signal in their traces at all, so that call is guaranteed to
+//!    come back empty-handed.
+//! 3. **Control.** Conclusions the model "improvises" introduce words the trace
+//!    never contained, and this slot's entire value lies in coming word for word
+//!    from something that was actually executed.
 //!
-//! 代价是**措辞机械**：statement 是拼出来的，不是写出来的。可以接受 ——
-//! 检索比对的是 `statement` 的内容而不是它的文采，而这里每一个标识符
-//! （命令、参数、环境变量、路径）都逐字保真。
+//! The cost is **mechanical phrasing**: the statement is assembled, not written.
+//! That is acceptable — retrieval matches against the content of `statement`, not
+//! its literary quality, and here every identifier (command, flag, environment
+//! variable, path) is preserved verbatim.
 //!
-//! # 明确不抽
+//! # Explicitly not extracted
 //!
-//! - **单次成功的调用**（读文件、列目录）：没有信息量。这不是价值取向，
-//!   是 `summarize()` 的信息论事实 —— 成功时摘要只有「返回 N 行 / M 字符」，
-//!   内容压根不在里面。
-//! - **命令的原始输出**：失败摘要里「失败：」之后那一截是工具输出的原文首行
-//!   （见 `cortex_agent::turn::summarize`），docs/memory-content.md §二③
-//!   已定案不存。[`safe_text`] 在这里把它剪掉。
-//! - **一路失败到底、没有成功收尾的序列**：还没有结论。
-//!   与「尚在讨论中的选项不是事实」同一条道理。
+//! - **A single successful call** (reading a file, listing a directory): no
+//!   information content. This is not a value judgement, it is an
+//!   information-theoretic fact about `summarize()` — on success the summary says
+//!   only "returned N lines / M characters", and the content isn't in there at
+//!   all.
+//! - **A command's raw output**: in a failure summary, everything after
+//!   「失败：」 is the first line of the tool's raw output (see
+//!   `cortex_agent::turn::summarize`), and docs/memory-content.md §2③ already
+//!   settled that it is not stored. [`safe_text`] cuts it away here.
+//! - **Sequences that fail all the way through with no successful conclusion**:
+//!   there is no conclusion yet. Same reasoning as "an option still under
+//!   discussion is not a fact".
 //!
-//! # 这一路今天在生产上能产出多少，取决于 `summary` 里有什么
+//! # How much this channel actually produces in production today depends on what
+//! is in `summary`
 //!
-//! 两处上游缺口会直接压低产出，都不在这个 crate 里：
+//! Two upstream gaps directly suppress its output, and neither is in this crate:
 //!
-//! 1. **成功的调用不带命令。** `cortex_agent::turn::summarize` 在 `ok` 分支
-//!    只输出「返回 N 行 / M 字符」，于是落库的摘要是「shell 返回 12 行」——
-//!    [`command_prefix`] 剥出来是空的，惯例那条判据在生产上直接哑火。
-//!    正确的修法是给 `episode_tool_calls` 加一列 `command`（新 migration +
-//!    改 `cortex-agent`），而不是继续从措辞里抠。
-//! 2. **「被用户批准过」没有结构化标记。** 确认回路的结果只活在一轮对话的
-//!    内存里（`cortexd::confirm` 明确不落库），`AgentEvent::ToolResult` 也
-//!    只带 `name / ok / summary`。这里只能退到 [`CONFIRMATION_MARKERS`]
-//!    这个文本启发式。
+//! 1. **Successful calls don't carry the command.**
+//!    `cortex_agent::turn::summarize` emits only "returned N lines / M
+//!    characters" on the `ok` branch, so the persisted summary reads
+//!    「shell 返回 12 行」— [`command_prefix`] extracts nothing from it, and the
+//!    habit criterion is dead on arrival in production. The correct fix is to add
+//!    a `command` column to `episode_tool_calls` (a new migration plus changes to
+//!    `cortex-agent`), not to keep picking at the phrasing.
+//! 2. **"Approved by the user" has no structured marker.** The result of the
+//!    confirmation loop lives only in the memory of a single turn
+//!    (`cortexd::confirm` explicitly does not persist it), and
+//!    `AgentEvent::ToolResult` carries only `name / ok / summary`. All that is
+//!    left here is the text heuristic in [`CONFIRMATION_MARKERS`].
 //!
-//! 评测的 fixture 用的是「命令 + 一行中文结论」这种更饱满的摘要，
-//! 所以题集上的读数是**上游补齐之后**的样子，不是今天生产的样子。
+//! The eval fixtures use a fuller kind of summary ("command + one line of Chinese
+//! conclusion"), so the readings on the dataset show what this looks like **after
+//! the upstream gaps are closed**, not what production looks like today.
 
 use chrono::{DateTime, Utc};
 use cortex_store::EpisodeToolCall;
@@ -74,44 +92,54 @@ use cortex_store::EpisodeToolCall;
 use crate::extract::{CandidateFact, EntityRef, ObjectRef};
 
 // ══════════════════════════════════════════════════════════
-//  参数
+//  Parameters
 // ══════════════════════════════════════════════════════════
 
-/// 一条命令出现几次才算「惯例」。
+/// How many occurrences a command needs before it counts as a "habit".
 ///
-/// 取 3 而不是 2：两次是巧合，三次才是模式。这个方向是刻意保守的 ——
-/// 惯例事实会被反复召回（它按定义就与高频操作相关），误判一条的成本
-/// 是每一轮都被它占掉一个注入名额。
+/// 3 rather than 2: twice is coincidence, three times is a pattern. This
+/// direction is deliberately conservative — habit facts get recalled repeatedly
+/// (by definition they relate to frequent operations), so the cost of getting one
+/// wrong is that it occupies an injection slot on every single turn.
 pub const DEFAULT_HABIT_THRESHOLD: usize = 3;
 
-/// 一段「失败 → 成功」里最多记几条失败的做法。
+/// How many failed approaches at most get recorded within one "failure →
+/// success" run.
 ///
-/// 试了七次才成的序列，前五次通常是同一个错的变体。留最靠近成功的两条：
-/// 它们与最终解法的差值最小，也就是「差异即知识」里那个差值最清晰的地方。
+/// In a sequence that took seven attempts to get right, the first five are
+/// usually variants of the same mistake. Keep the two closest to the success:
+/// their difference from the final solution is smallest, which is where the delta
+/// in "the difference is the knowledge" is at its clearest.
 pub const DEFAULT_MAX_FAILURES_PER_RUN: usize = 2;
 
-/// 一轮轨迹最多产出多少条候选。
+/// How many candidates one turn's traces may produce at most.
 ///
-/// 判据必须编译成预算（docs/memory-content.md §4.2），否则「重要就存」
-/// 在一段几十次调用的轨迹上会一次写进几十条事实，把这一轮的注入窗口吃光。
+/// A criterion must be compiled down into a budget (docs/memory-content.md §4.2),
+/// otherwise "store it if it's important", applied to a trace with dozens of
+/// calls, writes dozens of facts in one go and eats up that turn's entire
+/// injection window.
 pub const DEFAULT_MAX_CANDIDATES: usize = 6;
 
-/// 判惯例时回看多少条历史轨迹。
+/// How many historical trace entries to look back over when deciding habits.
 pub const DEFAULT_HISTORY_LIMIT: i64 = 500;
 
-/// 从 statement 里引用一段轨迹文本时的字符上限。
+/// The character limit when quoting a stretch of trace text inside a statement.
 ///
-/// 不只是省注入预算。**长句本身就是检索噪声源**：`ts_rank` 默认不做长度
-/// 归一，词多的文档在任何查询上都更容易蹭到分；散列向量后端上更明显。
-/// 实测把这个上限从 160 收到 80，一条一百多字的失败摘要就不再霸占
-/// 「买的显卡什么时候到」这种毫不相干的查询的第一名了。
-/// 同一个坑上一轮在 `crosslink` 的边上踩过（evals/README.md 的 D 行）。
+/// This is not just about saving injection budget. **A long sentence is itself a
+/// source of retrieval noise**: `ts_rank` does not normalize for length by
+/// default, so a document with more terms picks up score more easily on any
+/// query, and it is more pronounced still on the hash vector backend. Measured:
+/// tightening this limit from 160 to 80 stopped a hundred-plus-character failure
+/// summary from taking first place on a query as unrelated as "when is the
+/// graphics card I ordered arriving". The same trap was hit one round earlier on
+/// crosslink's edges (row D of evals/README.md).
 const QUOTE_MAX_CHARS: usize = 80;
 
-/// 命令前缀的字符上限。超过这个长度的多半不是一条命令，而是一整行日志。
+/// The character limit for a command prefix. Anything longer than this is
+/// probably not a command but a whole line of log output.
 const COMMAND_MAX_CHARS: usize = 120;
 
-/// 轨迹抽取的判据参数。
+/// The parameters governing trace extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceRules {
     pub habit_threshold: usize,
@@ -132,43 +160,52 @@ impl Default for TraceRules {
 }
 
 // ══════════════════════════════════════════════════════════
-//  谓词
+//  Predicates
 // ══════════════════════════════════════════════════════════
 
-/// 「失败几次之后，这个做法才通」。
+/// "This approach only worked after N failures."
 pub const WORKED_AFTER_FAILURES: &str = "worked_after_failures";
-/// 「这条命令在这个位置反复执行」。
+/// "This command is run repeatedly at this location."
 pub const RUNS_ROUTINELY_IN: &str = "runs_routinely_in";
-/// 「用户显式确认之后执行过这次高风险操作」。
+/// "This high-risk operation was performed after the user explicitly confirmed
+/// it."
 pub const APPROVED_BY_USER: &str = "approved_by_user";
 
-/// 这三个谓词一律**多值**，绝不进 `PredicateRules::functional`。
+/// These three predicates are **always multi-valued** and must never go into
+/// `PredicateRules::functional`.
 ///
-/// 经验是累加的：今天 `--locked` 管用不代表上个月 `--precise` 那次的教训
-/// 就此失效。把它们当单值会让新一条经验把旧一条打成 `superseded`，
-/// 而失效是 append-only 的不可逆写入。
+/// Experience accumulates: `--locked` working today does not mean last month's
+/// lesson about `--precise` has ceased to hold. Treating them as single-valued
+/// would let each new piece of experience mark the previous one `superseded` —
+/// and invalidation is an irreversible append-only write.
 pub const TRACE_PREDICATES: &[&str] = &[WORKED_AFTER_FAILURES, RUNS_ROUTINELY_IN, APPROVED_BY_USER];
 
 // ══════════════════════════════════════════════════════════
-//  文本处理
+//  Text handling
 // ══════════════════════════════════════════════════════════
 
-/// 摘要里「从这里开始是工具输出原文」的分界标记。
+/// The markers in a summary meaning "the tool's raw output starts here".
 ///
-/// 生产只会产出「失败：」这一种（`cortex_agent::turn::summarize` 里写死的
-/// `format!("失败：{}", first_line(&r.content, 120))`）。其余几个是给别的
-/// 轨迹生产者留的余地 —— 多剪一点只是少记一句话，少剪一点就是把原始字节
-/// 写进 append-only 的库。
+/// Production only ever emits 「失败：」 (hard-coded in
+/// `cortex_agent::turn::summarize` as
+/// `format!("失败：{}", first_line(&r.content, 120))`). The others are leeway for
+/// other trace producers — cutting a little too much only costs us one sentence,
+/// whereas cutting a little too little means writing raw bytes into an
+/// append-only database.
 const FAILURE_MARKERS: &[&str] = &["失败：", "失败:", "错误：", "错误:", "failed:", "error:"];
 
-/// 摘要里可以安全落进事实的那一截。
+/// The portion of a summary that can safely be persisted into a fact.
 ///
-/// 成功的摘要整条都安全：`summarize()` 在 `ok` 分支只输出行数与字符数，
-/// 一个字节的工具输出都不带。失败的摘要则是「命令 … 失败：<输出原文首行>」，
-/// 后半截按 docs/memory-content.md §二③ 不能存。
+/// A successful summary is safe in its entirety: on the `ok` branch,
+/// `summarize()` emits only line and character counts, carrying not one byte of
+/// tool output. A failure summary, by contrast, reads
+/// 「command … 失败：<first line of raw output>」, and the second half must not be
+/// stored, per docs/memory-content.md §2③.
 ///
-/// 找不到标记就整条保留 —— 那说明这条摘要不是生产格式，此时**猜**一个
-/// 切点比不切更危险（切错地方会把命令本身也剪掉，而那才是唯一有用的部分）。
+/// If no marker is found, the whole thing is kept — that means this summary is
+/// not in the production format, and at that point **guessing** a cut point is
+/// more dangerous than not cutting at all (cutting in the wrong place would take
+/// the command with it, and the command is the only useful part).
 #[must_use]
 pub fn safe_text(call: &EpisodeToolCall) -> &str {
     if call.ok {
@@ -182,8 +219,9 @@ pub fn safe_text(call: &EpisodeToolCall) -> &str {
     trim_dangling(head)
 }
 
-/// 切在标记处会留下半截连接词（`…重跑 cargo test，仍然` ← 「失败：」被剪掉了）。
-/// 把它们一起去掉，剩下的才是一句能独立读懂的话。
+/// Cutting at the marker leaves a dangling connective behind
+/// (`…重跑 cargo test，仍然` ← 「失败：」 was cut off). Removing those too is what
+/// leaves a sentence that reads on its own.
 fn trim_dangling(text: &str) -> &str {
     const CONNECTIVES: &[&str] = &["仍然", "依然", "还是", "结果", "但是", "但", "却", "并且"];
     let mut s = text.trim();
@@ -201,37 +239,46 @@ fn trim_dangling(text: &str) -> &str {
     }
 }
 
-/// 大小写不敏感的子串位置（只对 ASCII 折叠，中文标记原样比）。
+/// Case-insensitive substring position (folding ASCII only; Chinese markers are
+/// compared as-is).
 fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_ascii() {
         let h = haystack.to_ascii_lowercase();
         let n = needle.to_ascii_lowercase();
-        // to_ascii_lowercase 逐字节改写、不改变长度，字节位置可以直接用回原串
+        // to_ascii_lowercase rewrites byte by byte without changing the length, so
+        // the byte position can be used directly against the original string
         return h.find(&n);
     }
     haystack.find(needle)
 }
 
-/// 从摘要里剥出命令行部分。
+/// Peel the command-line portion out of a summary.
 ///
-/// 规则只有一条：**取开头连续的 ASCII 可打印字符**。摘要的形状是
-/// 「命令 + 中文结论」（`docker compose down --remove-orphans 之后再 just up 通过`），
-/// 第一个非 ASCII 字符就是命令结束的地方。
+/// There is exactly one rule: **take the leading run of printable ASCII
+/// characters**. The shape of a summary is "command + a Chinese conclusion"
+/// (`docker compose down --remove-orphans 之后再 just up 通过`), so the first
+/// non-ASCII character is where the command ends.
 ///
-/// # 为什么允许自己从 summary 的措辞里抠东西
+/// # Why we allow ourselves to pick at the wording of a summary here
 ///
-/// migration 20260807000005 明确写过「客户端不必再从 summary 的措辞里正则抠
-/// 文件名」，理由是抠错会**静默指向另一个文件**。这里不冲突：
-/// 路径有自己的列，我们照用；而**命令根本没有列**，不从摘要里取就等于没有。
-/// 抠错的后果也不同 —— 只是 statement 里少半截字，不会把链接指错地方。
+/// Migration 20260807000005 explicitly stated that "clients must no longer
+/// regex file names out of the wording of a summary", on the grounds that picking
+/// wrongly would **silently point at a different file**. There is no conflict
+/// here: paths have their own column and we use it; whereas **the command has no
+/// column at all**, so not taking it from the summary means not having it. The
+/// consequences of picking wrongly also differ — we merely lose half a phrase in
+/// the statement; no link ends up pointing somewhere wrong.
 ///
-/// 这仍然是一个 schema 缺口，正确的修法是给 `episode_tool_calls` 加一列
-/// `command`，那需要新 migration 与 `cortex-agent` 一起改。
+/// This is still a schema gap, and the correct fix is to add a `command` column
+/// to `episode_tool_calls`, which requires a new migration alongside changes to
+/// `cortex-agent`.
 ///
-/// 开头那个与工具名相同的 token 会被丢掉：生产落库时摘要是
-/// `format!("{name} {summary}")`，于是一次成功的 shell 调用长成
-/// 「shell 返回 12 行 / 340 字符」—— 剥出来的「shell」不是命令，是工具名。
-/// 剥完为空即「这条轨迹没带命令」，硬信号里凡是需要命令的都直接跳过它。
+/// A leading token identical to the tool name is dropped: what production
+/// persists is `format!("{name} {summary}")`, so a successful shell call comes out
+/// as 「shell 返回 12 行 / 340 字符」— and the "shell" peeled off the front is not
+/// a command, it is the tool name. Peeling down to nothing means "this trace
+/// carries no command", and every hard signal that needs a command skips it
+/// outright.
 #[must_use]
 pub fn command_prefix<'a>(name: &str, text: &'a str) -> Option<&'a str> {
     let end = text
@@ -240,8 +287,8 @@ pub fn command_prefix<'a>(name: &str, text: &'a str) -> Option<&'a str> {
         .map_or(text.len(), |(i, _)| i);
     let head = text[..end].trim();
 
-    // 只在「工具名后面正好是词边界」时剥掉它 —— 否则 name="ca" 会把
-    // `cargo build` 削成 `rgo build`
+    // Strip the tool name only when what follows it is exactly a word boundary —
+    // otherwise name="ca" would shave `cargo build` down to `rgo build`
     let rest = match head.strip_prefix(name) {
         Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => r.trim(),
         _ => head,
@@ -256,12 +303,15 @@ pub fn command_prefix<'a>(name: &str, text: &'a str) -> Option<&'a str> {
     Some(cmd)
 }
 
-/// 摘要里表示「这次是用户点头之后才跑的」的标记。
+/// The markers in a summary meaning "this only ran after the user gave the
+/// nod".
 ///
-/// **这是一个文本启发式，不是结构化信号 —— 今天没有别的载体。**
-/// 确认回路的结果只活在一轮对话的内存里（`cortexd::confirm` 明确不落库），
-/// `AgentEvent::ToolResult` 也只带 `name / ok / summary`。要把「被批准过」
-/// 变成可判定的列，得在 `cortex-agent` 那一侧把 `Approval` 一路带下来。
+/// **This is a text heuristic, not a structured signal — there is no other
+/// carrier today.** The result of the confirmation loop lives only in the memory
+/// of a single turn (`cortexd::confirm` explicitly does not persist it), and
+/// `AgentEvent::ToolResult` carries only `name / ok / summary`. Turning "was
+/// approved" into a column that can actually be tested means threading `Approval`
+/// all the way down on the `cortex-agent` side.
 pub const CONFIRMATION_MARKERS: &[&str] =
     &["用户确认", "用户已确认", "经用户确认", "user confirmed"];
 
@@ -271,7 +321,8 @@ fn is_user_confirmed(summary: &str) -> bool {
         .any(|m| find_ignore_ascii_case(summary, m).is_some())
 }
 
-/// 这条调用作用在什么上：优先文件路径，其次工具名。
+/// What this call acted on: the file path if there is one, otherwise the tool
+/// name.
 fn scope(call: &EpisodeToolCall) -> &str {
     match call.path.as_deref().map(str::trim) {
         Some(p) if !p.is_empty() => p,
@@ -279,7 +330,7 @@ fn scope(call: &EpisodeToolCall) -> &str {
     }
 }
 
-/// 给人读的位置名。`.` 在 statement 里是读不懂的。
+/// A human-readable name for the location. `.` is unreadable inside a statement.
 fn scope_label(s: &str) -> &str {
     match s {
         "." | "./" => "工作区根目录",
@@ -287,17 +338,20 @@ fn scope_label(s: &str) -> &str {
     }
 }
 
-/// 一条轨迹事实的主语。
+/// The subject of a trace fact.
 ///
-/// 优先用命令本身：查询问的是「跑什么才过」，命令名才是那个可被点住的实体。
-/// 命令取不到就退到路径，再退到工具名 —— 工具名（`shell` / `bash`）在库里
-/// 近乎常量，做主语没有分辨力，所以放在最后。
+/// The command itself is preferred: queries ask "what do I run to make it pass",
+/// and the command name is the entity that can actually be pinned down. If no
+/// command can be obtained it falls back to the path, and then to the tool name —
+/// tool names (`shell` / `bash`) are near-constant across the database and have no
+/// discriminating power as subjects, which is why they come last.
 fn subject_of(call: &EpisodeToolCall) -> EntityRef {
     if let Some(cmd) = command_prefix(&call.name, safe_text(call)) {
         return EntityRef::new(cmd, "command");
     }
-    // 路径退化成 `.` / `..` 时不建实体：一个叫「.」的实体谁都消解不了，
-    // 它只会把所有在仓库根上跑的东西并成一坨
+    // Do not create an entity when the path degenerates to `.` / `..`: nobody can
+    // resolve an entity named 「.」, and all it does is lump everything ever run
+    // at the repository root into one blob
     match call.path.as_deref().map(str::trim) {
         Some(p) if !p.is_empty() && p != "." && p != "./" && p != ".." => EntityRef::new(p, "file"),
         _ => EntityRef::new(&call.name, "tool"),
@@ -313,24 +367,27 @@ fn quote(text: &str) -> String {
 }
 
 // ══════════════════════════════════════════════════════════
-//  硬信号
+//  Hard signals
 // ══════════════════════════════════════════════════════════
 
-/// 一段「连续失败之后成功」。
+/// One stretch of "a run of failures, then a success".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Recovery<'a> {
     failures: Vec<&'a EpisodeToolCall>,
     success: &'a EpisodeToolCall,
 }
 
-/// 在一轮的调用序列里找出全部「失败 → 成功」段。
+/// Find every "failure → success" stretch in one turn's call sequence.
 ///
-/// 按**工具名**分组而不是按路径：同一件事在三次尝试里往往碰的是不同文件
-/// （先改 `Cargo.toml` 再改 `Cargo.lock`），按路径分组会把一段完整的
-/// 试错切成互不相干的三截，而知识恰恰在这三截的差值里。
+/// Grouped by **tool name** rather than by path: over three attempts at the same
+/// thing the calls often touch different files (edit `Cargo.toml` first, then
+/// `Cargo.lock`), and grouping by path would slice one complete
+/// trial-and-error run into three unrelated pieces — while the knowledge lives
+/// precisely in the differences between those pieces.
 ///
-/// 一路失败到底、本轮没有成功收尾的，不产出任何东西 —— 那是还没有结论的
-/// 过程，不是经验。
+/// Runs that fail all the way through with no successful conclusion in this turn
+/// produce nothing at all — that is a process without a conclusion yet, not
+/// experience.
 fn recoveries<'a>(calls: &'a [EpisodeToolCall]) -> Vec<Recovery<'a>> {
     let mut pending: Vec<(&str, Vec<&'a EpisodeToolCall>)> = Vec::new();
     let mut out = Vec::new();
@@ -356,11 +413,13 @@ fn recoveries<'a>(calls: &'a [EpisodeToolCall]) -> Vec<Recovery<'a>> {
     out
 }
 
-/// 惯例分组的键：同一个工具、同一个位置、同一条命令。
+/// The grouping key for habits: same tool, same location, same command.
 ///
-/// 三样都要：只按工具名分组，生产里的 `shell` 会把所有命令混成一堆；
-/// 只按命令分组，「在哪跑的」就丢了，而惯例是与位置绑定的
-/// （在仓库根跑 `just ci` 是惯例，在别人的目录里跑不是）。
+/// All three are required: grouping by tool name alone would let production's
+/// `shell` blend every command into one heap; grouping by command alone would
+/// lose "where it was run", and a habit is bound to its location (running
+/// `just ci` at the repository root is a habit; running it inside somebody else's
+/// directory is not).
 type HabitKey<'a> = (&'a str, &'a str, &'a str);
 
 fn habit_key<'a>(call: &'a EpisodeToolCall) -> Option<HabitKey<'a>> {
@@ -368,18 +427,21 @@ fn habit_key<'a>(call: &'a EpisodeToolCall) -> Option<HabitKey<'a>> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  合成候选
+//  Synthesizing candidates
 // ══════════════════════════════════════════════════════════
 
-/// 从一轮的工具轨迹产出候选事实。
+/// Produce candidate facts from one turn's tool traces.
 ///
-/// - `calls`：本轮的调用，按 `ordinal` 升序。
-/// - `history`：跨轮的历史调用（**含本轮**），只用来数「这条命令出现过几次」。
-/// - `occurred_at`：本轮的发生时间，作为事实的**事件时间**。
-///   这不是「用今天的日期充数」—— 命令确实是在这一轮里跑的，
-///   这是轨迹少数几个能给出精确事件时间的地方。
+/// - `calls`: this turn's calls, ascending by `ordinal`.
+/// - `history`: historical calls across turns (**including this one**), used only
+///   to count how many times a command has appeared.
+/// - `occurred_at`: when this turn happened, used as the fact's **event time**.
+///   This is not "passing today's date off as the answer" — the command really did
+///   run during this turn, and traces are one of the few places that can supply a
+///   precise event time.
 ///
-/// 纯函数：不碰数据库、不碰模型，因此能在没有二者的环境里断言到位。
+/// A pure function: it touches neither the database nor a model, so it can be
+/// asserted on fully in an environment that has neither.
 #[must_use]
 pub fn candidates_from_trace(
     calls: &[EpisodeToolCall],
@@ -401,7 +463,7 @@ pub fn candidates_from_trace(
         }
     };
 
-    // ── ① 失败后成功 ──
+    // ── ① Success after failure ──
     for rec in recoveries(calls) {
         let scope_of_run = scope(rec.success);
         let label = scope_label(scope_of_run);
@@ -409,12 +471,17 @@ pub fn candidates_from_trace(
         let success_cmd = command_prefix(&rec.success.name, success_text);
         let n = rec.failures.len();
 
-        // 试过但没走通的那几条。三道闸门，缺一条写出来就是错的或空的：
-        // ① 剥得出命令，否则剩下的只是「它失败了」，没有可复用的内容；
-        // ② 成功那条也剥得出命令，否则「差值」的另一端写不出来；
-        // ③ 两条命令**不一样** —— 差异即知识，差异为空就没有知识。
-        //    同一条命令失败又成功（改完代码重跑）说明变的是别的东西，
-        //    此时说「这条路不通」是**错的**。
+        // The approaches that were tried and didn't work. Three gates, and dropping
+        // any one of them makes what gets written either wrong or empty:
+        // ① a command can be peeled out, otherwise all that remains is "it
+        //    failed", with nothing reusable in it;
+        // ② a command can be peeled out of the successful call too, otherwise the
+        //    other end of the "difference" cannot be written down;
+        // ③ the two commands **differ** — the difference is the knowledge, and an
+        //    empty difference is no knowledge at all. The same command failing and
+        //    then succeeding (re-running after editing the code) means what changed
+        //    was something else, and saying "that route doesn't work" there is
+        //    **wrong**.
         let start = rec
             .failures
             .len()
@@ -428,31 +495,42 @@ pub fn candidates_from_trace(
             })
             .collect();
 
-        // **一段试错 = 一条事实**，不拆成「成功一条 + 每个死胡同各一条」。
+        // **One trial-and-error run = one fact**, not split into "one for the
+        // success plus one per dead end".
         //
-        // 这一条是量出来的，不是写着顺口。同一份题集上试过三种写法
-        //（`hash` 后端；「回归面」= 原有 116 题，工具经验那 8 题除外）：
+        // This was measured, not chosen because it reads nicely. Three phrasings
+        // were tried on the same dataset (`hash` backend; "regression surface" =
+        // the original 116 questions, excluding the 8 tool-experience ones):
         //
-        // | 写法 | 回归面 R@5 | 工具经验 R@∞ |
+        // | Phrasing | Regression surface R@5 | Tool experience R@∞ |
         // |---|---|---|
-        // | 拆开，每条只引命令 | 0.8707 | 0.625 |
-        // | 拆开，死胡同那条复述成功摘要 | 0.8621 | 1.000 |
-        // | 合成一条（现在这版） | **0.8707** | 0.750 |
+        // | Split, each entry quoting only the command | 0.8707 | 0.625 |
+        // | Split, with the dead-end entries restating the success summary | 0.8621 | 1.000 |
+        // | Merged into one (this version) | **0.8707** | 0.750 |
         //
-        // 拆开的写法必须在每个死胡同里复述一遍成功那条，否则问
-        // 「那条路能不能走通」时答案不在手边；而复述就是同一段知识以三份
-        // 近乎相同的词面进 BM25，把别的事实挤出注入窗口 —— crosslink 的边
-        // 就是这么栽的（evals/README.md 的 D 行）。合成一条同时解决两头：
-        // 差值的两端本来就该在一起，而总词面只剩三分之一，回归面一格没掉。
+        // The split phrasing has to restate the successful call inside every dead
+        // end, otherwise the answer isn't at hand when someone asks "does that
+        // route work"; and restating means the same piece of knowledge enters BM25
+        // as three near-identical surface forms, crowding other facts out of the
+        // injection window — which is exactly how crosslink's edges came to grief
+        // (row D of evals/README.md). Merging into one solves both ends at once:
+        // the two ends of the difference belonged together anyway, the total
+        // surface form drops to a third, and the regression surface doesn't lose a
+        // single cell.
         //
-        // 第三行那个 0.750 是 `hash` 桩的读数，不是结论：换成真实语义后端
-        // （`fastembed:bge-m3`）同一版是 **1.000**。掉的两道题问的是
-        // 「钉版本管不管用」这种与轨迹措辞零词面重合的问法，散列桩上本来
-        // 就答不了 —— README 早写过「向量那一路在桩上只是第二条词法通道」。
+        // The 0.750 on the third row is a reading from the `hash` stub, not a
+        // conclusion: on a real semantic backend (`fastembed:bge-m3`) the same
+        // version scores **1.000**. The two questions it loses ask things like
+        // "does pinning the version help", phrasings with zero surface-form overlap
+        // with the trace wording, which the hash stub cannot answer in the first
+        // place — the README said long ago that "on the stub, the vector channel is
+        // just a second lexical channel".
         //
-        // 失败那半句「为什么不行」删不得：**用户是照着症状问的**
-        //（「报编码错误」「端口被占」），而症状只写在失败摘要里，
-        // 成功摘要里一个字都没有（`summarize()` 成功分支只有行数与字符数）。
+        // The "why it didn't work" half of the failure must not be deleted:
+        // **users ask in terms of the symptom** (「报编码错误」, 「端口被占」),
+        // and the symptom is written only in the failure summary — the success
+        // summary doesn't contain a word of it (`summarize()`'s success branch has
+        // only line and character counts).
         let mut statement = format!(
             "{label}：失败 {n} 次之后，「{}」才通过。",
             quote(success_text)
@@ -469,10 +547,12 @@ pub fn candidates_from_trace(
         ));
     }
 
-    // ── ② 同一命令反复出现 ──
+    // ── ② The same command recurring ──
     //
-    // 只为**本轮也做过**的命令下结论：本轮没碰的命令，它的次数与这一轮
-    // 没有关系，此刻宣布它是惯例只是把同一条事实在每一轮都重算一遍。
+    // Conclusions are drawn only for commands **this turn also ran**: for a
+    // command this turn never touched, its count has nothing to do with this turn,
+    // and declaring it a habit right now merely recomputes the same fact on every
+    // single turn.
     let mut seen: Vec<HabitKey<'_>> = Vec::new();
     for call in calls {
         let Some(key) = habit_key(call) else { continue };
@@ -498,10 +578,12 @@ pub fn candidates_from_trace(
         ));
     }
 
-    // ── ③ 用户显式确认过的高风险操作 ──
+    // ── ③ High-risk operations the user explicitly confirmed ──
     //
-    // 这是唯一一条「单次成功也要抽」的信号，因此它与「单次成功的读操作不抽」
-    // 不矛盾：判据从来不是「成功就不抽」，是**有没有风险与授权**。
+    // This is the one signal where a single success still gets extracted, which is
+    // why it does not contradict "a single successful read is not extracted": the
+    // criterion was never "success means don't extract", it is **whether there is
+    // risk and authorization**.
     for call in calls
         .iter()
         .filter(|c| c.ok && is_user_confirmed(&c.summary))
@@ -511,7 +593,8 @@ pub fn candidates_from_trace(
             APPROVED_BY_USER,
             scope(call),
             format!("用户确认后执行过的高风险操作：{}。", quote(safe_text(call))),
-            // 硬信号里最硬的一条：有人真的按了那个按钮
+            // The hardest of the hard signals: somebody actually pressed that
+            // button
             0.95,
         ));
     }
@@ -550,7 +633,8 @@ mod tests {
         }
     }
 
-    /// 题集里那段依赖锁的轨迹（evals/suites 的 `sc-tool-lock`）。
+    /// The dependency-lock trace from the dataset (`sc-tool-lock` in
+    /// evals/suites).
     fn lock_trace() -> Vec<EpisodeToolCall> {
         vec![
             call(
@@ -581,7 +665,7 @@ mod tests {
         candidates_from_trace(calls, calls, Some("coding"), at(), &TraceRules::default())
     }
 
-    // ── 剪掉原始输出 ──────────────────────────────────────
+    // ── Cutting away the raw output ────────────────────────
 
     #[test]
     fn raw_tool_output_never_survives_into_a_statement() {
@@ -589,11 +673,14 @@ mod tests {
         for f in &facts {
             assert!(
                 !f.statement.contains("failed to select a version"),
-                "命令的原始输出不能进事实（memory-content §二③），实际：{}",
+                "a command's raw output must not enter a fact (memory-content §2③), actual: {}",
                 f.statement
             );
         }
-        assert!(!facts.is_empty(), "剪掉输出不等于什么都不抽");
+        assert!(
+            !facts.is_empty(),
+            "cutting away the output is not the same as extracting nothing"
+        );
     }
 
     #[test]
@@ -608,7 +695,7 @@ mod tests {
         assert_eq!(
             safe_text(&ok),
             "cargo test --locked 通过：本地与 CI 一致",
-            "成功的摘要没有一个字节的工具输出，整条都该留"
+            "a success summary carries not one byte of tool output, so the whole thing should be kept"
         );
 
         let bad = call(
@@ -621,13 +708,14 @@ mod tests {
         assert_eq!(
             safe_text(&bad),
             "just up",
-            "「失败：」之后是输出原文，必须剪掉"
+            "everything after 「失败：」 is raw output and must be cut away"
         );
     }
 
     #[test]
     fn safe_text_keeps_everything_when_there_is_no_marker() {
-        // 猜一个切点比不切更危险：切错地方会把命令本身剪掉
+        // Guessing a cut point is more dangerous than not cutting: cutting in the
+        // wrong place takes the command itself with it
         let bad = call(
             0,
             "bash",
@@ -641,7 +729,7 @@ mod tests {
         );
     }
 
-    // ── 命令前缀 ──────────────────────────────────────────
+    // ── Command prefix ─────────────────────────────────────
 
     #[test]
     fn command_prefix_stops_at_the_first_non_ascii_char() {
@@ -663,13 +751,14 @@ mod tests {
 
     #[test]
     fn command_prefix_drops_the_leading_tool_name() {
-        // 生产落库的摘要是 format!("{name} {summary}")，于是一次成功的 shell
-        // 调用长成「shell 返回 12 行 / 340 字符」—— 剥出来的只有工具名，
-        // 那不是命令。认成命令的下场是「shell 是这个项目的惯例」这种废话事实
+        // What production persists is format!("{name} {summary}"), so a successful
+        // shell call comes out as 「shell 返回 12 行 / 340 字符」— all that gets
+        // peeled off is the tool name, which is not a command. Accepting it as one
+        // yields vacuous facts like "shell is this project's habit"
         assert_eq!(
             command_prefix("shell", "shell 返回 12 行 / 340 字符"),
             None,
-            "只剩工具名就等于这条轨迹没带命令"
+            "nothing but the tool name left means this trace carries no command"
         );
         assert_eq!(
             command_prefix("shell", "shell cargo build 通过"),
@@ -685,7 +774,7 @@ mod tests {
         );
     }
 
-    // ── 失败后成功 ────────────────────────────────────────
+    // ── Success after failure ──────────────────────────────
 
     #[test]
     fn recovery_yields_both_the_fix_and_the_dead_ends() {
@@ -693,20 +782,20 @@ mod tests {
 
         assert!(
             facts.iter().any(|f| f.statement.contains("--locked")),
-            "最终生效的那个参数必须留下来，实际：{facts:#?}"
+            "the flag that finally worked must be kept, actual: {facts:#?}"
         );
         assert!(
             facts.iter().any(|f| f.statement.contains("cargo update")),
-            "被证伪的那条路同样是知识（Manus：保留错误记录不清洗），实际：{facts:#?}"
+            "the route that was ruled out is knowledge too (Manus: keep the error records, don't scrub them), actual: {facts:#?}"
         );
         assert!(
             facts.iter().any(|f| f.predicate == WORKED_AFTER_FAILURES),
-            "应当有一条「失败几次后这么做才通」"
+            "there should be one fact saying 'this only worked after N failures'"
         );
         assert_eq!(
             facts.len(),
             1,
-            "一段试错就是一条经验：拆成多条会让同一段知识以多份词面进 BM25，实际 {facts:#?}"
+            "one trial-and-error run is one piece of experience: splitting it makes the same knowledge enter BM25 as several surface forms, actual {facts:#?}"
         );
     }
 
@@ -718,7 +807,7 @@ mod tests {
         ];
         assert!(
             run(&calls).is_empty(),
-            "一路失败到底是还没有结论的过程，不是经验"
+            "failing all the way through is a process without a conclusion yet, not experience"
         );
     }
 
@@ -733,12 +822,13 @@ mod tests {
         )];
         assert!(
             run(&calls).is_empty(),
-            "单次成功的读操作没有信息量（memory-content §二②「明确不抽」）"
+            "a single successful read carries no information (memory-content §2②, 'explicitly not extracted')"
         );
     }
 
-    /// 同一条命令失败又成功 = 变的是别的东西（改完代码重跑），
-    /// 此时说「这条路不通」是**错的**：差异为空就没有知识。
+    /// The same command failing and then succeeding = what changed was something
+    /// else (re-running after editing the code), and saying "that route doesn't
+    /// work" there is **wrong**: an empty difference is no knowledge.
     #[test]
     fn the_same_command_failing_then_passing_is_not_a_dead_end() {
         let calls = vec![
@@ -754,22 +844,23 @@ mod tests {
         let facts = run(&calls);
         assert!(
             !facts[0].statement.contains("试过但不管用"),
-            "命令一个字都没变，不存在「这条路不通」这条知识：{}",
+            "not a single character of the command changed, so there is no 'that route doesn't work' knowledge here: {}",
             facts[0].statement
         );
     }
 
     #[test]
     fn recovery_groups_by_tool_not_by_path() {
-        // 三次调用碰了三个不同的文件，按路径分组会把一段完整的试错切碎
+        // The three calls touch three different files, and grouping by path would
+        // shred one complete trial-and-error run
         let facts = run(&lock_trace());
         assert!(
             facts.iter().any(|f| f.statement.contains("--locked")),
-            "同一段试错跨了 Cargo.toml → Cargo.lock，仍应认成一段"
+            "the same run spans Cargo.toml → Cargo.lock and should still be recognized as one"
         );
     }
 
-    // ── 惯例 ──────────────────────────────────────────────
+    // ── Habits ─────────────────────────────────────────────
 
     #[test]
     fn a_command_becomes_a_habit_only_at_the_threshold() {
@@ -779,7 +870,7 @@ mod tests {
             .collect();
         assert!(
             run_with_history(&this_turn, &twice).is_empty(),
-            "两次是巧合，不该下「这是惯例」的结论"
+            "twice is coincidence; no 'this is a habit' conclusion should be drawn"
         );
 
         let thrice: Vec<_> = (0..3)
@@ -790,13 +881,14 @@ mod tests {
             facts
                 .iter()
                 .any(|f| f.predicate == RUNS_ROUTINELY_IN && f.statement.contains("just ci")),
-            "第三次出现应当把它认成惯例，实际：{facts:#?}"
+            "the third occurrence should be recognized as a habit, actual: {facts:#?}"
         );
     }
 
     #[test]
     fn habit_needs_the_command_to_appear_in_this_very_turn() {
-        // 本轮碰都没碰的命令，它的次数与这一轮没有关系
+        // For a command this turn never touched, its count has nothing to do with
+        // this turn
         let other = vec![call(0, "bash", Some("."), true, "cargo build 通过")];
         let history: Vec<_> = (0..5)
             .map(|i| call(i, "bash", Some("."), true, "just ci 通过"))
@@ -804,7 +896,7 @@ mod tests {
         let facts = run_with_history(&other, &history);
         assert!(
             !facts.iter().any(|f| f.statement.contains("just ci")),
-            "本轮没做的事不该在这一轮被重新宣布一次，实际：{facts:#?}"
+            "something this turn did not do should not be re-declared during this turn, actual: {facts:#?}"
         );
     }
 
@@ -815,7 +907,7 @@ mod tests {
         candidates_from_trace(calls, history, Some("coding"), at(), &TraceRules::default())
     }
 
-    // ── 用户确认过的高风险操作 ────────────────────────────
+    // ── High-risk operations the user confirmed ────────────
 
     #[test]
     fn a_user_confirmed_destructive_call_is_worth_one_fact() {
@@ -827,11 +919,16 @@ mod tests {
             "用户确认后执行 DROP SCHEMA cortex_eval_1749000000_4242 CASCADE，清掉上周崩溃留下的临时 schema",
         )];
         let facts = run(&calls);
-        assert_eq!(facts.len(), 1, "实际产出 {} 条：{facts:#?}", facts.len());
+        assert_eq!(
+            facts.len(),
+            1,
+            "actually produced {} entries: {facts:#?}",
+            facts.len()
+        );
         assert_eq!(facts[0].predicate, APPROVED_BY_USER);
         assert!(
             facts[0].statement.contains("DROP SCHEMA"),
-            "批准过的到底是什么必须写进去，实际：{}",
+            "what exactly was approved must be written down, actual: {}",
             facts[0].statement
         );
     }
@@ -847,11 +944,11 @@ mod tests {
         )];
         assert!(
             run(&calls).is_empty(),
-            "没有授权痕迹就只是一次单次成功的调用"
+            "with no trace of authorization it is just one more single successful call"
         );
     }
 
-    // ── 预算 ──────────────────────────────────────────────
+    // ── Budget ─────────────────────────────────────────────
 
     #[test]
     fn output_is_capped_by_the_budget() {
@@ -875,7 +972,7 @@ mod tests {
         let facts = run(&calls);
         assert!(
             facts.len() <= DEFAULT_MAX_CANDIDATES,
-            "判据必须编译成预算，实际产出 {} 条",
+            "the criterion must be compiled down into a budget, actually produced {} entries",
             facts.len()
         );
     }
@@ -896,13 +993,13 @@ mod tests {
         for f in run(&calls) {
             assert!(
                 f.statement.chars().count() < 600,
-                "一条事实会以同样的体积进注入窗口，实际 {} 字符",
+                "a fact enters the injection window at exactly this size, actual {} characters",
                 f.statement.chars().count()
             );
         }
     }
 
-    // ── 事实的形状 ────────────────────────────────────────
+    // ── The shape of a fact ────────────────────────────────
 
     #[test]
     fn trace_facts_carry_the_turn_time_as_event_time() {
@@ -910,18 +1007,19 @@ mod tests {
         assert_eq!(
             facts[0].valid_at,
             Some(at()),
-            "命令确实是在这一轮跑的，这是轨迹少数几个有精确事件时间的地方"
+            "the command really did run during this turn, and traces are one of the few places with a precise event time"
         );
     }
 
     #[test]
     fn trace_facts_are_domain_agnostic_in_wording() {
-        // 跨会话复用的前提：statement 里不能出现会话/轮次这类只在当时成立的锚点
+        // The precondition for reuse across sessions: a statement must not contain
+        // session/turn anchors that only held at the time
         for f in run(&lock_trace()) {
             for banned in ["本轮", "本次会话", "episode", "session"] {
                 assert!(
                     !f.statement.contains(banned),
-                    "「{banned}」把经验绑死在当时那个会话上：{}",
+                    "「{banned}」 pins the experience to the session it came from: {}",
                     f.statement
                 );
             }

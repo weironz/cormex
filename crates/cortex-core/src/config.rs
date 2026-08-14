@@ -1,8 +1,9 @@
-//! 配置。
+//! Configuration.
 //!
-//! 单一来源：环境变量（开发期由 `.env` 注入）。
-//! 供应商相关的 `GOOSE_*` 变量在此收编，用户只面对 `CORTEX_*` / 标准的
-//! `*_API_KEY`，不暴露取件来源的命名。
+//! One single source: environment variables (injected from `.env` during
+//! development). Provider-related `GOOSE_*` variables are absorbed here, so
+//! users only ever face `CORTEX_*` and the standard `*_API_KEY` — the naming
+//! of what we vendored in is not exposed.
 
 use std::env;
 
@@ -14,7 +15,8 @@ pub struct Config {
     pub bind: String,
     pub s3: S3Config,
     pub llm: LlmConfig,
-    /// 本机标识，写入每一行数据用于审计与同步溯源。
+    /// This machine's identity, written on every row for auditing and sync
+    /// provenance.
     pub device_id: String,
 }
 
@@ -29,44 +31,51 @@ pub struct S3Config {
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    /// 供应商标识：deepseek / anthropic / openai / ollama …
+    /// Provider identifier: deepseek / anthropic / openai / ollama …
     pub provider: String,
-    /// 主对话模型
+    /// The main conversation model
     pub model: String,
-    /// 抽取、摘要等后台任务用的廉价模型
+    /// The cheap model for background work like extraction and summarization
     pub cheap_model: String,
-    /// 覆盖供应商定义里的 `base_url`。`None` = 用内置的那个。
+    /// Override the `base_url` from the provider definition. `None` = use the
+    /// built-in one.
     ///
-    /// # 为什么需要它
+    /// # Why this is needed
     ///
-    /// 供应商定义是编译进二进制的，`base_url` 也在里面。没有这一项，
-    /// 想把 `openai` 引擎指向别处 —— 自建的 vLLM / llama.cpp / LM Studio、
-    /// 公司内网网关、one-api / LiteLLM 中转、或者某个更便宜的兼容服务 ——
-    /// 都得改代码重编。
+    /// Provider definitions are compiled into the binary, `base_url` included.
+    /// Without this setting, pointing the `openai` engine somewhere else — a
+    /// self-hosted vLLM / llama.cpp / LM Studio, a corporate gateway, a
+    /// one-api / LiteLLM relay, or some cheaper compatible service — would
+    /// require editing code and rebuilding.
     ///
-    /// 「OpenAI 兼容」几乎是事实标准，所以给一个 URL 覆盖比我们逐个把
-    /// 供应商加进内置清单可用得多，也免得「支持哪些供应商」变成我们
-    /// 要维护的一张表。
+    /// "OpenAI-compatible" is very nearly a de facto standard, so a single URL
+    /// override is far more useful than us adding providers to a built-in list
+    /// one at a time — and it keeps "which providers are supported" from
+    /// becoming a table we have to maintain.
     pub base_url: Option<String>,
 }
 
-/// 读环境变量，**空串按「没设」处理**。
+/// Read an environment variable, **treating the empty string as unset**.
 ///
-/// `env::var` 对「设成空串」返回的是 `Ok("")` 而不是 `Err` —— 于是
-/// `env::var(k).unwrap_or(default)` 会被一个空串顶掉默认值。
+/// For a variable that is set to an empty string, `env::var` returns `Ok("")`
+/// rather than `Err` — so `env::var(k).unwrap_or(default)` gets its default
+/// knocked out by an empty string.
 ///
-/// 这不是理论问题，是**只在容器里显形**的一类：compose 里的
-/// `CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}` 会在 `.env` 没写这一项时
-/// 把变量设成空串（而不是不设），于是进程拿到的 model 是 `""`。
-/// 本地开发用 `.env` 是压根不写这一行，所以从来撞不到。
+/// This is not a theoretical problem; it is the kind that **only shows up
+/// inside a container**: `CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}` in compose
+/// sets the variable to an empty string (rather than leaving it unset) when
+/// `.env` does not mention it, so the process ends up with a model of `""`.
+/// Local development with `.env` simply omits the line, so you never hit it.
 ///
-/// 第一次上生产就是这么炸的：DeepSeek 回
+/// This is exactly how the first production deploy blew up: DeepSeek replied
 /// `The supported API model names are deepseek-v4-pro or deepseek-v4-flash,
-/// but you passed .`（注意句号前面那个空位）。而 cortexd 的启动日志一切正常，
-/// 健康检查也是 ok —— 要发一次真实对话才看得见。
+/// but you passed .` (note the gap before the period). Meanwhile cortexd's
+/// startup log looked entirely normal and the health check was ok — you had to
+/// send a real conversation to see it.
 ///
-/// 这里列的每一项（bind / bucket / region / model / device_id …）空串都无意义，
-/// 所以「空即未设」对全部调用点都成立。真需要「空是合法值」的配置项别用这个。
+/// An empty string is meaningless for every item listed here (bind / bucket /
+/// region / model / device_id …), so "empty means unset" holds at every call
+/// site. Do not use this for a setting where empty really is a legal value.
 fn non_empty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
@@ -80,7 +89,8 @@ fn optional(key: &str, default: &str) -> String {
 }
 
 impl Config {
-    /// 从环境变量加载。开发期先由调用方 `dotenvy::dotenv()` 注入 `.env`。
+    /// Load from the environment. During development the caller injects
+    /// `.env` first via `dotenvy::dotenv()`.
     pub fn from_env() -> Result<Self> {
         let provider = optional("CORTEX_LLM_PROVIDER", "deepseek");
 

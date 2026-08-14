@@ -1,21 +1,24 @@
-//! 同步载荷的对外序列化。
+//! Outward serialization of sync payloads.
 //!
-//! 不给 `cortex_store::SyncPayload` 直接 derive `Serialize`，而是在这里
-//! 显式映射，理由有二：
+//! `cortex_store::SyncPayload` deliberately does not derive `Serialize`; the
+//! mapping is written out explicitly here, for two reasons:
 //!
-//! 1. **`tsv` 与 `embedding` 是服务端派生列，不进同步 payload**
-//!    （memory.md §八 的硬性规定）。它们体积大、客户端用不上，
-//!    且换 embedding 模型时会全量变化，白白撑爆增量同步。
-//! 2. 存储层的结构体是内部表示，让它直接决定线上协议，
-//!    等于把每次内部重构都变成一次协议破坏。
+//! 1. **`tsv` and `embedding` are server-derived columns and never enter a sync
+//!    payload** (a hard rule from memory.md §8). They are bulky, useless to the
+//!    client, and they change wholesale whenever the embedding model changes,
+//!    blowing up incremental sync for nothing.
+//! 2. The storage layer's structs are an internal representation. Letting them
+//!    dictate the wire protocol directly turns every internal refactor into a
+//!    protocol break.
 //!
-//! 代价是新增字段要在这里补一行。这是**故意的摩擦** ——
-//! 它逼着人想清楚「这个字段该不该给客户端」。
+//! The price is that a new field needs one extra line here. That is **deliberate
+//! friction** — it forces someone to decide whether the client should be given
+//! this field at all.
 
 use cortex_store::SyncPayload;
 use serde_json::{Value, json};
 
-/// 把存储层的载荷转成下发给客户端的 JSON。
+/// Convert a storage-layer payload into the JSON sent down to clients.
 pub fn to_json(p: &SyncPayload) -> Value {
     match p {
         SyncPayload::Episode(e) => json!({
@@ -34,8 +37,9 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "hash": b.hash,
             "mime": b.mime,
             "size_bytes": b.size_bytes,
-            // 不下发 storage_key：客户端应通过 presigned URL 取对象，
-            // 而不是拿着内部存储路径直连
+            // storage_key is not sent down: clients should fetch objects through
+            // a presigned URL, not connect directly using an internal storage
+            // path
             "created_at": b.created_at.to_rfc3339(),
         }),
 
@@ -43,16 +47,19 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "episode_id": eb.episode_id,
             "blob_hash": eb.blob_hash,
             "kind": eb.kind,
-            // 文件名属于**引用**而非内容：同一份字节可以有多个文件名，
-            // 所以它在这里而不是在 blobs 那一支里
+            // A filename belongs to the **reference**, not to the content: the
+            // same bytes can carry several filenames, which is why it lives here
+            // rather than on the blobs branch
             "filename": eb.filename,
         }),
 
-        // 回放抽屉：这一轮注入了哪些记忆。
+        // The replay drawer: which memories were injected on this turn.
         //
-        // 只下发 fact_id，不下发 statement —— 客户端本来就会同步到 facts 表，
-        // 在这里再抄一份正文既浪费带宽，又会在事实被 redact 后留下一个
-        // 抹不掉的副本（那正是这张表刻意只存 id 的理由）
+        // Only fact_id goes down, never the statement — the client syncs the
+        // facts table anyway, so copying the body again here both wastes
+        // bandwidth and leaves an unerasable duplicate behind once the fact is
+        // redacted (which is exactly why this table deliberately stores only
+        // ids)
         SyncPayload::EpisodeMemory(m) => json!({
             "id": m.id,
             "episode_id": m.episode_id,
@@ -69,8 +76,9 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "episode_id": t.episode_id,
             "ordinal": t.ordinal,
             "name": t.name,
-            // 独立字段，客户端不必从 summary 的措辞里正则抠文件名 ——
-            // 那种抠法在措辞一改时会静默显示错文件
+            // Its own field, so the client never has to regex a filename out of
+            // the wording of summary — that kind of extraction silently shows
+            // the wrong file the moment the wording changes
             "path": t.path,
             "summary": t.summary,
             "ok": t.ok,
@@ -116,13 +124,16 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "statement": f.statement,
             "domain": f.domain,
             "confidence": f.confidence,
-            // 双时间轴都要给：客户端做本地回放需要它们
+            // Both axes of the bitemporal record go down: the client needs them
+            // for local time replay
             "valid_at": f.valid_at.map(|t| t.to_rfc3339()),
             "created_at": f.created_at.to_rfc3339(),
             "source_episode_id": f.source_episode_id,
-            // 来源通道与信任级都要给：客户端要按来源解释「这条记忆凭什么可信」，
-            // 出安全事件时也要能在本地把同一批来源挑出来。
-            // trust_tier 为 null 只出现在加列之前的存量行上（= 不知道）
+            // Source channel and trust tier both go down: the client explains
+            // "why this memory should be believed" in terms of its source, and
+            // during a security incident it must be able to pick out that same
+            // batch of sources locally. A null trust_tier appears only on rows
+            // that predate the column (= unknown)
             "source_channel": f.source_channel.as_str(),
             "trust_tier": f.trust_tier,
             "extracted_by": f.extracted_by,
@@ -154,9 +165,13 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "created_at": s.created_at.to_rfc3339(),
         }),
 
-        // 派生血缘边。必须下发，理由与 redaction 墓碑同源：客户端收到墓碑后
-        // 有义务执行同等的本地清除，而**派生物清不清得掉，取决于它知不知道
-        // 血缘**。只发墓碑不发边，客户端能清源、清不掉建立在源之上的摘要与图边
+        // Derivation lineage edges. These must go down, for the same reason as
+        // redaction tombstones: on receiving a tombstone the client is obliged
+        // to perform the equivalent local erasure, and **whether a derived
+        // artifact can be erased depends on whether the client knows its
+        // lineage**. Send the tombstone without the edges and the client can
+        // erase the source but not the summaries and graph edges built on top of
+        // it
         SyncPayload::Derivation(d) => json!({
             "id": d.id,
             "derived_kind": d.derived_kind.as_str(),
@@ -167,30 +182,38 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "created_at": d.created_at.to_rfc3339(),
         }),
 
-        // 会话生命周期事件。客户端按同一套状态机自己算末态（每个维度取
-        // 最后一条），而不是等服务端下发一个「当前标题」——后者要求服务端
-        // 在每次事件后再推一行状态，而那行状态本身没有全序可言
+        // Session lifecycle events. The client derives the final state itself
+        // using the same state machine (take the last entry per dimension),
+        // rather than waiting for the server to send down a "current title" —
+        // that would require the server to push a state row after every event,
+        // and such a row has no total order to speak of
         SyncPayload::SessionEvent(e) => json!({
             "id": e.id,
             "session_id": e.session_id,
             "op": e.op.as_str(),
             "title": e.title,
-            // workspace 是**本机**路径，下发出去多半在对端不存在。
-            // 仍然要发：不发的话对端连「这个会话在别的设备上是有工作区的」
-            // 都不知道，界面上没法解释为什么同一个会话在这台机器上没有文件工具
+            // workspace is a **local machine** path, and once sent down it most
+            // likely does not exist on the peer. Send it anyway: without it the
+            // peer does not even know that this session has a workspace on some
+            // other device, and the UI has no way to explain why the same
+            // session has no file tools on this machine
             "workspace": e.workspace,
-            // 归属哪个项目。**可能指向一个已经被删的项目** —— 删项目刻意不
-            // 级联改写会话事件，客户端与服务端一样，算末态时把悬挂的归属
-            // 当作未分组即可
+            // Which project this belongs to. **May point at an already-deleted
+            // project** — deleting a project deliberately does not cascade a
+            // rewrite over session events. The client does what the server does:
+            // while computing the final state, treat a dangling membership as
+            // ungrouped
             "project_id": e.project_id,
             "actor": e.actor.as_str(),
             "device_id": e.device_id,
             "created_at": e.created_at.to_rfc3339(),
         }),
 
-        // 项目生命周期事件。与会话那支同一套：客户端按状态机自己算末态
-        // （存在与否取最后一条 create/delete，名字取最后一条 create/rename），
-        // 而不是等服务端下发一份「当前项目列表」——后者没有全序可言
+        // Project lifecycle events. Same arrangement as the session branch: the
+        // client computes the final state itself with a state machine (existence
+        // from the last create/delete, the name from the last create/rename)
+        // rather than waiting for the server to send down a "current project
+        // list" — which has no total order to speak of
         SyncPayload::ProjectEvent(e) => json!({
             "id": e.id,
             "project_id": e.project_id,
@@ -201,8 +224,9 @@ pub fn to_json(p: &SyncPayload) -> Value {
             "created_at": e.created_at.to_rfc3339(),
         }),
 
-        // 抹除墓碑必须下发：客户端收到后有义务执行同等的本地清除
-        // （memory.md §九 的传播义务）
+        // Redaction tombstones must go down: on receiving one the client is
+        // obliged to perform the equivalent local erasure (the propagation
+        // obligation in memory.md §9)
         SyncPayload::Redaction(r) => json!({
             "id": r.id,
             "target_kind": r.target_kind.as_str(),

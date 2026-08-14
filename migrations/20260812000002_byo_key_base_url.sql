@@ -1,21 +1,24 @@
--- 自带 key 也要能带自己的端点。
+-- Bringing your own key should also let you bring your own endpoint.
 --
--- ## 为什么补这一列
+-- ## Why this column was added
 --
--- 上一条 migration 只存了 (provider, key)。但一个人「自己的 key」很少是
--- 官方那把 —— 更常见的是公司网关、one-api / LiteLLM 这类中转、某个更便宜
--- 的兼容服务，或者自建的 vLLM。那些端点的 URL 与内置定义里编译进去的
--- 那个不一样，而没有这一列的话，填了 key 也打不到自己的地方。
+-- The previous migration stored only (provider, key). But a person's "own key" is rarely
+-- the official one -- far more often it is a corporate gateway, a relay such as one-api /
+-- LiteLLM, some cheaper compatible service, or a self-hosted vLLM. The URL of those
+-- endpoints is not the one compiled into the built-in definition, and without this column
+-- a key that has been entered still cannot reach where its owner wants it to go.
 --
--- 这与服务端那个 `CORTEX_LLM_BASE_URL` 是同一件事的两半：部署级的覆盖
--- 给运维，用户级的覆盖给用户。
+-- This and the server-side `CORTEX_LLM_BASE_URL` are two halves of the same thing: the
+-- deployment-level override is for whoever runs the service, the user-level override is
+-- for the user.
 --
--- NULL = 用内置定义里的那个（官方端点）。
+-- NULL = use the one from the built-in definition (the official endpoint).
 
 ALTER TABLE llm_keys ADD COLUMN base_url text;
 
--- 墓碑行不带端点，与不带密文同理：一行「不再使用自带 key」的记录
--- 不该携带任何配置，否则读取时要多判一次「这行到底算不算数」
+-- A tombstone row carries no endpoint, for the same reason it carries no ciphertext: a
+-- record that says "no longer using an own key" should carry no configuration at all,
+-- otherwise every read needs one more judgement about "does this row count or not"
 ALTER TABLE llm_keys DROP CONSTRAINT llm_keys_shape;
 ALTER TABLE llm_keys ADD CONSTRAINT llm_keys_shape CHECK (
     (deleted AND ciphertext IS NULL AND key_tail IS NULL AND base_url IS NULL)

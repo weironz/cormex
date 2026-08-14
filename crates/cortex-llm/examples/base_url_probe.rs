@@ -1,9 +1,11 @@
-//! 证明 `CORTEX_LLM_BASE_URL` 真的把请求打到了别的地方。
+//! Proof that `CORTEX_LLM_BASE_URL` really does send requests somewhere else.
 //!
-//! 不是单元测试：要的就是一次**真的 HTTP 出站**，而那正是单元测试造不出来的
-//! 那一段 —— 一个只检查结构体字段的测试，在 goose 忽略了这个字段时照样是绿的。
+//! Not a unit test: what is wanted here is **actual outbound HTTP**, and that
+//! is precisely the part a unit test cannot produce — a test that only inspects
+//! struct fields stays green even when goose ignores the field.
 //!
-//! 用法：`cargo run -p cortex-llm --example base_url_probe -- http://127.0.0.1:9099`
+//! Usage:
+//! `cargo run -p cortex-llm --example base_url_probe -- http://127.0.0.1:9099`
 use cortex_core::config::LlmConfig;
 use cortex_llm::{LlmClient, Message};
 use futures::StreamExt as _;
@@ -12,7 +14,7 @@ use futures::StreamExt as _;
 async fn main() -> anyhow::Result<()> {
     let base = std::env::args()
         .nth(1)
-        .expect("用法：base_url_probe <base_url>");
+        .expect("usage: base_url_probe <base_url>");
     let cfg = LlmConfig {
         provider: "openai".into(),
         model: "my-local-model".into(),

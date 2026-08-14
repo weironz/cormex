@@ -1,18 +1,23 @@
-//! 集成测试脚手架。
+//! Integration test scaffolding.
 //!
-//! ## 隔离
+//! ## Isolation
 //!
-//! 每个测试跑在**自己的临时 schema** 里：连接串不变，只把 `search_path` 指到
-//! 一个新建的 schema，再在其中跑一遍 migration。测试之间互不可见，也绝不污染
-//! 开发库里的数据。测试结束 `DROP SCHEMA ... CASCADE`。
+//! Every test runs in **its own temporary schema**: the connection string is
+//! unchanged, only `search_path` is pointed at a freshly created schema, and the
+//! migrations are then run inside it. Tests cannot see each other, and they
+//! never pollute the data in the development database. At the end of a test,
+//! `DROP SCHEMA ... CASCADE`.
 //!
-//! 不用「事务里跑、跑完回滚」那套：并发不漏行的测试必须真提交，
-//! 单事务里根本模拟不出多个并发事务的提交顺序。
+//! The "run inside a transaction and roll back afterwards" approach is not used:
+//! the test for not dropping rows under concurrency has to genuinely commit, and
+//! a single transaction cannot simulate the commit ordering of several
+//! concurrent transactions at all.
 //!
-//! ## 数据库不可用时 skip 而非 fail
+//! ## Skip rather than fail when the database is unavailable
 //!
-//! CI 里有真实 Postgres，开发机上可能没起 `docker compose`。
-//! 拿不到数据库时 [`setup`] 返回 `None`，测试直接返回 —— 不是失败。
+//! CI has a real Postgres; a development machine may not have `docker compose`
+//! running. When no database can be reached, [`setup`] returns `None` and the
+//! test simply returns — that is not a failure.
 
 #![allow(dead_code)]
 
@@ -26,12 +31,14 @@ use cortex_store::{FactSource, NewEntity, NewEpisode, NewFact, Role, Store};
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
-/// 泄漏的临时 schema 超过这个岁数就顺手清掉。
+/// Leaked temporary schemas older than this get cleaned up in passing.
 ///
-/// 测试 panic 时 [`TestDb::cleanup`] 不会执行，schema 会留下来 —— 这个扫描
-/// 就是为那种情况兜底。之所以按岁数而不是「一把全清」：`cargo test` 会跑多个
-/// 测试二进制，无差别清扫会把兄弟进程正在用的 schema 删掉。十分钟远大于任何
-/// 一个测试二进制的寿命，不会误伤。
+/// When a test panics, [`TestDb::cleanup`] never runs and the schema is left
+/// behind — this sweep is the backstop for that case. It goes by age rather
+/// than "wipe them all" because `cargo test` runs several test binaries, and an
+/// indiscriminate sweep would delete a schema a sibling process is currently
+/// using. Ten minutes is far longer than the lifetime of any one test binary, so
+/// there is no collateral damage.
 const STALE_SCHEMA_AGE_MS: u128 = 10 * 60 * 1000;
 
 const SCHEMA_PREFIX: &str = "cortex_test_";
@@ -43,7 +50,8 @@ pub struct TestDb {
 }
 
 impl TestDb {
-    /// 删掉临时 schema 并断开连接。测试结尾显式调用。
+    /// Drop the temporary schema and disconnect. Called explicitly at the end
+    /// of a test.
     pub async fn cleanup(self) {
         self.store.close().await;
         let sql = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema);
@@ -57,36 +65,42 @@ impl TestDb {
         &self.schema
     }
 
-    /// 在测试 schema 里执行一句 SQL。
+    /// Execute one SQL statement inside the test schema.
     ///
-    /// 存在的理由只有一个：**构造正常代码路径写不出来的坏数据**。
-    /// `Store` 刻意不提供裸写入口（写只能走 `write_txn`），但有些失效模式
-    /// 恰恰要求先有一条不该存在的行 —— 比如 `sync_log` 里一条 payload
-    /// 加载器不认识的表名。测试之外没有任何地方该这么用。
+    /// It exists for exactly one reason: **to construct bad data that the
+    /// normal code paths cannot produce**. `Store` deliberately offers no raw
+    /// write entry point (writes can only go through `write_txn`), but some
+    /// failure modes require a row that should not exist in the first place —
+    /// for instance a table name in `sync_log` that the payload loader does not
+    /// recognize. Nowhere outside tests should use this.
     pub async fn exec_raw(&self, sql: impl Into<String>) {
         self.try_exec_raw(sql)
             .await
-            .expect("测试用 SQL 应当执行成功");
+            .expect("the test SQL should execute successfully");
     }
 
-    /// 在测试 schema 里跑一句查询，把**第一列**按文本取回来。
+    /// Run one query inside the test schema and take the **first column** back
+    /// as text.
     ///
-    /// 为 `EXPLAIN` 而存在：执行计划是一张多行文本表，而 `Store` 只暴露
-    /// 领域方法、`pool()` 是 `pub(crate)`。让测试自己开一条连接又会绕过
-    /// `search_path`，查到开发库而不是这个临时 schema 去。
+    /// It exists for `EXPLAIN`: a query plan is a multi-row text table, while
+    /// `Store` exposes only domain methods and `pool()` is `pub(crate)`. Having
+    /// the test open its own connection would bypass `search_path` and query the
+    /// development database instead of this temporary schema.
     ///
-    /// 不支持绑定参数 —— 调用方自己把字面量拼进去。
-    /// 这在测试里可以接受，在生产代码里不行。
+    /// Bind parameters are not supported — the caller splices its literals in
+    /// itself. That is acceptable in a test and not in production code.
     ///
-    /// 必须走 `raw_sql`（simple query 协议）而不是 `query_as`：后者用
-    /// prepared statement，一次只能一条语句，而这里要先 `SET search_path`
-    /// 再查 —— 报的是 `cannot insert multiple commands into a prepared
-    /// statement`，一条完全不指向真正原因的错误。
+    /// It has to go through `raw_sql` (the simple query protocol) rather than
+    /// `query_as`: the latter uses a prepared statement, which permits only one
+    /// statement at a time, whereas here we must `SET search_path` before
+    /// querying — and the error it reports is `cannot insert multiple commands
+    /// into a prepared statement`, which points nowhere near the actual cause.
     pub async fn query_raw(&self, sql: impl Into<String>) -> Vec<String> {
         use sqlx::Row as _;
-        // `public` 必须留在 search_path 里，否则 `::vector` 解析不到 —— 报的是
-        // `type "vector" does not exist`，一条看起来像「扩展没装」的错误。
-        // 与 setup() 里那条连接选项保持一致
+        // `public` has to stay in search_path, or `::vector` cannot be
+        // resolved -- and the error is `type "vector" does not exist`, which
+        // looks like "the extension is not installed".
+        // Keep this consistent with the connection options in setup()
         let stmt = format!(
             "SET search_path TO \"{}\", public; {}",
             self.schema,
@@ -95,16 +109,18 @@ impl TestDb {
         sqlx::raw_sql(AssertSqlSafe(stmt))
             .fetch_all(&self.admin)
             .await
-            .expect("测试用查询应当执行成功")
+            .expect("the test query should execute successfully")
             .into_iter()
             .filter_map(|r| r.try_get::<String, _>(0).ok())
             .collect()
     }
 
-    /// 同 [`Self::exec_raw`]，但把数据库的拒绝当作**结果**而不是 panic。
+    /// Like [`Self::exec_raw`], but treats the database's refusal as a
+    /// **result** rather than a panic.
     ///
-    /// 用在「这条坏数据应当写不进去」这类断言上：CHECK 约束报错正是期望，
-    /// 而 `exec_raw` 会把期望变成测试崩溃。
+    /// Used for assertions of the form "this bad data should not be writable":
+    /// a CHECK constraint error is exactly what is expected, and `exec_raw`
+    /// would turn that expectation into a test crash.
     pub async fn try_exec_raw(&self, sql: impl Into<String>) -> Result<(), String> {
         let stmt = format!("SET search_path TO \"{}\"; {}", self.schema, sql.into());
         sqlx::raw_sql(AssertSqlSafe(stmt))
@@ -115,20 +131,24 @@ impl TestDb {
     }
 }
 
-/// 建一个隔离的测试库。拿不到数据库返回 `None`（测试应当 skip）。
+/// Build an isolated test database. Returns `None` when no database can be
+/// reached (the test should skip).
 pub async fn setup() -> Option<TestDb> {
     setup_upto(None).await
 }
 
-/// 只跑到某个 migration 版本为止，用于**造存量行**。
+/// Run migrations only up to a given version, in order to **manufacture
+/// pre-existing rows**.
 ///
-/// 存在的理由与 [`TestDb::exec_raw`] 同源：有些失效模式要求库先处于一个
-/// 旧形态。`ALTER TABLE ... ADD COLUMN ... DEFAULT` 给存量行留下的取值
-/// 此后永远改不了（改它要 UPDATE，而 UPDATE 只在 redact/purge 里被允许），
-/// 所以那个默认值必须被真的验一遍 —— 而全量跑完 migration 的库里
-/// **一条存量行都没有**，什么也验不到。
+/// It exists for the same reason as [`TestDb::exec_raw`]: some failure modes
+/// require the database to start in an older shape. The value that
+/// `ALTER TABLE ... ADD COLUMN ... DEFAULT` leaves on pre-existing rows can
+/// never be changed afterwards (changing it would take an UPDATE, and UPDATE is
+/// only permitted in redact/purge), so that default has to be genuinely
+/// verified — and a database with all migrations applied has **no pre-existing
+/// rows at all**, so there is nothing to verify.
 ///
-/// 之后调用 `db.store.migrate()` 把剩下的 migration 补上。
+/// Afterwards call `db.store.migrate()` to apply the remaining migrations.
 pub async fn setup_upto(max_version: Option<i64>) -> Option<TestDb> {
     let url = database_url()?;
 
@@ -150,22 +170,26 @@ pub async fn setup_upto(max_version: Option<i64>) -> Option<TestDb> {
         return None;
     }
 
-    // `public` 留在 search_path 里是为了让 `vector` 扩展的类型可见；
-    // 建表建视图一律落到第一个 schema，也就是本次测试专属的那个。
+    // `public` stays in search_path so that the `vector` extension's types are
+    // visible; tables and views all land in the first schema, i.e. the one
+    // dedicated to this test.
     let options = PgConnectOptions::from_str(&url)
-        .expect("DATABASE_URL 应当是合法的连接串")
+        .expect("DATABASE_URL should be a valid connection string")
         .options([("search_path", format!("{schema},public"))]);
 
-    // 并发不漏行的测试要同时跑几十个写事务外加一个读端，
-    // 池子留够，免得读端排在写端后面拿不到连接（那会掩盖竞态）。
+    // The test for not dropping rows under concurrency runs dozens of write
+    // transactions plus a reader at once, so leave enough connections that the
+    // reader does not queue behind the writers and fail to get one (that would
+    // mask the race).
     let pool = PgPoolOptions::new()
         .max_connections(40)
         .connect_with(options)
         .await
-        .expect("临时 schema 建好之后应当能连上");
+        .expect("it should be possible to connect once the temporary schema exists");
 
-    // 先在池子上跑 migration 再交给 Store：`Store::pool()` 是 pub(crate)，
-    // 集成测试拿不到（那是有意的 —— 写只能走 write_txn）
+    // Run the migrations on the pool before handing it to Store:
+    // `Store::pool()` is pub(crate) and integration tests cannot reach it (that
+    // is deliberate -- writes can only go through write_txn)
     if let Some(v) = max_version {
         run_migrations_upto(&pool, v).await;
     }
@@ -174,7 +198,7 @@ pub async fn setup_upto(max_version: Option<i64>) -> Option<TestDb> {
         store
             .migrate()
             .await
-            .expect("migration 应当能在临时 schema 里跑通");
+            .expect("the migrations should run cleanly in the temporary schema");
     }
 
     Some(TestDb {
@@ -184,11 +208,12 @@ pub async fn setup_upto(max_version: Option<i64>) -> Option<TestDb> {
     })
 }
 
-/// 只应用 `version <= max_version` 的 migration。
+/// Apply only the migrations with `version <= max_version`.
 ///
-/// `Migrator` 的字段是 `#[doc(hidden)]` 的 semver 豁免字段，但这是唯一能
-/// 「跑一半」的入口 —— 另一条路是把 migration 的 SQL 在测试里再抄一遍，
-/// 而那样测的就不再是 `migrations/` 里的那一份了。
+/// `Migrator`'s fields are `#[doc(hidden)]` semver-exempt fields, but this is
+/// the only entry point that can "run halfway" — the alternative is copying the
+/// migration SQL into the test, and then what is being tested is no longer the
+/// copy in `migrations/`.
 async fn run_migrations_upto(pool: &PgPool, max_version: i64) {
     static ALL: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -200,7 +225,7 @@ async fn run_migrations_upto(pool: &PgPool, max_version: i64) {
         .collect();
     assert!(
         !subset.is_empty(),
-        "没有版本 <= {max_version} 的 migration —— 是不是版本号写错了？"
+        "there is no migration with version <= {max_version} -- is the version number wrong?"
     );
 
     let partial = sqlx::migrate::Migrator {
@@ -210,11 +235,12 @@ async fn run_migrations_upto(pool: &PgPool, max_version: i64) {
     partial
         .run(pool)
         .await
-        .expect("前半段 migration 应当能跑通");
+        .expect("the first stretch of migrations should run cleanly");
 }
 
 fn database_url() -> Option<String> {
-    // 测试的工作目录是 crate 目录，dotenvy 会一路向上找到仓库根的 .env
+    // The test's working directory is the crate directory, and dotenvy walks
+    // upward until it finds the repository root's .env
     let _ = dotenvy::dotenv();
     match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => Some(url),
@@ -229,17 +255,18 @@ fn unique_schema_name() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{SCHEMA_PREFIX}{millis}_{}_{n}", std::process::id())
 }
 
-/// 清掉上一次崩溃留下的临时 schema（只清足够老的，见 [`STALE_SCHEMA_AGE_MS`]）。
+/// Clean up temporary schemas left behind by a previous crash (only ones old
+/// enough; see [`STALE_SCHEMA_AGE_MS`]).
 async fn sweep_stale_schemas(admin: &PgPool) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("系统时钟不应早于 1970")
+        .expect("the system clock should not predate 1970")
         .as_millis();
 
     let names: Vec<(String,)> = sqlx::query_as(
@@ -263,7 +290,7 @@ async fn sweep_stale_schemas(admin: &PgPool) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  造数据的小工具
+//  Small helpers for manufacturing data
 // ══════════════════════════════════════════════════════════
 
 pub const DEVICE: &str = "test-device";
@@ -276,7 +303,8 @@ pub fn new_episode(session_id: &str, text: &str) -> NewEpisode {
         role: Role::User,
         content: serde_json::json!({ "role": "user", "text": text }),
         text: Some(text.to_owned()),
-        // 真实链路上这里是 jieba 分词后的空格串；测试里用原文足够
+        // On the real path this is a space-separated string after jieba
+        // segmentation; in tests the original text is good enough
         tsv_source: Some(text.to_owned()),
         domain: Some("test".to_owned()),
         device_id: DEVICE.to_owned(),
@@ -311,7 +339,8 @@ pub fn new_fact(subject: Id, predicate: &str, object: &str, source_episode: Id) 
         confidence: 0.9,
         valid_at: Some(Utc::now()),
         source_episode_id: source_episode,
-        // 与真实抽取管线同档：它现在分辨不出「用户亲述」，一律 Conversation
+        // Same tier as the real extraction pipeline: it currently cannot tell
+        // "the user said it themselves" apart, so everything is Conversation
         source: FactSource::Conversation,
         derived_from: Vec::new(),
         extracted_by: "test-extractor".to_owned(),

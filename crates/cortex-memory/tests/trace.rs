@@ -1,12 +1,16 @@
-//! 工具轨迹抽取的集成测试：真连数据库，验证轨迹派生的事实最终**长在库里**。
+//! Integration tests for tool-trace extraction: a real database, checking that
+//! trace-derived facts really **end up living in the database**.
 //!
-//! 判据的纯逻辑在 `cortex_memory::trace` 的单测里已经钉死了。这一层只回答
-//! 单测回答不了的三个问题：
+//! The pure logic of the criteria is already nailed down by the unit tests in
+//! `cortex_memory::trace`. This layer answers only the three questions the unit
+//! tests cannot:
 //!
-//! 1. 轨迹到底有没有被**读**（`write_candidates` 是否真的多了一个输入源）；
-//! 2. 落库的行上 `source_channel` / `trust_tier` 对不对；
-//! 3. 惯例这条判据能不能**跨 episode** 累计 —— 单测里的 `history` 是喂进去的，
-//!    真实的 history 来自 `store.recent_tool_calls`。
+//! 1. whether the trace is actually **read** (whether `write_candidates` really
+//!    gained one more input source);
+//! 2. whether `source_channel` / `trust_tier` are right on the persisted rows;
+//! 3. whether the habit criterion can accumulate **across episodes** — in the
+//!    unit tests `history` is fed in, whereas the real history comes from
+//!    `store.recent_tool_calls`.
 
 mod common;
 
@@ -15,7 +19,8 @@ use cortex_store::{NewRedaction, RedactionMode, RedactionTarget};
 
 use common::{DEVICE, ctx, offline_extractor, seed_episode, seed_episode_with_tools, setup, ts};
 
-/// 题集 `sc-tool-lock` 那段轨迹：两次失败一次成功，形状照抄生产。
+/// The trace from eval item `sc-tool-lock`: two failures then one success,
+/// shape copied verbatim from production.
 const LOCK_TRACE: &[(&str, Option<&str>, bool, &str)] = &[
     (
         "bash",
@@ -43,16 +48,17 @@ async fn statements(store: &cortex_store::Store, ids: &[Id]) -> Vec<String> {
         let f = store
             .fact(&id.to_string())
             .await
-            .expect("查事实不该失败")
-            .expect("刚写的事实应当查得到");
+            .expect("querying a fact should not fail")
+            .expect("a fact just written should be findable");
         out.push(f.statement);
     }
     out
 }
 
-/// 这条测试就是「抽取器读没读那张表」的最小证据。
+/// This test is the minimal evidence for "did the extractor read that table".
 ///
-/// 注意候选列表是**空的** —— 对话本身一个字都没提结论，全部产出都来自轨迹。
+/// Note the candidate list is **empty** — the conversation itself says not one
+/// word about the conclusion; everything produced comes from the trace.
 #[tokio::test]
 async fn a_turn_with_only_a_tool_trace_still_produces_facts() {
     let Some(db) = setup().await else { return };
@@ -63,31 +69,35 @@ async fn a_turn_with_only_a_tool_trace_still_produces_facts() {
     let report = extractor
         .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 2, 11)))
         .await
-        .expect("轨迹抽取不该失败");
+        .expect("trace extraction should not fail");
 
     assert!(
         !report.written.is_empty(),
-        "对话候选为空但轨迹里有「失败后成功」，抽取器必须产出事实；\
-         一条都没有就说明它压根没读 episode_tool_calls"
+        "the conversation candidates are empty but the trace holds a success after failure, \
+         so the extractor must produce facts; not a single one means it never read \
+         episode_tool_calls at all"
     );
 
     let all = statements(&store, &report.written).await.join("\n");
     assert!(
         all.contains("--locked"),
-        "最终生效的那个参数必须逐字留下来，实际落库：\n{all}"
+        "the flag that finally worked must survive verbatim, actually persisted:\n{all}"
     );
     assert!(
         all.contains("cargo update"),
-        "被证伪的那条路同样是知识（Manus：保留错误记录不清洗），实际落库：\n{all}"
+        "the path that got falsified is knowledge too (Manus: keep the failure record, \
+         do not scrub it), actually persisted:\n{all}"
     );
 
     db.cleanup().await;
 }
 
-/// 「失败：」之后那一截是工具输出原文，`docs/memory-content.md` §二③ 已定案不存。
+/// Everything after "失败：" is the tool's raw output, and
+/// `docs/memory-content.md` §2③ already settled that it is not stored.
 ///
-/// 这一条在评测里的对应物是 qt01 的 `never_extracted`。放一份在这里，
-/// 是因为评测要连数据库跑整套题集，而这条约束值得有一个几秒钟就能失败的守卫。
+/// Its counterpart in the eval suite is qt01's `never_extracted`. A copy lives
+/// here because the eval has to run the whole suite against a database, whereas
+/// this constraint deserves a guard that can go red in a couple of seconds.
 #[tokio::test]
 async fn raw_tool_output_never_reaches_the_database() {
     let Some(db) = setup().await else { return };
@@ -98,22 +108,24 @@ async fn raw_tool_output_never_reaches_the_database() {
     let report = extractor
         .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 2, 11)))
         .await
-        .expect("轨迹抽取不该失败");
+        .expect("trace extraction should not fail");
 
     let all = statements(&store, &report.written).await.join("\n");
     assert!(
         !all.contains("failed to select a version"),
-        "命令的原始输出进了 append-only 的库就再也拿不出来（只剩 redact 一条出路），\
-         实际落库：\n{all}"
+        "once a command's raw output enters an append-only store there is no getting it \
+         back out (redact is the only way out), actually persisted:\n{all}"
     );
 
     db.cleanup().await;
 }
 
-/// 轨迹派生的事实必须标 `tool_output`（tier 3）。
+/// Trace-derived facts must be marked `tool_output` (tier 3).
 ///
-/// 标错方向是有害的：tier 的用途是「最可信的那批不该被外部内容盖掉」，
-/// 把「模型自己造出来又自己读回来」的那批抬到 tier 2 就等于取消了这道栅栏。
+/// Getting the direction wrong is harmful: what a tier is for is "the most
+/// trusted batch must not be papered over by external content", so lifting the
+/// batch the model produced itself and then read back itself up to tier 2
+/// amounts to abolishing that barrier.
 #[tokio::test]
 async fn trace_facts_are_written_as_tool_output_tier_three() {
     let Some(db) = setup().await else { return };
@@ -124,29 +136,30 @@ async fn trace_facts_are_written_as_tool_output_tier_three() {
     let report = extractor
         .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 2, 11)))
         .await
-        .expect("轨迹抽取不该失败");
+        .expect("trace extraction should not fail");
 
     for id in &report.written {
         let f = store
             .fact(&id.to_string())
             .await
-            .expect("查事实不该失败")
-            .expect("刚写的事实应当查得到");
+            .expect("querying a fact should not fail")
+            .expect("a fact just written should be findable");
         assert_eq!(
             f.source_channel.as_str(),
             "tool_output",
-            "轨迹派生的事实来源通道错了：{}",
+            "wrong source channel on a trace-derived fact: {}",
             f.statement
         );
         assert_eq!(
             f.trust_tier,
             Some(3),
-            "tier 必须与通道一致：{}",
+            "the tier must agree with the channel: {}",
             f.statement
         );
         assert!(
             f.embedding.is_some(),
-            "embedding 必须与主行同事务写入，否则向量召回永远漏这条：{}",
+            "the embedding must be written in the same transaction as the main row, \
+             or vector recall misses this one forever: {}",
             f.statement
         );
     }
@@ -154,8 +167,9 @@ async fn trace_facts_are_written_as_tool_output_tier_three() {
     db.cleanup().await;
 }
 
-/// 惯例这条判据要跨 episode 才算得出来 —— 这是 `store.recent_tool_calls`
-/// 存在的唯一理由，也是单测（history 是喂进去的）覆盖不到的那一半。
+/// The habit criterion can only be computed across episodes — that is the sole
+/// reason `store.recent_tool_calls` exists, and it is the half the unit tests
+/// (where `history` is fed in) cannot cover.
 #[tokio::test]
 async fn a_habit_only_emerges_after_enough_turns() {
     let Some(db) = setup().await else { return };
@@ -170,7 +184,7 @@ async fn a_habit_only_emerges_after_enough_turns() {
         let report = extractor
             .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 6, turn)))
             .await
-            .expect("轨迹抽取不该失败");
+            .expect("trace extraction should not fail");
         written_so_far.extend(report.written);
 
         let all = statements(&store, &written_so_far).await.join("\n");
@@ -178,19 +192,22 @@ async fn a_habit_only_emerges_after_enough_turns() {
         assert_eq!(
             claimed,
             turn >= 3,
-            "第 {turn} 轮时是否已经宣布惯例 = {claimed}，与阈值 3 不符。\
-             库里现有：\n{all}"
+            "whether a habit had been declared by turn {turn} = {claimed}, which disagrees \
+             with the threshold of 3. Currently in the database:\n{all}"
         );
     }
 
     db.cleanup().await;
 }
 
-/// 出处被抹除之后，轨迹派生的那一路也必须一个字都不写。
+/// Once the source is redacted, the trace-derived path must not write a single
+/// word either.
 ///
-/// 单独测一遍是因为它走的是**新加的**输入源：原有那条守卫只覆盖了
-/// 调用方传进来的候选，而轨迹是抽取器自己去库里读的 —— 漏掉这一句，
-/// redact 之后一次在途的抽取任务就能把已抹除轮次的命令重新写回来。
+/// It gets its own test because it goes through a **newly added** input source:
+/// the existing guard only covered the candidates handed in by the caller,
+/// whereas the trace is something the extractor reads out of the database
+/// itself — miss this one line and a single in-flight extraction after a redact
+/// can write the commands of the redacted turn straight back in.
 #[tokio::test]
 async fn redacted_source_blocks_trace_derived_writes() {
     let Some(db) = setup().await else { return };
@@ -210,22 +227,22 @@ async fn redacted_source_blocks_trace_derived_writes() {
     store
         .write_txn(async |tx| tx.insert_redaction(&tombstone).await)
         .await
-        .expect("墓碑应能落库");
+        .expect("the tombstone should be persisted");
 
     let report = extractor
         .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 2, 11)))
         .await
-        .expect("被抹除的出处不该导致报错，只是什么都不写");
+        .expect("a redacted source should not raise an error, it just writes nothing");
 
     assert!(
         report.written.is_empty() && report.new_entities.is_empty(),
-        "在途抽取任务绝不能把已抹除轮次的轨迹回填：{report:?}"
+        "an in-flight extraction must never write back the trace of a redacted turn: {report:?}"
     );
 
     db.cleanup().await;
 }
 
-/// 纯聊天的轮次不该因为新增了这一路而多出任何事实。
+/// A pure-chat turn should not gain any facts just because this path was added.
 #[tokio::test]
 async fn a_turn_without_tool_calls_is_unaffected() {
     let Some(db) = setup().await else { return };
@@ -236,11 +253,11 @@ async fn a_turn_without_tool_calls_is_unaffected() {
     let report = extractor
         .write_candidates(&store, Vec::new(), &ctx(ep, ts(2026, 2, 11)))
         .await
-        .expect("空候选 + 无轨迹不该失败");
+        .expect("empty candidates plus no trace should not fail");
 
     assert_eq!(
         report.candidates, 0,
-        "没有轨迹的轮次不该凭空多出候选：{report:?}"
+        "a turn with no trace should not conjure candidates out of thin air: {report:?}"
     );
     assert!(report.written.is_empty());
 

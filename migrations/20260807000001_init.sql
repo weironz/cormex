@@ -1,61 +1,80 @@
--- Cortex 记忆系统初始 schema
--- 设计见 docs/memory.md；本文件是 schema 的权威版本，文档中的 SQL 片段以此为准。
+-- Initial schema of the Cortex memory system
+-- Design rationale: see docs/memory.md. This file is the authoritative version of
+-- the schema; where the docs show SQL fragments, this file wins.
 --
--- 核心约束：全链路 append-only。除 redact/purge 外，不存在 UPDATE 与 DELETE。
--- 主键统一为 ULID（26 字符 Crockford base32 大写），客户端可离线生成。
--- 向量维度 1024，对应 bge-m3。更换模型见 docs/memory.md §七。
+-- Core constraint: append-only, end to end. Apart from redact/purge there is no
+-- UPDATE and no DELETE anywhere.
+-- Primary keys are uniformly ULIDs (26-character Crockford base32, uppercase), so
+-- clients can generate them offline.
+-- Vector dimension is 1024, matching bge-m3. To change models see docs/memory.md §7.
 --
--- 【写入纪律】（详见 docs/memory.md §九，违反即破坏同步正确性）：
---   1. 所有需同步表的写入必须与 sync_log 追加在同一事务内完成；
---   2. 该事务开头执行 pg_advisory_xact_lock(4272)，把提交顺序串行化，
---      保证 sync_log.seq 的顺序 == 对读端的可见顺序（裸 BIGSERIAL 做不到这一点：
---      序列值在 INSERT 时分配，提交乱序会让先拉取的客户端永久漏行）；
---   3. 取号事务必须短小、纯写。LLM 调用与 embedding 计算一律在事务外完成；
---   4. tsv 与主行同事务写入，永不异步补写（补写是 UPDATE，且不进 sync_log 就不可见）。
+-- [Write discipline] (details in docs/memory.md §9; break any of these and you
+-- break sync correctness):
+--   1. every write to a table that has to sync must append to sync_log inside the
+--      same transaction;
+--   2. that transaction opens with pg_advisory_xact_lock(4272), which serializes
+--      commit order and so guarantees that sync_log.seq order == the order in which
+--      rows become visible to readers (a bare BIGSERIAL cannot do this: the sequence
+--      value is handed out at INSERT time, so out-of-order commits make a client that
+--      already pulled skip those rows permanently);
+--   3. the sequence-taking transaction must be short and write-only. LLM calls and
+--      embedding computation always happen outside the transaction;
+--   4. tsv is written in the same transaction as its main row, never backfilled
+--      asynchronously (a backfill is an UPDATE, and without a sync_log row it is
+--      invisible to every other device).
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- ULID：26 字符 Crockford base32（无 I/L/O/U），大写。
--- COLLATE "C" 使 B-tree 逐字节比较——既快，又保证排序与生成时间一致。
+-- ULID: 26 characters of Crockford base32 (no I/L/O/U), uppercase.
+-- COLLATE "C" makes the B-tree compare byte by byte -- which is both fast and keeps
+-- sort order identical to generation order in time.
 CREATE DOMAIN ulid AS TEXT COLLATE "C"
     CHECK (VALUE ~ '^[0-9A-HJKMNP-TV-Z]{26}$');
 
--- SHA-256 十六进制小写
+-- SHA-256, lowercase hex
 CREATE DOMAIN sha256 AS TEXT COLLATE "C"
     CHECK (VALUE ~ '^[0-9a-f]{64}$');
 
 -- ══════════════════════════════════════════════════════════
---  同步日志（outbox）—— 多端同步的唯一事实序
+--  Sync log (outbox) -- the one true ordering for multi-device sync
 --
---  每个业务写事务同时向此表追加一行。客户端增量拉取只面向本表：
---    GET /sync?since={seq} → 返回 seq > since 的记录及其对应业务行。
---  跨表全序天然成立（九张表各自的 BIGSERIAL 无法比较，单一游标在
---  数学上不成立——这正是本表存在的原因）。
---  按 log 序回放也保证了 FK 顺序（facts 永远在其 source episode 之后到达）。
---  附带收益：LISTEN/NOTIFY 挂在本表上即是 WebSocket 实时推送的事件源。
+--  Every business write transaction appends one row here. Incremental client pulls
+--  look at nothing but this table:
+--    GET /sync?since={seq} → returns the records with seq > since plus their
+--    corresponding business rows.
+--  A total order across tables falls out for free (the nine tables' individual
+--  BIGSERIALs are not comparable with each other, so a single cursor over them is
+--  mathematically impossible -- which is exactly why this table exists).
+--  Replaying in log order also guarantees FK order (facts always arrive after the
+--  episode they came from).
+--  Bonus: hang LISTEN/NOTIFY off this table and you have the event source for
+--  WebSocket live push.
 -- ══════════════════════════════════════════════════════════
 
 CREATE TABLE sync_log (
     seq        BIGSERIAL   PRIMARY KEY,
     table_name TEXT        NOT NULL,
-    record_id  TEXT        NOT NULL,   -- 目标行主键；episode_blobs 用 'episode_id:blob_hash'
+    record_id  TEXT        NOT NULL,   -- primary key of the target row; episode_blobs uses 'episode_id:blob_hash'
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
 -- ══════════════════════════════════════════════════════════
---  L0 原始层 —— 唯一真相来源，只追加，永不修改
+--  L0 raw layer -- the single source of truth, appended to and never modified
 -- ══════════════════════════════════════════════════════════
 
 CREATE TABLE episodes (
     id          ulid        PRIMARY KEY,
     session_id  TEXT        NOT NULL,
     role        TEXT        NOT NULL CHECK (role IN ('user', 'assistant', 'tool', 'system')),
-    -- 原始消息，含供应商特有的 thinking / reasoning 等不透明块，无损保存。
-    -- 被 redact 后写占位 '{"redacted":true}'（见 docs/memory.md §十一）。
+    -- The raw message, including provider-specific opaque blocks such as
+    -- thinking / reasoning, preserved losslessly.
+    -- Once redacted, the placeholder '{"redacted":true}' is written here
+    -- (see docs/memory.md §11).
     content     JSONB       NOT NULL,
-    -- 从 content 提取的纯文本，供全文检索
+    -- Plain text extracted out of content, for full-text search
     text        TEXT,
-    -- 由 Rust 侧 jieba-rs 分词后写入；与主行同事务，永不异步补写
+    -- Written after tokenization by jieba-rs on the Rust side; same transaction as
+    -- the main row, never backfilled asynchronously
     tsv         TSVECTOR,
     domain      TEXT,
     device_id   TEXT        NOT NULL,
@@ -63,10 +82,10 @@ CREATE TABLE episodes (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-COMMENT ON COLUMN episodes.occurred_at IS '事件发生时间（客户端时钟，经单调化处理）';
-COMMENT ON COLUMN episodes.created_at  IS '服务端入库时间';
+COMMENT ON COLUMN episodes.occurred_at IS 'When the event happened (client clock, after monotonization)';
+COMMENT ON COLUMN episodes.created_at  IS 'When the server stored it';
 
--- ── 二进制内容：SHA-256 内容寻址，天然去重、天然不可变 ──
+-- ── Binary content: SHA-256 content addressing, so dedup and immutability come free ──
 
 CREATE TABLE blobs (
     hash        sha256      PRIMARY KEY,
@@ -83,8 +102,9 @@ CREATE TABLE episode_blobs (
     PRIMARY KEY (episode_id, blob_hash)
 );
 
--- 异步 pipeline 产出：不转成文本的媒体是检索黑洞。
--- 写入前必须查 redactions 表，防止在途任务把已抹除内容回填（docs/memory.md §十一）。
+-- Output of the async pipeline: media that never becomes text is a retrieval black hole.
+-- Before writing, the redactions table must be consulted, so that an in-flight job cannot
+-- refill content that has already been erased (docs/memory.md §11).
 CREATE TABLE blob_transcripts (
     id              ulid         PRIMARY KEY,
     blob_hash       sha256       NOT NULL REFERENCES blobs(hash),
@@ -93,8 +113,9 @@ CREATE TABLE blob_transcripts (
     text            TEXT         NOT NULL,
     tsv             TSVECTOR,
     embedding       VECTOR(1024),
-    -- 音视频转录按段落行，记录片段的毫秒偏移——支撑「出处跳转到 31:40」。
-    -- 图片/OCR 为 NULL。
+    -- Audio/video transcripts get one row per segment and record the segment's
+    -- millisecond offsets -- this is what makes "jump to the source at 31:40" work.
+    -- NULL for images and OCR.
     span_start_ms   BIGINT,
     span_end_ms     BIGINT,
     transcribed_by  TEXT         NOT NULL,
@@ -104,30 +125,34 @@ CREATE TABLE blob_transcripts (
 );
 
 -- ══════════════════════════════════════════════════════════
---  L1 事实层
+--  L1 fact layer
 -- ══════════════════════════════════════════════════════════
 
 CREATE TABLE entities (
     id              ulid         PRIMARY KEY,
-    -- person / project / file / org / concept / tool …… 开放不枚举
+    -- person / project / file / org / concept / tool ... open-ended, deliberately not an enum
     kind            TEXT         NOT NULL,
     name            TEXT         NOT NULL,
     summary         TEXT,
-    -- 实体向量用于抽取期的实体消解（同名/近义实体匹配），不参与四路召回
+    -- Entity vectors serve entity resolution during extraction (matching same-name /
+    -- near-synonymous entities); they take no part in the four-way retrieval
     embedding       VECTOR(1024),
     embedding_model TEXT         NOT NULL,
     device_id       TEXT         NOT NULL,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp()
 );
 
--- 别名消解：不修改 entities，追加一条合并记录。
+-- Alias resolution: entities is not modified, a merge record is appended instead.
 --
--- UNIQUE(from_entity) 使每个实体至多一条出边：
---   · 归属图成为函数图，链式归属可确定性解析；
---   · 并发分叉（两台设备把 A 分别并进 B 和 C）物理上变为 first-writer-wins，
---     后到者被唯一约束拒绝，服务端回执客户端转 no-op；
---   · 环仍可能出现（A→B 与 B→A 是两条不同 from 的边），由 cortexd 写入前
---     沿 into_entity 链走到底做成环检测拒绝（见 docs/memory.md §九）。
+-- UNIQUE(from_entity) gives every entity at most one outgoing edge:
+--   · the ownership graph becomes a functional graph, so chained merges resolve
+--     deterministically;
+--   · a concurrent fork (two devices merging A into B and into C respectively)
+--     physically becomes first-writer-wins -- the later one is rejected by the unique
+--     constraint, and the server's receipt turns it into a no-op on the client;
+--   · cycles are still possible (A→B and B→A are two edges with different from), and
+--     are rejected by cortexd walking the into_entity chain to its end before writing
+--     (see docs/memory.md §9).
 CREATE TABLE entity_merges (
     id                ulid         PRIMARY KEY,
     from_entity       ulid         NOT NULL REFERENCES entities(id) UNIQUE,
@@ -142,54 +167,64 @@ CREATE TABLE entity_merges (
 CREATE TABLE facts (
     id                ulid         PRIMARY KEY,
     subject_id        ulid         NOT NULL REFERENCES entities(id),
-    -- prefers / decided / owns / blocked_by …… 开放不枚举，枚举则新领域进不来
+    -- prefers / decided / owns / blocked_by ... open-ended, deliberately not an enum:
+    -- enumerate it and no new domain can ever get in
     predicate         TEXT         NOT NULL,
     object_text       TEXT,
-    -- 指向另一实体时，本行即构成知识图谱中的一条边
+    -- When it points at another entity, this row is an edge in the knowledge graph
     object_entity_id  ulid         REFERENCES entities(id),
-    -- 自然语言表述，用于向量化与界面展示。被 redact 后写占位 '[redacted]'
+    -- Natural-language phrasing, used for embedding and for display in the UI.
+    -- Once redacted, the placeholder '[redacted]' is written here
     statement         TEXT         NOT NULL,
     tsv               TSVECTOR,
     embedding         VECTOR(1024),
     embedding_model   TEXT         NOT NULL,
     domain            TEXT,
-    -- 抽取器写入时一次性打分，此后不可变（append-only）。
-    -- 语义：抽取器对「该事实忠实反映了原文」的置信度。可作检索融合的次要信号。
+    -- Scored once by the extractor at write time, immutable thereafter (append-only).
+    -- Semantics: the extractor's confidence that this fact faithfully reflects the
+    -- source text. Usable as a secondary signal when fusing retrieval results.
     confidence        REAL         NOT NULL DEFAULT 1.0
                       CHECK (confidence >= 0.0 AND confidence <= 1.0),
 
-    -- 【事件时间】何时开始为真。NULL = 未知或一直如此
+    -- [Valid time] when it started being true. NULL = unknown, or always has been
     valid_at          TIMESTAMPTZ,
 
-    -- 出处：可审计的根基
+    -- Provenance: the bedrock that makes any of this auditable
     source_episode_id ulid         NOT NULL REFERENCES episodes(id),
     extracted_by      TEXT         NOT NULL,
     device_id         TEXT         NOT NULL,
-    -- 【系统时间】Cortex 何时知道这件事
+    -- [Transaction time] when Cortex came to know this
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp(),
 
     CHECK (object_text IS NOT NULL OR object_entity_id IS NOT NULL)
 );
 
--- 事实的生命周期事件。系统自动失效与用户手工编辑共用此表。
--- 失效以追加记录表达，而非就地 UPDATE —— 这是 append-only 与多端无冲突的前提。
+-- Lifecycle events of a fact. Automatic system invalidation and manual user edits
+-- share this table.
+-- Invalidation is expressed by appending a record rather than an in-place UPDATE --
+-- that is the premise of both append-only and conflict-free multi-device sync.
 CREATE TABLE fact_events (
     id                ulid         PRIMARY KEY,
     fact_id           ulid         NOT NULL REFERENCES facts(id),
 
-    -- invalidate 使事实失效；revoke 撤销失效（状态机语义：末态由最后一条
-    -- 状态事件决定）；flag 标记「矛盾待人工确认」，是批注、不改变状态。
+    -- invalidate makes a fact invalid; revoke undoes an invalidation (state-machine
+    -- semantics: the final state is whatever the last state event says); flag marks
+    -- "contradiction, needs human confirmation" -- an annotation that does not change state.
     op                TEXT         NOT NULL CHECK (op IN ('invalidate', 'revoke', 'flag')),
-    -- op = invalidate 时的原因分类。四者时间语义不同，混用会导致认知回放出错：
-    --   superseded 曾经为真，世界变了（superseded_by 必填，否则演化链断裂）
-    --   corrected  从未为真，抽取错误
-    --   retracted  用户主动删除，不对真值表态
-    --   expired    曾经为真，到期失效
-    -- 注意：corrected 占比只是「抽取精确率的有偏滞后下界」——它依赖检索曝光
-    -- 与用户勤快度，测不到漏抽与未被检索的错误，不可当作抽取质量的直接度量。
+    -- Reason category when op = invalidate. The four differ in their time semantics, and
+    -- mixing them up makes epistemic replay come out wrong:
+    --   superseded was true once, then the world changed (superseded_by is mandatory,
+    --              otherwise the evolution chain breaks)
+    --   corrected  never was true, the extraction was wrong
+    --   retracted  the user deleted it deliberately; takes no position on truth
+    --   expired    was true once, then lapsed
+    -- Note: the share of corrected is only "a biased, lagging lower bound on extraction
+    -- precision" -- it depends on retrieval exposure and on how diligent the user is, and
+    -- it cannot see missed extractions or errors that were never retrieved, so it must not
+    -- be taken as a direct measure of extraction quality.
     kind              TEXT         CHECK (kind IN ('superseded', 'corrected', 'retracted', 'expired')),
 
-    -- 【事件时间】何时停止为真
+    -- [Valid time] when it stopped being true
     invalid_at        TIMESTAMPTZ,
     superseded_by     ulid         REFERENCES facts(id),
 
@@ -197,19 +232,19 @@ CREATE TABLE fact_events (
     reason            TEXT,
     source_episode_id ulid         REFERENCES episodes(id),
     device_id         TEXT         NOT NULL,
-    -- 【系统时间】何时发现 / 何时操作
+    -- [Transaction time] when it was discovered / when the action was taken
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp(),
 
-    -- invalidate 必须给出原因分类与失效时间
+    -- invalidate must state a reason category and an invalidation time
     CHECK (op <> 'invalidate' OR (kind IS NOT NULL AND invalid_at IS NOT NULL)),
-    -- revoke / flag 不携带 invalidate 专属字段
+    -- revoke / flag do not carry the invalidate-only fields
     CHECK (op = 'invalidate' OR (kind IS NULL AND invalid_at IS NULL AND superseded_by IS NULL)),
-    -- superseded 必须指明被谁取代，否则「事实演化链」断裂
+    -- superseded must name what superseded it, otherwise the "fact evolution chain" breaks
     CHECK (kind IS DISTINCT FROM 'superseded' OR superseded_by IS NOT NULL)
 );
 
 -- ══════════════════════════════════════════════════════════
---  L2 摘要层
+--  L2 summary layer
 -- ══════════════════════════════════════════════════════════
 
 CREATE TABLE summaries (
@@ -227,14 +262,18 @@ CREATE TABLE summaries (
 );
 
 -- ══════════════════════════════════════════════════════════
---  抹除记录 —— 全系统唯一允许破坏 append-only 之处
+--  Redaction records -- the one place in the whole system where breaking
+--  append-only is permitted
 --
---  用于密钥误粘贴、隐私等必须真正销毁内容的场景。
---  target_kind 只有 episode|blob：redact 按 source_episode_id 级联清除
---  全部派生落点（facts.statement/tsv/embedding、blob_transcripts、
---  相关 summaries 重新生成），语义与执行规则见 docs/memory.md §十一。
---  本表进 sync_log 下发；客户端收到后必须幂等执行同等本地清除。
---  让位的是内容，墓碑与审计链永久保留。
+--  For the cases where content genuinely has to be destroyed: a secret pasted by
+--  mistake, privacy.
+--  target_kind is only episode|blob: a redact cascades along source_episode_id and
+--  clears every derived landing point (facts.statement/tsv/embedding,
+--  blob_transcripts, and regenerates the affected summaries); the semantics and the
+--  execution rules are in docs/memory.md §11.
+--  This table ships through sync_log; on receipt a client must idempotently perform
+--  the equivalent local erasure.
+--  What gives way is the content -- the tombstone and the audit chain are kept forever.
 -- ══════════════════════════════════════════════════════════
 
 CREATE TABLE redactions (
@@ -249,12 +288,14 @@ CREATE TABLE redactions (
 );
 
 -- ══════════════════════════════════════════════════════════
---  视图
+--  Views
 -- ══════════════════════════════════════════════════════════
 
--- 每条事实的最新一次【状态】事件（flag 是批注，不参与状态判定）。
--- 排序用 (created_at, id) —— created_at 为 clock_timestamp() 微秒级，
--- id 仅作极端同刻的确定性 tiebreaker。
+-- The most recent [state] event of each fact (flag is an annotation and takes no part
+-- in deciding state).
+-- Ordered by (created_at, id) -- created_at is clock_timestamp() at microsecond
+-- resolution, and id is only a deterministic tiebreaker for the extreme case of two
+-- events at the very same instant.
 CREATE VIEW fact_status AS
 SELECT DISTINCT ON (fact_id)
        fact_id, op, kind, invalid_at, superseded_by, actor,
@@ -263,16 +304,19 @@ FROM fact_events
 WHERE op IN ('invalidate', 'revoke')
 ORDER BY fact_id, created_at DESC, id DESC;
 
--- 当前有效的事实：从未失效，或最近一次状态事件是 revoke（已恢复）
+-- Facts that are currently valid: never invalidated, or the latest state event was a
+-- revoke (restored)
 CREATE VIEW active_facts AS
 SELECT f.*
 FROM facts f
 LEFT JOIN fact_status s ON s.fact_id = f.id
 WHERE s.op IS NULL OR s.op = 'revoke';
 
--- 实体经别名合并后的最终归属。
--- UNIQUE(from_entity) 保证函数图（每实体至多一条出边），沿链走到底即终点；
--- depth 上限是环的兜底保险（环由写时守护阻止，见 entity_merges 注释）。
+-- Where an entity finally belongs after alias merges.
+-- UNIQUE(from_entity) guarantees a functional graph (at most one outgoing edge per
+-- entity), so walking the chain to its end lands on the terminus; the depth cap is a
+-- backstop against cycles (cycles are stopped by the write-time guard, see the
+-- entity_merges comment).
 CREATE VIEW canonical_entities AS
 WITH RECURSIVE walk(id, canonical, depth) AS (
     SELECT e.id, e.id, 0
@@ -288,46 +332,48 @@ FROM walk
 ORDER BY id, depth DESC;
 
 -- ══════════════════════════════════════════════════════════
---  索引
+--  Indexes
 --
---  向量索引覆盖 facts / summaries / blob_transcripts（四路召回）
---  以及 entities（仅抽取期实体消解用，不参与召回）。
---  L0 episodes 数量是事实的几十倍，仅建全文索引 ——
---  精确回溯用「全文 + 时间」定位即可。此策略使召回向量规模
---  约为 episodes 的 1/50，十万级对话不会爆。
+--  Vector indexes cover facts / summaries / blob_transcripts (the four-way retrieval)
+--  plus entities (used only for entity resolution during extraction, not for retrieval).
+--  L0 episodes outnumber facts by tens of times, so they get a full-text index only --
+--  exact retrospection can be pinpointed with "full text + time". This strategy keeps
+--  the retrievable vector population at roughly 1/50 of episodes, so a hundred thousand
+--  conversations will not blow it up.
 -- ══════════════════════════════════════════════════════════
 
--- 向量（HNSW，余弦距离）
+-- Vectors (HNSW, cosine distance)
 CREATE INDEX idx_facts_vec       ON facts            USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX idx_entities_vec    ON entities         USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX idx_summaries_vec   ON summaries        USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX idx_transcripts_vec ON blob_transcripts USING hnsw (embedding vector_cosine_ops);
 
--- 全文（BM25 那一路召回）
+-- Full text (the BM25 leg of the retrieval)
 CREATE INDEX idx_episodes_tsv    ON episodes         USING gin (tsv);
 CREATE INDEX idx_facts_tsv       ON facts            USING gin (tsv);
 CREATE INDEX idx_summaries_tsv   ON summaries        USING gin (tsv);
 CREATE INDEX idx_transcripts_tsv ON blob_transcripts USING gin (tsv);
 
--- 图遍历（idx_facts_sp 前缀即覆盖 subject_id 单列查询，不另建）
+-- Graph traversal (the prefix of idx_facts_sp already covers subject_id-only queries,
+-- so no separate index)
 CREATE INDEX idx_facts_object    ON facts (object_entity_id) WHERE object_entity_id IS NOT NULL;
--- 矛盾检测：按 (主语, 谓词) 查现存事实
+-- Contradiction detection: look up existing facts by (subject, predicate)
 CREATE INDEX idx_facts_sp        ON facts (subject_id, predicate);
 
--- 实体消解热路径：按 (kind, name) 精确匹配
+-- Entity-resolution hot path: exact match on (kind, name)
 CREATE INDEX idx_entities_kn     ON entities (kind, name);
 
--- 时间近因
+-- Time recency
 CREATE INDEX idx_episodes_time   ON episodes (occurred_at DESC);
 CREATE INDEX idx_episodes_sess   ON episodes (session_id, occurred_at);
 
--- 生命周期（与 fact_status 视图排序对齐）
+-- Lifecycle (aligned with the ordering of the fact_status view)
 CREATE INDEX idx_fact_events     ON fact_events (fact_id, created_at DESC);
 
--- redact 级联：按出处找派生行
+-- Redact cascade: find the derived rows from the provenance
 CREATE INDEX idx_facts_source    ON facts (source_episode_id);
 
--- 换 embedding 模型时分批回填
+-- Backfill in batches when swapping the embedding model
 CREATE INDEX idx_facts_model     ON facts (embedding_model);
 CREATE INDEX idx_entities_model  ON entities (embedding_model);
 CREATE INDEX idx_summaries_model ON summaries (embedding_model);

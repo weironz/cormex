@@ -1,7 +1,8 @@
-//! 存储层错误。
+//! Storage-layer errors.
 //!
-//! 本层不吞错：sqlx 的原始错误原样携带，边界处（HTTP / CLI）再收敛到
-//! [`cortex_core::CortexError`]。
+//! This layer swallows nothing: the raw sqlx error is carried through as-is,
+//! and only at the boundary (HTTP / CLI) is it narrowed down to
+//! [`cortex_core::CortexError`].
 
 use thiserror::Error;
 
@@ -18,23 +19,30 @@ pub enum StoreError {
     #[error("{ty} 不认识的取值：{value}")]
     UnknownVariant { ty: &'static str, value: String },
 
-    /// `sync_log.table_name` 指向了本层不认识的表。
-    /// 出现即说明有人绕过 [`crate::WriteTxn`] 直接写了库。
+    /// `sync_log.table_name` points at a table this layer does not recognize.
+    /// Seeing this means somebody bypassed [`crate::WriteTxn`] and wrote to the
+    /// database directly.
     #[error("sync_log 引用了未知的表：{0}")]
     UnknownTable(String),
 
-    /// 派生物没有声明它的源。
+    /// A derived record failed to declare its sources.
     ///
-    /// 不是「校验没过」这么简单：源被 redact 之后，找不到血缘的派生物会
-    /// 继续泄露已被擦除的内容，而且**事后补不出来**（谁摘的、摘了什么，
-    /// 只有生成它的那一步知道）。所以宁可这条摘要写不进去。
+    /// This is not merely "validation failed": once the source has been
+    /// redacted, a derived record with no provenance keeps leaking the very
+    /// content that was supposed to be erased — and the provenance **cannot be
+    /// reconstructed after the fact** (who summarized it, and from what, is
+    /// known only to the step that produced it). So we would rather this
+    /// summary never be written at all.
     #[error("{kind} {id} 没有声明任何源 —— 派生物必须带血缘（docs/memory-content.md §5.3）")]
     MissingProvenance { kind: &'static str, id: String },
 
-    /// 调用方给的东西不对（schema 名不合法、租户池满了）。
+    /// The caller handed us something wrong (illegal schema name, tenant pool
+    /// full).
     ///
-    /// 与 [`Self::Sql`] 分开是有用的：那些是「数据库那边出事了」，
-    /// 该重试或者告警；这一类是「你这么问不对」，重试多少次都一样。
+    /// Keeping this separate from [`Self::Sql`] earns its keep: those mean
+    /// "something went wrong over on the database side" and warrant a retry or
+    /// an alert; this class means "you asked wrong", and retrying it any number
+    /// of times changes nothing.
     #[error("{0}")]
     Invalid(String),
 
@@ -43,22 +51,29 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// 这次写失败是不是「主键 / 唯一约束已存在」。
+    /// Whether this write failed because "the primary key / unique constraint
+    /// already exists".
     ///
-    /// 判 SQLSTATE 而不是匹配错误消息：消息带着表名、约束名与 Postgres 的
-    /// 本地化措辞，换个 locale 或改个约束名就不匹配了。23505 是 SQL 标准里的
-    /// `unique_violation`，不会变。
+    /// We test the SQLSTATE rather than matching on the error message: the
+    /// message carries the table name, the constraint name, and Postgres's
+    /// localized wording, so a different locale or a renamed constraint stops
+    /// matching. 23505 is `unique_violation` from the SQL standard and will not
+    /// change.
     ///
-    /// # 谁需要它
+    /// # Who needs this
     ///
-    /// 幂等写入。本地 agent 断网时把 episode 排进队列，联网后重放 ——
-    /// 「服务端收下了」与「本地记下已刷出」之间崩一次就会重来一遍。
-    /// 那是**正常路径**：认不出来就会报 500，客户端把一次成功的重放当成
-    /// 失败，然后永远重试下去。
+    /// Idempotent writes. A local agent that loses its connection queues up
+    /// episodes and replays them once it is back online — and a crash between
+    /// "the server accepted it" and "the local side recorded it as flushed"
+    /// makes it replay one more time. That is the **normal path**: failing to
+    /// recognize it produces a 500, the client treats a successful replay as a
+    /// failure, and then retries forever.
     ///
-    /// 判定放在这一层而不是调用方：`sqlx::Error` 的形状是存储层的实现细节，
-    /// 让 cortexd 为了摸一个 SQLSTATE 而依赖 sqlx，等于把整个数据库驱动
-    /// 拉进依赖图里 —— 而依赖方向是严格单向的。
+    /// The check lives at this layer rather than in the caller: the shape of
+    /// `sqlx::Error` is a storage-layer implementation detail, and making
+    /// cortexd depend on sqlx just to poke at one SQLSTATE would drag the whole
+    /// database driver into its dependency graph — and the dependency direction
+    /// is strictly one-way.
     #[must_use]
     pub fn is_duplicate_key(&self) -> bool {
         matches!(self, Self::Sql(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505"))

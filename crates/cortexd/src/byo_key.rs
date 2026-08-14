@@ -1,21 +1,27 @@
-//! 自带 API key —— 用自己的 key，不占配额。
+//! Bring your own API key — use your own key, and it does not count against the
+//! quota.
 //!
-//! # 这一段是来还债的
+//! # This module exists to pay off a debt
 //!
-//! 配额超限的消息里写着「可以在设置里填自己的 API key」，而那个入口
-//! **不存在**。一句已经发到用户眼前的空头支票，比没有这个功能更糟：
-//! 它让一个正被拦住的人去翻一个根本没有的设置项。
+//! The over-quota message told the user they "can enter their own API key in
+//! settings", and that entry point **did not exist**. A promise already
+//! delivered to the user's face is worse than not having the feature at all: it
+//! sends someone who is currently blocked hunting for a settings item that is
+//! simply not there.
 //!
-//! # 加密
+//! # Encryption
 //!
-//! 密钥来自部署的 `CORTEX_SECRET_KEY`（32 字节，hex），**不进数据库**。
-//! 于是一份被拖走的备份里没有可用的 key —— 这是加密存储的全部意义，
-//! 也是为什么没配这个变量时端点直接 501 而不是明文存下去：
-//! 一个以为自己被加密保护着的人，比一个知道没有保护的人更危险。
+//! The key comes from the deployment's `CORTEX_SECRET_KEY` (32 bytes, hex) and
+//! **never enters the database**. So a stolen backup contains no usable key —
+//! that is the entire point of encrypted storage, and it is also why the
+//! endpoint answers 501 when the variable is unset rather than storing the key
+//! in plaintext: someone who believes they are protected by encryption is more
+//! dangerous than someone who knows there is no protection.
 //!
-//! 用 AES-256-GCM（`ring`）。nonce 每次现随机，与密文拼在一起 ——
-//! GCM 重用 nonce 会同时毁掉机密性与完整性，而「每次现随机」是这里
-//! 唯一不需要额外状态的做法。
+//! Uses AES-256-GCM (`ring`). The nonce is freshly random each time and
+//! concatenated with the ciphertext — reusing a nonce under GCM destroys
+//! confidentiality and integrity simultaneously, and "fresh random each time" is
+//! the only approach here that requires no extra state.
 
 use axum::{Json, extract::State};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
@@ -24,15 +30,16 @@ use serde::{Deserialize, Serialize};
 use crate::routes::ApiError;
 use crate::state::AppState;
 
-/// 部署的主密钥。hex 编码的 32 字节。
+/// The deployment's master key. 32 bytes, hex-encoded.
 const SECRET_KEY_ENV: &str = "CORTEX_SECRET_KEY";
 
-/// 取主密钥。
+/// Fetch the master key.
 ///
 /// # Errors
-/// 没配，或者不是 32 字节的 hex。**不生成一把临时的** ——
-/// 那会让重启之后所有已存的 key 变成解不开的字节，而症状是
-/// 「昨天还好好的，今天全部调用失败」。
+/// Not configured, or not 32 bytes of hex. **It never generates an ephemeral
+/// one** — that would turn every stored key into undecryptable bytes after a
+/// restart, and the symptom would be "everything worked yesterday, today every
+/// call fails".
 fn kek() -> Result<LessSafeKey, ApiError> {
     let raw = std::env::var(SECRET_KEY_ENV).map_err(|_| {
         ApiError::unsupported(format!(
@@ -47,16 +54,17 @@ fn kek() -> Result<LessSafeKey, ApiError> {
     Ok(LessSafeKey::new(unbound))
 }
 
-/// 加密：`nonce(12) || 密文`。
+/// Encrypt: `nonce(12) || ciphertext`.
 fn seal(plain: &str) -> Result<Vec<u8>, ApiError> {
     seal_with(&kek()?, plain)
 }
 
-/// 同上，但密钥由调用方给。
+/// Same as above, but the caller supplies the key.
 ///
-/// 拆出来是为了**测试不必碰环境变量**：`CORTEX_SECRET_KEY` 是进程全局的，
-/// 而 cargo 默认并行跑测试 —— 四条各自 set_var 的测试会互相把对方的密钥
-/// 换掉，表现是随机失败。实测撞到过。
+/// Split out so that **tests never have to touch environment variables**:
+/// `CORTEX_SECRET_KEY` is process-global while cargo runs tests in parallel by
+/// default — four tests each calling set_var would swap each other's keys out,
+/// and the symptom is random failures. Actually observed.
 fn seal_with(key: &LessSafeKey, plain: &str) -> Result<Vec<u8>, ApiError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce_bytes)
@@ -73,23 +81,26 @@ fn seal_with(key: &LessSafeKey, plain: &str) -> Result<Vec<u8>, ApiError> {
     Ok(out)
 }
 
-/// 解密。
+/// Decrypt.
 fn open(blob: &[u8]) -> Result<String, ApiError> {
     open_with(&kek()?, blob)
 }
 
-/// 同上，但密钥由调用方给。理由见 [`seal_with`]。
+/// Same as above, but the caller supplies the key. Reasoning in [`seal_with`].
 fn open_with(key: &LessSafeKey, blob: &[u8]) -> Result<String, ApiError> {
     if blob.len() <= NONCE_LEN {
         return Err(ApiError::internal("密文太短，库里那一行是坏的"));
     }
     let (nonce_bytes, rest) = blob.split_at(NONCE_LEN);
-    let nonce: [u8; NONCE_LEN] = nonce_bytes.try_into().expect("刚刚按 NONCE_LEN 切的");
+    let nonce: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .expect("we split at NONCE_LEN one line ago");
     let mut buf = rest.to_vec();
     let plain = key
         .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
         .map_err(|_| {
-            // 最可能的原因是主密钥换了。说清楚，否则这条错误看起来像库坏了
+            // The most likely cause is that the master key was rotated. Say so,
+            // or this error reads like a corrupted database
             ApiError::internal(format!(
                 "解不开已存的 API key —— 多半是 {SECRET_KEY_ENV} 变了。\
                  重新填一次即可"
@@ -98,51 +109,59 @@ fn open_with(key: &LessSafeKey, blob: &[u8]) -> Result<String, ApiError> {
     String::from_utf8(plain.to_vec()).map_err(|_| ApiError::internal("解出来的不是合法 UTF-8"))
 }
 
-/// 存着的那把 key（已解密）。
+/// The stored key, already decrypted.
 pub struct OwnKey {
     pub provider: String,
     pub api_key: String,
-    /// 自己的端点。`None` = 用内置定义里那个（官方）。
+    /// The user's own endpoint. `None` = use the one from the built-in
+    /// definition (the official endpoint).
     ///
-    /// 一个人「自己的 key」很少是官方那把 —— 更常见的是公司网关、
-    /// one-api / LiteLLM 中转、某个更便宜的兼容服务。存了 key 却不能存端点，
-    /// 那把 key 照样打不到他自己的地方
+    /// A person's "own key" is rarely the official one — far more often it is a
+    /// corporate gateway, a one-api / LiteLLM relay, or some cheaper compatible
+    /// service. Storing the key without being able to store the endpoint leaves
+    /// that key still unable to reach the place it belongs to
     pub base_url: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct SetKeyRequest {
-    /// 供应商 id，与 `cortex-llm` 的 provider 名一致
+    /// Provider id, matching the provider names in `cortex-llm`
     pub provider: String,
     pub api_key: String,
-    /// 可选：自己的端点。留空就用内置定义里那个
+    /// Optional: the user's own endpoint. Empty means use the built-in one
     #[serde(default)]
     pub base_url: Option<String>,
 }
 
-/// 下发给界面的形状 —— **只有尾巴**，永远不回明文。
+/// The shape sent down to the UI — **the tail only**; the plaintext is never
+/// returned.
 ///
-/// 回明文会让这把 key 出现在浏览器缓存、日志、以及任何一次
-/// 「把请求粘给别人看」里。用户要换 key 时重新填一遍即可。
+/// Returning the plaintext would put this key into the browser cache, the logs,
+/// and every occasion where somebody pastes a request for someone else to look
+/// at. A user who wants to change keys simply enters a new one.
 #[derive(Serialize)]
 pub struct KeyStatus {
     pub configured: bool,
     pub provider: Option<String>,
-    /// 明文 key 的后 4 位，用来认出「填的是哪一把」
+    /// The last 4 characters of the plaintext key, so the user can tell which
+    /// key is stored
     pub key_tail: Option<String>,
-    /// 填的自建端点。没填就是 `None`（走官方）
+    /// The self-hosted endpoint that was entered. `None` when none was (the
+    /// official endpoint is used)
     pub base_url: Option<String>,
     pub updated_at: Option<String>,
-    /// 这个部署支持保存自带 key 吗（没配主密钥就是 false）
+    /// Whether this deployment supports storing a bring-your-own key (false
+    /// when no master key is configured)
     pub supported: bool,
 }
 
 impl AppState {
-    /// 这个租户存着的自带 key。没有就是 `None`。
+    /// The bring-your-own key stored for this tenant. `None` when there is none.
     ///
-    /// **失败一律当作「没有」并记日志**：自带 key 是一条优化路径，
-    /// 读不出来时回落到服务端那把 key 是安全的（只是要占配额），
-    /// 而让整次对话失败不是。
+    /// **Any failure is treated as "there is none" and logged**: a
+    /// bring-your-own key is an optimization path, and falling back to the
+    /// server's key when it cannot be read is safe (it merely counts against the
+    /// quota), whereas failing the whole conversation is not.
     pub async fn own_key(&self, tenant: &crate::request_tenant::Tenant) -> Option<OwnKey> {
         let store = tenant.store().ok()?;
         let row = sqlx::query_as::<_, (String, Option<Vec<u8>>, bool, Option<String>)>(
@@ -174,10 +193,10 @@ impl AppState {
     }
 }
 
-/// `GET /settings/llm-key` —— 填没填过、填的是哪一把。
+/// `GET /settings/llm-key` — whether one was entered, and which one.
 ///
 /// # Errors
-/// 查不动库。
+/// The database could not be queried.
 pub async fn get(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -232,10 +251,11 @@ pub async fn get(
     }))
 }
 
-/// `PUT /settings/llm-key` —— 存一把自己的 key。
+/// `PUT /settings/llm-key` — store your own key.
 ///
 /// # Errors
-/// 部署没配主密钥（501）、供应商名不认识、或者写不进去。
+/// The deployment has no master key configured (501), the provider name is
+/// unrecognised, or the write failed.
 pub async fn put(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -245,8 +265,9 @@ pub async fn put(
     if api_key.is_empty() {
         return Err(ApiError::bad_request("API key 不能为空"));
     }
-    // 供应商名当场校验。存下一个拼错的名字，症状要等到下一次对话
-    // 才出现，而那时用户已经不记得自己填了什么
+    // Validate the provider name right here. Store a misspelled one and the
+    // symptom does not appear until the next conversation — by which point the
+    // user no longer remembers what they typed
     if !cortex_llm::provider::available()
         .iter()
         .any(|a| a == &req.provider)
@@ -295,13 +316,14 @@ pub async fn put(
     get(State(st), headers).await
 }
 
-/// `DELETE /settings/llm-key` —— 不再用自带 key。
+/// `DELETE /settings/llm-key` — stop using the bring-your-own key.
 ///
-/// 追加一行墓碑而不是删那一行：与全库 append-only 一致，
-/// 而且「什么时候撤下的」在排查时是有用的。
+/// Appends a tombstone row rather than deleting the existing one: consistent
+/// with the database-wide append-only rule, and "when was it withdrawn" is
+/// useful during diagnosis.
 ///
 /// # Errors
-/// 写不进去。
+/// The write failed.
 pub async fn delete(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -328,72 +350,88 @@ pub async fn delete(
 mod tests {
     use super::*;
 
-    /// 造一把测试密钥。**不碰环境变量** —— 见 [`seal_with`] 的注释。
+    /// Build a test key. **Touches no environment variable** — see the comment
+    /// on [`seal_with`].
     fn test_key(byte: u8) -> LessSafeKey {
-        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[byte; 32]).expect("32 字节"))
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[byte; 32]).expect("32 bytes"))
     }
 
-    /// 加密再解密要拿回原文。
+    /// Encrypting and then decrypting must return the original text.
     #[test]
     fn a_key_survives_the_round_trip() {
         let k = test_key(0x11);
         let secret = "sk-deadbeef-0123456789";
-        let blob = seal_with(&k, secret).expect("加密");
+        let blob = seal_with(&k, secret).expect("encrypt");
         assert!(
             !blob.windows(secret.len()).any(|w| w == secret.as_bytes()),
-            "密文里能直接找到明文 —— 加密根本没发生"
+            "the plaintext can be found verbatim inside the ciphertext —— no encryption happened \
+             at all"
         );
-        assert_eq!(open_with(&k, &blob).expect("解密"), secret);
+        assert_eq!(open_with(&k, &blob).expect("decrypt"), secret);
     }
 
-    /// 同一份明文两次加密**不能**产生相同密文。
+    /// Encrypting the same plaintext twice **must not** produce the same
+    /// ciphertext.
     ///
-    /// 相同就意味着 nonce 被复用了，而 GCM 重用 nonce 会同时毁掉机密性
-    /// 与完整性 —— 这是这类实现最经典的一种错法。
+    /// Identical output means the nonce was reused, and reusing a nonce under
+    /// GCM destroys confidentiality and integrity simultaneously — the single
+    /// most classic way to get this kind of implementation wrong.
     #[test]
     fn the_same_secret_never_encrypts_to_the_same_bytes() {
         let k = test_key(0x22);
-        let a = seal_with(&k, "sk-same").expect("第一次");
-        let b = seal_with(&k, "sk-same").expect("第二次");
-        assert_ne!(a, b, "两次加密结果相同 —— nonce 被复用了");
-    }
-
-    /// 换了主密钥就解不开，而且**不能**解出一段垃圾当成 key 用。
-    #[test]
-    fn a_rotated_master_key_fails_instead_of_returning_garbage() {
-        let blob = seal_with(&test_key(0x33), "sk-rotate-me").expect("加密");
-        assert!(
-            open_with(&test_key(0x44), &blob).is_err(),
-            "换了密钥居然解开了 —— GCM 的完整性校验没起作用，             那意味着一段被篡改的密文也能通过"
+        let a = seal_with(&k, "sk-same").expect("first encryption");
+        let b = seal_with(&k, "sk-same").expect("second encryption");
+        assert_ne!(
+            a, b,
+            "two encryptions produced identical output —— the nonce was reused"
         );
     }
 
-    /// 被篡改过的密文必须解不开（AEAD 的完整性那一半）。
+    /// A rotated master key must fail to decrypt, and **must not** yield garbage
+    /// that then gets used as a key.
+    #[test]
+    fn a_rotated_master_key_fails_instead_of_returning_garbage() {
+        let blob = seal_with(&test_key(0x33), "sk-rotate-me").expect("encrypt");
+        assert!(
+            open_with(&test_key(0x44), &blob).is_err(),
+            "a different key managed to decrypt it —— GCM's integrity check is not working, which \
+             means a tampered ciphertext would pass too"
+        );
+    }
+
+    /// A tampered ciphertext must fail to decrypt (the integrity half of AEAD).
     #[test]
     fn a_tampered_ciphertext_is_rejected() {
         let k = test_key(0x55);
-        let mut blob = seal_with(&k, "sk-tamper").expect("加密");
+        let mut blob = seal_with(&k, "sk-tamper").expect("encrypt");
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
         assert!(
             open_with(&k, &blob).is_err(),
-            "改了一个 bit 还能解开 —— 那说明用的不是 AEAD，             而库里那一行是任何能写库的人都可以替换的"
+            "flipping one bit still decrypted —— that means this is not AEAD, and the row in the \
+             database is replaceable by anyone who can write to it"
         );
     }
 
-    /// 没配主密钥时**不落明文**，直接说不支持。
+    /// With no master key configured, **nothing is stored in plaintext**; the
+    /// endpoint simply says it is unsupported.
     ///
-    /// 这条要读环境变量，所以刻意只断言「读不出来时是错」这一件事，
-    /// 不去 set_var —— 并行跑的别的测试不该被它影响。
+    /// This one reads an environment variable, so it deliberately asserts only
+    /// the single fact "it is an error when the key cannot be read" and never
+    /// calls set_var — other tests running in parallel must not be disturbed by
+    /// it.
     #[test]
     fn without_a_master_key_there_is_no_storage_at_all() {
         if std::env::var(SECRET_KEY_ENV).is_ok() {
-            // 开发机的 .env 里配了。那这条测的东西在这里不成立，跳过
+            // The development machine's .env sets it. What this test asserts
+            // does not hold here, so skip
             return;
         }
         assert!(
             seal("sk-plain").is_err(),
-            "没有主密钥时居然加密成功了 —— 那只可能是把明文存了下去，             而一个以为自己被加密保护着的人比知道没有保护的人更危险"
+            "encryption succeeded without a master key —— the only way that happens is by storing \
+             the plaintext, and someone who believes they are protected by encryption is more \
+             dangerous than someone who knows there is no protection"
         );
     }
 }

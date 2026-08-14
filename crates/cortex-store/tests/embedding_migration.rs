@@ -1,30 +1,34 @@
-//! 换 embedding 模型时不静默失忆 —— 存储层的那一半。
+//! No silent amnesia when switching embedding models — the storage layer's half.
 //!
-//! # 这里守的是什么
+//! # What is guarded here
 //!
-//! 四条向量查询全部按 `embedding_model` 过滤，所以「跨模型算距离得到垃圾」
-//! 不会发生。代价是换模型的当天**向量那一路返回 0 行** —— 而 BM25 /
-//! 图遍历 / recency 三路照常工作，于是它看起来不像坏了，
-//! 只像「语义召回好像变差了点」。没有任何人被告知。
+//! All four vector queries filter by `embedding_model`, so "computing distances
+//! across models and getting garbage" cannot happen. The price is that on the
+//! day of the switch **the vector channel returns 0 rows** — while BM25, graph
+//! traversal, and recency carry on working, so it does not look broken, only
+//! like "semantic retrieval seems a bit worse". Nobody is told.
 //!
-//! 下面第一条测试**先复现这个失效**，再验证旁表把它补回来。
-//! 只验后者的测试是没有意义的：它证明不了那条路原本是断的。
+//! The first test below **reproduces that failure first** and only then verifies
+//! that the side table restores it. A test that only verified the latter would
+//! be meaningless: it could not prove the path was broken to begin with.
 
 mod common;
 
 use cortex_store::{EMBEDDING_DIM, NewFactEmbedding, Vector};
 
-/// 造一条方向确定的单位向量：第 `i` 维为 1。
+/// Build a unit vector with a definite direction: dimension `i` is 1.
 ///
-/// 不用随机向量：随机的话「第 k 近」是什么由运气决定，断言只能写成
-/// 「返回了若干条」—— 那种断言对排序错误是瞎的。
+/// Not a random vector: with randomness, "what is the k-th nearest" comes down
+/// to luck and the assertion could only say "some rows came back" — and that
+/// kind of assertion is blind to ordering errors.
 fn unit(i: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; EMBEDDING_DIM];
     v[i % EMBEDDING_DIM] = 1.0;
     v
 }
 
-/// 写 n 条带向量的事实，全部记在 `model` 名下。返回它们的 id。
+/// Write n facts carrying vectors, all recorded under `model`. Returns their
+/// ids.
 async fn seed(ctx: &common::TestDb, model: &str, n: usize) -> Vec<String> {
     let ep = common::new_episode("s-embed", "换模型测试");
     let ent = common::new_entity("project", "cortex");
@@ -48,7 +52,7 @@ async fn seed(ctx: &common::TestDb, model: &str, n: usize) -> Vec<String> {
             Ok(())
         })
         .await
-        .expect("写入种子数据");
+        .expect("writing the seed data");
     ids
 }
 
@@ -63,39 +67,47 @@ async fn switching_model_silently_drops_vector_recall_until_backfilled() {
     let ids = seed(&ctx, "old-model", 5).await;
     let probe = Vector::from(unit(0));
 
-    // ── ① 旧模型下一切正常 ──────────────────────────────────
+    // ── ① Everything is fine under the old model ───────────
     let hit = store
         .recall_vector(&probe, "old-model", 10)
         .await
-        .expect("向量召回");
-    assert_eq!(hit.len(), 5, "旧模型下应当召回全部 5 条");
+        .expect("vector retrieval");
+    assert_eq!(
+        hit.len(),
+        5,
+        "all 5 rows should be retrieved under the old model"
+    );
     assert_eq!(
         hit[0].id, ids[0],
-        "第 0 维为 1 的探针应当最近的是第 0 条 —— 顺序错了说明外层没按距离排"
+        "a probe with dimension 0 set to 1 should have row 0 as its nearest -- a wrong order \
+         means the outer level is not sorting by distance"
     );
 
-    // ── ② 换模型：**这就是那个静默失效** ────────────────────
+    // ── ② Switch models: **this is the silent failure** ────
     let after = store
         .recall_vector(&probe, "new-model", 10)
         .await
-        .expect("向量召回");
+        .expect("vector retrieval");
     assert!(
         after.is_empty(),
-        "换模型后旧向量必须一条都不返回（跨空间的距离不可比）。\
-         真正的问题在于这件事**没有任何报错** —— BM25 与图遍历照常兜着，\
-         界面上只表现为「语义召回好像变差了点」。实际返回了 {} 条",
+        "after a model switch the old vectors must return nothing at all (distances across \
+         spaces are not comparable). The real problem is that this **raises no error** -- BM25 \
+         and graph traversal keep covering for it, and in the UI it shows up only as \"semantic \
+         retrieval seems a bit worse\". It returned {} rows",
         after.len()
     );
 
-    // ── ③ 回填：往旁表插新空间的向量 ────────────────────────
+    // ── ③ Backfill: insert new-space vectors into the side table ──
     store
         .write_txn(async |tx| {
             for (i, id) in ids.iter().enumerate() {
                 tx.insert_fact_embedding(&NewFactEmbedding {
-                    fact_id: id.parse().expect("fact id 是 ULID"),
+                    fact_id: id.parse().expect("the fact id is a ULID"),
                     embedding_model: "new-model".to_owned(),
-                    // 刻意用**反过来**的方向：如果并集查询错拿了原列的向量，
-                    // 排序会与这里的期望相反，测试就抓得到
+                    // Deliberately the **reversed** direction: if the union
+                    // query wrongly picked up the vector from the original
+                    // column, the ordering would come out opposite to what is
+                    // expected here and the test would catch it
                     embedding: Vector::from(unit(4 - i)),
                 })
                 .await?;
@@ -103,29 +115,35 @@ async fn switching_model_silently_drops_vector_recall_until_backfilled() {
             Ok(())
         })
         .await
-        .expect("回填旁表向量");
+        .expect("backfilling the side-table vectors");
 
-    // ── ④ 补回来了 ─────────────────────────────────────────
+    // ── ④ Restored ─────────────────────────────────────────
     let healed = store
         .recall_vector(&probe, "new-model", 10)
         .await
-        .expect("向量召回");
-    assert_eq!(healed.len(), 5, "回填之后新模型下应当重新召回全部 5 条");
+        .expect("vector retrieval");
+    assert_eq!(
+        healed.len(),
+        5,
+        "after the backfill all 5 rows should be retrievable again under the new model"
+    );
     assert_eq!(
         healed[0].id, ids[4],
-        "旁表里第 4 条才是第 0 维为 1 的那个 —— 拿到 ids[0] 说明并集用的是\
-         原列的向量而不是旁表的，也就是回填等于没做"
+        "in the side table it is row 4 that has dimension 0 set to 1 -- getting ids[0] means the \
+         union used the vector from the original column rather than the side table, which makes \
+         the backfill worthless"
     );
 
-    // ── ⑤ 旧模型不受影响 ───────────────────────────────────
+    // ── ⑤ The old model is unaffected ──────────────────────
     let old_still = store
         .recall_vector(&probe, "old-model", 10)
         .await
-        .expect("向量召回");
+        .expect("vector retrieval");
     assert_eq!(
         old_still.len(),
         5,
-        "回填不该动旧空间 —— 双模型召回（回填期间不丢记忆）全靠这一点"
+        "the backfill must not touch the old space -- dual-model retrieval (losing no memory \
+         during a backfill) rests entirely on this"
     );
 
     ctx.cleanup().await;
@@ -139,33 +157,44 @@ async fn a_fact_present_on_both_sides_is_returned_once() {
     };
     let store = &ctx.store;
 
-    // 原列就是 same-model，再往旁表塞一条**同模型**的 —— 正常回填不会造出
-    // 这种重叠（回填器只挑 embedding_model <> 当前 的事实），但「换走再换回来」
-    // 能。重复的症状是同一条记忆在召回里出现两次、RRF 给它双份排名，
-    // 是一个悄悄放大的偏置而不是报错
+    // The original column is already same-model, and we stuff another row for
+    // the **same model** into the side table -- a normal backfill cannot
+    // manufacture this overlap (the backfiller only picks facts whose
+    // embedding_model <> the current one), but "switch away and switch back"
+    // can. The symptom of a duplicate is the same memory appearing twice in
+    // retrieval with RRF giving it a double ranking: a quietly amplifying bias
+    // rather than an error
     let ids = seed(&ctx, "same-model", 3).await;
     store
         .write_txn(async |tx| {
             tx.insert_fact_embedding(&NewFactEmbedding {
-                fact_id: ids[0].parse().expect("fact id"),
+                fact_id: ids[0].parse().expect("the fact id"),
                 embedding_model: "same-model".to_owned(),
                 embedding: Vector::from(unit(7)),
             })
             .await
         })
         .await
-        .expect("写旁表向量");
+        .expect("writing the side-table vector");
 
     let hit = store
         .recall_vector(&Vector::from(unit(0)), "same-model", 10)
         .await
-        .expect("向量召回");
-    assert_eq!(hit.len(), 3, "两侧都命中的事实必须只出现一次，实际 {hit:?}");
+        .expect("vector retrieval");
+    assert_eq!(
+        hit.len(),
+        3,
+        "a fact hit on both sides must appear only once; got {hit:?}"
+    );
 
     let mut seen: Vec<&str> = hit.iter().map(|f| f.id.as_str()).collect();
     seen.sort_unstable();
     seen.dedup();
-    assert_eq!(seen.len(), 3, "去重后条数应当不变 —— 变了说明有重复行");
+    assert_eq!(
+        seen.len(),
+        3,
+        "the count should not change after deduplication -- if it does, there were duplicate rows"
+    );
 
     ctx.cleanup().await;
 }
@@ -180,27 +209,31 @@ async fn census_and_backlog_agree_with_each_other() {
 
     let ids = seed(&ctx, "old-model", 4).await;
 
-    // 普查：只有旧模型
-    let census = store.embedding_census().await.expect("普查");
+    // Census: only the old model
+    let census = store.embedding_census().await.expect("the census");
     assert_eq!(
         census,
         vec![("old-model".to_string(), 4)],
-        "普查结果应当只有旧模型一档、覆盖 4 条"
+        "the census should show only the old model tier, covering 4 rows"
     );
 
-    // 待办：4 条都缺新模型的向量
+    // Backlog: all 4 lack a vector for the new model
     let todo = store
         .facts_missing_embedding("new-model", 100)
         .await
-        .expect("取待办");
-    assert_eq!(todo.len(), 4, "换模型时全部 4 条都该在待办里");
+        .expect("fetching the backlog");
+    assert_eq!(
+        todo.len(),
+        4,
+        "on a model switch all 4 rows should be in the backlog"
+    );
 
-    // 回填两条
+    // Backfill two of them
     store
         .write_txn(async |tx| {
             for id in ids.iter().take(2) {
                 tx.insert_fact_embedding(&NewFactEmbedding {
-                    fact_id: id.parse().expect("fact id"),
+                    fact_id: id.parse().expect("the fact id"),
                     embedding_model: "new-model".to_owned(),
                     embedding: Vector::from(unit(1)),
                 })
@@ -209,58 +242,69 @@ async fn census_and_backlog_agree_with_each_other() {
             Ok(())
         })
         .await
-        .expect("回填两条");
+        .expect("backfilling two rows");
 
-    // 普查：两档并存，这正是「回填进行中」应有的样子
-    let census = store.embedding_census().await.expect("普查");
+    // Census: both tiers coexist, which is exactly what "a backfill in
+    // progress" should look like
+    let census = store.embedding_census().await.expect("the census");
     assert_eq!(
         census,
         vec![("old-model".to_string(), 4), ("new-model".to_string(), 2)],
-        "回填一半时两档都在，且按覆盖数降序"
+        "halfway through the backfill both tiers are present, ordered by coverage descending"
     );
 
-    // 待办少了两条 —— 这条断言同时守住「回填器不会把同一条反复补」
+    // The backlog is two shorter -- this assertion also guards "the backfiller
+    // does not redo the same row over and over"
     let todo = store
         .facts_missing_embedding("new-model", 100)
         .await
-        .expect("取待办");
+        .expect("fetching the backlog");
     assert_eq!(
         todo.len(),
         2,
-        "已补的两条必须从待办里消失，否则回填器会无限循环地重补同一批"
+        "the two already backfilled must disappear from the backlog, or the backfiller loops \
+         forever redoing the same batch"
     );
 
     ctx.cleanup().await;
 }
 
-/// 执行计划守卫 —— 基准集**不能被物化**。
+/// Query-plan guard — the base set **must not be materialized**.
 ///
-/// # 它验什么，不验什么
+/// # What it verifies, and what it does not
 ///
-/// **验**：计划里不出现 `CTE Scan`。这是计划**形状**的性质，与数据量无关，
-/// 所以在测试规模上也测得准。
+/// **It verifies**: that `CTE Scan` does not appear in the plan. That is a
+/// property of the plan's **shape**, independent of data volume, so it is
+/// accurate even at test scale.
 ///
-/// **不验**：两侧有没有真的走 HNSW。那取决于行数与统计信息 ——
-/// 测试库里只有几条，planner 会选 btree（`idx_facts_model`）而不是 HNSW，
-/// 连 `enable_seqscan = off` 都逼不出来（它只关掉顺序扫描，btree 还在）。
-/// 想验索引选择得造几千行 × 1024 维，慢且脆，而且验的是 planner 的成本模型
-/// 不是我们的查询写法。
+/// **It does not verify**: whether either side genuinely uses HNSW. That depends
+/// on row counts and statistics — the test database holds a handful of rows, at
+/// which scale the planner picks a btree (`idx_facts_model`) rather than HNSW,
+/// and not even `enable_seqscan = off` can force it (that only turns off
+/// sequential scans; the btree remains). Verifying index selection would require
+/// manufacturing thousands of rows × 1024 dimensions: slow, brittle, and
+/// verifying the planner's cost model rather than how we wrote the query.
 ///
-/// # 为什么这半条仍然值得写
+/// # Why this half is still worth writing
 ///
-/// 第一版把基准集抽成了 `WITH base AS (…)`。它被两个分支各引用一次，
-/// PG 12 起只在**引用一次**时内联，于是它被物化 —— 分支一的
-/// `ORDER BY embedding <=> $1` 只能对着一堆已落地的行排序，HNSW 彻底出局。
+/// The first version factored the base set into `WITH base AS (…)`. Each of the
+/// two branches references it once, and since PG 12 a CTE is inlined only when
+/// referenced **once**, so it got materialized — and branch one's
+/// `ORDER BY embedding <=> $1` could only sort a pile of already-materialized
+/// rows, putting HNSW completely out of play.
 ///
-/// 那个写法在小库上跑得飞快，等库长大了才暴露，而那时它看起来像
-/// 「数据库变慢了」而不是「索引没被用上」。这条测试拦的正是它。
+/// That formulation runs blazingly fast on a small database and only surfaces
+/// once the database grows, at which point it looks like "the database got
+/// slower" rather than "the index isn't being used". This test stops exactly
+/// that.
 ///
-/// # 顺带记下一个**本次改动之前就存在**的问题
+/// # And a note on a problem that **predates this change**
 ///
-/// 分支一其实**用不了** `idx_facts_vec`，原因与本次改动无关：
-/// `active_facts` 是带 LEFT JOIN 的视图（join 到 `fact_status`，
-/// 后者又是 `fact_events` 上的 DISTINCT ON），planner 必须先把 join 做完
-/// 才能按距离排序。改动前那条查询的计划是：
+/// Branch one in fact **could not use** `idx_facts_vec`, for reasons unrelated
+/// to this change: `active_facts` was a view with a LEFT JOIN (joining
+/// `fact_status`, itself a DISTINCT ON over `fact_events`), and the planner had
+/// to finish the join before it could sort by distance. The plan for that query
+/// before the change was:
 ///
 /// ```text
 ///   Sort (Sort Key: f.embedding <=> …)
@@ -269,9 +313,10 @@ async fn census_and_backlog_agree_with_each_other() {
 ///           ->  Sort  ->  Seq Scan on fact_events
 /// ```
 ///
-/// 也就是说主召回路上那个 HNSW 一直是摆设。**已修**：
-/// migrations/20260810000001 把视图换成两层反连接，5 万条事实上
-/// 289.7ms → 0.5ms。下面那条「不许出现外连接」的断言守的就是这个。
+/// In other words, the HNSW on the main retrieval path had been decorative all
+/// along. **Fixed**: migrations/20260810000001 replaced the view with a
+/// two-level anti-join, taking 289.7ms → 0.5ms over 50,000 facts. The "no outer
+/// join allowed" assertion below is what guards that.
 #[tokio::test]
 async fn the_base_set_is_not_materialized() {
     let Some(ctx) = common::setup().await else {
@@ -284,7 +329,7 @@ async fn the_base_set_is_not_materialized() {
         .write_txn(async |tx| {
             for id in &ids {
                 tx.insert_fact_embedding(&NewFactEmbedding {
-                    fact_id: id.parse().expect("fact id"),
+                    fact_id: id.parse().expect("the fact id"),
                     embedding_model: "other".to_owned(),
                     embedding: Vector::from(unit(2)),
                 })
@@ -293,10 +338,11 @@ async fn the_base_set_is_not_materialized() {
             Ok(())
         })
         .await
-        .expect("旁表也要有行，否则分支二在计划里根本不出现");
+        .expect("the side table needs rows too, or branch two never appears in the plan at all");
 
-    // `query_raw` 不支持绑定参数，所以把三个参数拼成字面量。
-    // 1024 维的向量字面量有几 KB —— 在测试里可以接受，在生产代码里不行
+    // `query_raw` does not support bind parameters, so the three parameters are
+    // spliced in as literals. A 1024-dimensional vector literal runs to several
+    // KB -- acceptable in a test, not in production code
     let probe = format!(
         "'[{}]'::vector",
         unit(0)
@@ -317,42 +363,52 @@ async fn the_base_set_is_not_materialized() {
 
     assert!(
         !text.contains("CTE Scan"),
-        "计划里出现了 CTE Scan —— 基准集被物化了，向量索引彻底出局。         别把 base 抽成 `WITH`：它被两个分支各引用一次，PG 不会内联它。"
+        "a CTE Scan appeared in the plan -- the base set was materialized and the vector index \
+         is completely out of play. Do not factor base into a `WITH`: each of the two branches \
+         references it once, so PG will not inline it."
     );
-    // 两个分支都要真的出现在计划里 —— 少一个说明并集写法把某一侧优化掉了，
-    // 而那正是「回填了却召不回来」的样子
+    // Both branches must genuinely appear in the plan -- one missing means the
+    // union formulation optimized one side away, and that is exactly what
+    // "backfilled but not retrievable" looks like
     assert!(
         text.contains("facts"),
-        "计划里没有 facts —— 分支一不见了：
+        "the plan contains no facts -- branch one is gone:
 {text}"
     );
     assert!(
         text.contains("fact_embeddings"),
-        "计划里没有 fact_embeddings —— 分支二不见了，回填等于白做：
+        "the plan contains no fact_embeddings -- branch two is gone, making the backfill \
+         worthless:
 {text}"
     );
 
-    // **ORDER BY 前面不能有外连接。**
+    // **No outer join may precede the ORDER BY.**
     //
-    // 这条守的是 active_facts 的形状。它原来是 `facts LEFT JOIN fact_status`，
-    // 而外连接必须**先做完**才能按距离排序 —— 于是 idx_facts_vec 从来没被
-    // 用上过，主召回路上那个 HNSW 一直是摆设。反连接（NOT EXISTS）不一样：
-    // planner 可以把它当成 facts 上的一个过滤条件，索引就够得着了。
+    // This guards the shape of active_facts. It used to be
+    // `facts LEFT JOIN fact_status`, and an outer join must be **finished
+    // first** before anything can be sorted by distance -- so idx_facts_vec was
+    // never used and the HNSW on the main retrieval path was decorative all
+    // along. An anti-join (NOT EXISTS) is different: the planner can treat it
+    // as a filter condition on facts, which puts the index within reach.
     //
-    // # 为什么不直接断言「计划里有 idx_facts_vec」
+    // # Why not simply assert "idx_facts_vec appears in the plan"
     //
-    // 试过，测不出来。测试库里只有个位数行，那个规模下 planner 选顺序扫描
-    // 或者小 btree 永远更便宜 —— 连 `enable_seqscan = off` 都逼不出 HNSW，
-    // 它会改走 idx_facts_model 再排序。**4 行数据上「planner 选了什么」
-    // 证明不了任何事**，所以这里断言的是结构，不是选择。
+    // Tried it; it cannot be tested. The test database holds single digits of
+    // rows, and at that scale a sequential scan or a small btree is always
+    // cheaper for the planner -- not even `enable_seqscan = off` can force HNSW
+    // out of it; it switches to idx_facts_model and sorts afterwards. **On 4
+    // rows of data, "what the planner chose" proves nothing**, so what is
+    // asserted here is structure rather than choice.
     //
-    // 定量证据在 migrations/20260810000001 里：5 万条事实上
-    // 289.7ms → 0.5ms，19.8 万次缓冲访问 → 531 次。
+    // The quantitative evidence is in migrations/20260810000001: over 50,000
+    // facts, 289.7ms → 0.5ms, and 198,000 buffer accesses → 531.
     assert!(
         !text.contains("Left Join"),
-        "计划里出现了外连接 —— active_facts 又变回「必须先 join 完」的形状了。
-这不会让结果变错，只会让每次向量召回都退化成全表扫描 + 几万次 1024 维距离计算，
-而且没有任何别的测试会为此变红。见 migrations/20260810000001：
+        "an outer join appeared in the plan -- active_facts has gone back to the shape that \
+         \"must finish the join first\".
+This does not make the results wrong, it just degrades every vector retrieval into a full table
+scan plus tens of thousands of 1024-dimensional distance computations, and no other test will go
+red for it. See migrations/20260810000001:
 {text}"
     );
 

@@ -1,40 +1,48 @@
-//! 启动时把所有租户的 schema 迁到最新。
+//! Migrating every tenant's schema up to date at startup.
 //!
-//! # 为什么这件事需要一个专门的模块
+//! # Why this needs a module of its own
 //!
-//! 单用户时 migration 是一句 `store.migrate()`，只有两种结果：过了，或者
-//! 服务起不来。多租户之后它变成一个**部分失败**的操作 —— 二十个租户里
-//! 有一个的 schema 出了问题（磁盘满、有人手动改过表、上一次升级跑到一半
-//! 断电），而剩下十九个完全正常。
+//! With a single user, migration is one `store.migrate()` call with exactly two
+//! outcomes: it passed, or the service does not come up. Under multi-tenancy it
+//! becomes a **partially failing** operation — one schema out of twenty has a
+//! problem (disk full, somebody altered a table by hand, the last upgrade lost
+//! power halfway through) while the other nineteen are perfectly fine.
 //!
-//! 这时候「整个服务起不来」是**错的**：一个用户的库坏了不该让所有人下线。
-//! 而「静默跳过」更错：那个用户会带着一个缺表的 schema 继续用，症状是
-//! 某个功能偶尔报一句看不懂的 SQL 错误。
+//! At that point "the whole service does not come up" is **wrong**: one user's
+//! database being broken should not take everybody offline. And "silently skip
+//! it" is worse: that user carries on with a schema that is missing tables, and
+//! the symptom is some feature occasionally emitting an incomprehensible SQL
+//! error.
 //!
-//! 所以这里的产物是一份**逐租户的结果清单**，调用方据此决定：正常的照常
-//! 服务，坏掉的那几个明确标记为不可用并报出来。
+//! So what this produces is a **per-tenant result list**, from which the caller
+//! decides: the healthy ones keep serving, and the broken few are explicitly
+//! marked unavailable and reported.
 
 use crate::error::Result;
 use crate::store::Store;
 use crate::tenant::{SchemaName, TenantPools};
 
-/// 一个租户的迁移结果。
+/// The migration result for one tenant.
 #[derive(Debug)]
 pub struct TenantMigration {
     pub schema: SchemaName,
-    /// `None` = 成功；`Some` = 这个租户不可用，附上给人看的原因。
+    /// `None` = success; `Some` = this tenant is unavailable, with a
+    /// human-readable reason attached.
     pub failure: Option<String>,
 }
 
-/// 把 `schemas` 里每个租户都迁到最新。
+/// Migrate every tenant in `schemas` up to date.
 ///
-/// **逐个来，不并发。** migration 里有 `CREATE INDEX`（HNSW 那几个尤其重），
-/// 二十个 schema 同时建索引会把一台 2 核的机器直接打死 —— 而那正是启动时
-/// 最不该发生的事。慢几秒换一个能起来的服务。
+/// **One at a time, not concurrently.** The migrations contain `CREATE INDEX`
+/// (the HNSW ones especially heavy), and building indexes on twenty schemas at
+/// once will flatten a 2-core machine outright — which is the last thing that
+/// should happen at startup. A few extra seconds buys a service that actually
+/// comes up.
 ///
 /// # Errors
-/// 不返回 `Err`：单个租户的失败进 [`TenantMigration::failure`]。
-/// 整体失败（连不上数据库）由调用方在建 [`TenantPools`] 时就撞到了。
+/// Never returns `Err`: an individual tenant's failure goes into
+/// [`TenantMigration::failure`]. A wholesale failure (cannot reach the
+/// database) has already hit the caller while constructing [`TenantPools`].
 pub async fn migrate_all(pools: &TenantPools, schemas: &[SchemaName]) -> Vec<TenantMigration> {
     let mut out = Vec::with_capacity(schemas.len());
     for schema in schemas {
@@ -46,8 +54,8 @@ pub async fn migrate_all(pools: &TenantPools, schemas: &[SchemaName]) -> Vec<Ten
             },
         };
         if let Some(why) = &failure {
-            // error 而不是 warn：这个租户从现在起是不可用的，
-            // 而它在别处的表现只会是零散的 SQL 错误
+            // error rather than warn: this tenant is unavailable from now on,
+            // and everywhere else it will show up only as scattered SQL errors
             tracing::error!(schema = schema.as_str(), reason = %why, "租户 schema 迁移失败，该用户暂不可用");
         }
         out.push(TenantMigration {
@@ -58,17 +66,20 @@ pub async fn migrate_all(pools: &TenantPools, schemas: &[SchemaName]) -> Vec<Ten
     out
 }
 
-/// 给一个新用户开一片 schema 并迁到最新。
+/// Open a schema for a new user and migrate it up to date.
 ///
-/// # 顺序不能反
+/// # The order cannot be reversed
 ///
-/// 先建 schema、再迁移，最后才把 `users` 那一行写下去 —— 调用方按这个顺序
-/// 做。反过来（先写 users 再建 schema）会留下一个「账号存在但库是空的」
-/// 的中间态，而那个用户一登录就撞上一片没有表的 schema。
+/// Create the schema, then migrate, and only then write the `users` row — that
+/// is the order callers must follow. The other way around (write users first,
+/// create the schema after) leaves an intermediate state where "the account
+/// exists but the database is empty", and that user hits a schema with no
+/// tables the moment they log in.
 ///
 /// # Errors
-/// 建不出 schema，或者 migration 跑不过。**失败时 schema 可能已经建了一半**
-/// —— 调用方应当把它删掉再报错，别留下孤儿。
+/// The schema could not be created, or the migration did not pass. **On failure
+/// the schema may already be half-built** — the caller should drop it before
+/// reporting the error rather than leaving an orphan behind.
 pub async fn provision(pools: &TenantPools, schema: &SchemaName) -> Result<()> {
     pools.create_schema(schema).await?;
     let store: std::sync::Arc<Store> = pools.get(schema).await?;
@@ -79,9 +90,11 @@ pub async fn provision(pools: &TenantPools, schema: &SchemaName) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 失败要**逐个**记下来，而不是让整批垮掉。
+    /// Failures must be recorded **one by one** rather than bringing the whole
+    /// batch down.
     ///
-    /// 这条守的是「一个用户的库坏了不该让所有人下线」。
+    /// This test guards "one user's database being broken should not take
+    /// everybody offline".
     #[test]
     fn a_failure_is_recorded_per_tenant_not_thrown() {
         let ok = TenantMigration {
@@ -102,7 +115,7 @@ mod tests {
         assert_eq!(broken, ["u_01arz3ndektsv4rrffq69g5fav"]);
         assert!(
             results.iter().any(|r| r.failure.is_none()),
-            "一个租户失败不该让别的租户也标成失败"
+            "one tenant failing must not mark the other tenants as failed too"
         );
     }
 }

@@ -1,40 +1,45 @@
-//! 媒体转录：把图片 / 音视频变成**可被检索的文本**。
+//! Media transcription: turn images / audio / video into **text that can be retrieved**.
 //!
 //! ```text
-//! blob 字节
+//! blob bytes
 //!     │
-//!     ├─① 挑转录器   按 MIME 分流 vision / OCR / ASR
-//!     ├─② 抹除前置检查  查 redactions，已抹除就别白跑一趟模型
-//!     ├─③ 转录       → Vec<Segment>（音视频带毫秒偏移，图片不带）
-//!     ├─④ 分词 + 向量化  与主行同事务写入的前提
-//!     └─⑤ 抹除复检   ←── 真正关键的一次：③④ 期间可能刚好被 redact 了
+//!     ├─① pick a transcriber   route by MIME to vision / OCR / ASR
+//!     ├─② redaction pre-check  consult redactions; don't burn a model call for nothing
+//!     ├─③ transcribe           → Vec<Segment> (audio/video carry ms offsets, images don't)
+//!     ├─④ tokenize + embed     the precondition for writing in the same txn as the main row
+//!     └─⑤ redaction re-check   ←── the one that matters: a redact may have landed during ③④
 //! ```
 //!
-//! # 为什么必须有这一层
+//! # Why this layer has to exist
 //!
-//! `blob_transcripts` 表在 migration 里就建好了（含 `span_start_ms` /
-//! `span_end_ms`），但在此之前**没有任何东西往里写**。
-//! 不转成文本的媒体在四路召回里一条也命中不了 —— 存了等于没存，
-//! 用户传过的图三个月后自己也找不回来。
+//! The `blob_transcripts` table has been in place since the migration (with
+//! `span_start_ms` / `span_end_ms`), but until now **nothing ever wrote to it**.
+//! Media that never becomes text cannot be hit by any of the four retrieval
+//! paths — storing it is the same as not storing it, and three months later the
+//! user cannot find the image they themselves uploaded.
 //!
-//! # 两条必须守住的纪律
+//! # Two disciplines that must hold
 //!
-//! 1. **写入前必须查 `redactions`。**
-//!    redact 是全链路 append-only 里唯一的例外（docs/memory.md §十一），
-//!    它的销毁承诺依赖「没有在途任务事后把秘密回填」。转录是最慢的一类
-//!    在途任务（一次 vision 调用几十秒），窗口最大。
-//!    本模块把它做进了**签名**：[`TranscribePipeline::run`] 必须收一个
-//!    [`RedactionGuard`]，接线的人不可能忘记传。
-//! 2. **模型调用在事务外。** 与抽取同理（CLAUDE.md 约束 2）：这里只产出
-//!    [`cortex_store::NewBlobTranscript`] 这样的「待写行」，
-//!    真正的 `write_txn` 由调用方开，且开完立刻提交。
+//! 1. **Consult `redactions` before writing.**
+//!    redact is the single exception to append-only across the whole chain
+//!    (docs/memory.md §11); its promise to destroy data rests on "no in-flight
+//!    task writes the secret back afterwards". Transcription is the slowest
+//!    class of in-flight task (one vision call takes tens of seconds), so its
+//!    window is the widest.
+//!    This module builds that into the **signature**: [`TranscribePipeline::run`]
+//!    must be handed a [`RedactionGuard`], so whoever wires it up cannot forget.
+//! 2. **Model calls happen outside the transaction.** Same reasoning as
+//!    extraction (CLAUDE.md constraint 2): this module only produces "rows
+//!    waiting to be written" such as [`cortex_store::NewBlobTranscript`];
+//!    the actual `write_txn` is opened by the caller, and committed at once.
 //!
-//! # ASR 现状
+//! # State of ASR
 //!
-//! 本模块**没有**可用的 ASR 实现，只留了 trait 与 [`TranscriptKind::Asr`]
-//! 这条分支。原因与缺口见 [`Transcriber`] 的文档。
-//! 宁可让 [`Outcome::Unsupported`] 明说「这个 MIME 没人管」，
-//! 也不塞一个跑不通的实现进来。
+//! This module has **no** working ASR implementation — only the trait and the
+//! [`TranscriptKind::Asr`] branch. The reasons and the gaps are documented on
+//! [`Transcriber`].
+//! Better to have [`Outcome::Unsupported`] say plainly "nobody claims this MIME"
+//! than to stuff in an implementation that does not run.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -51,27 +56,30 @@ use crate::tokenize;
 //  Segment
 // ══════════════════════════════════════════════════════════
 
-/// 转录产出的一段文本。一段 = `blob_transcripts` 里的一行。
+/// One chunk of text produced by transcription. One chunk = one row in
+/// `blob_transcripts`.
 ///
-/// # 为什么分段而不是一整块
+/// # Why chunks instead of one blob of text
 ///
-/// 音视频的检索价值在于**能跳回去**：搜到「他说了要用 RustFS」之后，
-/// 用户要的是播放器跳到 31:40，而不是一段两小时的文字墙。
-/// `span_*_ms` 就是为此存在的，切段是它唯一的用法。
+/// The retrieval value of audio and video is **being able to jump back**: after
+/// finding "he said we should use RustFS", what the user wants is the player to
+/// seek to 31:40, not a two-hour wall of text.
+/// `span_*_ms` exists for exactly that, and chunking is its only use.
 ///
-/// 图片没有时间轴，`span_*` 恒为 `None` —— 这也是 schema 里
-/// `CHECK (span_end_ms IS NULL OR span_start_ms IS NOT NULL)` 的由来。
+/// Images have no timeline, so `span_*` is always `None` — which is also where
+/// the schema's `CHECK (span_end_ms IS NULL OR span_start_ms IS NOT NULL)`
+/// comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub text: String,
-    /// 片段起点（毫秒）。图片 / OCR 为 `None`。
+    /// Chunk start (milliseconds). `None` for images / OCR.
     pub span_start_ms: Option<i64>,
-    /// 片段终点（毫秒）。有终点必须有起点，见 [`Self::validate`]。
+    /// Chunk end (milliseconds). An end requires a start, see [`Self::validate`].
     pub span_end_ms: Option<i64>,
 }
 
 impl Segment {
-    /// 一段没有时间轴的文本（图片描述、整页 OCR）。
+    /// A chunk of text with no timeline (image caption, whole-page OCR).
     #[must_use]
     pub fn whole(text: impl Into<String>) -> Self {
         Self {
@@ -81,7 +89,7 @@ impl Segment {
         }
     }
 
-    /// 一段带时间轴的文本（ASR、视频抽帧）。
+    /// A chunk of text with a timeline (ASR, video frame captures).
     #[must_use]
     pub fn span(text: impl Into<String>, start_ms: i64, end_ms: i64) -> Self {
         Self {
@@ -91,25 +99,28 @@ impl Segment {
         }
     }
 
-    /// 时长（毫秒）。缺任一端点即 `None`。
+    /// Duration (milliseconds). `None` if either endpoint is missing.
     #[must_use]
     pub fn duration_ms(&self) -> Option<i64> {
         self.span_start_ms.zip(self.span_end_ms).map(|(s, e)| e - s)
     }
 
-    /// 校验这一段能不能写进 `blob_transcripts`。
+    /// Check whether this chunk can be written into `blob_transcripts`.
     ///
-    /// # 为什么在 Rust 侧再查一遍
+    /// # Why check again on the Rust side
     ///
-    /// 三条约束数据库都有（`text NOT NULL`、`CHECK (span_end_ms IS NULL OR
-    /// span_start_ms IS NOT NULL)`），但违反它们的代价不对称：
-    /// `write_txn` 是持着 `pg_advisory_xact_lock(4272)` 的，一条坏行会让
-    /// **整个事务回滚**，连带丢掉同批次的其它转录，而错误信息只有一句
-    /// Postgres 的约束名。在这里拦下来能指名道姓说清是哪一段。
+    /// The database has all three constraints (`text NOT NULL`,
+    /// `CHECK (span_end_ms IS NULL OR span_start_ms IS NOT NULL)`), but the cost
+    /// of violating them is asymmetric: `write_txn` holds
+    /// `pg_advisory_xact_lock(4272)`, so one bad row rolls back **the entire
+    /// transaction**, taking the other transcripts of the same batch down with
+    /// it — and the only error you get is a Postgres constraint name. Catching
+    /// it here lets us name the offending chunk exactly.
     ///
     /// # Errors
     ///
-    /// 文本为空、有终点无起点、时间为负、或终点早于起点。
+    /// Empty text, an end without a start, a negative time, or an end earlier
+    /// than its start.
     pub fn validate(&self) -> Result<()> {
         if self.text.trim().is_empty() {
             return Err(CortexError::Invalid(
@@ -135,58 +146,67 @@ impl Segment {
 //  Transcriber
 // ══════════════════════════════════════════════════════════
 
-/// 一种把媒体变成文本的办法。
+/// One way of turning media into text.
 ///
-/// # 四种 kind 对应四条完全不同的 pipeline
+/// # The four kinds are four completely different pipelines
 ///
-/// | kind | 输入 | 现状 |
+/// | kind | input | state |
 /// |---|---|---|
-/// | [`TranscriptKind::VisionCaption`] | 图片 | [`VisionTranscriber`]，走多模态 LLM |
-/// | [`TranscriptKind::Ocr`] | 图片 / 扫描件 | 未实现。vision caption 的「文字」行已覆盖大部分场景 |
-/// | [`TranscriptKind::Asr`] | 音频 / 视频 | **未实现**，见下 |
-/// | [`TranscriptKind::FrameCaption`] | 视频抽帧 | 未实现，依赖解容器抽帧 |
+/// | [`TranscriptKind::VisionCaption`] | images | [`VisionTranscriber`], via a multimodal LLM |
+/// | [`TranscriptKind::Ocr`] | images / scans | not implemented. The "文字" line of a vision caption already covers most cases |
+/// | [`TranscriptKind::Asr`] | audio / video | **not implemented**, see below |
+/// | [`TranscriptKind::FrameCaption`] | video frames | not implemented, needs container demuxing and frame extraction |
 ///
-/// # ASR 缺什么
+/// # What ASR is missing
 ///
-/// 三条路都不通，所以这里只留接口不留实现：
+/// All three routes are blocked, which is why there is an interface here and no
+/// implementation:
 ///
-/// - **本地推理**：`fastembed` 那条路只有文本模型，Whisper 要么绑
-///   `whisper.cpp`（C 依赖 + 六端交叉编译）要么自己用 `ort` 装配
-///   （前后处理 mel 谱、beam search、时间戳对齐全得手写）；
-/// - **云 API**：需要一个提供 ASR 的供应商密钥。goose 的 provider 层
-///   只覆盖 chat completions，转写端点（OpenAI `/v1/audio/transcriptions`）
-///   不在其中，得自己写 HTTP 客户端 —— 那正好是「取件」要避免的那类活；
-/// - **多模态 LLM 直接吃音频**：技术上可行 —— 本机 Ollama 上的 `gemma4`
-///   在 `/api/show` 里就声明了 `audio` 能力，rmcp 也早有
-///   `RawAudioContent`。**缺口只在 goose**：它的 `MessageContent`
-///   只接了 Text / Image / Tool* / Thinking / SystemNotification，
-///   没把 rmcp 的 Audio 变体接进来，图像那条路上的 `convert_image`
-///   也没有音频对应物。
-///   这一条离可用最近，缺的是 goose 侧的一小段（一个变体 + 一个
-///   `convert_audio`）；在本层绕开 goose 自己发请求能解，
-///   但那等于放弃取件收益、把各家音频格式差异重新背回来。
+/// - **Local inference**: the `fastembed` route only has text models. Whisper
+///   means either binding `whisper.cpp` (a C dependency plus cross-compiling for
+///   six targets) or assembling it yourself on `ort` (mel spectrogram pre/post
+///   processing, beam search and timestamp alignment all written by hand);
+/// - **Cloud API**: needs a key from a provider that offers ASR. goose's
+///   provider layer only covers chat completions; the transcription endpoints
+///   (OpenAI `/v1/audio/transcriptions`) are not among them, so we would have to
+///   write the HTTP client ourselves — precisely the kind of work that "take the
+///   part off the shelf" is meant to avoid;
+/// - **Feeding audio straight to a multimodal LLM**: technically viable — the
+///   local Ollama's `gemma4` already declares an `audio` capability in
+///   `/api/show`, and rmcp has had `RawAudioContent` for a while.
+///   **The gap is only in goose**: its `MessageContent` only wires up
+///   Text / Image / Tool* / Thinking / SystemNotification, never pulled in
+///   rmcp's Audio variant, and there is no audio counterpart to `convert_image`
+///   on the image route.
+///   This is the route closest to usable; what's missing is a small piece on the
+///   goose side (one variant plus a `convert_audio`). Bypassing goose and
+///   issuing the request from this layer would work, but that means giving up
+///   the take-it-off-the-shelf payoff and shouldering every vendor's audio
+///   format differences again.
 ///
-/// 在此之前，音视频走到 [`Outcome::Unsupported`]，**明说没人管**。
+/// Until then, audio and video land on [`Outcome::Unsupported`], which
+/// **says plainly that nobody handles them**.
 #[async_trait::async_trait]
 pub trait Transcriber: Send + Sync {
-    /// 写进 `blob_transcripts.kind`。
+    /// Written into `blob_transcripts.kind`.
     fn kind(&self) -> TranscriptKind;
 
-    /// 写进 `blob_transcripts.transcribed_by`。
+    /// Written into `blob_transcripts.transcribed_by`.
     ///
-    /// 必须能唯一标识「哪个模型/哪套 pipeline 产出的」，理由与
-    /// `embedding_model` 完全相同（见 [`crate::embed::FastModel::model_id`]）：
-    /// 换模型后要靠它区分新旧、决定重跑哪些行。
+    /// It must uniquely identify "which model / which pipeline produced this",
+    /// for exactly the same reason as `embedding_model` (see
+    /// [`crate::embed::FastModel::model_id`]): after switching models it is what
+    /// tells old rows from new ones and decides which rows to re-run.
     fn transcribed_by(&self) -> &str;
 
-    /// 这个 MIME 归不归它管。
+    /// Whether this MIME is its business.
     fn supports(&self, mime: &str) -> bool;
 
-    /// 转录。
+    /// Transcribe.
     ///
     /// # Errors
     ///
-    /// 模型调用失败、内容非法、或产出无法使用。
+    /// The model call failed, the content is invalid, or the output is unusable.
     async fn transcribe(&self, bytes: &[u8], mime: &str) -> Result<Vec<Segment>>;
 }
 
@@ -207,42 +227,46 @@ impl<T: Transcriber + ?Sized> Transcriber for Arc<T> {
 }
 
 // ══════════════════════════════════════════════════════════
-//  抹除防护
+//  Redaction guard
 // ══════════════════════════════════════════════════════════
 
-/// 「这个 blob 是不是已经被抹除了」的判定。
+/// The verdict on "has this blob already been redacted".
 ///
-/// # 为什么它是必填参数而不是可选项
+/// # Why it is a required parameter and not an option
 ///
-/// docs/memory.md §十一 的在途任务防护：redact 要真正销毁数据，就必须保证
-/// 执行的那一刻起，**没有任何在途任务事后把内容写回来**。转录是窗口最大的
-/// 在途任务 —— 一次 vision 调用几十秒，期间用户完全可能点了「抹除」。
+/// The in-flight-task protection from docs/memory.md §11: for redact to truly
+/// destroy data, it must guarantee that from the moment it runs, **no in-flight
+/// task writes the content back afterwards**. Transcription is the in-flight
+/// task with the widest window — a single vision call takes tens of seconds, and
+/// the user may well hit "redact" during it.
 ///
-/// 本 crate 不能碰 store（分层与并行任务的边界），所以把这个约束做进类型：
-/// [`TranscribePipeline::run`] 收一个 `&dyn RedactionGuard`，
-/// 接线的人**没有办法**在不显式提供实现的情况下调用它。
+/// This crate must not touch store (the layering and parallel-task boundary), so
+/// the constraint is encoded in the type: [`TranscribePipeline::run`] takes a
+/// `&dyn RedactionGuard`, and whoever wires it up has **no way** to call it
+/// without explicitly supplying an implementation.
 ///
-/// cortexd 那侧的实现就一行：
+/// The implementation on the cortexd side is one line:
 ///
 /// ```ignore
 /// store.is_redacted(RedactionTarget::Blob, blob_hash).await
 /// ```
 #[async_trait::async_trait]
 pub trait RedactionGuard: Send + Sync {
-    /// 查 `redactions` 表里有没有针对这个 blob 的墓碑。
+    /// Look for a tombstone against this blob in the `redactions` table.
     ///
     /// # Errors
     ///
-    /// 查询失败。**必须向上传播，绝不能当成 `false`** ——
-    /// 把「查不出来」当成「没被抹除」正是这道防护要防的事。
+    /// The query failed. **This must propagate upward and must never be treated
+    /// as `false`** — taking "cannot tell" for "not redacted" is exactly what
+    /// this guard exists to prevent.
     async fn is_redacted(&self, blob_hash: &str) -> Result<bool>;
 }
 
-/// 永远回答「没被抹除」。**仅供单测与离线开发**，定位同
-/// [`crate::embed::HashEmbedder`]。
+/// Always answers "not redacted". **Unit tests and offline development only**,
+/// same standing as [`crate::embed::HashEmbedder`].
 ///
-/// 名字里带 `Never` 而不是 `AllowAll`，是为了让它出现在生产代码里时
-/// 一眼就看出不对劲。
+/// It is named `Never` rather than `AllowAll` so that its appearance in
+/// production code looks wrong at a glance.
 pub struct NeverRedacted;
 
 #[async_trait::async_trait]
@@ -256,27 +280,31 @@ impl RedactionGuard for NeverRedacted {
 //  Pipeline
 // ══════════════════════════════════════════════════════════
 
-/// 一次转录的结局。
+/// How one transcription ended.
 ///
-/// 三态而非 `Vec`：空 `Vec` 无法区分「被抹除了，必须丢弃」与
-/// 「没有转录器，等以后补」与「转出来是空的」，而这三种情况调用方的
-/// 后续动作完全不同（丢弃 / 重排队 / 报警）。
+/// Three states rather than a `Vec`: an empty `Vec` cannot distinguish "redacted,
+/// must be discarded" from "no transcriber, catch up later" from "the
+/// transcription came back empty", and the caller's next move differs completely
+/// across those three (discard / re-queue / raise an alarm).
 #[derive(Debug)]
 pub enum Outcome {
-    /// 转录完成，这些行可以写进 `blob_transcripts`。
+    /// Transcription finished; these rows can go into `blob_transcripts`.
     ///
-    /// 已经过抹除复检，调用方拿到后**尽快**开事务写掉；
-    /// 拖得越久，窗口又开回来了。
+    /// They have already passed the redaction re-check, so the caller should
+    /// open a transaction and write them **as soon as possible**; the longer it
+    /// waits, the wider the window opens again.
     Ready(Vec<NewBlobTranscript>),
-    /// 该 blob 已被抹除。**整体丢弃，一行都不许写。**
+    /// This blob has been redacted. **Discard the lot; not a single row may be
+    /// written.**
     Redacted,
-    /// 没有转录器认领这个 MIME（当前主要是音视频，见 [`Transcriber`]）。
-    /// 不是错误：将来 ASR 落地后重跑一次即可。
+    /// No transcriber claims this MIME (currently that mostly means audio and
+    /// video, see [`Transcriber`]).
+    /// Not an error: once ASR lands, re-running once is enough.
     Unsupported { mime: String },
 }
 
 impl Outcome {
-    /// 可写入的行；非 [`Self::Ready`] 时为空切片。
+    /// The writable rows; an empty slice when this is not [`Self::Ready`].
     #[must_use]
     pub fn rows(&self) -> &[NewBlobTranscript] {
         match self {
@@ -286,14 +314,16 @@ impl Outcome {
     }
 }
 
-/// 把转录器、分词与向量化串成一条可直接落库的流水线。
+/// Strings transcribers, tokenization and embedding into one pipeline whose
+/// output can go straight into the database.
 pub struct TranscribePipeline {
     transcribers: Vec<Arc<dyn Transcriber>>,
     embedder: SharedEmbedder,
 }
 
 impl TranscribePipeline {
-    /// 建一条空流水线。至少要 [`Self::with_transcriber`] 一个才有用。
+    /// Build an empty pipeline. It only becomes useful once at least one
+    /// [`Self::with_transcriber`] has been added.
     #[must_use]
     pub fn new(embedder: SharedEmbedder) -> Self {
         Self {
@@ -302,36 +332,42 @@ impl TranscribePipeline {
         }
     }
 
-    /// 挂一个转录器。**先挂的先匹配** —— 同一个 MIME 有多个候选时
-    /// （例如图片既能 caption 又能 OCR），顺序即优先级。
+    /// Attach a transcriber. **First attached, first matched** — when several
+    /// candidates claim the same MIME (an image can be captioned or OCR'd, for
+    /// instance), order is priority.
     #[must_use]
     pub fn with_transcriber(mut self, transcriber: Arc<dyn Transcriber>) -> Self {
         self.transcribers.push(transcriber);
         self
     }
 
-    /// 谁认领这个 MIME。
+    /// Who claims this MIME.
     #[must_use]
     pub fn transcriber_for(&self, mime: &str) -> Option<&Arc<dyn Transcriber>> {
         self.transcribers.iter().find(|t| t.supports(mime))
     }
 
-    /// 跑一遍：字节 → 待写入的 `blob_transcripts` 行。
+    /// Run once: bytes → `blob_transcripts` rows waiting to be written.
     ///
-    /// # 抹除检查为什么查两次
+    /// # Why the redaction check happens twice
     ///
-    /// - **转录之前**：纯粹省钱省时间。已经被抹除的 blob 没必要再花几十秒
-    ///   调一次 vision 模型。这一次查漏了不会造成数据泄露。
-    /// - **返回之前**：这一次才是防护本身。redact 完全可能落在转录进行中，
-    ///   而那正是「在途任务把秘密回填」的确切形状。
+    /// - **Before transcribing**: purely to save money and time. There is no
+    ///   point spending tens of seconds on a vision call for a blob that is
+    ///   already redacted. Missing a redaction here leaks nothing.
+    /// - **Before returning**: this one is the guard itself. A redact can
+    ///   perfectly well land while transcription is running, and that is the
+    ///   exact shape of "an in-flight task writes the secret back".
     ///
-    /// 两次都查不能保证零窗口（拿到 `Ready` 到真正 INSERT 之间仍有间隙），
-    /// 真正的收口在 redact 执行器那侧的幂等级联重跑（docs/memory.md §十一）；
-    /// 这里做的是把窗口从「几十秒」压到「几毫秒」。
+    /// Checking twice does not make the window zero (there is still a gap
+    /// between receiving `Ready` and the actual INSERT); the real closure is the
+    /// idempotent cascading re-run on the redact executor side
+    /// (docs/memory.md §11). What happens here is squeezing the window from
+    /// "tens of seconds" down to "a few milliseconds".
     ///
     /// # Errors
     ///
-    /// 转录失败、向量化失败、抹除查询失败，或产出的段落非法。
+    /// Transcription failed, embedding failed, the redaction query failed, or a
+    /// produced chunk is invalid.
     pub async fn run(
         &self,
         blob_hash: &str,
@@ -366,8 +402,9 @@ impl TranscribePipeline {
                 .map_err(|e| CortexError::Invalid(format!("第 {i} 段：{e}")))?;
         }
 
-        // 向量化整批一次调用：段落数通常是个位数到几十，
-        // 逐条调用会把 embedder 的锁抢成筛子（见 embed.rs 的锁说明）
+        // Embed the whole batch in one call: the chunk count is usually a single
+        // digit to a few dozen, and calling one at a time would shred the
+        // embedder's lock into a sieve (see the lock notes in embed.rs)
         let texts: Vec<String> = segments.iter().map(|s| s.text.clone()).collect();
         let vectors = self.embedder.embed(&texts).await?;
         if vectors.len() != segments.len() {
@@ -378,7 +415,7 @@ impl TranscribePipeline {
             )));
         }
 
-        // ← 真正关键的一次：③④ 期间可能刚好被 redact 了
+        // ← the one that matters: a redact may have landed during ③④
         if guard.is_redacted(blob_hash).await? {
             tracing::warn!(
                 blob_hash,
@@ -398,8 +435,10 @@ impl TranscribePipeline {
             .map(|(seg, vector)| NewBlobTranscript {
                 id: Id::new(),
                 blob_hash: blob_hash.to_string(),
-                // tsv 必须与主行同事务写入，永不异步补写（CLAUDE.md 约束 3），
-                // 所以分词在这里就做完，随行一起交给调用方
+                // tsv must be written in the same transaction as the main row
+                // and never backfilled asynchronously (CLAUDE.md constraint 3),
+                // so tokenization is done right here and handed to the caller
+                // together with the row
                 tsv_source: Some(tokenize::to_tsvector_input(&seg.text)),
                 text: seg.text,
                 kind,
@@ -416,24 +455,31 @@ impl TranscribePipeline {
 }
 
 // ══════════════════════════════════════════════════════════
-//  VisionTranscriber —— 真实的多模态模型
+//  VisionTranscriber — the real multimodal model
 // ══════════════════════════════════════════════════════════
 
-/// 描述的质量要求全部写在这里。
+/// Every quality requirement for the caption lives here.
 ///
-/// # 为什么 prompt 要这么长
+/// # Why the prompt is this long
 ///
-/// 这段文字**是**这份图片将来能不能被找到的全部依据 —— 原图不会再被读第二遍。
-/// 「一张图片」这种描述在检索里等于零：它与库里任何一张图的描述都一样，
-/// BM25 分不出、向量也分不出。所以 prompt 必须逼出四类可检索信号：
+/// This text **is** the entire basis on which the image can later be found — the
+/// original is never read a second time. A caption like "an image" is worth zero
+/// in retrieval: it is identical to the caption of every other image in the
+/// store, so neither BM25 nor the vectors can tell them apart. The prompt
+/// therefore has to force out four classes of retrievable signal:
 ///
-/// 1. **图里的文字**（OCR 性质）—— 用户最常靠它回忆（「那个报错叫什么来着」）；
-/// 2. **可识别实体** —— 人名、产品、文件名、URL、版本号；抽取管线还能二次消费；
-/// 3. **结构类型** —— 「截图」还是「照片」还是「图表」，是最强的粗筛信号；
-/// 4. **足以回想起来的细节** —— 检索的最后一米是人眼确认「对，就是这张」。
+/// 1. **The text inside the image** (OCR in nature) — what users most often
+///    recall by ("what was that error message called again");
+/// 2. **Identifiable entities** — people, products, file names, URLs, version
+///    numbers; the extraction pipeline can consume these a second time;
+/// 3. **Structural type** — "screenshot" vs "photo" vs "chart", the strongest
+///    coarse-filter signal there is;
+/// 4. **Detail enough to recognize it** — the last metre of retrieval is a human
+///    eye confirming "yes, that's the one".
 ///
-/// 输出用中文：库里的分词器是 jieba（[`crate::tokenize`]），
-/// embedding 是 bge-m3（中文优先）。让模型输出英文会在两条召回路上同时打折。
+/// Output is in Chinese: the tokenizer in the store is jieba
+/// ([`crate::tokenize`]) and the embedding is bge-m3 (Chinese-first). Making the
+/// model answer in English takes a haircut on both retrieval paths at once.
 const VISION_SYSTEM: &str = "\
 你是媒体转录器。你的输出会被存进记忆库并用于**全文检索与向量检索**，\
 原图之后不会再被读取——找不回来就等于这张图不存在。
@@ -452,16 +498,18 @@ const VISION_SYSTEM: &str = "\
 实体：可识别的人名、产品名、品牌、文件名、路径、URL、版本号、日期、金额，逗号分隔
 内容：2 到 4 句话描述画面，要写到「看过这张图的人能凭这段话把它认出来」的程度；最多 200 字";
 
-/// 用多模态 LLM 给图片生成描述。
+/// Caption images with a multimodal LLM.
 ///
-/// # 模型为什么必须能单独配
+/// # Why the model has to be configurable on its own
 ///
-/// Cortex 的默认供应商是 DeepSeek，而 **DeepSeek 一个 vision 模型都没有**
-/// （`/models` 只返回 `deepseek-v4-flash` / `deepseek-v4-pro`）。
-/// 所以转录用的模型与对话主模型天然可能不是一家，
-/// 见 [`Self::from_env`] 的 `CORTEX_VISION_*` 变量。
+/// Cortex's default provider is DeepSeek, and **DeepSeek has no vision model at
+/// all** (`/models` only returns `deepseek-v4-flash` / `deepseek-v4-pro`).
+/// So the model used for transcription may naturally come from a different
+/// vendor than the main conversation model; see the `CORTEX_VISION_*` variables
+/// on [`Self::from_env`].
 ///
-/// `Debug` 转发给 [`LlmClient`] 自己的实现，后者已经保证不打印密钥。
+/// `Debug` is forwarded to [`LlmClient`]'s own implementation, which already
+/// guarantees it never prints the key.
 #[derive(Debug)]
 pub struct VisionTranscriber {
     client: LlmClient,
@@ -470,13 +518,14 @@ pub struct VisionTranscriber {
 }
 
 impl VisionTranscriber {
-    /// 绑定一个已经构造好的客户端与模型名。
+    /// Bind an already-constructed client to a model name.
     ///
     /// # Errors
     ///
-    /// 模型名解析失败，或该模型在供应商定义里**明写**不支持 vision。
-    /// 未声明能力（Ollama、goose 目录里的供应商）按可用处理 ——
-    /// 理由见 [`cortex_llm::VisionSupport`]。
+    /// The model name failed to resolve, or the provider definition **explicitly
+    /// states** that the model does not support vision. Models that declare no
+    /// capability at all (Ollama, providers in goose's catalogue) are treated as
+    /// usable — the reasoning is on [`cortex_llm::VisionSupport`].
     pub fn new(client: LlmClient, model: &str) -> Result<Self> {
         let model_config = client.model_config(model).map_err(CortexError::from)?;
         if client.vision_support(&model_config) == VisionSupport::Unsupported {
@@ -492,19 +541,22 @@ impl VisionTranscriber {
         })
     }
 
-    /// 按 `CORTEX_VISION_PROVIDER` / `CORTEX_VISION_MODEL` 构造。
+    /// Construct from `CORTEX_VISION_PROVIDER` / `CORTEX_VISION_MODEL`.
     ///
-    /// **没设 `CORTEX_VISION_PROVIDER` 就返回 `Ok(None)`** —— 这是刻意的
-    /// 优雅降级：多模态转录需要一个额外的、可能要另付费的供应商，
-    /// 不该强迫每个部署都配。此时图片照常归档，只是暂时检索不到，
-    /// 将来配上再重跑一遍即可。
+    /// **If `CORTEX_VISION_PROVIDER` is unset, return `Ok(None)`** — a
+    /// deliberate graceful degradation: multimodal transcription needs an extra
+    /// provider that may cost extra money, and no deployment should be forced to
+    /// configure one. Images are still archived as usual, they just cannot be
+    /// retrieved for now; configure it later and re-run once.
     ///
-    /// 但**设了 provider 却缺密钥就是错误**，不再降级：
-    /// 那是明确表达了「我要开这个功能」，静默关掉会让人几周后才发现。
+    /// But **a provider set with the key missing is an error**, with no further
+    /// degradation: that is an explicit statement of "I want this feature on",
+    /// and turning it off silently means finding out weeks later.
     ///
     /// # Errors
     ///
-    /// 供应商名不认识、缺少该供应商的密钥环境变量、或模型不支持 vision。
+    /// The provider name is not recognized, the provider's key environment
+    /// variable is missing, or the model does not support vision.
     pub fn from_env() -> Result<Option<Self>> {
         let Ok(provider) = std::env::var("CORTEX_VISION_PROVIDER") else {
             tracing::info!("未设置 CORTEX_VISION_PROVIDER，图片转录关闭（图片仍会归档）");
@@ -523,7 +575,7 @@ impl VisionTranscriber {
 
         let key_var = cortex_llm::provider::api_key_env(&provider).map_err(CortexError::from)?;
         let api_key = if key_var.is_empty() {
-            String::new() // 免鉴权（Ollama）
+            String::new() // no authentication required (Ollama)
         } else {
             std::env::var(&key_var).map_err(|_| {
                 CortexError::Config(format!(
@@ -537,8 +589,10 @@ impl VisionTranscriber {
                 provider,
                 model: model.clone(),
                 cheap_model: model.clone(),
-                // 转录用的 vision 模型可以指向另一个端点 —— 一个自建部署
-                // 常常是「对话走本地、看图走云上」的混合，两者不该被绑死
+                // The vision model used for transcription may point at a
+                // different endpoint — a self-hosted deployment is often a mix
+                // of "chat runs locally, looking at images runs in the cloud",
+                // and the two should not be welded together
                 base_url: std::env::var("CORTEX_VISION_BASE_URL")
                     .ok()
                     .map(|v| v.trim().to_owned())
@@ -551,7 +605,8 @@ impl VisionTranscriber {
         Self::new(client, &model).map(Some)
     }
 
-    /// 写进 `transcribed_by` 的标识，形如 `ollama/gemma4:latest`。
+    /// The identifier written into `transcribed_by`, shaped like
+    /// `ollama/gemma4:latest`.
     #[must_use]
     pub fn model_id(&self) -> &str {
         &self.transcribed_by
@@ -569,8 +624,9 @@ impl Transcriber for VisionTranscriber {
     }
 
     fn supports(&self, mime: &str) -> bool {
-        // 只认各家 vision API 的交集：BMP/TIFF 这类即使是图片也发不出去，
-        // 认领了只会在 transcribe 里失败一次再回到这里
+        // Only accept the intersection of the vendors' vision APIs: things like
+        // BMP/TIFF are images but cannot be sent, so claiming them would just
+        // mean failing once inside transcribe and coming back here
         cortex_llm::normalize_image_mime(mime).is_ok()
     }
 
@@ -590,8 +646,9 @@ impl Transcriber for VisionTranscriber {
             .await
             .map_err(CortexError::from)?;
 
-        // as_concat_text 只拼 Text 块，thinking / redacted-thinking 自动被排除 ——
-        // 把模型的思考过程写进记忆库既没有检索价值又会污染 BM25
+        // as_concat_text only joins Text blocks, so thinking / redacted-thinking
+        // are excluded automatically — writing the model's chain of thought into
+        // the memory store has no retrieval value and pollutes BM25
         let text = reply.as_concat_text().trim().to_string();
         tracing::info!(
             model = %self.transcribed_by,
@@ -608,30 +665,33 @@ impl Transcriber for VisionTranscriber {
                 self.transcribed_by
             )));
         }
-        // 图片没有时间轴，整张一段
+        // Images have no timeline; the whole picture is one chunk
         Ok(vec![Segment::whole(text)])
     }
 }
 
 // ══════════════════════════════════════════════════════════
-//  StubTranscriber —— 不依赖任何外部服务
+//  StubTranscriber — depends on no external service
 // ══════════════════════════════════════════════════════════
 
-/// 确定性的转录桩，**仅供测试与离线开发**，定位同
-/// [`crate::embed::HashEmbedder`]。
+/// A deterministic transcription stub, **for tests and offline development
+/// only**, same standing as [`crate::embed::HashEmbedder`].
 ///
-/// 不具备任何理解能力（产出的文本与图片内容无关），但它无需模型、无需网络、
-/// 输出稳定可断言，使得流水线、抹除防护、时间轴这些逻辑的测试
-/// 不必依赖一次几十秒的真实 vision 调用。
+/// It understands nothing (the text it produces has no relation to the image
+/// content), but it needs no model and no network and its output is stable
+/// enough to assert on, which lets the tests for the pipeline, the redaction
+/// guard and the timeline avoid depending on a real vision call that takes tens
+/// of seconds.
 ///
-/// kind 可配：`Asr` / `FrameCaption` 会产出**多段带毫秒偏移**的结果，
-/// 正是为了让 `span_*_ms` 那条路径也有东西可测。
+/// kind is configurable: `Asr` / `FrameCaption` produce **several chunks with
+/// millisecond offsets**, precisely so that the `span_*_ms` path has something
+/// to test against.
 pub struct StubTranscriber {
     kind: TranscriptKind,
 }
 
 impl StubTranscriber {
-    /// 默认 [`TranscriptKind::VisionCaption`]，认领图片。
+    /// Defaults to [`TranscriptKind::VisionCaption`], which claims images.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -639,13 +699,14 @@ impl StubTranscriber {
         }
     }
 
-    /// 指定 kind。决定它认领哪类 MIME、以及产出带不带时间轴。
+    /// Pick the kind. It decides which MIME family this stub claims, and whether
+    /// its output carries a timeline.
     #[must_use]
     pub fn with_kind(kind: TranscriptKind) -> Self {
         Self { kind }
     }
 
-    /// 该 kind 的产出带不带时间轴。
+    /// Whether this kind's output carries a timeline.
     fn is_timed(&self) -> bool {
         matches!(
             self.kind,
@@ -660,8 +721,10 @@ impl Default for StubTranscriber {
     }
 }
 
-/// 内容指纹。用 `DefaultHasher` 而不是真 SHA-256：这里只要「同输入同输出、
-/// 不同输入大概率不同」，不需要任何密码学性质，也不值得为此加一个依赖。
+/// Content fingerprint. `DefaultHasher` rather than a real SHA-256: all that is
+/// needed here is "same input, same output; different inputs most likely
+/// different", no cryptographic property whatsoever, and it is not worth adding
+/// a dependency for.
 fn fingerprint(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -675,8 +738,9 @@ impl Transcriber for StubTranscriber {
     }
 
     fn transcribed_by(&self) -> &str {
-        // 与真实转录器的 id 形态明显不同，库里一眼能看出哪些行是桩产出的，
-        // 将来重跑时按它筛选
+        // Deliberately shaped unlike a real transcriber's id, so a glance at the
+        // store shows which rows came from the stub, and a future re-run can
+        // filter on it
         "stub-transcriber-v1"
     }
 
@@ -703,7 +767,8 @@ impl Transcriber for StubTranscriber {
             ))]);
         }
 
-        // 1..=3 段，每段 1500ms，首尾相接。段数由内容决定，因此可复现
+        // 1..=3 chunks of 1500ms each, laid end to end. The chunk count is
+        // derived from the content, so it is reproducible
         const SEGMENT_MS: i64 = 1500;
         let count = (bytes.len() % 3) + 1;
         Ok((0..count)
@@ -735,7 +800,7 @@ mod tests {
             .with_transcriber(Arc::new(StubTranscriber::new()))
     }
 
-    // ── Segment 校验 ──────────────────────────────────────
+    // ── Segment validation ────────────────────────────────
 
     #[test]
     fn end_without_start_is_rejected_before_postgres_sees_it() {
@@ -746,8 +811,9 @@ mod tests {
         };
         assert!(
             bad.validate().is_err(),
-            "有终点无起点违反 blob_transcripts 的 CHECK；\
-             放过去会让整个持锁事务回滚，连带丢掉同批次的其它转录"
+            "an end without a start violates the CHECK on blob_transcripts; \
+             letting it through rolls back the whole lock-holding transaction \
+             and takes the other transcripts of the same batch with it"
         );
     }
 
@@ -755,12 +821,12 @@ mod tests {
     fn reversed_and_negative_spans_are_rejected() {
         assert!(
             Segment::span("x", 900, 100).validate().is_err(),
-            "终点早于起点的段落会让「跳到 31:40」变成跳回过去"
+            "a chunk whose end precedes its start turns \"seek to 31:40\" into seeking backwards"
         );
         assert!(Segment::span("x", -1, 100).validate().is_err());
         assert!(
             Segment::span("x", 0, 0).validate().is_ok(),
-            "零时长是合法的"
+            "a zero-length span is legal"
         );
     }
 
@@ -768,7 +834,7 @@ mod tests {
     fn empty_text_is_rejected() {
         assert!(
             Segment::whole("   ").validate().is_err(),
-            "空转录不会被任何检索命中，写进去只是占一行"
+            "an empty transcript is hit by no retrieval path; writing it only occupies a row"
         );
     }
 
@@ -778,13 +844,16 @@ mod tests {
         assert_eq!(Segment::whole("x").duration_ms(), None);
     }
 
-    // ── MIME 分流 ────────────────────────────────────────
+    // ── MIME routing ─────────────────────────────────────
 
     #[test]
     fn stub_claims_only_its_own_media_family() {
         let vision = StubTranscriber::new();
         assert!(vision.supports("image/png"));
-        assert!(vision.supports("IMAGE/JPEG"), "MIME 大小写不该影响分流");
+        assert!(
+            vision.supports("IMAGE/JPEG"),
+            "MIME letter case must not affect routing"
+        );
         assert!(!vision.supports("audio/mpeg"));
         assert!(!vision.supports("application/pdf"));
 
@@ -796,7 +865,7 @@ mod tests {
         assert!(frames.supports("video/mp4"));
         assert!(
             !frames.supports("audio/mpeg"),
-            "抽帧对纯音频无意义，不该认领"
+            "frame extraction is meaningless for pure audio; it must not claim it"
         );
     }
 
@@ -808,11 +877,13 @@ mod tests {
             .unwrap();
         match out {
             Outcome::Unsupported { mime } => assert_eq!(mime, "audio/mpeg"),
-            other => panic!("音频当前无人认领，应明说 Unsupported，实际 {other:?}"),
+            other => panic!(
+                "audio is unclaimed today; this must say Unsupported outright, got {other:?}"
+            ),
         }
     }
 
-    // ── 时间轴 ──────────────────────────────────────────
+    // ── Timeline ─────────────────────────────────────────
 
     #[tokio::test]
     async fn image_rows_carry_no_timeline() {
@@ -825,7 +896,7 @@ mod tests {
         assert_eq!(
             (rows[0].span_start_ms, rows[0].span_end_ms),
             (None, None),
-            "图片没有时间轴，编一个偏移会让「跳到 0:00」出现在一张截图上"
+            "images have no timeline; inventing an offset puts a \"seek to 0:00\" on a screenshot"
         );
         assert_eq!(rows[0].kind, TranscriptKind::VisionCaption);
     }
@@ -834,30 +905,31 @@ mod tests {
     async fn timed_segments_are_contiguous_and_ordered() {
         let p = TranscribePipeline::new(Arc::new(HashEmbedder::new()))
             .with_transcriber(Arc::new(StubTranscriber::with_kind(TranscriptKind::Asr)));
-        // 3 字节 → 3 % 3 + 1 = 1 段；4 字节 → 2 段。挑一个能出多段的长度
-        let bytes = b"abcde"; // 5 % 3 + 1 = 3 段
+        // 3 bytes → 3 % 3 + 1 = 1 chunk; 4 bytes → 2 chunks. Pick a length that
+        // yields several
+        let bytes = b"abcde"; // 5 % 3 + 1 = 3 chunks
         let out = p
             .run(HASH, bytes, "audio/mpeg", &NeverRedacted)
             .await
             .unwrap();
         let rows = out.rows();
-        assert_eq!(rows.len(), 3, "5 字节的桩输入应产出 3 段");
+        assert_eq!(rows.len(), 3, "a 5-byte stub input yields 3 chunks");
 
         for (i, row) in rows.iter().enumerate() {
-            let start = row.span_start_ms.expect("ASR 段落必须有起点");
-            let end = row.span_end_ms.expect("ASR 段落必须有终点");
-            assert!(end > start, "第 {i} 段时长非正");
+            let start = row.span_start_ms.expect("an ASR chunk must have a start");
+            let end = row.span_end_ms.expect("an ASR chunk must have an end");
+            assert!(end > start, "chunk {i} has a non-positive duration");
             if i > 0 {
                 assert_eq!(
                     start,
                     rows[i - 1].span_end_ms.unwrap(),
-                    "段落必须首尾相接，留空隙会让「跳回原处」落在没有内容的地方"
+                    "chunks must lie end to end; a gap makes \"jump back\" land on nothing"
                 );
             }
         }
     }
 
-    // ── 抹除防护 ────────────────────────────────────────
+    // ── Redaction guard ──────────────────────────────────
 
     struct AlwaysRedacted;
 
@@ -868,7 +940,8 @@ mod tests {
         }
     }
 
-    /// 第一次查放行、之后全部拦下 —— 模拟「转录进行中用户点了抹除」。
+    /// Lets the first query through and blocks every one after it — simulating
+    /// "the user hit redact while transcription was running".
     struct RedactedMidFlight(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
@@ -894,12 +967,16 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, Outcome::Redacted));
-        assert!(out.rows().is_empty(), "Redacted 不得带出任何可写行");
+        assert!(
+            out.rows().is_empty(),
+            "Redacted must not carry out a single writable row"
+        );
     }
 
     #[tokio::test]
     async fn redaction_during_transcription_discards_everything() {
-        // 这是这道防护存在的**唯一**理由：转录期间几十秒的窗口。
+        // This is the **only** reason this guard exists: the tens-of-seconds
+        // window during transcription.
         let guard = RedactedMidFlight(std::sync::atomic::AtomicUsize::new(0));
         let out = pipeline()
             .run(HASH, PNG, "image/png", &guard)
@@ -907,7 +984,8 @@ mod tests {
             .unwrap();
         assert!(
             matches!(out, Outcome::Redacted),
-            "复检必须发生在返回之前，否则在途任务会把已抹除的内容回填"
+            "the re-check must happen before returning, otherwise an in-flight task \
+             writes the redacted content back"
         );
     }
 
@@ -916,14 +994,15 @@ mod tests {
         let err = pipeline()
             .run(HASH, PNG, "image/png", &BrokenGuard)
             .await
-            .expect_err("查不出来必须报错");
+            .expect_err("a query that cannot answer must be an error");
         assert!(
             err.to_string().contains("数据库连不上"),
-            "把「查不出来」当成「没被抹除」正是这道防护要防的事；实际：{err}"
+            "taking \"cannot tell\" for \"not redacted\" is exactly what this guard \
+             prevents; got: {err}"
         );
     }
 
-    // ── 落库行的完整性 ──────────────────────────────────
+    // ── Completeness of the rows to be written ───────────
 
     #[tokio::test]
     async fn rows_carry_everything_the_insert_needs() {
@@ -939,10 +1018,16 @@ mod tests {
         assert_eq!(
             row.embedding.as_ref().unwrap().as_slice().len(),
             crate::embed::EMBEDDING_DIM,
-            "维度必须与 migration 的 VECTOR(1024) 一致"
+            "the dimension must match the migration's VECTOR(1024)"
         );
-        let tsv = row.tsv_source.as_deref().expect("tsv 必须与主行同事务写入");
-        assert!(!tsv.is_empty(), "tsv 为空 = BM25 那一路召回对这行永久失效");
+        let tsv = row
+            .tsv_source
+            .as_deref()
+            .expect("tsv must be written in the same transaction as the main row");
+        assert!(
+            !tsv.is_empty(),
+            "an empty tsv = the BM25 retrieval path is permanently dead for this row"
+        );
     }
 
     #[tokio::test]
@@ -958,7 +1043,7 @@ mod tests {
         assert_eq!(
             a.rows()[0].text,
             b.rows()[0].text,
-            "桩必须可复现，否则测试无法断言"
+            "the stub must be reproducible, or the tests have nothing to assert on"
         );
         assert_ne!(
             a.rows()[0].text,
@@ -973,7 +1058,7 @@ mod tests {
                 .unwrap()
                 .rows()[0]
                 .text,
-            "不同内容应产出不同文本，否则检索会把所有图片视为同一张"
+            "different content must produce different text, else retrieval sees one image"
         );
     }
 
@@ -991,27 +1076,31 @@ mod tests {
 
     #[test]
     fn vision_prompt_demands_all_four_retrieval_signals() {
-        // 少任何一类，这张图将来就少一条能被找到的路。
+        // Drop any one of these classes and the image loses one of the routes by
+        // which it could later be found.
         for signal in ["类型", "文字", "实体", "内容"] {
             assert!(
                 VISION_SYSTEM.contains(signal),
-                "prompt 必须索取「{signal}」，否则产出的描述在检索里没有这条信号"
+                "the prompt must ask for \"{signal}\", otherwise the caption it \
+                 produces carries no such signal into retrieval"
             );
         }
         assert!(
             VISION_SYSTEM.contains("这是一张图片"),
-            "prompt 必须**点名**禁止零信息的描述——只说「要详细」模型仍会写废话"
+            "the prompt must ban zero-information captions **by name** — merely saying \
+             \"be detailed\" still gets filler out of the model"
         );
         assert!(
             VISION_SYSTEM.contains("中文"),
-            "库里是 jieba + bge-m3，输出英文会在 BM25 与向量两条路上同时打折"
+            "the store runs jieba + bge-m3; answering in English takes a haircut on \
+             both the BM25 and the vector path"
         );
     }
 
     #[test]
     fn vision_transcriber_refuses_a_blind_model() {
-        // DeepSeek 一个 vision 模型都没有。构造期就该失败，
-        // 而不是等到线上第一张图进来才发现。
+        // DeepSeek has no vision model at all. This must fail at construction
+        // time, not when the first image arrives in production.
         let client = cortex_llm::LlmClient::from_config(
             &cortex_core::config::LlmConfig {
                 provider: "deepseek".into(),
@@ -1023,8 +1112,8 @@ mod tests {
         )
         .unwrap();
         let err = VisionTranscriber::new(client, "deepseek-v4-pro")
-            .expect_err("不支持 vision 的模型不能当转录器");
-        assert!(err.to_string().contains("deepseek-v4-pro"), "实际：{err}");
+            .expect_err("a model without vision support cannot serve as a transcriber");
+        assert!(err.to_string().contains("deepseek-v4-pro"), "got: {err}");
     }
 
     #[test]
@@ -1039,7 +1128,7 @@ mod tests {
             "test-key",
         )
         .unwrap();
-        let t = VisionTranscriber::new(client, "claude-opus-5").expect("Claude 支持图像");
+        let t = VisionTranscriber::new(client, "claude-opus-5").expect("Claude supports images");
         assert_eq!(t.kind(), TranscriptKind::VisionCaption);
         assert_eq!(t.transcribed_by(), "anthropic/claude-opus-5");
         assert!(t.supports("image/png") && !t.supports("image/bmp"));

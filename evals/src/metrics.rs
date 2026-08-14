@@ -1,16 +1,20 @@
-//! 指标：Recall@k、MRR、逐路贡献、误召率，以及按题型 / 语种的分组聚合。
+//! Metrics: Recall@k, MRR, per-path contribution, false-recall rate, and
+//! grouped aggregation by question kind / language.
 //!
-//! # 为什么必须分组
+//! # Why grouping is mandatory
 //!
-//! 总分掩盖问题。「整体 Recall@5 = 0.72」看起来还行，但如果它是
-//! 「专名精确 0.95 + 中文语义 0.30」平均出来的，真正该修的是分词与向量那一路。
-//! 所以所有指标都按题型与语种各出一份。
+//! A total score hides problems. "Overall Recall@5 = 0.72" looks acceptable,
+//! but if it is the average of "proper-noun exact 0.95 + Chinese semantic 0.30",
+//! what actually needs fixing is tokenization and the vector path. So every
+//! metric is emitted once per question kind and once per language.
 //!
-//! # 为什么必须有逐路贡献
+//! # Why per-path contribution is mandatory
 //!
-//! 四路召回里哪一路该保留、哪一路该换成融合后的 decay，只能靠
-//! 「有多少题**只有**这一路捞到 gold」来裁决。没有这个数字，
-//! roadmap 里「时间近因召回路定案」那条就永远只能靠嘴仗。
+//! Which of the four retrieval paths to keep, and which to replace with a decay
+//! applied after fusion, can only be settled by "how many questions had
+//! **only** this path find the gold". Without that number, the roadmap item
+//! "settle the temporal recency retrieval path" stays a matter of argument
+//! forever.
 
 use std::collections::BTreeMap;
 
@@ -19,56 +23,63 @@ use serde::Serialize;
 use crate::matcher::{Matcher, QuestionMatchers};
 use crate::suite::{Lang, Question, QuestionKind};
 
-/// 报告的 k 取值。1 看「第一条对不对」，5 看实际注入窗口，10 看召回上限。
+/// The k values reported. 1 checks "is the first one right", 5 matches the
+/// actual injection window, 10 shows the recall ceiling.
 pub const K_VALUES: [usize; 3] = [1, 5, 10];
 
-/// 逐路诊断时用的 k —— 与融合侧的主指标对齐。
+/// The k used for per-path diagnostics — aligned with the main metrics on the
+/// fusion side.
 pub const CHANNEL_K: usize = 5;
 
-/// 各路的稳定顺序，报告与 JSON 都按它排。
+/// The stable ordering of the paths; both the report and the JSON follow it.
 pub const CHANNELS: [&str; 5] = ["bm25", "vector", "graph", "recency", "episode"];
 
-/// 一道题是否可计分。
+/// Whether a question can be scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// 正常计分
+    /// Scored normally
     Scored,
-    /// gold 压根没落进库 —— 这是**题目或抽取管线**的问题，不是检索的问题。
-    /// 混进检索指标里会把抽取的锅算到检索头上，所以单独统计。
+    /// The gold never landed in the store at all — that is **the question's or
+    /// the extraction pipeline's** problem, not retrieval's. Mixing it into the
+    /// retrieval metrics would charge extraction's fault to retrieval, so it is
+    /// counted separately.
     GoldMissing,
-    /// gold 在 `facts` 里但已失效，而这道题又不是时间回放题 —— 题目标错了
+    /// The gold is in `facts` but is invalidated, and this is not a time-replay
+    /// question — the question is mislabelled
     GoldInactive,
 }
 
-/// 检索器返回的一条结果（融合后、已按预算截断）。
+/// One result returned by the retriever (post-fusion, already truncated to the
+/// budget).
 #[derive(Debug, Clone, Serialize)]
 pub struct ScoredItem {
     pub fact_id: String,
     pub statement: String,
-    /// 命中它的召回路
+    /// The retrieval paths that found it
     pub channels: Vec<String>,
 }
 
-/// 一路召回的原始结果（未融合），用于逐路诊断。
+/// One path's raw (unfused) results, for per-path diagnostics.
 #[derive(Debug, Clone)]
 pub struct ChannelRun {
     pub name: &'static str,
-    /// 按该路自身相关性排好序的 statement
+    /// Statements sorted by that path's own relevance
     pub statements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelResult {
-    /// 该路召回了多少条
+    /// How many entries this path retrieved
     pub size: usize,
-    /// gold 在该路内的最佳名次（从 0 起）；`None` = 这一路完全没捞到
+    /// The gold's best rank within this path (zero-based); `None` = this path
+    /// found nothing at all
     pub best_rank: Option<usize>,
-    /// 该路自己的 Recall@5
+    /// This path's own Recall@5
     pub recall_at_k: f64,
 }
 
-/// 一道题的完整结果。
+/// One question's complete result.
 #[derive(Debug, Clone, Serialize)]
 pub struct QuestionResult {
     pub id: String,
@@ -76,51 +87,64 @@ pub struct QuestionResult {
     pub lang: Lang,
     pub query: String,
     pub status: Status,
-    /// 走的是 `retrieve_as_of`（系统时间回放）还是四路召回
+    /// Whether this went through `retrieve_as_of` (system-time replay) or the
+    /// four retrieval paths
     pub replay: bool,
     pub gold_total: usize,
-    /// 这道题写了几条 forbidden。为 0 的题不计入误召率，否则分母被稀释
+    /// How many forbidden entries this question declares. Questions with 0 do
+    /// not count toward the false-recall rate, otherwise the denominator is
+    /// diluted
     pub forbidden_total: usize,
-    /// 这道题写了几条「不该被抽出来」的断言
+    /// How many "should never have been extracted" assertions this question
+    /// declares
     pub never_extracted_total: usize,
-    /// 其中实际在语料快照里找到了的 —— **抽取侧的误抽**。
+    /// How many of those were actually found in the corpus snapshot — **a
+    /// mis-extraction on the extraction side**.
     ///
-    /// 与 `forbidden_hit` 不是一回事：那个问「排没排进前 k」，这个问
-    /// 「它压根在不在库里」。抽取 prompt 的「绝对不抽」只在这一列上留痕
+    /// Not the same thing as `forbidden_hit`: that one asks "did it rank into
+    /// the top k", this one asks "is it in the store at all". The extraction
+    /// prompt's "never extract this" leaves its trace in this column alone
     pub leaked: Vec<String>,
-    /// 每条 gold 在融合结果里的名次
+    /// Each gold's rank in the fused results
     pub gold_ranks: Vec<Option<usize>>,
-    /// gold 的描述，与 `gold_ranks` 等长 —— 报告里要指出「哪一条没召回」
+    /// Descriptions of the golds, the same length as `gold_ranks` — the report
+    /// has to point out "which one was not recalled"
     pub gold_labels: Vec<String>,
     /// k → Recall@k
     pub recall: BTreeMap<usize, f64>,
-    /// 不限名次的召回率 —— 把「根本没捞到」与「捞到了但排太后」分开。
-    /// 两者的修法完全不同：前者要动召回，后者要动排序
+    /// Recall with no rank limit — separating "never found at all" from "found
+    /// but ranked too low". The two are fixed completely differently: the
+    /// former means changing retrieval, the latter means changing ranking
     pub recall_any: f64,
-    /// 首个 gold 名次的倒数；一条都没召回则为 0
+    /// The reciprocal of the first gold's rank; 0 when nothing was recalled
     pub reciprocal_rank: f64,
-    /// k → top-k 里是否混入了 forbidden
+    /// k → whether a forbidden entry slipped into the top k
     pub forbidden_hit: BTreeMap<usize, bool>,
-    /// 混进 top-5 的 forbidden 条目分别是被哪几路捞上来的。
-    /// 「误召是谁造成的」只有这个数字能回答 —— 没有它，噪声只能整体归咎于「融合」
+    /// Which paths pulled up each forbidden entry that slipped into the top 5.
+    /// Only this number can answer "who caused the false recall" — without it,
+    /// noise can only be blamed on "fusion" as a whole
     pub forbidden_channels: BTreeMap<String, usize>,
-    /// 融合结果的条数
+    /// How many entries the fused result holds
     pub returned: usize,
     pub channels: BTreeMap<String, ChannelResult>,
-    /// 若只有一路捞到了 gold，是哪一路 —— 判断某路该不该保留的直接依据
+    /// If only one path found the gold, which one — the direct basis for
+    /// deciding whether a path should be kept
     pub exclusive_channel: Option<String>,
-    /// 融合结果的前几条，供人工看 bad case
+    /// The first few fused results, for inspecting bad cases by hand
     pub top: Vec<ScoredItem>,
 }
 
-/// 报告里展示多少条 top 结果。
+/// How many top results the report displays.
 const TOP_SAMPLE: usize = 5;
 
-/// 给一道题打分。
+/// Score one question.
 ///
-/// `fused` 是检索器的最终输出（已按预算截断）；`channels` 是四路的原始召回，
-/// 只用于诊断，不参与主指标。`status` 与 `leaked` 由调用方在 ingest 后
-/// 根据语料快照判定 —— 它们都是**抽取侧**的读数，检索一步都还没跑就已经确定。
+/// `fused` is the retriever's final output (already truncated to the budget);
+/// `channels` holds the four paths' raw retrievals, used only for diagnostics
+/// and taking no part in the main metrics. `status` and `leaked` are determined
+/// by the caller from the corpus snapshot after ingest — both are readings from
+/// the **extraction** side, already fixed before retrieval has run a single
+/// step.
 #[must_use]
 pub fn score(
     q: &Question,
@@ -147,7 +171,8 @@ pub fn score(
 
     let recall_any = recall_at(&gold_ranks, usize::MAX);
 
-    // MRR 取**首个**命中 gold 的名次倒数，与信息检索的标准定义一致
+    // MRR takes the reciprocal of the **first** matching gold's rank, matching
+    // the standard information-retrieval definition
     let reciprocal_rank = gold_ranks
         .iter()
         .flatten()
@@ -226,10 +251,11 @@ pub fn score(
     }
 }
 
-/// Recall@k：有多少条 gold 落在了前 k 名里。
+/// Recall@k: how many golds landed within the top k.
 ///
-/// gold 为空（「应当召回不到」题）时返回 `NaN` 的做法太容易在下游炸开，
-/// 这里返回 1.0 并由聚合层把这类题排除在 Recall 统计之外。
+/// Returning `NaN` when gold is empty ("should retrieve nothing" questions) is
+/// far too likely to blow up downstream, so this returns 1.0 and the
+/// aggregation layer excludes such questions from the Recall statistics.
 fn recall_at(ranks: &[Option<usize>], k: usize) -> f64 {
     if ranks.is_empty() {
         return 1.0;
@@ -239,67 +265,79 @@ fn recall_at(ranks: &[Option<usize>], k: usize) -> f64 {
 }
 
 // ══════════════════════════════════════════════════════════
-//  聚合
+//  Aggregation
 // ══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelAggregate {
-    /// 这一路捞到 gold 的题数
+    /// How many questions this path found the gold for
     pub covered: usize,
-    /// **只有**这一路捞到 gold 的题数 —— 该路不可替代性的直接度量
+    /// How many questions **only** this path found the gold for — the direct
+    /// measure of the path's irreplaceability
     pub exclusive: usize,
-    /// 该路单独的 Recall@5 宏平均
+    /// The macro average of this path's own Recall@5
     pub recall_at_k: f64,
-    /// 平均召回条数
+    /// Average number of entries retrieved
     pub avg_size: f64,
-    /// 这一路把多少个 forbidden 条目送进了 top-5 —— 噪声的归因
+    /// How many forbidden entries this path sent into the top 5 — attribution
+    /// for the noise
     pub forbidden_contributions: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Aggregate {
     pub label: String,
-    /// 该组的总题数
+    /// Total questions in this group
     pub total: usize,
-    /// 计入 Recall / MRR 的题数（排除 gold 未落库与「应当召回不到」）
+    /// Questions counted toward Recall / MRR (excluding golds that never landed
+    /// and "should retrieve nothing" questions)
     pub scored: usize,
-    /// 计入逐路统计的题数。时间回放题不走四路召回，必须从分母里剔除，
-    /// 否则每一路的覆盖率都被凭空稀释
+    /// Questions counted toward the per-path statistics. Time-replay questions
+    /// do not use the four retrieval paths and must be removed from the
+    /// denominator, otherwise every path's coverage is diluted for no reason
     pub channel_scored: usize,
-    /// 平均返回条数。「应当召回不到」的题上它不为 0，就说明检索器**无法弃权**
+    /// Average number of entries returned. If this is non-zero on "should
+    /// retrieve nothing" questions, the retriever **cannot abstain**
     pub avg_returned: f64,
     pub gold_missing: usize,
     pub gold_inactive: usize,
-    /// k → Recall@k 的宏平均
+    /// The macro average of k → Recall@k
     pub recall: BTreeMap<usize, f64>,
-    /// 不限名次的召回率宏平均
+    /// The macro average of recall with no rank limit
     pub recall_any: f64,
     pub mrr: f64,
-    /// gold 命中时的平均名次（从 1 起）。只统计确实召回到的
+    /// The average rank (one-based) when a gold is hit. Only counts the ones
+    /// actually recalled
     pub avg_gold_rank: f64,
-    /// 有 forbidden 的题里，top-k 混入干扰项的比例
+    /// Among questions that have forbidden entries, the proportion where a
+    /// distractor slipped into the top k
     pub forbidden_rate: BTreeMap<usize, f64>,
     pub forbidden_questions: usize,
-    /// 写了「不该被抽出来」断言的题数
+    /// How many questions declare "should never have been extracted"
+    /// assertions
     pub leak_questions: usize,
-    /// 其中实际泄漏的条数 —— **抽取侧唯一的越少越好指标**。
+    /// How many of those actually leaked — **the only lower-is-better metric on
+    /// the extraction side**.
     ///
-    /// 它与 Recall 正交：Recall 只会奖励「抽得多」，而抽得多恰恰是
-    /// `docs/memory-content.md` §二③ 判定为有害的方向。没有这一列，
-    /// 「绝对不抽」这条判据在整套评测里没有任何落点
+    /// It is orthogonal to Recall: Recall only ever rewards "extract more", and
+    /// extracting more is precisely the direction `docs/memory-content.md` §2③
+    /// judges harmful. Without this column, the "never extract this" criterion
+    /// has nowhere to land anywhere in the eval
     pub extraction_leaks: usize,
     pub channels: BTreeMap<String, ChannelAggregate>,
 }
 
-/// 宏平均聚合。
+/// Macro-average aggregation.
 ///
-/// 用宏平均（每题等权）而非微平均：题集里各题的 gold 条数不一样，
-/// 微平均会让「gold 有 3 条」的题隐性地占 3 倍权重。
+/// A macro average (each question weighted equally) rather than a micro
+/// average: the questions in a suite have different numbers of golds, and a
+/// micro average would implicitly give a question with 3 golds triple weight.
 #[must_use]
 pub fn aggregate(label: impl Into<String>, results: &[&QuestionResult]) -> Aggregate {
     let total = results.len();
 
-    // Recall / MRR 只看「有 gold 且 gold 确实落库了」的题
+    // Recall / MRR only look at questions that have a gold and whose gold
+    // really landed in the store
     let scorable: Vec<&&QuestionResult> = results
         .iter()
         .filter(|r| r.status == Status::Scored && r.gold_total > 0)
@@ -323,8 +361,10 @@ pub fn aggregate(label: impl Into<String>, results: &[&QuestionResult]) -> Aggre
             .map(|rank| *rank as f64 + 1.0),
     );
 
-    // 只有真写了 forbidden 的题才计入误召率，否则分母被一堆恒不命中的题稀释，
-    // 数字会好看得毫无意义
+    // Only questions that actually declare forbidden entries count toward the
+    // false-recall rate, otherwise the denominator is diluted by a pile of
+    // questions that can never hit, and the number looks good while meaning
+    // nothing
     let forbidden_pool: Vec<&&QuestionResult> =
         results.iter().filter(|r| r.forbidden_total > 0).collect();
 
@@ -338,8 +378,9 @@ pub fn aggregate(label: impl Into<String>, results: &[&QuestionResult]) -> Aggre
         forbidden_rate.insert(k, v);
     }
 
-    // 时间回放走 `facts_as_of`，根本不发四路查询 —— 把它算进逐路分母，
-    // 每一路都会平白背上一堆「没捞到」
+    // Time replay goes through `facts_as_of` and never issues the four-path
+    // queries at all — counting it in the per-path denominator would saddle
+    // every path with a pile of undeserved "did not find it"
     let channel_pool: Vec<&&QuestionResult> =
         scorable.iter().filter(|r| !r.replay).copied().collect();
 
@@ -469,11 +510,14 @@ mod tests {
             item("b", "对象存储用 RustFS", &["bm25", "vector"]),
         ];
         let r = score(&q, &m, &fused, &[], Status::Scored, false, vec![]);
-        assert_eq!(r.recall[&1], 0.0, "gold 排第二，Recall@1 应为 0");
+        assert_eq!(
+            r.recall[&1], 0.0,
+            "the gold ranks second, so Recall@1 should be 0"
+        );
         assert_eq!(r.recall[&5], 1.0);
         assert!(
             (r.reciprocal_rank - 0.5).abs() < 1e-9,
-            "排名 2 的倒数应为 0.5，实际 {}",
+            "the reciprocal of rank 2 should be 0.5, got {}",
             r.reciprocal_rank
         );
     }
@@ -486,7 +530,7 @@ mod tests {
         let r = score(&q, &m, &fused, &[], Status::Scored, false, vec![]);
         assert!(
             (r.recall[&5] - 0.5).abs() < 1e-9,
-            "两条 gold 命中一条应为 0.5，实际 {}",
+            "hitting one of two golds should be 0.5, got {}",
             r.recall[&5]
         );
     }
@@ -504,8 +548,14 @@ mod tests {
             item("f", "旧方案是 MinIO", &[]),
         ];
         let r = score(&q, &m, &fused, &[], Status::Scored, false, vec![]);
-        assert!(!r.forbidden_hit[&5], "干扰项排第 6，@5 不该算命中");
-        assert!(r.forbidden_hit[&10], "干扰项在前 10 名内，@10 应当命中");
+        assert!(
+            !r.forbidden_hit[&5],
+            "the distractor ranks sixth, so @5 must not count as a hit"
+        );
+        assert!(
+            r.forbidden_hit[&10],
+            "the distractor is within the top 10, so @10 should count as a hit"
+        );
     }
 
     #[test]
@@ -522,7 +572,8 @@ mod tests {
         assert_eq!(
             r.exclusive_channel.as_deref(),
             Some("bm25"),
-            "只有 BM25 捞到时必须能识别出来 —— 这是判断某路能否砍掉的依据"
+            "when only BM25 found it that must be detectable — this is the \
+             basis for deciding whether a path can be cut"
         );
     }
 
@@ -549,24 +600,28 @@ mod tests {
             vec![],
         );
         let broken = score(&q, &m, &[], &[], Status::GoldMissing, false, vec![]);
-        let agg = aggregate("全部", &[&good, &broken]);
+        let agg = aggregate("all", &[&good, &broken]);
         assert_eq!(agg.total, 2);
-        assert_eq!(agg.scored, 1, "gold 未落库的题不该拉低检索指标");
+        assert_eq!(
+            agg.scored, 1,
+            "a question whose gold never landed must not drag the retrieval \
+             metrics down"
+        );
         assert_eq!(agg.gold_missing, 1);
         assert!(
             (agg.recall[&5] - 1.0).abs() < 1e-9,
-            "实际 {}",
+            "got {}",
             agg.recall[&5]
         );
     }
 
     #[test]
     fn aggregate_of_nothing_is_zero_not_nan() {
-        let agg = aggregate("空", &[]);
+        let agg = aggregate("empty", &[]);
         assert_eq!(agg.mrr, 0.0);
         assert!(
             agg.recall.values().all(|v| v.is_finite()),
-            "NaN 会毒化整张报告"
+            "a NaN would poison the entire report"
         );
     }
 }

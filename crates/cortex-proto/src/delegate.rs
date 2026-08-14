@@ -1,88 +1,108 @@
-//! 委托凭据 —— 记忆服务给**不受信调用方**签一把带作用域的短期钥匙。
+//! Delegated credentials — the memory service signing a short-lived, scoped
+//! key for an **untrusted caller**.
 //!
-//! # 这是记忆服务的功能，不是沙箱的
+//! # This is a feature of the memory service, not of the sandbox
 //!
-//! 名字里没有「sandbox」是刻意的。cortexd 要回答的问题是「**一个低信任
-//! 调用方能在我身上干什么**」，那是它自己的入站授权策略；至于拿到钥匙的
-//! 那一方是个 docker 容器、一个 WASM 沙箱、还是别人机房里的一个进程，
-//! 它不关心也不该关心。
+//! The absence of "sandbox" from the name is deliberate. The question cortexd
+//! answers is "**what may a low-trust caller do to me**", which is its own
+//! inbound authorization policy; whether the party receiving the key is a
+//! docker container, a WASM sandbox, or a process in somebody else's data
+//! centre, cortexd neither knows nor should know.
 //!
-//! 独立开源出去的记忆服务因此带着这条能力：**你可以把记忆读写权限按会话
-//! 切一小块交出去，而不必把用户的主凭据递过去。**
+//! The memory service, open-sourced on its own, therefore carries this
+//! capability with it: **you can hand out a per-session slice of memory read
+//! and write access without handing over the user's primary credential.**
 //!
-//! # 谁能签
+//! # Who may sign
 //!
-//! 调用方带的是**用户自己那把 bearer**，不是什么服务凭据。于是它只能为
-//! 「把 token 交给它的那个用户」签发 —— 不产生任何新特权。
+//! The caller presents **the user's own bearer**, not some service credential.
+//! So it can only issue keys for "the user who handed it that token" — no new
+//! privilege is created anywhere.
 //!
-//! 反过来做（给编排器一把能替任意用户签发的服务密钥）会平白多一个越权面：
-//! 谁拿到那把密钥，谁就能给自己签一把读任何人记忆的钥匙。
+//! Doing it the other way round (giving the orchestrator a service key that can
+//! issue on behalf of any user) would gratuitously add an escalation surface:
+//! whoever gets that key can sign themselves a key that reads anyone's memory.
 
 use serde::{Deserialize, Serialize};
 
-/// `POST /delegated-tokens` 的请求体。
+/// The request body of `POST /delegated-tokens`.
 ///
-/// # 为什么只有 `session_id`，不带项目
+/// # Why only `session_id`, with no project
 ///
-/// 项目由服务端**从会话行里查**，不由调用方给。让调用方给的话，它可以声称
-/// 某个会话属于另一个项目，而项目决定的是容器与卷 —— 那等于用一个字段
-/// 越过工作区隔离。
+/// The project is **looked up out of the session row** by the server, not
+/// supplied by the caller. Let the caller supply it and it can claim some
+/// session belongs to another project — and the project is what determines
+/// container and volume, so that would be stepping over workspace isolation
+/// with a single field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateRequest {
-    /// 这把钥匙绑哪个会话。作用域只认它。
+    /// Which session this key is bound to. The scope recognizes nothing else.
     pub session_id: String,
 }
 
-/// `POST /delegated-tokens` 的回执。
+/// The receipt from `POST /delegated-tokens`.
 ///
-/// # 为什么三样一次给全
+/// # Why all three come back at once
 ///
-/// 三样都来自**同一行会话记录**。分成三次请求的话，并发改动下三个判断会
-/// 看到不同的快照，症状是「偶尔进错容器」—— 没有比这更难复现的。
-/// cortexd 那侧对应的 `sandbox_scope` 也是同一个理由的一次查询。
+/// All three derive from **the same session row**. Split into three requests,
+/// concurrent modification lets the three decisions see different snapshots,
+/// and the symptom is "occasionally enters the wrong container" — nothing is
+/// harder to reproduce than that. The `sandbox_scope` on the cortexd side is a
+/// single query for the same reason.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delegation {
-    /// 钥匙本身。调用方把它交给被委托的那一方（例如塞进容器的 env）。
+    /// The key itself. The caller hands it to the delegated party (stuffed into
+    /// a container's env, say).
     pub token: String,
-    /// 这把钥匙代表谁。
+    /// Who this key stands for.
     ///
-    /// 调用方拿它做资源归属（日志、按人分的账）。**它由服务端从凭据解析**，
-    /// 与 `GET /auth/me` 回的是同一个 id —— 但那要多打一次网络，
-    /// 而这两样本来就该来自同一次认证。
+    /// The caller uses it for resource attribution (logs, per-person billing).
+    /// **The server parses it out of the credential**, and it is the same id
+    /// `GET /auth/me` returns — but that would cost another network round trip,
+    /// and these two things should come from the same authentication anyway.
     pub owner: String,
-    /// 这个作用域的**规范名**：由 owner 与项目派生，同一作用域恒等。
+    /// The **canonical name** of this scope: derived from owner and project,
+    /// identical for identical scopes.
     ///
-    /// 调用方拿它当资源名用（容器名、卷名、缓存键）。因此它保证：
-    /// 只含 `[a-z0-9-]`、不超过 53 字节、不同作用域不碰撞。
+    /// The caller uses it as a resource name (container name, volume name,
+    /// cache key). It therefore guarantees: only `[a-z0-9-]`, no more than 53
+    /// bytes, and no collisions between distinct scopes.
     ///
-    /// **owner 只有服务端解析得出**（它来自凭据），所以这个名字必须由服务端
-    /// 给 —— 调用方自己拼不出来，也不该能拼。
+    /// **Only the server can resolve the owner** (it comes out of the
+    /// credential), so this name has to be issued by the server — the caller
+    /// cannot construct it, and should not be able to.
     pub scope_key: String,
-    /// 这个会话该跑在哪儿。
+    /// Where this session is supposed to run.
     ///
-    /// `Local` = 钉在某台客户机的目录上，云端这一侧跑不了它。调用方据此
-    /// 拒绝，而不是起一个注定读不到那些文件的容器。
+    /// `Local` = pinned to directories on some client machine; the cloud side
+    /// cannot run it. The caller uses this to refuse, rather than starting a
+    /// container that is guaranteed not to be able to read those files.
     pub runtime: crate::dto::SessionRuntimeDto,
-    /// 这个账号的模型额度是不是已经用完了。
+    /// Whether this account's model quota is already used up.
     ///
-    /// # 为什么是「报告」而不是「拦下」
+    /// # Why this reports rather than blocks
     ///
-    /// 额度管的是**模型花销**，而这把钥匙不只用于对话：拿它去列文件、下载
-    /// 工作区一个 token 都不花。用额度拦签发，等于用户额度用完之后连自己的
-    /// 文件都拿不走 —— 那正是「拿不走自己的数据」那类问题。
+    /// Quota governs **model spend**, and this key is not used only for
+    /// conversation: listing files or downloading a workspace with it costs not
+    /// one token. Blocking issuance on quota means that once a user's quota
+    /// runs out they cannot even retrieve their own files — which is exactly
+    /// the "can't get my own data out" class of problem.
     ///
-    /// 所以这里只报告，由调用方按用途决定：一轮**对话**该在起容器之前就
-    /// 拒掉（省一次冷启动），列文件则照常。
+    /// So this only reports, and the caller decides according to purpose: a
+    /// **conversation** turn should be refused before the container is even
+    /// started (saving a cold start), while listing files proceeds as normal.
     ///
-    /// 真正的闸门始终在 `POST /llm/stream` ——**钱是在那儿花的**，
-    /// 而那一条不依赖任何调用方的自觉。
+    /// The real gate is always `POST /llm/stream` — **that is where the money
+    /// gets spent**, and that one does not depend on any caller's good
+    /// intentions.
     pub quota_exhausted: bool,
 }
 
-/// `DELETE /delegated-tokens` 的请求体。
+/// The request body of `DELETE /delegated-tokens`.
 ///
-/// 签出去的钥匙没派上用场（容器没起来）就要收回来 —— 否则它是一把没有
-/// 主人的钥匙，在 TTL 内一直有效。
+/// A key that was signed and then never used (the container failed to start)
+/// has to be taken back — otherwise it is an ownerless key that stays valid for
+/// the whole TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeRequest {
     pub token: String,

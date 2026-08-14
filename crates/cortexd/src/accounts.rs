@@ -1,27 +1,35 @@
-//! 账号：注册 / 登录 / 刷新 / 登出，以及它们背后的那几张表。
+//! Accounts: register / log in / refresh / log out, plus the tables behind them.
 //!
-//! 纯逻辑（密码哈希、令牌生成、重放判定）在 [`crate::credentials`]；
-//! 这里只做「跟数据库打交道」与「拼成 HTTP」。
+//! The pure logic (password hashing, token generation, replay adjudication)
+//! lives in [`crate::credentials`]; this module only does "talk to the database"
+//! and "assemble it into HTTP".
 //!
-//! # 会话为什么能一直用下去
+//! # Why a session keeps working indefinitely
 //!
-//! 两种令牌，寿命差两个数量级：
+//! Two kinds of token, two orders of magnitude apart in lifetime:
 //!
-//! - **access token**：15 分钟。每次请求都带，泄露的窗口因此很短。
-//! - **refresh token**：30 天。只在换 access token 时用一次，用完就轮转。
+//! - **access token**: 15 minutes. Sent on every request, so the window a leak
+//!   opens is short.
+//! - **refresh token**: 30 days. Used exactly once, to exchange for a new access
+//!   token, and rotated on use.
 //!
-//! 客户端把 refresh token 存进系统凭据库，于是「关掉应用再打开」不需要
-//! 重新输密码 —— 它拿旧的换一对新的就继续用。**这是「不用反复登录」
-//! 的全部机制**，而它成立的前提是客户端真的把那串东西存下来
-//! （见 `app/lib/auth/`）。服务端发了长效令牌而客户端不存，等于没做。
+//! The client stores the refresh token in the system credential store, so
+//! "close the app and open it again" does not require retyping the password —
+//! it exchanges the old one for a new pair and carries on. **This is the entire
+//! mechanism behind "no repeated logins"**, and it only holds if the client
+//! genuinely persists that string (see `app/lib/auth/`). A server issuing
+//! long-lived tokens that the client does not store has done nothing at all.
 //!
-//! # 轮转与重放
+//! # Rotation and replay
 //!
-//! 每次刷新都签一个新的、把旧的标记 `rotated_at`。拿一个已经轮转过的
-//! 来换 = 它泄露了（合法客户端手上只有最新那个），此时**整条 family
-//! 一起作废** —— 只废这一个不够，攻击者手上还有他刚换到的那个。
+//! Every refresh issues a new token and stamps the old one with `rotated_at`.
+//! Presenting an already-rotated token for exchange means it leaked (a
+//! legitimate client only holds the newest one), and at that point **the entire
+//! family is revoked together** — revoking just that one is not enough, because
+//! the attacker also holds whatever they just exchanged it for.
 //!
-//! 判定本身在 [`crate::credentials::judge_refresh`]，那里有三态与它们的理由。
+//! The adjudication itself is in [`crate::credentials::judge_refresh`], where
+//! the three outcomes and their reasoning live.
 
 use axum::{Json, extract::State};
 use chrono::{Duration, Utc};
@@ -35,27 +43,30 @@ use crate::credentials::{
 use crate::routes::ApiError;
 use crate::state::AppState;
 
-/// access token 的寿命。
+/// Lifetime of an access token.
 ///
-/// 短到「泄露也没多大用」，长到「不至于每几分钟就为刷新往返一次」。
-/// 15 分钟是这两者的常见折衷，没有更深的理由 —— 真正兜底的是刷新那条链
-/// 能被整体作废。
+/// Short enough that "a leak is not worth much", long enough that "we are not
+/// making a refresh round trip every few minutes". 15 minutes is the common
+/// compromise between those, with no deeper reason — the real backstop is that
+/// the refresh chain can be revoked as a whole.
 const ACCESS_TTL: Duration = Duration::minutes(15);
 
-/// refresh token 的寿命。
+/// Lifetime of a refresh token.
 ///
-/// **这个数就是「多久不用就要重新登录」。** 30 天意味着日常使用的人
-/// 永远不会再看到登录框（每次刷新都会续期），而一台放了一个月没开的
-/// 机器要重新输密码 —— 那正是我们想要的那条线。
+/// **This number is "how long you can go unused before having to log in
+/// again".** 30 days means someone using the product daily never sees the login
+/// box again (every refresh renews it), while a machine left unopened for a
+/// month asks for the password — which is exactly the line we want.
 const REFRESH_TTL: Duration = Duration::days(30);
 
-/// 注册默认是**关**的。
+/// Registration is **closed** by default.
 ///
-/// 开放注册意味着任何人都能拿服务端那把 DeepSeek key 烧钱，而生产是
-/// 一台 2 核 3.5 GB、已经跑着 19 个容器的机器。
+/// Open registration means anyone can burn money with the server's DeepSeek key,
+/// and production is a 2-core, 3.5 GB machine already running 19 containers.
 ///
-/// 取值刻意不是 `1` / `true` 而是这个字面量，与 `CORTEX_AUTH=disabled`
-/// 同款：一个手滑设成 `0` 的环境变量不该把门打开。
+/// The accepted value is deliberately this literal rather than `1` / `true`,
+/// matching `CORTEX_AUTH=disabled`: an environment variable fat-fingered to `0`
+/// must not open the door.
 const OPEN_REGISTRATION_ENV: &str = "CORTEX_OPEN_REGISTRATION";
 const OPEN_REGISTRATION_ON: &str = "enabled";
 
@@ -64,34 +75,43 @@ fn open_registration() -> bool {
 }
 
 impl AppState {
-    /// 建一个账号：开 schema、迁移、写 users 行。
+    /// Create an account: provision the schema, migrate it, write the users row.
     ///
-    /// # 顺序不能反
+    /// # The order cannot be reversed
     ///
-    /// 先建 schema 并迁移，**最后**才写 users 那一行。反过来会留下
-    /// 「账号存在但库是空的」这个中间态，而那个用户一登录就撞上一片没有
-    /// 表的 schema —— 报的是看不懂的 SQL 错误，不是「你的账号还没建好」。
+    /// The schema is created and migrated first, and the users row is written
+    /// **last**. The other way round leaves the intermediate state "the account
+    /// exists but its database is empty", and that user logs in straight into a
+    /// schema with no tables — what they get is an unintelligible SQL error, not
+    /// "your account is not finished being set up".
     ///
     /// # Errors
-    /// 用户名已存在、密码太短、建 schema 失败、migration 失败。
+    /// The username already exists, the password is too short, provisioning the
+    /// schema failed, or the migration failed.
     pub async fn create_account(&self, username: &str, password: &str) -> Result<String, ApiError> {
         let hash = hash_password(password).map_err(|e| ApiError::bad_request(e.to_string()))?;
         let user_id = cortex_core::Id::new().to_string();
 
-        // **第一个账号落在 `public` 上，不另开 schema。**
+        // **The first account lands on `public`; no separate schema is created.**
         //
-        // 那片库里已经有东西了 —— 一个自托管的人是先用了几个月、
-        // 后来才建账号的。给他也 derive 一个新 schema，等于他建完号
-        // 一登录，几个月的记忆全部消失（库还在，只是没有任何一条路
-        // 通向它了）。而这**不报错**：会话列表就是空的，看着像新装的。
+        // That database already has things in it — a self-hosting user has been
+        // using the system for months and only creates an account later. Deriving
+        // a fresh schema for them too means that the moment they finish
+        // registering and log in, months of memory vanish (the data is still
+        // there, there is simply no path leading to it any more). And this
+        // **raises no error**: the session list is just empty, looking like a
+        // fresh install.
         //
-        // 端到端跑一次才发现：老 token 建号之后指向了 `u_01kz…`，
-        // 而存量数据在 `public`。设计里本来就写着「1 号用户的 schema 名
-        // 就叫 public，存量数据不搬家」，是实现漏了这一支。
+        // Found only on an end-to-end run: after creating an account with the
+        // old token, it pointed at `u_01kz…` while the existing data sat in
+        // `public`. The design already said "user #1's schema is named public,
+        // existing data does not move"; the implementation had simply missed
+        // this branch.
         let schema = schema_for_new_account(&user_id, self.user_count().await? == 0)?;
 
-        // schema 先行。失败时还没有任何账号记录，重试即可 ——
-        // 而反过来会留下一个登不进去的账号
+        // Schema first. On failure there is no account record yet and a retry is
+        // fine — whereas the reverse order leaves behind an account nobody can
+        // log into
         cortex_store::provision(self.accounts()?.tenants.as_ref(), &schema)
             .await
             .map_err(|e| ApiError::internal(format!("给新账号开库失败：{e}")))?;
@@ -110,22 +130,24 @@ impl AppState {
         .map_err(|e| ApiError::internal(format!("写用户记录失败：{e}")))?;
 
         if inserted.rows_affected() == 0 {
-            // schema 已经建了，但账号没写成。删掉它，别留孤儿 ——
-            // 一片没人认领的 schema 会一直占着 catalog，而且下次用同一个
-            // 用户名注册时又会建一片新的
+            // The schema was created but the account row was not written.
+            // Drop it rather than leaving an orphan — an unclaimed schema
+            // occupies the catalog forever, and the next registration with the
+            // same username would create yet another one
             let _ = self.accounts()?.tenants.as_ref().drop_schema(&schema).await;
             return Err(ApiError::bad_request("这个用户名已经有人用了"));
         }
         Ok(user_id)
     }
 
-    /// 这个部署有几个账号。
+    /// How many accounts this deployment has.
     ///
-    /// 只用来判断「是不是第一个」，所以不缓存 —— 它每次注册请求跑一次，
-    /// 而注册在这个产品里是极低频动作。
+    /// Only used to decide "is this the first one", so it is not cached — it
+    /// runs once per registration request, and registration is an extremely
+    /// low-frequency action in this product.
     ///
     /// # Errors
-    /// 没接数据库，或者查不动。
+    /// No database is attached, or the query failed.
     pub async fn user_count(&self) -> Result<i64, ApiError> {
         let row = sqlx::query("SELECT count(*) AS n FROM cortex_auth.users")
             .fetch_one(&self.accounts()?.pool)
@@ -134,7 +156,7 @@ impl AppState {
         Ok(row.get("n"))
     }
 
-    /// 签一对新令牌。`family` 为 `None` 时开一条新链（登录）。
+    /// Issue a new token pair. A `family` of `None` starts a new chain (login).
     async fn issue(
         &self,
         user_id: &str,
@@ -174,10 +196,11 @@ impl AppState {
         })
     }
 
-    /// 用 refresh token 换一对新的，并把旧的标记为已轮转。
+    /// Exchange a refresh token for a new pair, marking the old one rotated.
     ///
     /// # Errors
-    /// 令牌不认识、已过期、已作废，或者**被重放**（此时整条 family 作废）。
+    /// The token is unrecognised, expired, revoked, or **replayed** (in which
+    /// case the entire family is revoked).
     pub async fn rotate(&self, plain: &str) -> Result<AuthTokens, ApiError> {
         let digest = refresh_digest(plain);
         let row = sqlx::query(
@@ -190,8 +213,9 @@ impl AppState {
         .await
         .map_err(|e| ApiError::internal(format!("查令牌失败：{e}")))?;
 
-        // 查不到就是查不到。**不要**告诉客户端「这个令牌不存在」与
-        // 「这个令牌过期了」的区别 —— 那等于给爆破者一个进度条
+        // Not found is not found. **Do not** tell the client the difference
+        // between "this token does not exist" and "this token expired" — that
+        // hands a brute-forcer a progress bar
         let Some(row) = row else {
             return Err(ApiError::unauthorized("登录已失效，请重新登录"));
         };
@@ -210,8 +234,10 @@ impl AppState {
 
         match judge_refresh(&record) {
             RefreshVerdict::RevokeFamily { family } => {
-                // 这一条已经被换过了，而合法客户端手上只有最新那个 ——
-                // 所以这次请求来自别人。整条链作废，两边都得重新登录
+                // This one has already been exchanged, and a legitimate client
+                // only holds the newest one — so this request came from
+                // somebody else. Revoke the whole chain; both sides have to log
+                // in again
                 let family = family.to_string();
                 let n = self.revoke_family(&family).await;
                 tracing::warn!(
@@ -240,7 +266,7 @@ impl AppState {
         }
     }
 
-    /// 作废整条链，返回作废了几条。
+    /// Revoke the whole chain, returning how many rows were revoked.
     async fn revoke_family(&self, family: &str) -> u64 {
         let Ok(acc) = self.accounts() else { return 0 };
         sqlx::query(
@@ -255,17 +281,20 @@ impl AppState {
     }
 }
 
-/// 已签发的 access token → (用户 id, 过期时刻)。
+/// Issued access tokens → (user id, expiry instant).
 ///
-/// # 为什么在内存里，不落库、也不签 JWT
+/// # Why in memory, neither persisted nor signed as a JWT
 ///
-/// 落库意味着**每个请求一次数据库往返**，而 access token 每个请求都带。
-/// JWT 要引一套签名依赖，还要管密钥轮转 —— 而它换来的「无状态校验」
-/// 对一个单进程部署没有价值。
+/// Persisting means **one database round trip per request**, and the access
+/// token is sent on every request. A JWT would pull in a signing dependency and
+/// require key rotation management — and the "stateless verification" it buys
+/// is worth nothing to a single-process deployment.
 ///
-/// 代价是**重启之后所有 access token 失效**。这不痛：refresh token 在库里
-/// 活得好好的，客户端撞到一次 401 就用它换一对新的，用户什么都感觉不到。
-/// 这也正是「两种令牌」这个设计顺带买到的东西。
+/// The price is that **every access token is void after a restart**. That does
+/// not hurt: the refresh token is alive and well in the database, the client
+/// hits one 401 and exchanges it for a new pair, and the user notices nothing.
+/// This is precisely the thing the "two kinds of token" design buys us
+/// incidentally.
 #[derive(Default)]
 pub struct AccessBook {
     inner: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
@@ -274,49 +303,64 @@ pub struct AccessBook {
 impl AccessBook {
     fn issue(&self, user_id: &str, ttl: std::time::Duration) -> String {
         let mut buf = [0u8; 32];
-        getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝签发可预测的令牌");
+        getrandom::fill(&mut buf).expect(
+            "the kernel entropy source is unavailable; refusing to issue a predictable token",
+        );
         let token = hex::encode(buf);
-        let mut g = self.inner.lock().expect("access 簿子的锁不该中毒");
-        // 顺手清一次过期的。挂定时器要多一个后台任务与它的失败路径，
-        // 而这条路本来就是「有人登录/刷新」时才走
+        let mut g = self
+            .inner
+            .lock()
+            .expect("the access book's lock should never be poisoned");
+        // Prune the expired ones while we are here. A timer would mean one more
+        // background task plus its failure path, whereas this code path only
+        // runs when somebody logs in or refreshes
         let now = std::time::Instant::now();
         g.retain(|_, (_, exp)| *exp > now);
         g.insert(token.clone(), (user_id.to_owned(), now + ttl));
         token
     }
 
-    /// 这个 token 属于谁。过期或不认识都返回 `None`。
-    /// 只给测试用的签发口。
+    /// Who this token belongs to. Returns `None` for both expired and
+    /// unrecognised tokens.
     ///
-    /// `issue` 是私有的（签发要走完整的登录流程），但认证中间件那条不变式
-    /// 需要一张真的、簿子认得的票 —— 手搓一串十六进制测不到任何东西。
+    /// An issuing entry point for tests only.
+    ///
+    /// `issue` is private (issuing goes through the full login flow), but the
+    /// authentication middleware's invariant needs a real token that the book
+    /// recognises — hand-rolling a hex string would test nothing at all.
     #[cfg(test)]
     pub fn issue_for_test(&self, user_id: &str, ttl: std::time::Duration) -> String {
         self.issue(user_id, ttl)
     }
 
     pub fn resolve(&self, token: &str) -> Option<String> {
-        let g = self.inner.lock().expect("access 簿子的锁不该中毒");
+        let g = self
+            .inner
+            .lock()
+            .expect("the access book's lock should never be poisoned");
         let (user, exp) = g.get(token)?;
         (*exp > std::time::Instant::now()).then(|| user.clone())
     }
 }
 
-/// 新账号落在哪个 schema。
+/// Which schema a new account lands in.
 ///
-/// # 第一个账号必须是 `public`
+/// # The first account must be `public`
 ///
-/// 那片库里通常已经有东西 —— 自托管的人是先用了几个月、后来才建账号的。
-/// 给他也 derive 一个新 schema，等于建完号一登录，几个月的记忆全部消失：
-/// 库还在，只是没有任何一条路通向它了。而这**不报错**，会话列表就是空的，
-/// 看着像新装的。
+/// That database usually already has things in it — a self-hosting user has
+/// been using the system for months and only creates an account later. Deriving
+/// a fresh schema for them means that the moment they finish registering and log
+/// in, months of memory vanish: the data is still there, there is simply no path
+/// leading to it any more. And this **raises no error**; the session list is
+/// just empty, looking like a fresh install.
 ///
-/// 端到端跑一次才发现的（老 token 建号之后指向了 `u_01kz…`，
-/// 而存量数据在 `public`）。设计里本来就写着「1 号用户的 schema 名就叫
-/// public，存量数据不搬家」，是实现漏了这一支。
+/// Found only on an end-to-end run (after creating an account with the old
+/// token, it pointed at `u_01kz…` while the existing data sat in `public`). The
+/// design already said "user #1's schema is named public, existing data does not
+/// move"; the implementation had simply missed this branch.
 ///
 /// # Errors
-/// `user_id` 不是合法 ULID。
+/// `user_id` is not a valid ULID.
 fn schema_for_new_account(
     user_id: &str,
     is_first: bool,
@@ -341,11 +385,13 @@ pub async fn login(
     .await
     .map_err(|e| ApiError::internal(format!("查用户失败：{e}")))?;
 
-    // 用户名不存在与密码错误回**同一句话**：区分开来等于送人一份用户名字典。
+    // A nonexistent username and a wrong password return **the same sentence**:
+    // distinguishing them hands out a username dictionary.
     //
-    // 时间侧信道这里不做等时处理：真要防，得对不存在的用户也跑一遍 argon2，
-    // 而那会把「随便猜个用户名」变成一次 16ms 的 CPU 消耗 —— 那是个更好用的
-    // DoS 放大器。取舍写在这里，别当成漏了
+    // The timing side channel is deliberately not equalised here: defending it
+    // properly would mean running argon2 even for nonexistent users, which turns
+    // "guess a random username" into 16ms of CPU — a far better DoS amplifier.
+    // The trade-off is written down here; do not mistake it for an oversight
     let deny = || ApiError::unauthorized("用户名或密码不对");
     let Some(row) = row else { return Err(deny()) };
     if row.get::<bool, _>("disabled") {
@@ -362,7 +408,8 @@ pub async fn login(
     ))
 }
 
-/// `POST /auth/refresh` —— 客户端**不用重新登录**靠的就是这条。
+/// `POST /auth/refresh` — this endpoint is the entire reason the client
+/// **never has to log in again**.
 pub async fn refresh(
     State(st): State<AppState>,
     Json(req): Json<RefreshRequest>,
@@ -370,10 +417,11 @@ pub async fn refresh(
     Ok(Json(st.rotate(&req.refresh_token).await?))
 }
 
-/// `POST /auth/logout` —— 作废这条链。
+/// `POST /auth/logout` — revoke this chain.
 ///
-/// 作废**整条 family** 而不是只作废递上来的那一个：登出的意图是
-/// 「这台设备上的登录不再有效」，而那条链上还有它刚换出来的后继。
+/// Revokes **the whole family** rather than only the token presented: the intent
+/// of logging out is "the login on this device is no longer valid", and the
+/// chain still holds the successor it just exchanged for.
 pub async fn logout(
     State(st): State<AppState>,
     Json(req): Json<RefreshRequest>,
@@ -390,38 +438,34 @@ pub async fn logout(
     .map(|r| r.rows_affected())
     .unwrap_or(0);
 
-    // 认不出的令牌也回 200：登出是幂等的，而报 404 只会让「我已经登出了吗」
-    // 变成一个客户端要处理的分支
+    // An unrecognised token also gets a 200: logging out is idempotent, and a
+    // 404 would only turn "am I already logged out?" into a branch the client
+    // has to handle
     Ok(Json(serde_json::json!({ "revoked": n })))
 }
 
-/// `POST /auth/register` —— **默认 403**。
+/// `POST /auth/register` — **403 by default**.
 pub async fn register(
     State(st): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthTokens>, ApiError> {
-    // **第一个账号永远放行。**
+    // **There is no longer a "the first account is admitted unconditionally"
+    // exception.**
     //
-    // 私有化部署的第一步是「把它跑起来」，而那时既没有邮箱通道、也可能
-    // 没有 shell（有人是点一个 compose 就部署完的）。要求先 SSH 上去跑
-    // `--create-user` 才能用，等于把一个纯运维的步骤塞进产品的第一分钟。
+    // Its former justification was: the first step of a self-hosted deployment
+    // is getting it running, and at that moment there is no email channel and
+    // possibly no shell either. The price was that on a freshly deployed machine
+    // with no account yet and exposed to the internet, whoever reached it first
+    // became the owner — and across repeated deployments that window cannot be
+    // outrun.
     //
-    // 代价要说清楚：**一台刚部署好、还没建号、又直接暴露在公网上的机器，
-    // 第一个访问它的人会成为主人。** 这个窗口只在「部署完成」到「你注册」
-    // 之间，通常几秒，而且一旦关上就永远关上。不接受它的人应当先用
-    // `--create-user` 建号，再放通网络。
-    // **不再有「第一个账号无条件放行」这条特例。**
-    //
-    // 它曾经的理由是：私有化部署的第一步是把它跑起来，那时既没有邮箱通道、
-    // 也可能没有 shell。代价是一台刚部署好、还没建号、又暴露在公网上的机器，
-    // 第一个访问它的人会成为主人 —— 对反复部署来说这个窗口躲不过去。
-    //
-    // 现在第一个账号由 `.env` 里的 CORTEX_ADMIN_USERNAME / _PASSWORD 在
-    // **启动时**建好（见 `main::ensure_admin`），或者用 `--create-user`。
-    // 两条路都不经过公网，于是这里不需要任何特例 —— 少一条分支，
-    // 也少一个窗口。
+    // The first account is now created **at startup** from
+    // CORTEX_ADMIN_USERNAME / _PASSWORD in `.env` (see `main::ensure_admin`), or
+    // with `--create-user`. Neither path crosses the public internet, so no
+    // exception is needed here — one fewer branch, and one fewer window.
     if !open_registration() {
-        // 说清楚是「这个部署关着」而不是「你填错了」，否则对方会一直重试
+        // Say plainly that "this deployment has it closed" rather than "you
+        // typed something wrong", or the caller will keep retrying
         return Err(ApiError::forbidden(format!(
             "这个部署没有开放注册。管理员可以设 {OPEN_REGISTRATION_ENV}={OPEN_REGISTRATION_ON} 打开，             或者用 cortexd --create-user 直接建号"
         )));
@@ -430,10 +474,10 @@ pub async fn register(
     Ok(Json(st.issue(&user_id, None, None).await?))
 }
 
-/// `GET /auth/usage` —— 我这个窗口用了多少、还剩多少。
+/// `GET /auth/usage` — how much I used this window and how much is left.
 ///
 /// # Errors
-/// 没接账号体系，或者算不出用量。
+/// No accounts system is attached, or the usage could not be computed.
 pub async fn usage(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -442,10 +486,11 @@ pub async fn usage(
     Ok(Json(st.quota_status(&user_id).await?.into()))
 }
 
-/// 这个请求是谁发的。
+/// Who sent this request.
 ///
-/// access token 认不出时回落到 1 号用户 —— 那是老的预共享 token 那条路，
-/// 它已经过了入站那道门，否则这个 handler 根本不会被调到。
+/// When the access token is not recognised, this falls back to user #1 — that
+/// is the old pre-shared token path, which has already passed the inbound gate,
+/// or this handler would never have been reached at all.
 pub async fn current_user(st: &AppState, headers: &axum::http::HeaderMap) -> String {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -460,9 +505,10 @@ pub async fn current_user(st: &AppState, headers: &axum::http::HeaderMap) -> Str
 
 /// `GET /auth/me`
 ///
-/// 用请求里那个 access token 反查是谁。**老的预共享 token 也认**，
-/// 映射到 1 号用户 —— 过渡期 CLI 与现有桌面端都还在用它，
-/// 一次性切换会让它们当天全部失联。
+/// Look up who the request's access token belongs to. **The old pre-shared token
+/// is recognised too**, mapping to user #1 — during the transition the CLI and
+/// every existing desktop client still use it, and a hard cutover would lose
+/// contact with all of them the same day.
 pub async fn whoami(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -474,8 +520,8 @@ pub async fn whoami(
         .unwrap_or_default();
     let user_id = match st.access_book().resolve(bearer) {
         Some(id) => id,
-        // 认不出就是老 token 那条路（它已经过了入站那道门，
-        // 否则这个 handler 根本不会被调到）
+        // Unrecognised means the legacy token path (it has already passed the
+        // inbound gate, or this handler would never have been reached)
         None => owner_user_id(&st).await.unwrap_or_else(|| "owner".into()),
     };
     let row = sqlx::query("SELECT username, schema_name FROM cortex_auth.users WHERE id = $1")
@@ -489,8 +535,9 @@ pub async fn whoami(
             username: r.get("username"),
             schema_name: r.get("schema_name"),
         })),
-        // 老 token 那条路映射到 1 号用户，而 1 号用户可能还没在 users 表里
-        // （部署早于账号体系）。这不是错误，是过渡期的正常状态
+        // The legacy token path maps to user #1, and user #1 may not be in the
+        // users table yet (the deployment predates the accounts system). This is
+        // not an error, it is the normal transitional state
         None => Ok(Json(WhoAmI {
             user_id,
             username: "(尚未建账号)".into(),
@@ -499,9 +546,10 @@ pub async fn whoami(
     }
 }
 
-/// 1 号用户的 id。老 token 那条路映射到他。
+/// User #1's id. The legacy token path maps to them.
 ///
-/// 按 id 升序取第一个 —— ULID 有序，所以「第一个」就是「最早建的那个」。
+/// Takes the first row in ascending id order — ULIDs are ordered, so "the
+/// first" is "the earliest created".
 async fn owner_user_id(st: &AppState) -> Option<String> {
     let acc = st.accounts().ok()?;
     sqlx::query("SELECT id FROM cortex_auth.users ORDER BY id LIMIT 1")
@@ -514,62 +562,74 @@ async fn owner_user_id(st: &AppState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    /// **注册再也没有「第一个账号」这条特例了。**
+    /// **Registration no longer has a "first account" exception.**
     ///
-    /// 它曾经无条件放行，代价是一台刚部署好、还没建号、又暴露在公网上的
-    /// 机器，第一个访问 /auth/register 的人会成为主人。部署一次能靠手快
-    /// 躲过去，反复部署躲不过去。
+    /// It used to admit that request unconditionally, and the price was that on
+    /// a freshly deployed machine with no account yet and exposed to the
+    /// internet, whoever reached /auth/register first became the owner. You can
+    /// outrun that once by being quick; across repeated deployments you cannot.
     ///
-    /// 现在第一个账号在**开始监听之前**就由 `.env` 建好了（见
-    /// `main::ensure_admin`），或者用 `--create-user`。两条都不经过公网，
-    /// 于是这里不需要特例 —— 而这条测试盯着那条特例别再长回来。
+    /// The first account is now created from `.env` **before the listener
+    /// opens** (see `main::ensure_admin`), or with `--create-user`. Neither path
+    /// crosses the public internet, so no exception is needed here — and this
+    /// test watches to make sure the exception does not grow back.
     #[test]
     fn registration_has_no_first_account_exception() {
         let src = include_str!("accounts.rs");
         let gate = src
             .split("pub async fn register")
             .nth(1)
-            .expect("register 还在吧");
-        // 只看函数体前半段（到密码哈希为止就够了）
+            .expect("register is still here, right?");
+        // Only look at the first part of the body (up to the password hash is
+        // enough)
         let head = &gate[..gate.len().min(2000)];
         assert!(
             !head.contains("user_count"),
-            "register 里又数起用户数了 —— 那通常意味着「第一个账号特殊对待」             这条特例回来了，而它带着一个公网上的抢主人窗口。             第一个账号应当由 .env（main::ensure_admin）或 --create-user 建"
+            "register is counting users again —— that usually means the \"treat the first \
+             account specially\" exception is back, and it brings a race-for-owner window on the \
+             public internet with it. The first account should be created from .env \
+             (main::ensure_admin) or with --create-user"
         );
     }
 
     use super::*;
 
-    /// **默认必须是关的。**
+    /// **The default has to be closed.**
     ///
-    /// 忘了配一个环境变量的后果不该是「陌生人可以开号并烧我的 API key」。
+    /// Forgetting to set one environment variable must not amount to "strangers
+    /// can open accounts and burn my API key".
     #[test]
     fn registration_is_closed_unless_explicitly_opened() {
-        // 这个测试不改进程环境（会影响并行跑的别的用例），
-        // 只验判据本身：除了那个字面量，什么都不算开
+        // This test does not modify the process environment (that would affect
+        // other cases running in parallel); it verifies the criterion itself:
+        // nothing counts as open except that one literal
         for v in [
             "", "0", "1", "true", "TRUE", "yes", "on", "disabled", "Enabled",
         ] {
             assert_ne!(
                 v.trim(),
                 OPEN_REGISTRATION_ON,
-                "{v:?} 不该被当成「开放注册」—— 手滑设成 1 或 true 不能把门打开"
+                "{v:?} must not count as \"registration open\" —— fat-fingering 1 or true must \
+                 not open the door"
             );
         }
         assert_eq!("enabled", OPEN_REGISTRATION_ON);
     }
 
-    /// refresh 的寿命就是「多久不用要重新登录」，别让它悄悄变短。
+    /// The refresh lifetime is "how long you can go unused before logging in
+    /// again"; do not let it quietly shrink.
     #[test]
     fn a_session_survives_a_month_of_restarts() {
         assert_eq!(
             REFRESH_TTL.num_days(),
             30,
-            "这个数就是用户体感上的「多久要重新登录一次」，改它要有意识"
+            "this number is what the user experiences as \"how often do I have to log in \
+             again\"; changing it must be a conscious act"
         );
         assert!(
             ACCESS_TTL < REFRESH_TTL,
-            "access 必须比 refresh 短得多，否则短命令牌那一层就没意义了"
+            "access must be far shorter than refresh, or the short-lived-token layer means \
+             nothing"
         );
     }
 }
@@ -578,19 +638,21 @@ mod tests {
 mod account_schema_tests {
     use super::*;
 
-    /// 第一个账号接管 `public`，其余各自开一片。
+    /// The first account takes over `public`; every other one gets its own.
     #[test]
     fn the_first_account_takes_over_public() {
         let id = cortex_core::Id::new().to_string();
         assert_eq!(
             schema_for_new_account(&id, true).unwrap().as_str(),
             "public",
-            "第一个账号必须落在 public 上。落在别处的话，一个用了几个月才建号的人             建完号一登录，全部记忆消失 —— 而且不报错，会话列表就是空的"
+            "the first account must land on public. Anywhere else means that someone who used \
+             the system for months before registering logs in afterwards to find all their \
+             memory gone —— with no error, the session list is simply empty"
         );
         let second = schema_for_new_account(&id, false).unwrap();
         assert!(
             second.as_str().starts_with("u_"),
-            "第二个之后必须各自一片，实际拿到 {}",
+            "from the second account onwards each must get its own schema; actually got {}",
             second.as_str()
         );
         assert_ne!(second.as_str(), "public");
