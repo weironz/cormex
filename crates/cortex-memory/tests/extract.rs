@@ -479,7 +479,15 @@ async fn entity_object_becomes_a_graph_edge() {
 #[ignore = "needs DEEPSEEK_API_KEY; makes real API calls"]
 async fn real_llm_extraction_quality() {
     let _ = dotenvy::dotenv();
-    let llm = cortex_llm::LlmClient::from_env().expect("should build an LlmClient from the env");
+    // Skip rather than fail when no provider is configured, mirroring how
+    // `setup()` treats a missing DATABASE_URL. `#[ignore]` alone stopped being
+    // enough the moment CI started passing `--include-ignored` to reach the
+    // database tests -- that flag cannot tell "needs a database CI has" from
+    // "needs an API key CI must not have", and the latter costs money.
+    let Ok(llm) = cortex_llm::LlmClient::from_env() else {
+        eprintln!("skipped: no LLM provider configured (DEEPSEEK_API_KEY and friends)");
+        return;
+    };
     let extractor = cortex_memory::extract::Extractor::new(
         llm,
         Arc::new(cortex_memory::embed::HashEmbedder::new()),
@@ -548,7 +556,15 @@ async fn real_llm_end_to_end_ingest() {
     let Some(db) = setup().await else { return };
     let store = db.store.clone();
 
-    let llm = cortex_llm::LlmClient::from_env().expect("should build an LlmClient from the env");
+    // Skip rather than fail when no provider is configured, mirroring how
+    // `setup()` treats a missing DATABASE_URL. `#[ignore]` alone stopped being
+    // enough the moment CI started passing `--include-ignored` to reach the
+    // database tests -- that flag cannot tell "needs a database CI has" from
+    // "needs an API key CI must not have", and the latter costs money.
+    let Ok(llm) = cortex_llm::LlmClient::from_env() else {
+        eprintln!("skipped: no LLM provider configured (DEEPSEEK_API_KEY and friends)");
+        return;
+    };
     let extractor = cortex_memory::extract::Extractor::new(
         llm,
         Arc::new(cortex_memory::embed::HashEmbedder::new()),
