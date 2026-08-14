@@ -1,8 +1,9 @@
 //! The live backend — wiring the storage layer, the provider layer and the
 //! memory engine onto the HTTP contract.
 //!
-//! Its contract is identical to [`crate::state::mock`]'s: routes and DTOs do not
-//! change when the backend is switched.
+//! Its contract is identical to the mock backend's
+//! ([`crate::state::BackendChoice::Mock`]): routes and DTOs do not change when
+//! the backend is switched.
 //!
 //! # There is **no** agent loop here
 //!
@@ -135,7 +136,8 @@ pub(crate) fn validate_project_name(raw: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
-/// How many extractions may run at once. See [`Live::extract_permit`].
+/// How many extractions may run at once. The gate it sizes is
+/// [`Live::extract_gate`]; [`under_gate`] is what holds a permit against it.
 const EXTRACT_CONCURRENCY_ENV: &str = "CORTEX_EXTRACT_CONCURRENCY";
 
 /// Defaults to 3.
@@ -429,7 +431,7 @@ impl TranscribeOutcome {
 }
 
 /// Wire `store.is_redacted` into the transcription pipeline's
-/// [`RedactionGuard`].
+/// [`cortex_memory::transcribe::RedactionGuard`].
 ///
 /// The pipeline builds this constraint into its signature (taking a trait rather
 /// than a closure), so the caller has no way to omit it — the consequence of
@@ -564,11 +566,16 @@ impl Live {
     /// The local agent writing one conversational turn back into the memory
     /// database.
     ///
-    /// This is the "memory half" of [`run_turn`] pulled out on its own: once the
-    /// agent loop moved to the local side, the loop runs there while persistence
-    /// and retrieval stay here. Both paths run **the same** logic (write the
-    /// episode → retrieve → attribute → tool attribution → extract), with no
-    /// fork, deliberately.
+    /// This is the **memory half of a turn**, and since the agent loop left this
+    /// process it is the only half still here: the loop runs wherever the agent
+    /// runs, and `POST /episodes` hands the finished turn over. There used to be
+    /// a second, in-process copy of this same sequence (write the episode →
+    /// retrieve → attribute → tool attribution → extract) sitting behind
+    /// cortexd's own turn loop. Deleting that copy is what leaves our own agent
+    /// and a third-party agent exercising one function rather than two — which
+    /// is the only thing that keeps this function honest, because a divergence
+    /// between two copies goes unnoticed until the two populations of users
+    /// compare notes.
     ///
     /// # Idempotent, with the duplicate check outside the transaction
     ///
@@ -634,8 +641,9 @@ impl Live {
                 })?,
         };
 
-        // ── Attachment pre-check (outside the transaction, same reasoning as
-        //    run_turn step 0) ──
+        // ── Attachment pre-check (deliberately outside the transaction: this
+        //    is a read, and `write_txn` offers none — a ticket-taking
+        //    transaction stays short and write-only) ──
         let attachments = dedup_attachments(&req.attachments);
         for a in &attachments {
             if self.store.blob(&a.hash).await.map_err(store_err)?.is_none() {
@@ -723,8 +731,9 @@ impl Live {
             }
         }
 
-        // ── Tool attribution (its own transaction; reasoning in run_turn step
-        //    5b) ──
+        // ── Tool attribution (its own transaction, so that it can fail on its
+        //    own without taking the episode down with it — see the trade-off
+        //    stated where the failure is logged, below) ──
         if !req.tool_calls.is_empty() {
             let anchor = req.anchor_episode_id.as_deref().unwrap_or(&req.id);
             let anchor: Id = anchor.parse().map_err(|_| {
@@ -768,9 +777,9 @@ impl Live {
                     Ok(last)
                 })
                 .await;
-            // Same trade-off as run_turn: the conversation has completed, and
-            // failing to write the attribution is a loss of observability that
-            // should not surface as a failed write
+            // The trade-off: the conversation has completed, and failing to
+            // write the attribution is a loss of observability that should not
+            // surface as a failed write
             if let Err(e) = res {
                 tracing::warn!(error = %e, calls = n, "could not persist the tool attribution");
             }
@@ -1172,10 +1181,11 @@ impl Live {
     ///
     /// # Why this layer exists on its own
     ///
-    /// It has two consumers: the agent's own `memory_search` tool
-    /// ([`TurnHost`]) and the outward-facing MCP server ([`crate::mcp`]). If
-    /// each wrote its own copy, "what a third party found" and "what our own
-    /// agent found" would drift apart — which is the rule
+    /// Every consumer reaches it through one door — the `memory_search` tool on
+    /// [`crate::mcp`] — and that includes our own agent, which holds a delegated
+    /// credential and speaks the same MCP as Claude Code or goose. Let any
+    /// caller render its own and "what a third party found" and "what our own
+    /// agent found" drift apart — which is the rule
     /// [`Self::retrieve`]'s comment already established once, lifted one level
     /// higher here: **there is only one rendering, too**.
     ///
@@ -2040,10 +2050,11 @@ fn store_err(e: cortex_store::StoreError) -> CortexError {
 
 /// Retrieval result → wire fact.
 ///
-/// [`run_turn`] (the web path, over SSE) and [`Live::write_episode`] (the local
-/// agent path, over the HTTP response) share this one mapping. With a copy in
-/// each, the symptom of drift is **the same memory looking different on two
-/// clients**, with no error at all.
+/// [`Live::write_episode`] (the memory handed back with a turn's ack, which the
+/// client shows in the conversation drawer) and [`Live::memory_search`] (the
+/// search results) share this one mapping. With a copy in each, the symptom of
+/// drift is **the same memory looking different in the drawer and in search**,
+/// with no error at all.
 fn fact_dto_of(m: &cortex_memory::MemoryItem) -> FactDto {
     FactDto {
         id: m.id.clone(),

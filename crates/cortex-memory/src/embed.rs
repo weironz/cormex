@@ -6,7 +6,11 @@
 //! |---|---|---|
 //! | `api` (**default**) | [`crate::embed_api`] | Calls a remote `/v1/embeddings` (self-hosted container or cloud service) |
 //! | `hash` | this file | Offline development and CI. **Not a semantic space** |
-//! | `fast` | [`crate::embed_local`], feature `local-embed` | One process handles everything, no external service |
+//! | `fast` | `crate::embed_local`, feature `local-embed` | One process handles everything, no external service |
+//!
+//! `embed_local` is the one entry that is **not** a link: the module only
+//! exists under `local-embed`, and these docs are built without it — a link
+//! would break every default `cargo doc`.
 //!
 //! # Why the default moved from in-process inference to HTTP
 //!

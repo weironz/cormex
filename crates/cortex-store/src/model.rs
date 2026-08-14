@@ -1172,11 +1172,10 @@ pub const SESSION_TITLE_MAX_CHARS: usize = 200;
 /// The character cap on `session_events.workspace`, matching the CHECK in the
 /// migration.
 ///
-/// **Defined in [`cortex_core`]**, because
-/// [`cortex_agent::workspace::validate`], which enforces this cap, runs on both
-/// sides: in cortexd (a server-side directory) and in the local agent (a
-/// directory on the user's own machine), and the latter should not depend on the
-/// database layer just for a number. The re-export here keeps
+/// **Defined in [`cortex_core`]**, because the validator that enforces it lives
+/// on the agent side (in the repository that drives this service), and an agent
+/// should not have to depend on the database layer just to learn a number.
+/// The re-export here keeps
 /// `cortex_store::WORKSPACE_PATH_MAX_CHARS` usable — keeping it aligned with the
 /// migration's CHECK remains the storage layer's responsibility.
 pub use cortex_core::WORKSPACE_PATH_MAX_CHARS;

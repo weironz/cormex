@@ -10,7 +10,7 @@
 //! not used: they require either a live database connection at compile time or
 //! a maintained `.sqlx` offline cache, which is a nuisance for CI and for
 //! newcomers getting started. Everything here uses the runtime API
-//! ([`sqlx::query_as`] + [`sqlx::FromRow`]); the price is that a misspelled
+//! (`sqlx::query_as` + [`sqlx::FromRow`]); the price is that a misspelled
 //! column name only surfaces when the tests run — integration tests that talk
 //! to a real database cover that gap.
 //!

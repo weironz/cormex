@@ -1,7 +1,10 @@
 //! Write-side negative filtering — credentials are blocked **before extraction
 //! begins**.
 //!
-//! Corresponds to item #4 on the differences list in [`docs/memory-content.md`].
+//! One of the deliberate differences from the mainstream memory systems, and it
+//! comes down to **where** the filter sits: ahead of the extraction call rather
+//! than inside it (rule 2 below has the counterexample).
+//!
 //! Previously this layer consisted of one sentence in the extract prompt ("the
 //! literal values of credentials and secrets … do not extract"), and that is a
 //! **soft constraint**: the model can see the raw text, and the raw text has

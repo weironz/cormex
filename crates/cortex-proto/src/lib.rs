@@ -1,43 +1,32 @@
-//! Everything that travels on the client ↔ server wire.
+//! Everything that travels on the memory service's wire.
 //!
-//! # Why this is a crate of its own
+//! This is the contract a client codes against: the browser-based memory
+//! browser, a CLI, or a third-party agent talking to `/mcp`. **They are all
+//! equal citizens** — the same endpoints, the same DTOs, no private shortcut
+//! for a first-party client. That is deliberate: an API whose only caller is
+//! its own author is an API nobody notices the rot in.
 //!
-//! Once the agent loop moved onto the local machine, **two** processes speak
-//! this protocol: cortexd speaks it to the web client, and the local agent
-//! speaks it to the GUI / CLI (proxying paths it does not recognize straight
-//! through to cortexd).
+//! # Why this is a crate of its own rather than types inlined in the server
 //!
+//! Because a Rust client can depend on *just this* — no sqlx, no pgvector, no
+//! embedding backend — and get the definitions rather than re-typing them.
 //! Two independently released binaries each maintaining their own copy of the
-//! DTO definitions will drift; it is only a matter of time. And drift shows up
-//! as **fields going silently missing**: `serde` ignores unknown fields by
-//! default, so one absent `path` merely means the UI draws one row fewer —
-//! nothing goes red. Put the definitions in one shared crate and that whole
-//! class of mismatch is gone **at compile time** — both sides refer to the
-//! same type.
+//! DTOs will drift; it is only a matter of time. And drift shows up as **fields
+//! going silently missing**: `serde` ignores unknown fields by default, so one
+//! absent `path` merely means the UI draws one row fewer — nothing goes red.
+//! One shared crate removes that whole class of mismatch **at compile time**.
 //!
-//! # Why only one type is left in [`confirm`]
+//! # What is deliberately *not* here
 //!
-//! The response body of `GET /confirmations` *is* [`confirm::PendingInfo`], and
-//! the fields of [`dto::ChatEvent::Confirm`] have to line up with it word for
-//! word — splitting the two across crates would hand the two halves of one
-//! contract to two different places. So it stays here.
-//!
-//! The **registry** itself (`ConfirmRegistry` with its oneshots, TTL and `Drop`
-//! cleanup) used to live here too, on the strength of that same sentence. But
-//! that sentence does not cover it: the registry is not a contract, it is
-//! runtime. And it dragged the whole of `cortex-agent` into this **wire
-//! protocol** crate, so that **anyone who wanted only the memory layer had to
-//! compile the agent along with it** — and the memory layer is meant to be
-//! open-sourced on its own, with this dependency standing in the way.
-//!
-//! The registry now lives in `cortex-local`: the only possible host (cortexd
-//! runs no agent, and the one inside a container never asks for confirmation).
-//! The wire spelling of a risk level is `cortex_agent::Risk::as_wire`, which
-//! sits right next to the enum itself — any host that can get hold of a `Risk`
-//! can get hold of that too.
+//! No chat stream, no tool-confirmation ledger, no permission mode. Those
+//! belong to whatever agent is driving; this service stores and retrieves
+//! memory and never runs a turn. They did live here once — carried over
+//! wholesale when this repository was split out — and every one of them
+//! documented itself in terms of crates that do not ship with this one, so
+//! their rustdoc links pointed at nothing. An integrator reading a memory
+//! service's wire protocol should not have to work out which half applies.
 
 pub mod auth;
-pub mod confirm;
 pub mod delegate;
 pub mod dto;
 pub mod episodes;

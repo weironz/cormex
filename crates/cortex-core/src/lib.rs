@@ -32,25 +32,23 @@ pub mod error;
 pub mod history;
 pub mod id;
 pub mod injection;
-pub mod state_dir;
 
 pub use config::Config;
 pub use error::{CortexError, Result};
 pub use id::Id;
-pub use state_dir::{
-    ADDR_FILE_EXT, LIVE_FILE_EXT, LivePointer, live_file, state_dir, token_fingerprint,
-};
 
 /// Character limit for `session_events.workspace`, matching the CHECK in the
 /// migration (`cortex_store` re-exports it; keeping those two aligned remains
 /// the storage layer's job).
 ///
-/// It sits in this "very thin" crate because the validator that enforces it,
-/// `cortex_agent::workspace::validate`, has to run on both sides: cortexd
-/// validates a server-side directory, the local agent validates a directory on
-/// the user's own machine. If each layer above wrote its own literal, the
-/// symptom of drift would be "the client thinks the binding succeeded but the
-/// server returns 500" — the database CHECK's error never reaches the user.
+/// It sits in this "very thin" crate because **both ends need the number and
+/// neither should pull in the other's dependencies for it**: the storage layer
+/// re-exports it next to the CHECK it mirrors, and an agent validating a path
+/// on the user's own machine gets it without depending on sqlx.
+///
+/// If each layer wrote its own literal instead, the symptom of drift would be
+/// "the client thinks the binding succeeded but the server returns 500" — the
+/// database CHECK's error never reaches the user.
 pub const WORKSPACE_PATH_MAX_CHARS: usize = 4096;
 
 /// Compile-time version number, used by `/health` and the CLI's version

@@ -51,6 +51,20 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # A broken intra-doc link fails nothing until a reader clicks it and lands
+      # on nothing -- and then concludes they failed to check out part of the
+      # repository. This gate was added after a sweep found 14 of them, most
+      # predating the split: three pointed at items with no definition anywhere
+      # (`Live::extract_permit`, `DelegatedTokens::touch`, `Self::conflict`) and
+      # one at a `docs/` directory this repository does not have.
+      #
+      # `--no-deps`: dependencies' own docs are not ours to keep tidy, and
+      # building them would multiply the runtime for no signal.
+      - name: rustdoc links
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+
   # ── Tests ──────────────────────────────────────────────
   test:
     name: Tests

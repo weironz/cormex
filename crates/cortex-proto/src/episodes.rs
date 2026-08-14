@@ -49,8 +49,8 @@ pub struct ToolCallInput {
     pub path: Option<String>,
     pub summary: String,
     pub ok: bool,
-    /// What this write changed (unified diff, already truncated). See `diff` on
-    /// `dto::ChatEvent::Tool`.
+    /// What this write changed (unified diff, **already truncated by the sender**
+    /// — see [`crate::dto::ToolCallDto::diff`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }

@@ -198,7 +198,7 @@ pub trait Transcriber: Send + Sync {
     ///
     /// It must uniquely identify "which model / which pipeline produced this",
     /// for exactly the same reason as `embedding_model` (see
-    /// [`crate::embed::FastModel::model_id`]): after switching models it is what
+    /// [`crate::embed::Embedder::model_id`]): after switching models it is what
     /// tells old rows from new ones and decides which rows to re-run.
     fn transcribed_by(&self) -> &str;
 

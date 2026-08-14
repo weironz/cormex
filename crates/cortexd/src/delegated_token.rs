@@ -68,8 +68,10 @@ use std::time::{Duration, Instant};
 /// Far longer than a ticket (60 seconds): this one is for long-lived
 /// connections, and a container may live for hours. Still bounded, though — a
 /// token should expire naturally once its container has been reaped, rather than
-/// sitting in the table forever. Every [`DelegatedTokens::touch`] renews it, so
-/// an active sandbox is never killed by mistake.
+/// sitting in the table forever. Use renews it — [`DelegatedTokens::resolve`]
+/// stamps `Instant::now()` on every successful lookup, as does
+/// [`DelegatedTokens::rebind`] — so an active sandbox is never killed by
+/// mistake.
 const TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// What the sandbox may do. **Authorized semantically, not by route.**

@@ -175,87 +175,6 @@ pub struct EmbeddingHealth {
 
 // ──────────────────────────── /chat ────────────────────────────
 
-/// How much this turn is allowed to interrupt the user. Aligned with Claude
-/// Code's mode menu.
-///
-/// # Why three levels rather than copying all five
-///
-/// Claude Code's menu also has Plan (produce a plan before acting) and Auto
-/// (let the model decide). Each of those is a feature in its own right — the
-/// first needs a whole plan/approve/execute flow, the second needs a
-/// classifier — and neither has anything to do with "do we ask". Stuffing them
-/// into the same enum would only make this look finished while in fact leaving
-/// two empty shells.
-///
-/// # Why this lives in cortex-proto
-///
-/// It is simultaneously an HTTP contract (a field of `ChatRequest`) and a type
-/// shared by two hosts. Put it in `cortex-agent` and the string the Flutter side
-/// serializes has to line up with an internal enum in the agent layer — and
-/// "cross-layer literals that must agree" is exactly the kind of convention
-/// this repository has repeatedly seen drift apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionMode {
-    /// Confirm each one: ask for file writes and for command execution, and ask
-    /// for anything out of scope. **The default.**
-    #[default]
-    Ask,
-    /// Edit files automatically: writes go unasked, only execution asks. Out of
-    /// scope still asks — being out of scope and being risky are two different
-    /// things.
-    AcceptEdits,
-    /// Everything goes: never ask, not even out of scope. Aligned with "Bypass
-    /// permissions".
-    ///
-    /// Deliberately not the default: a config copied from somewhere else, or a
-    /// field somebody forgot to send, should not silently grant the agent
-    /// unattended execution. Turning it on requires somebody to choose it
-    /// explicitly.
-    Bypass,
-}
-
-/// The request body of one conversational turn.
-///
-/// # There used to be a `sandbox: bool` here. **Do not add it back.**
-///
-/// It let the client declare per turn whether "this turn runs in the cloud
-/// sandbox". What that produced in the field: a user staring at a switch they
-/// do not understand ("cloud sandbox"? what happens if it is off?), sending
-/// "take a look at this file for me" with it off, and getting an agent with no
-/// file tools — a failure that reads like the agent being broken, not like a
-/// switch being off.
-///
-/// The **server** decides now: if cortexd can reach docker, it runs in the
-/// sandbox. If it cannot, it says plainly that this deployment cannot run
-/// conversations (cortexd is the memory service; it runs no agent of its own)
-/// and points at the two routes that do work. The user deals only with the
-/// session; whether there is a container behind it is transparent to them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatRequest {
-    pub session_id: String,
-    pub message: String,
-    /// The attachments carried by this turn. The hashes must be **already
-    /// registered** blobs (via `/blobs`, or `/blobs/presign` +
-    /// `/blobs/commit`); the server only creates the association and no bytes
-    /// travel down this path.
-    ///
-    /// Empty by default, so old clients that never send this field keep working.
-    #[serde(default)]
-    pub attachments: Vec<AttachmentRef>,
-    /// This turn's permission level. Old clients that omit it get
-    /// [`PermissionMode::Ask`].
-    ///
-    /// Carried per turn rather than stored on the session: the user can change
-    /// it at the bottom of the chat box at any moment, and once changed the
-    /// **next** utterance should already follow the new level. Storing it
-    /// server-side means one more synchronization for the client, and when that
-    /// synchronization fails what the user sees is "but I *did* switch the
-    /// level".
-    #[serde(default)]
-    pub permission_mode: PermissionMode,
-}
-
 /// One `episode_blobs` association — the **upstream** direction
 /// (client → server).
 ///
@@ -309,180 +228,7 @@ pub struct AttachmentDto {
     pub size_bytes: i64,
 }
 
-/// SSE events. The `type` field is the discriminant; clients dispatch on it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ChatEvent {
-    /// Incremental text. Clients should append rather than replace, otherwise
-    /// the view flickers and reflows.
-    Delta { text: String },
-    /// Which memories were injected this turn — this is where "auditable"
-    /// lands in the UI, letting the user see on what grounds the agent answered
-    /// the way it did.
-    Memory { facts: Vec<FactDto> },
-    /// A tool call (the coding scenario).
-    Tool {
-        name: String,
-        summary: String,
-        /// The file path this call touched.
-        ///
-        /// **It has to be optional** — not every tool touches a file
-        /// (`memory_search` does not), and handing over an empty string makes
-        /// the client draw a file entry pointing at the root directory.
-        ///
-        /// A field of its own rather than having clients regex it out of
-        /// `summary`: the summary is human-readable natural language whose
-        /// wording changes at any time; once a client depends on its shape, one
-        /// rewording means **silently showing the wrong file** — no error, no
-        /// crash, just a pointer to a different file.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
-        /// What this write changed, for line-by-line coloured rendering.
-        /// `None` = nothing worth showing (tools that touch no file, and writes
-        /// whose content did not change by a single character).
-        ///
-        /// A field of its own rather than spliced into `summary`, for exactly
-        /// the same reason as `path`: the summary is one human-readable
-        /// sentence whose wording changes at any time, and once a client slices
-        /// structured content out of it, one rewording means **silently showing
-        /// the wrong thing**.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        diff: Option<String>,
-    },
-    /// **A high-risk tool call needs the user's confirmation. This turn is
-    /// already suspended, waiting for a receipt.**
-    ///
-    /// Clients should show `preview` to the user verbatim, then
-    /// `POST /confirmations` (carrying `token` and `decision`).
-    ///
-    /// # The ordering of this event relative to [`Self::Tool`] is not guaranteed
-    ///
-    /// The two travel on different internal channels (`Tool` is bridged from
-    /// agent events, this one is emitted directly by the host) and can swap
-    /// under concurrency. So this event **carries by itself** everything needed
-    /// to make the decision (tool name, risk level, full argument preview) and
-    /// depends on no preceding `Tool` event — a client must never render this
-    /// confirmation dialog based on "what the last Tool event said".
-    ///
-    /// # What happens if no receipt arrives
-    ///
-    /// After `timeout_secs` seconds the server treats it as a **rejection** and
-    /// carries on with the turn (the model is told "nobody answered"). The
-    /// client's still-open confirmation dialog is void at that point, and a
-    /// receipt sent afterwards gets a 404. Deliberately no extra "expired"
-    /// event is emitted for this: the client holds `timeout_secs` and can run
-    /// the countdown itself, whereas one more event is one more ordering to
-    /// handle.
-    Confirm {
-        /// A one-shot credential, returned verbatim with the receipt. 256 bits
-        /// of kernel randomness; unguessable.
-        token: String,
-        /// The name of the tool about to run.
-        tool: String,
-        /// The risk level: `"safe"` / `"write"` / `"execute"`. The set of
-        /// values is pinned by `cortex_agent::Risk::as_wire` — the same
-        /// literals as [`crate::confirm::PendingInfo::risk`], because the two
-        /// routes (live SSE and the catch-up list) have to be saying the same
-        /// thing.
-        ///
-        /// The server constructs it as a `&'static str`; here it has to be a
-        /// `String`, because **the CLI reads this event back** and a
-        /// `&'static str` cannot be deserialized into. That is why the CLI once
-        /// wrote a `ChatEvent` of its own — and consequently could never see
-        /// the newly added `scope` field.
-        risk: String,
-        /// The full arguments, for human reading. **Do not truncate before
-        /// displaying** — the server already truncated once and marked it
-        /// explicitly; a second cut by the client means the user approves the
-        /// half he never saw.
-        preview: String,
-        /// How many seconds until this is treated as a rejection.
-        timeout_secs: u64,
-        /// The absolute target path of an out-of-scope access. `None` = inside
-        /// the workspace, nothing out of scope.
-        ///
-        /// The UI should use it to say things plainly: "the agent wants to
-        /// write `C:\Users\x\Desktop\a.txt`, which is outside the current
-        /// workspace". Without it all the user sees is a `path` argument, and
-        /// he cannot tell whether that is inside the workspace or on his
-        /// desktop — two things whose consequences are far apart.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        scope: Option<String>,
-        /// What this write will turn the file into. `None` = no change worth
-        /// showing.
-        ///
-        /// # This field was very nearly left out here
-        ///
-        /// The diff was initially added only to `PendingMeta` / `PendingInfo`,
-        /// i.e. the **catch-up** route of `GET /confirmations`. But live
-        /// confirmation travels on this SSE event — so the dialog never had a
-        /// diff, and only the catch-up after a reconnect did.
-        ///
-        /// Both routes have to carry it: they are two ways of arriving at the
-        /// same thing, and the symptom of one missing is "usually absent,
-        /// occasionally present", which is harder to track down than being
-        /// absent altogether.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        diff: Option<String>,
-    },
-    /// Finished, carrying this turn's episode id for traceability.
-    Done { episode_id: String },
-    /// Something went wrong. Still returned as an SSE event, so that a client
-    /// is not left with a truncated stream and no way to tell why.
-    Error { message: String },
-}
-
 // ────────────────────── Tool confirmation (R11) ──────────────────────
-
-/// The request body of `POST /confirmations` — the upstream receipt.
-///
-/// # Why the token is in the **body** rather than the path
-///
-/// `POST /confirmations/{token}` would be more RESTful, but that token is a
-/// credential capable of approving a shell execution once, and paths land
-/// verbatim in access logs, in reverse-proxy logs, and in `history`. Bodies do
-/// not.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConfirmReceipt {
-    pub token: String,
-    pub decision: ConfirmDecision,
-}
-
-/// The user's answer.
-///
-/// An enum rather than `approve: bool`: a JSON `{"approve": "false"}` (a
-/// string) gets leniently parsed as `true` by plenty of client libraries, and
-/// the direction of a wrong guess here is **approving a command nobody ever
-/// approved**. Two hard-coded literals; a typo is a 400.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfirmDecision {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConfirmAck {
-    /// Always true — a receipt that was not accepted gets a 404 and never
-    /// reaches this point.
-    pub accepted: bool,
-}
-
-/// The response of `GET /confirmations`: the confirmations still awaiting an
-/// answer.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PendingConfirmations {
-    pub pending: Vec<crate::confirm::PendingInfo>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct PendingQuery {
-    /// Look at only one session's. Omit it to get all of them — a client that
-    /// has just reconnected does not yet know which session to care about, and
-    /// needs the whole picture before it can decide.
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
 
 // ──────────────────────── Authentication (R9) ────────────────────────
 
@@ -705,13 +451,14 @@ pub struct InjectedMemoryDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallDto {
     pub name: String,
-    /// See `path` on [`ChatEvent::Tool`].
+    /// Which file the call touched, when it touched one.
     pub path: Option<String>,
     pub summary: String,
     pub ok: bool,
-    /// See `diff` on [`ChatEvent::Tool`]. The persisted copy is **already
-    /// truncated** (the agent side truncates it; the database CHECK is the last
-    /// fence).
+    /// What the call changed, as a unified diff. **Already truncated when it
+    /// arrives**: the agent doing the truncating is the one that knows how big
+    /// its own diffs get, and the database CHECK is the last fence rather than
+    /// the first. This service stores what it is given; it never produces one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }
@@ -1156,8 +903,8 @@ pub struct SyncRecord {
 
 // ───────────────────────── /ws live sync ─────────────────────────
 
-/// WebSocket downstream events. The `type` field is the discriminant, following
-/// the same convention as [`ChatEvent`].
+/// WebSocket downstream events. The `type` field is the discriminant, the same
+/// externally-tagged shape every enum on this wire uses.
 ///
 /// # Why only a signal is pushed, never the data
 ///

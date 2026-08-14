@@ -53,7 +53,8 @@ use crate::tokenize;
 
 /// The predicate used for cross-domain links.
 ///
-/// It is not in [`crate::extract::DEFAULT_FUNCTIONAL`], which makes it a
+/// It is deliberately absent from the functional set that
+/// [`crate::extract::PredicateRules`] is built with by default, which makes it a
 /// **multi-valued** predicate: one entity can have several edges out without them
 /// superseding each other. That is what we want — one module may perfectly well
 /// correspond to both a decision from a meeting and a budget constraint at the

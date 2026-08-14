@@ -39,7 +39,7 @@ use cortex_proto::llm::{LlmStreamChunk, LlmStreamError, LlmStreamRequest};
 /// the existing tests are **all green**.
 ///
 /// This uses the same technique as `cortex-store`'s `table::ALL`: the macro
-/// generates [`PROTECTED_ROUTES`] while it expands the registration chain, and
+/// generates `PROTECTED_ROUTES` while it expands the registration chain, and
 /// `mod tests` uses it to hit the real `router()` entry by entry. Adding a route
 /// necessarily adds it to the inventory; it cannot be forgotten.
 ///
@@ -48,8 +48,12 @@ use cortex_proto::llm::{LlmStreamChunk, LlmStreamError, LlmStreamRequest};
 /// Every `.route()` comes first and `.route_layer()` is the final statement —
 /// axum's `route_layer` **only covers routes registered before it**. If somebody
 /// moves it into the middle, the routes after it lose authentication while
-/// remaining in [`PROTECTED_ROUTES`], so
+/// remaining in `PROTECTED_ROUTES`, so
 /// `every_protected_route_rejects_anonymous_requests` goes red on the spot.
+///
+/// (That inventory is `#[cfg(test)]` — it exists only for the tests that walk
+/// it, and it is deliberately not carried into a release binary, which is also
+/// why nothing here can link to it.)
 ///
 /// `$state` is **the name the caller binds that `AppState` to**.
 ///
@@ -1044,9 +1048,10 @@ impl ApiError {
     /// road that will never open"). So only a genuinely permanent absence
     /// deserves it.
     ///
-    /// The boundary with [`Self::conflict`]: that one says "the capability
-    /// exists, **this session** simply is not here", which the user can fix by
-    /// doing something; this one says "this road will never open".
+    /// The boundary with a 503 ([`cortex_core::CortexError::Unavailable`]): that
+    /// one says "the capability exists, it just cannot be had **right now**",
+    /// which a wait or a configuration change fixes; this one says "this road
+    /// will never open".
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self {
             message: Some(message.into()),
