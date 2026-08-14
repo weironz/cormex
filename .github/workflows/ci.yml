@@ -83,16 +83,25 @@ jobs:
         run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
 
       # ★ The two migration sets **have to be run separately, each with its version table
-      #   in its own schema**. The symptom of merging them is not "an error" but blowing up
-      #   halfway through account creation -- half the tables built, `_sqlx_migrations`
-      #   recording the other half, and every later run resuming from the middle.
-      #   The local equivalent is `just db-migrate`, where they are two separate lines too.
+      #   in its own schema**. Running them as two commands is not enough on its own:
+      #   `_sqlx_migrations` follows the connection's `search_path`, so two invocations
+      #   against the same default schema share one version table. The second one then
+      #   reports `migration 20260807000001 was previously applied but is missing in the
+      #   resolved migrations` -- it is looking at the first set's bookkeeping.
+      #
+      #   The runtime path does this correctly (`Store::migrate_global` creates the schema
+      #   and opens its own connection with `search_path=cortex_auth`, precisely because
+      #   `search_path` is a connection-level property and cannot be changed on a live
+      #   pool). CI has to mirror it rather than assume two commands are two namespaces.
       - name: Apply migrations
         run: |
+          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
           sqlx migrate run --source migrations
-          sqlx migrate run --source migrations-global
+          sqlx migrate run --source migrations-global \
+            --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth"
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
+          PGPASSWORD: postgres
 
       # ★ `--include-ignored` cannot be left out. Every test that needs a database is marked
       #   `#[ignore]`, and the default invocation skips them -- while in CI's output
