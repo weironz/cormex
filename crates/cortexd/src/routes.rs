@@ -284,12 +284,12 @@ async fn issue_ticket(State(st): State<AppState>) -> Json<TicketResponse> {
 /// 租户库连不上时同样按未分组：那时该报错的是紧接着的那次真正的读写，
 /// 而不是「决定用哪个容器」这一步 —— 在这里报，错误信息会指向一件
 /// 与病因完全无关的事。
-async fn sandbox_scope(
+async fn delegation_scope(
     st: &AppState,
     owner: &str,
     session_id: &str,
 ) -> (
-    crate::sandbox_token::SandboxScope,
+    crate::delegated_token::DelegatedScope,
     cortex_store::SessionRuntime,
 ) {
     // 项目与执行归属来自**同一行**。分两次查的话，两个判断会在并发改动下
@@ -305,7 +305,7 @@ async fn sandbox_scope(
         .as_ref()
         .map_or(cortex_store::SessionRuntime::Cloud, |s| s.runtime);
     (
-        crate::sandbox_token::SandboxScope {
+        crate::delegated_token::DelegatedScope {
             owner: owner.to_owned(),
             session_id: session_id.to_owned(),
             project: state.and_then(|s| s.project_id),
@@ -332,14 +332,14 @@ async fn sandbox_scope(
 /// 两个调用方：cortexd 自己那几条要摸容器的路由，以及 `POST /delegated-tokens`
 /// （agent 编排器走的那条）。**必须是同一份** —— 签发规则漂开的表现是
 /// 「换一条路进来的容器第二轮 401」，而那两条路的用户是不同的人群。
-fn delegate_token(st: &AppState, scope: crate::sandbox_token::SandboxScope) -> String {
+fn delegate_token(st: &AppState, scope: crate::delegated_token::DelegatedScope) -> String {
     let key = scope.key();
-    match st.sandbox_tokens().find_by_key(&key) {
+    match st.delegations().find_by_key(&key) {
         Some(t) => {
-            st.sandbox_tokens().rebind(&t, &scope.session_id);
+            st.delegations().rebind(&t, &scope.session_id);
             t
         }
-        None => st.sandbox_tokens().issue(scope),
+        None => st.delegations().issue(scope),
     }
 }
 
@@ -353,7 +353,7 @@ async fn delegate(
     Json(req): Json<cortex_proto::delegate::DelegateRequest>,
 ) -> Result<Json<cortex_proto::delegate::Delegation>, ApiError> {
     let owner = crate::accounts::current_user(&st, &headers).await;
-    let (scope, runtime) = sandbox_scope(&st, &owner, &req.session_id).await;
+    let (scope, runtime) = delegation_scope(&st, &owner, &req.session_id).await;
     let scope_key = scope.key();
     // 额度只**报告**不拦：这把钥匙不只用于对话，拿它列文件、下载工作区
     // 一个 token 都不花。见 `Delegation::quota_exhausted`
@@ -378,7 +378,7 @@ async fn revoke_delegation(
     State(st): State<AppState>,
     Json(req): Json<cortex_proto::delegate::RevokeRequest>,
 ) -> StatusCode {
-    st.sandbox_tokens().revoke(&req.token);
+    st.delegations().revoke(&req.token);
     StatusCode::NO_CONTENT
 }
 
@@ -544,10 +544,11 @@ async fn memory_search(
 async fn write_episode(
     State(st): State<AppState>,
     headers: HeaderMap,
-    // 沙箱令牌带的作用域，由认证中间件塞进来。**来源由凭据决定，
+    // 委托凭据带的作用域，由认证中间件塞进来。**来源由凭据决定，
     // 不由请求体决定** —— 这一点是整条记忆写入路径的关键：
-    // 让客户端自报「我是沙箱」等于让被注入的 agent 自己选信任级。
-    sandbox: Option<axum::Extension<crate::sandbox_token::SandboxScope>>,
+    // 让客户端自报「我是低信任的」等于让被注入的 agent 自己选信任级。
+    // `None` 表示这是一把完整的用户凭据，没有降级。
+    delegation: Option<axum::Extension<crate::delegated_token::DelegatedScope>>,
     Json(req): Json<NewEpisodeRequest>,
 ) -> Result<Json<EpisodeAck>, ApiError> {
     // **只有带 anchor 的那一条会花钱**（它触发抽取）。不带的只是落原文，
@@ -558,27 +559,29 @@ async fn write_episode(
         st.enforce_quota(&user).await?;
     }
     let tenant = st.tenant(&headers).await?;
-    // 沙箱只能写**它自己那个会话**。没有这一条的话，一个被注入的 agent
-    // 可以把编造的「用户说过的话」写进这个人的**任意**会话里 ——
+    // 被委托的调用方只能写**它自己那个会话**。没有这一条的话，一个被注入的
+    // agent 可以把编造的「用户说过的话」写进这个人的**任意**会话里 ——
     // 而作用域绑 session 的全部意义就在这儿
-    if let Some(axum::Extension(scope)) = &sandbox
+    if let Some(axum::Extension(scope)) = &delegation
         && scope.session_id != req.session_id
     {
         tracing::warn!(
             owner = %scope.owner, bound = %scope.session_id, attempted = %req.session_id,
-            "沙箱试图写别的会话"
+            "被委托的调用方试图写别的会话"
         );
-        return Err(ApiError::bad_request("沙箱只能写它自己那个会话的对话记录"));
+        return Err(ApiError::bad_request(
+            "这把凭据只能写它绑定的那个会话的对话记录",
+        ));
     }
     Ok(Json(
         st.write_episode(
             &tenant,
             req,
-            // **来源由凭据决定**（见上面那段）。沙箱令牌 → tier 3；
-            // 别的已认证凭据 → tier 2。第三方经 MCP 写进来的那一档
+            // **来源由凭据决定**（见上面那段）。委托凭据 → tier 3；
+            // 完整的用户凭据 → tier 2。第三方经 MCP 写进来的那一档
             // （tier 4）不走这条路由，走 `crate::mcp` 的 remember 工具
-            if sandbox.is_some() {
-                cortex_memory::extract::TurnOrigin::Sandbox
+            if delegation.is_some() {
+                cortex_memory::extract::TurnOrigin::Delegated
             } else {
                 cortex_memory::extract::TurnOrigin::Trusted
             },
@@ -1006,7 +1009,7 @@ mod tests {
             // 账号端点在没有它时会 panic，而那正是它们不该被路由到的信号
             accounts: None,
             access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
-            sandboxes: std::sync::Arc::new(crate::sandbox_token::SandboxTokens::default()),
+            delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
             // 路由测试不碰 docker。`sandbox: true` 的请求在这里会拿到
             // 「这个部署没有云沙箱」，而那正是它该拿到的
         };

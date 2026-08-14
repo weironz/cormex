@@ -299,7 +299,7 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         // 而 `/episodes` 与 `/memory/search` 是**穿透容器边界的持久通道**
         //（写进去的记忆会在未来所有会话、所有设备上被召回）。
         // 完整论证见 `sandbox_token` 的模块文档。
-        if let Some(scope) = st.sandbox_tokens().resolve(tok) {
+        if let Some(scope) = st.delegations().resolve(tok) {
             let (method, path) = (req.method().clone(), req.uri().path().to_owned());
             if scope.allows(&method, &path) {
                 // 作用域塞进扩展，供 handler 做**会话级**收窄

@@ -585,7 +585,7 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
         .write_candidates(
             &store,
             vec![candidate("beta", "project", "uses", "MySQL", None)],
-            &ctx(ep_sbx, ts(2026, 1, 2)).from(cortex_memory::extract::TurnOrigin::Sandbox),
+            &ctx(ep_sbx, ts(2026, 1, 2)).from(cortex_memory::extract::TurnOrigin::Delegated),
         )
         .await
         .expect("沙箱那轮同样应能落库");

@@ -114,26 +114,27 @@ pub struct ExtractContext {
 ///
 /// | | 谁在说 | 落到 |
 /// |---|---|---|
-/// | [`Self::Trusted`] | 用户自己，经我们的客户端 | tier 2 `conversation` |
-/// | [`Self::Sandbox`] | 云沙箱容器 | tier 3 `tool_output` |
+/// | [`Self::Trusted`] | 用户自己，经一把完整的用户凭据 | tier 2 `conversation` |
+/// | [`Self::Delegated`] | 持委托凭据的调用方（典型是沙箱容器） | tier 3 `tool_output` |
 /// | [`Self::External`] | 第三方 agent（MCP） | tier 4 `external` |
 ///
-/// # 为什么沙箱要降一档
+/// # 为什么被委托的那一档要降一级
 ///
-/// 沙箱里跑的是不可信代码：模型的输出、用户装的依赖、被 prompt 注入的
-/// 工具调用。它写回来的 `role: user` 文本**不是用户说的**，是那个容器
-/// 说的 —— 而容器可能已经被它自己读到的东西诱导。这与工具轨迹降到 tier 3
+/// 拿委托凭据的那一头跑的是不可信代码：模型的输出、用户装的依赖、被 prompt
+/// 注入的工具调用。它写回来的 `role: user` 文本**不是用户说的**，是那个
+/// 进程说的 —— 而它可能已经被自己读到的东西诱导。这与工具轨迹降到 tier 3
 /// 是同一个论证。
 ///
 /// # 为什么外部还要再降一档
 ///
-/// 沙箱至少是**我们起的**容器，跑的是用户让它干的活。第三方 agent 连这个
-/// 都不成立：那一头是谁、被喂了什么、有没有人在看，我们一概不知道。
+/// 被委托的那一头至少是**用户自己那把 bearer 换来的**，跑的是用户让它干的
+/// 活，而且作用域绑死在一个会话上。第三方 agent 连这个都不成立：那一头是
+/// 谁、被喂了什么、有没有人在看，我们一概不知道。
 ///
 /// # 为什么这一格是我们特有的
 ///
 /// 被投毒的 fact 会在**未来所有会话、所有设备**上被召回并注入 system
-/// prompt，而写它的那个容器 / 那个第三方早就不在了。四家云 agent 没有这条
+/// prompt，而写它的那个进程 / 那个第三方早就不在了。四家云 agent 没有这条
 /// 通道（它们的沙箱没有可写的长期记忆），所以没人替我们守。
 ///
 /// # 为什么是枚举而不是几个 bool
@@ -143,11 +144,12 @@ pub struct ExtractContext {
 /// 会出现，那时落哪一档全看代码里哪个 `if` 在前面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TurnOrigin {
-    /// 用户自己，经我们的客户端。**默认**。
+    /// 用户自己，经一把完整的用户凭据。**默认**。
     #[default]
     Trusted,
-    /// 云沙箱容器写回来的。
-    Sandbox,
+    /// 持委托凭据的调用方写回来的。至今唯一的实例是云沙箱容器，
+    /// 但这一档判的是凭据的信任级，不是它跑在哪里。
+    Delegated,
     /// 第三方 agent 经 MCP 写进来的。
     External,
 }
@@ -161,7 +163,7 @@ impl TurnOrigin {
     pub const fn conversation_channel(self) -> FactSource {
         match self {
             Self::Trusted => FactSource::Conversation,
-            Self::Sandbox => FactSource::ToolOutput,
+            Self::Delegated => FactSource::ToolOutput,
             Self::External => FactSource::External,
         }
     }

@@ -11,6 +11,7 @@ mod byo_key;
 mod cors;
 mod credentials;
 mod cursor;
+mod delegated_token;
 mod import;
 mod live;
 /// 记忆对外的 MCP 门面。见那个模块的头注释
@@ -19,7 +20,6 @@ mod quota;
 mod reembed;
 mod request_tenant;
 mod routes;
-mod sandbox_token;
 mod snapshots;
 mod state;
 mod sync_notify;

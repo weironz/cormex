@@ -1,37 +1,46 @@
-//! 沙箱令牌 —— 发给容器里那个 `cortex-local` 的凭据。
+//! 委托凭据 —— 记忆服务发给**不受信调用方**的短期钥匙。
 //!
-//! # 为什么不能把用户的登录 token 塞进容器
+//! 这不是沙箱基建，尽管沙箱是它至今唯一的调用方。这里回答的问题是
+//! 「**一个我不信任的东西，能在我身上干什么**」—— 那是记忆服务自己的
+//! 入站授权策略，与谁在外面跑容器无关。签发走 `POST /delegated-tokens`，
+//! 带的是**调用方自己那把 bearer**：没有服务凭据，也就没有越权面。
 //!
-//! 容器里跑的是**不可信代码**：模型的输出、用户装的依赖、被 prompt 注入的
+//! 下面的论证以沙箱为例，因为它是被真正验证过的那个场景。换成别的低信任
+//! 调用方（第三方 agent、CI 任务、一段临时脚本）每一条都照样成立。
+//!
+//! # 为什么不能把用户的登录 token 直接交出去
+//!
+//! 那一侧跑的是**不可信代码**：模型的输出、用户装的依赖、被 prompt 注入的
 //! 工具调用，全在里面。拿到用户的 bearer token 等于拿到那个人的全部记忆、
 //! 全部会话、全部附件。
 //!
 //! OpenHands 在这一点上走的是另一条路（把 LLM api key 直接发进容器，容器
-//! 自己连供应商）。我们不 —— key 留在 cortexd，容器经 `/llm/stream` 代理，
-//! 顺带天然有了配额与计费的位置。
+//! 自己连供应商）。我们不 —— key 留在记忆服务这边，调用方经 `/llm/stream`
+//! 代理，顺带天然有了配额与计费的位置。
 //!
-//! # 这个令牌的作用域**不只是一张路由白名单**
+//! # 这个凭据的作用域**不只是一张路由白名单**
 //!
 //! 这是本设计里最不显然的一处。四家云 agent（Codex / Claude web / Devin /
 //! Manus）都可以只做路由级隔离，因为**它们的沙箱没有可写的长期记忆**：
 //! 沙箱能碰的只有一个 clone 出来的 git 工作副本，坏了丢掉重来。
 //!
-//! 我们不同。沙箱要调 `POST /episodes`（写对话）与 `GET /memory/search`
-//! （查记忆），这两条是**穿透容器边界的持久通道**：
+//! 我们不同。调用方要调 `POST /episodes`（写对话）与 `GET /memory/search`
+//! （查记忆），这两条是**穿透那道边界的持久通道**：
 //!
 //! - `/episodes` 的 `role` 若由请求体自由决定，被注入的 agent 可以伪装成
 //!   「用户亲口说的」写进抽取管线 —— 那条 fact 会在**未来所有会话、所有
-//!   设备**上被召回并注入 system prompt。容器早就销毁了，记忆还在。
-//! - `/memory/search` 若按租户检索，沙箱能把该用户**其他会话**里的敏感记忆
-//!   捞出来，再经出网通道送走。
+//!   设备**上被召回并注入 system prompt。**容器早就销毁了，记忆还在。**
+//!   这一条是记忆服务独有的：进程死了、容器删了，它写进来的东西不跟着走。
+//! - `/memory/search` 若按租户检索，调用方能把该用户**其他会话**里的敏感
+//!   记忆捞出来，再经出网通道送走。
 //!
 //! 所以「爆炸半径已被容器限住」这句话对两家成立，对我们不成立。作用域必须
-//! 下沉到**语义**：见 [`SandboxScope`]。
+//! 下沉到**语义**：见 [`DelegatedScope`]。
 //!
-//! # 令牌与 session 绑定，不只与 owner 绑定
+//! # 凭据与 session 绑定，不只与 owner 绑定
 //!
-//! 一个用户可能有多个会话。沙箱只该看得见自己那一个 —— 否则「隔离」只隔到
-//! 了用户这一层，而同一个用户的两段工作之间同样需要边界（一段在处理公司
+//! 一个用户可能有多个会话。调用方只该看得见自己那一个 —— 否则「隔离」只隔
+//! 到了用户这一层，而同一个用户的两段工作之间同样需要边界（一段在处理公司
 //! 合同、另一段在跑一个从网上抄来的脚本）。
 
 use std::collections::HashMap;
@@ -42,12 +51,12 @@ use std::time::{Duration, Instant};
 ///
 /// 比票据（60 秒）长得多：这把是长连接用的，容器一活可能几小时。
 /// 但仍然有限 —— 容器被回收后令牌应当自然失效，而不是永远留在表里。
-/// 每次 [`SandboxTokens::touch`] 会续期，所以活跃的沙箱不会被误杀。
+/// 每次 [`DelegatedTokens::touch`] 会续期，所以活跃的沙箱不会被误杀。
 const TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// 沙箱能做什么。**按语义授权，不是按路由**。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxScope {
+pub struct DelegatedScope {
     /// 令牌属于谁。租户隔离仍然由它决定 —— 这一层是既有的。
     pub owner: String,
     /// 绑定的会话。沙箱只能读写这一个会话的东西。
@@ -59,7 +68,7 @@ pub struct SandboxScope {
     pub project: Option<String>,
 }
 
-impl SandboxScope {
+impl DelegatedScope {
     /// 容器与卷按这个键分。
     ///
     /// # 为什么按项目而不是按用户
@@ -162,13 +171,13 @@ fn is_session_path(path: &str) -> bool {
 /// 而那是**对的**：那些容器也需要被重新接管，让它们带着一把还能用的凭据
 /// 继续跑才是问题。
 #[derive(Default)]
-pub struct SandboxTokens {
-    inner: Mutex<HashMap<String, (SandboxScope, Instant)>>,
+pub struct DelegatedTokens {
+    inner: Mutex<HashMap<String, (DelegatedScope, Instant)>>,
 }
 
-impl SandboxTokens {
+impl DelegatedTokens {
     /// 签一把。调用方必须**已经**确认了 owner 的身份。
-    pub fn issue(&self, scope: SandboxScope) -> String {
+    pub fn issue(&self, scope: DelegatedScope) -> String {
         let mut buf = [0u8; 32];
         getrandom::fill(&mut buf).expect("内核熵源不可用，拒绝签发可预测的令牌");
         let token = hex::encode(buf);
@@ -183,7 +192,7 @@ impl SandboxTokens {
 
     /// 认这把令牌吗，认的话它的作用域是什么。顺带续期。
     #[must_use]
-    pub fn resolve(&self, token: &str) -> Option<SandboxScope> {
+    pub fn resolve(&self, token: &str) -> Option<DelegatedScope> {
         let mut guard = self.inner.lock().ok()?;
         let now = Instant::now();
         let (scope, at) = guard.get_mut(token)?;
@@ -206,7 +215,7 @@ impl SandboxTokens {
     /// 真机第一轮通、第二轮 401，就是这个。**令牌的生命周期跟着容器走**，
     /// 不跟着轮次走。
     ///
-    /// 按 [`SandboxScope::key`] 而不是按 owner 找：一个用户可以同时有几个
+    /// 按 [`DelegatedScope::key`] 而不是按 owner 找：一个用户可以同时有几个
     /// 项目的沙箱活着，拿错那把的后果是**把 A 项目的令牌塞给 B 项目的容器**
     /// —— 而容器起来之后照常应答，只是它认的是另一把，第二轮才 401。
     #[must_use]
@@ -249,16 +258,16 @@ mod tests {
     use super::*;
     use axum::http::Method;
 
-    fn scope() -> SandboxScope {
-        SandboxScope {
+    fn scope() -> DelegatedScope {
+        DelegatedScope {
             owner: "u1".into(),
             session_id: "s1".into(),
             project: None,
         }
     }
 
-    fn in_project(owner: &str, project: &str) -> SandboxScope {
-        SandboxScope {
+    fn in_project(owner: &str, project: &str) -> DelegatedScope {
+        DelegatedScope {
             owner: owner.into(),
             session_id: "s1".into(),
             project: Some(project.into()),
@@ -343,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_token_resolves_to_its_scope_and_an_unknown_one_does_not() {
-        let book = SandboxTokens::default();
+        let book = DelegatedTokens::default();
         let t = book.issue(scope());
         assert_eq!(book.resolve(&t).as_ref(), Some(&scope()));
         assert!(
@@ -354,7 +363,7 @@ mod tests {
 
     #[test]
     fn revoking_takes_effect_immediately() {
-        let book = SandboxTokens::default();
+        let book = DelegatedTokens::default();
         let t = book.issue(scope());
         book.revoke(&t);
         assert!(
@@ -397,13 +406,15 @@ mod tests {
     #[test]
     fn 作用域键拼出来的容器名不超过_dns_标签上限() {
         // 最长的现实输入：两个 26 字符的 ULID
-        let worst = SandboxScope {
+        let worst = DelegatedScope {
             owner: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             session_id: "s".into(),
             project: Some("01BX5ZZKBKACTAV9WEVGEMMVRZ".into()),
         };
-        // 与 `sandbox_runner` 的前缀对齐。两处写歪的后果不同：那边加长了
-        // 才会真的炸，所以这里取更长的那个（容器名）算
+        // `cortex-sbx-` 是编排那一侧（另一个仓库）给容器起名用的前缀。
+        // **它在这里是硬编码的常量，不是从那边 import 的** —— 两个仓库之间
+        // 只有 HTTP，没有共享的库。所以这条断言防的是「那边把前缀加长了而
+        // 这里不知道」：真炸在那边，但先在这里红
         let name_len = "cortex-sbx-".len() + worst.key().len();
         assert!(
             name_len <= 63,
@@ -438,7 +449,7 @@ mod tests {
 
     #[test]
     fn expired_tokens_are_swept_when_a_new_one_is_issued() {
-        let book = SandboxTokens::default();
+        let book = DelegatedTokens::default();
         {
             let mut g = book.inner.lock().unwrap();
             g.insert(

@@ -77,10 +77,10 @@ pub struct Runtime {
     /// 已签发的 access token。见 [`crate::accounts::AccessBook`]。
     pub access: Arc<crate::accounts::AccessBook>,
     /// 已签发的**沙箱**令牌。与上面两本簿子并列而不是合并：它是唯一一种
-    /// 带**语义作用域**的凭据（见 [`crate::sandbox_token::SandboxScope`]），
+    /// 带**语义作用域**的凭据（见 [`crate::delegated_token::DelegatedScope`]），
     /// 合进 `AccessBook` 会让「这把 token 能干什么」变成一个要在调用点
     /// 到处判断的问题。
-    pub sandboxes: Arc<crate::sandbox_token::SandboxTokens>,
+    pub delegations: Arc<crate::delegated_token::DelegatedTokens>,
 }
 
 /// 账号相关的两个句柄。
@@ -138,9 +138,9 @@ impl Runtime {
             // 与「数据库连不上」在日志里是两条不同的失败
             accounts: None,
             access: Arc::new(crate::accounts::AccessBook::default()),
-            sandboxes: Arc::new(crate::sandbox_token::SandboxTokens::default()),
-            // 由 main 在拿到配置后调 `with_sandbox` 补上：连 docker 要
-            // 试探一次 daemon，而 from_env 是同步的且不该做 IO
+            // 纯内存、随进程走。**刻意不落库**：进程重启后所有委托凭据失效，
+            // 而那是对的 —— 拿着它的那些调用方也需要被重新接管
+            delegations: Arc::new(crate::delegated_token::DelegatedTokens::default()),
         })
     }
 }
@@ -385,8 +385,8 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn sandbox_tokens(&self) -> &crate::sandbox_token::SandboxTokens {
-        &self.inner.rt.sandboxes
+    pub fn delegations(&self) -> &crate::delegated_token::DelegatedTokens {
+        &self.inner.rt.delegations
     }
 
     // ───────────────────────── 多租户 ─────────────────────────
