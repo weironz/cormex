@@ -1,0 +1,29 @@
+[package]
+name = "cortex-evals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cortex 检索质量评测 —— 没有它，调参就是玄学"
+publish = false
+
+[dependencies]
+cortex-core.workspace = true
+cortex-llm.workspace = true
+cortex-store.workspace = true
+cortex-memory.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# 版本沿用工作区声明，不在此另写版本号。
+# 评测与被评测代码必须编译进**同一份** sqlx —— 两份 sqlx-core 共存会让
+# `Store` 的类型对不上，直接编译失败（根 Cargo.toml 里 pgvector 那条注释同源）。
+chrono.workspace = true
+sqlx.workspace = true

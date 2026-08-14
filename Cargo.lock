@@ -1098,6 +1098,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-evals"
+version = "0.1.8"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "cortex-core",
+ "cortex-llm",
+ "cortex-memory",
+ "cortex-store",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cortex-import"
 version = "0.1.8"
 dependencies = [

@@ -9,6 +9,7 @@ members = [
     "crates/cortex-proto",
     "crates/cortex-import",
     "crates/cortexd",
+    "evals",
 ]
 
 [workspace.package]

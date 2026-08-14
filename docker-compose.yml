@@ -1,0 +1,234 @@
+name: cortex
+
+# ─── 关于下面每一处 `${CORTEX_BIND_ADDR:-127.0.0.1}:` ────────────────────
+#
+# 端口默认只绑**回环**而不是 `0.0.0.0`，收掉的是**局域网**那一面：
+# 一台开着 Wi-Fi 的开发机，原来是把带默认口令的 postgres 与对象存储
+# 摆在整个网段面前。
+#
+# # 但它挡不住沙箱容器 —— 这条是实测出来的，别照字面信
+#
+# 原以为这一改顺带也把沙箱关在外面了。真机测下来**不成立**（Docker Desktop
+# / Windows）：
+#
+#   沙箱内 → cortex-postgres:5432（DNS 名）        拒绝   ← 拓扑隔离生效
+#   沙箱内 → host.docker.internal:15432（绑 0.0.0.0）可达
+#   沙箱内 → host.docker.internal:15432（改绑 127.0.0.1 之后）**仍然可达**
+#
+# Docker Desktop 的端口转发跑在那台 Linux 虚拟机里，容器经
+# `host.docker.internal` 到达的正是转发器这一侧，绑不绑回环都一样。
+# 更难看的是同一次实测里它还连上了这台机器上**另一个项目**的 postgres
+# 与对象存储 —— 那两个不归这份 compose 管，改这里也管不着。
+#
+# 唯一实测有效的是把沙箱网段设成 `internal: true`（容器里连默认路由都没有，
+# `host.docker.internal` 解析得出、路由不过去，上面三条全部拒绝）。
+# 代价是**内部网段上已发布端口失效**（同样实测过：宿主 curl 连不上），
+# 而 cortexd 眼下正是靠已发布端口反代进容器的 —— 所以那一步要连着一个
+# 双宿的中继容器一起做，记在 roadmap 的 B3。
+#
+# 在原生 Linux 上（生产就是）绑回环**确实**是一道边界：docker-proxy 绑的是
+# 宿主 netns 的 127.0.0.1，容器经网桥网关 172.17.0.1 过来碰不到它。
+# 这一条是推理不是实测 —— 这台机器上没有原生 Linux docker 可验。
+# 而生产 `deploy/docker-compose.yml` 一个 `ports:` 都没有，本来就不暴露。
+#
+# 想从局域网另一台机器连，设 `CORTEX_BIND_ADDR=0.0.0.0`。
+#
+# **cortexd 自己的端口不在此列**：容器必须够得着它才能回调（记忆写入、
+# 拉历史），那条路由被沙箱令牌收窄到 5 条白名单路由 —— 那是有意留的门。
+services:
+  # ─── Postgres + pgvector ──────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: cortex-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cortex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cortex_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-cortex}
+      # 中文分词在 Rust 侧用 jieba-rs 完成，此处无需任何分词扩展
+      #
+      # 【新库才生效】initdb 的额外参数。data-checksums 让每一页都带校验和，
+      # 是「静默位翻转能被发现」的前提 —— 没有它，损坏会一路复制进备份。
+      # 已经建好的库改不了这个开关，用 `just pg-enable-checksums` 离线补
+      # （见 docs/operations.md）。
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---data-checksums}
+    # WAL 归档。archive_mode 只能在启动时设，所以写在 command 里而不是 SQL。
+    #   archive_timeout=60  即使没有写入也每 60s 强制切段 —— RPO 的上界由它决定
+    #   archive_command     文档标准写法：目标已存在就报错，绝不静默覆盖
+    #                       （同名不同内容的 WAL 段是灾难，宁可停下来让人看见）
+    #   summarize_wal=on    PG17 的 WAL 摘要器，pg_basebackup --incremental 的前提。
+    #                       现在用不上增量，但打开它才留得住这条升级路
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=mkdir -p /backup/wal && test ! -f /backup/wal/%f && cp %p /backup/wal/%f
+      - -c
+      - archive_timeout=60
+      - -c
+      - wal_level=replica
+      - -c
+      - wal_compression=on
+      - -c
+      - summarize_wal=on
+    ports:
+      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # 备份落在宿主机目录而不是 named volume：脚本要能直接读、能被 rclone
+      # 推到第二存储、能在容器全没了之后还翻得出来。默认 ./data/backup，
+      # 而仓库根的 data/ 已在 .gitignore 里。
+      - ${CORTEX_BACKUP_DIR:-./data/backup}:/backup
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cortex} -d ${POSTGRES_DB:-cortex}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ─── RustFS（S3 兼容对象存储）──────────────────────────
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: cortex-rustfs
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      # 开发环境单卷。四卷纠删码要求四块**独立物理盘**，
+      # 开发机只有一块盘时那是假冗余，RustFS 也会检测到共享设备并拒绝启动。
+      # 生产部署改为 /data/rustfs{0...3} 并挂到真实独立磁盘。
+      RUSTFS_VOLUMES: /data
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: ${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
+      # strict = 每次写入落盘后才确认。「永不丢失」的前提，勿调为 relaxed
+      RUSTFS_DURABILITY_MODE: strict
+      # RustFS 无按桶的 CORS 接口，允许来源是服务级配置。
+      # 开发环境放开，以便 Flutter Web 直接 presigned PUT。
+      RUSTFS_CORS_ALLOWED_ORIGINS: "*"
+      RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
+      RUSTFS_OBS_LOGGER_LEVEL: info
+    ports:
+      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_API_PORT:-9000}:9000"      # S3 API
+      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9001}:9001"  # 控制台
+    volumes:
+      - rustfs_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─── embedding 服务（OpenAI 兼容 /v1/embeddings）────────
+  #
+  # 放在 `embed` profile 里，**默认不起**。理由：它是这套栈里最重的一个
+  # （bge-m3 fp32 权重 2.2 GB，常驻 2.5–3 GB），而 `just up` 应该是
+  # 「起个数据库就能开工」，不该在开发机上默默吃掉 3 GB。
+  #
+  #   docker compose --profile embed up -d     # 想在本地自建
+  #
+  # 不想自建就把 .env 指到任何一家 OpenAI 兼容的服务：
+  #
+  #   CORTEX_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   CORTEX_EMBED_MODEL=text-embedding-v3
+  #   CORTEX_EMBED_API_KEY=sk-...
+  #
+  # 两条路都不走的话，离线开发用 CORTEX_EMBED_BACKEND=hash ——
+  # 但要记住**它不是语义空间**，检索质量的评测结果在它上面没有意义。
+  #
+  # **模型必须是 1024 维**：schema 写死 VECTOR(1024)。
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    container_name: cortex-embeddings
+    profiles: [embed]
+    restart: unless-stopped
+    command: >-
+      --model-id ${CORTEX_EMBED_SERVED_MODEL:-BAAI/bge-m3}
+      --port 80
+      --auto-truncate
+    environment:
+      HF_HOME: /data
+    ports:
+      # 开发时 cortexd 跑在宿主机上（不在 compose 里），所以要映出来。
+      # 对应 .env：CORTEX_EMBED_ENDPOINT=http://127.0.0.1:8090/v1/embeddings
+      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${CORTEX_EMBED_PORT:-8090}:80"
+    volumes:
+      - embed_models:/data
+    healthcheck:
+      # 权重载入完成前 /health 不通，正好当就绪探针。
+      # start_period 给 5 分钟：第一次要下 2.2 GB
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s
+
+  # ─── 沙箱网段唯一的双宿出口 ─────────────────────────────
+  #
+  # 放在 `sandbox` profile 里，**默认不起**（同 embeddings 的理由：
+  # `just up` 该是「起个数据库就能开工」）。
+  #
+  #   docker compose --profile sandbox up -d      # 或 just sandbox-up
+  #
+  # 它同时接两张网：
+  #   cortex-sandbox-net  internal，沙箱在这儿，**没有默认路由**
+  #   default             普通网桥，它靠这张网出去
+  #
+  # 于是它是这张拓扑上唯一两边都够得着的点，两个方向都由它做：
+  # 出网（沙箱 → 放行的外网）与反向中继（cortexd → 指定的沙箱容器）。
+networks:
+  default:
+    name: cortex_default
+
+volumes:
+  pg_data:
+  rustfs_data:
+  embed_models:
+
+  # ─── cortexd：记忆服务本体 ────────────────────────────
+  #
+  # 这一份是**独立可跑**的：Postgres + 对象存储 + 一个 LLM 供应商的 key，
+  # 没有别的前置。agent 那一侧（对话循环、容器编排）不在这个仓库里，
+  # 也不该在 —— 用它做记忆层的人一行都用不上。
+  cortexd:
+    build:
+      context: .
+      dockerfile: scripts/docker/Dockerfile.cortexd
+    image: ${CORTEXD_IMAGE:-cormex/cortexd:local}
+    container_name: cormex-cortexd
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD:-cortex_dev_only}@postgres:5432/${POSTGRES_DB:-cortex}
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: ${S3_BUCKET:-cortex-blobs}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
+      CORTEXD_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
+      # 不配任何凭据时 cortexd **拒绝启动**。要关就得显式说 —— 见 auth.rs
+      CORTEX_AUTH: ${CORTEX_AUTH:-}
+      CORTEX_TOKEN_SHA256: ${CORTEX_TOKEN_SHA256:-}
+      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
+      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
+      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
+      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
+      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
+      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
+      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CORTEX_SECRET_KEY: ${CORTEX_SECRET_KEY:-}
+    ports:
+      - "${CORTEXD_PORT:-8080}:8080"
+    networks:
+      - default
