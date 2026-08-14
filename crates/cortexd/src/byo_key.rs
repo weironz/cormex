@@ -43,14 +43,18 @@ const SECRET_KEY_ENV: &str = "CORTEX_SECRET_KEY";
 fn kek() -> Result<LessSafeKey, ApiError> {
     let raw = std::env::var(SECRET_KEY_ENV).map_err(|_| {
         ApiError::unsupported(format!(
-            "这个部署没有配 {SECRET_KEY_ENV}，不能保存 API key。\
-             管理员可以用 `openssl rand -hex 32` 生成一个填进 .env"
+            "this deployment has no {SECRET_KEY_ENV} configured, so API keys cannot be \
+             stored. An administrator can generate one with `openssl rand -hex 32` and \
+             put it in .env"
         ))
     })?;
     let bytes = hex::decode(raw.trim())
-        .map_err(|_| ApiError::internal(format!("{SECRET_KEY_ENV} 不是合法的 hex")))?;
-    let unbound = UnboundKey::new(&AES_256_GCM, &bytes)
-        .map_err(|_| ApiError::internal(format!("{SECRET_KEY_ENV} 必须是 32 字节（64 位 hex）")))?;
+        .map_err(|_| ApiError::internal(format!("{SECRET_KEY_ENV} is not valid hex")))?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &bytes).map_err(|_| {
+        ApiError::internal(format!(
+            "{SECRET_KEY_ENV} must be 32 bytes (64 hex characters)"
+        ))
+    })?;
     Ok(LessSafeKey::new(unbound))
 }
 
@@ -67,15 +71,19 @@ fn seal(plain: &str) -> Result<Vec<u8>, ApiError> {
 /// and the symptom is random failures. Actually observed.
 fn seal_with(key: &LessSafeKey, plain: &str) -> Result<Vec<u8>, ApiError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce_bytes)
-        .map_err(|_| ApiError::internal("内核熵源不可用，拒绝用可预测的 nonce 加密"))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|_| {
+        ApiError::internal(
+            "the kernel entropy source is unavailable; refusing to encrypt \
+         with a predictable nonce",
+        )
+    })?;
     let mut buf = plain.as_bytes().to_vec();
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce_bytes),
         Aad::empty(),
         &mut buf,
     )
-    .map_err(|_| ApiError::internal("加密失败"))?;
+    .map_err(|_| ApiError::internal("encryption failed"))?;
     let mut out = nonce_bytes.to_vec();
     out.extend_from_slice(&buf);
     Ok(out)
@@ -89,7 +97,9 @@ fn open(blob: &[u8]) -> Result<String, ApiError> {
 /// Same as above, but the caller supplies the key. Reasoning in [`seal_with`].
 fn open_with(key: &LessSafeKey, blob: &[u8]) -> Result<String, ApiError> {
     if blob.len() <= NONCE_LEN {
-        return Err(ApiError::internal("密文太短，库里那一行是坏的"));
+        return Err(ApiError::internal(
+            "the ciphertext is too short — that row in the database is corrupt",
+        ));
     }
     let (nonce_bytes, rest) = blob.split_at(NONCE_LEN);
     let nonce: [u8; NONCE_LEN] = nonce_bytes
@@ -102,11 +112,12 @@ fn open_with(key: &LessSafeKey, blob: &[u8]) -> Result<String, ApiError> {
             // The most likely cause is that the master key was rotated. Say so,
             // or this error reads like a corrupted database
             ApiError::internal(format!(
-                "解不开已存的 API key —— 多半是 {SECRET_KEY_ENV} 变了。\
-                 重新填一次即可"
+                "the stored API key cannot be decrypted — most likely {SECRET_KEY_ENV} \
+                 changed. Entering it again is all it takes"
             ))
         })?;
-    String::from_utf8(plain.to_vec()).map_err(|_| ApiError::internal("解出来的不是合法 UTF-8"))
+    String::from_utf8(plain.to_vec())
+        .map_err(|_| ApiError::internal("what came out is not valid UTF-8"))
 }
 
 /// The stored key, already decrypted.
@@ -171,7 +182,7 @@ impl AppState {
         .fetch_optional(store.pool())
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "读不出自带 key，这一轮走服务端的 key");
+            tracing::warn!(error = %e, "could not read the bring-your-own key; this turn uses the server's key");
             None
         })?;
 
@@ -186,7 +197,8 @@ impl AppState {
                 base_url,
             }),
             Err(e) => {
-                tracing::warn!(error = ?e, "自带 key 解不开，这一轮走服务端的 key");
+                tracing::warn!(error = ?e, "the bring-your-own key would not decrypt; this turn uses \
+                 the server's key");
                 None
             }
         }
@@ -229,7 +241,9 @@ pub async fn get(
     )
     .fetch_optional(store.pool())
     .await
-    .map_err(|e| ApiError::internal(format!("查不出自带 key 的状态：{e}")))?;
+    .map_err(|e| {
+        ApiError::internal(format!("could not read the bring-your-own key status: {e}"))
+    })?;
 
     Ok(Json(match row {
         Some((provider, key_tail, false, at, base_url)) => KeyStatus {
@@ -263,7 +277,7 @@ pub async fn put(
 ) -> Result<Json<KeyStatus>, ApiError> {
     let api_key = req.api_key.trim();
     if api_key.is_empty() {
-        return Err(ApiError::bad_request("API key 不能为空"));
+        return Err(ApiError::bad_request("the API key must not be empty"));
     }
     // Validate the provider name right here. Store a misspelled one and the
     // symptom does not appear until the next conversation — by which point the
@@ -273,7 +287,7 @@ pub async fn put(
         .any(|a| a == &req.provider)
     {
         return Err(ApiError::bad_request(format!(
-            "不认识的供应商 {}，可选：{}",
+            "unrecognised provider {}; available: {}",
             req.provider,
             cortex_llm::provider::available().join(" / ")
         )));
@@ -290,9 +304,11 @@ pub async fn put(
         .collect();
 
     let tenant = st.tenant(&headers).await?;
-    let store = tenant
-        .store()
-        .map_err(|e| ApiError::unsupported(format!("这个部署存不了自带 key：{e}")))?;
+    let store = tenant.store().map_err(|e| {
+        ApiError::unsupported(format!(
+            "this deployment cannot store a bring-your-own key: {e}"
+        ))
+    })?;
 
     sqlx::query(
         "INSERT INTO llm_keys (id, provider, ciphertext, key_tail, deleted, base_url)
@@ -310,9 +326,9 @@ pub async fn put(
     )
     .execute(store.pool())
     .await
-    .map_err(|e| ApiError::internal(format!("存不进去：{e}")))?;
+    .map_err(|e| ApiError::internal(format!("could not store it: {e}")))?;
 
-    tracing::info!(provider = %req.provider, "用户存了自带 API key");
+    tracing::info!(provider = %req.provider, "the user stored a bring-your-own API key");
     get(State(st), headers).await
 }
 
@@ -340,9 +356,9 @@ pub async fn delete(
     .bind(cortex_core::Id::new().to_string())
     .execute(store.pool())
     .await
-    .map_err(|e| ApiError::internal(format!("撤不掉：{e}")))?;
+    .map_err(|e| ApiError::internal(format!("could not revoke it: {e}")))?;
 
-    tracing::info!("用户撤下了自带 API key");
+    tracing::info!("the user removed their bring-your-own API key");
     get(State(st), headers).await
 }
 
@@ -364,7 +380,7 @@ mod tests {
         let blob = seal_with(&k, secret).expect("encrypt");
         assert!(
             !blob.windows(secret.len()).any(|w| w == secret.as_bytes()),
-            "the plaintext can be found verbatim inside the ciphertext —— no encryption happened \
+            "the plaintext can be found verbatim inside the ciphertext — no encryption happened \
              at all"
         );
         assert_eq!(open_with(&k, &blob).expect("decrypt"), secret);
@@ -383,7 +399,7 @@ mod tests {
         let b = seal_with(&k, "sk-same").expect("second encryption");
         assert_ne!(
             a, b,
-            "two encryptions produced identical output —— the nonce was reused"
+            "two encryptions produced identical output — the nonce was reused"
         );
     }
 
@@ -394,7 +410,7 @@ mod tests {
         let blob = seal_with(&test_key(0x33), "sk-rotate-me").expect("encrypt");
         assert!(
             open_with(&test_key(0x44), &blob).is_err(),
-            "a different key managed to decrypt it —— GCM's integrity check is not working, which \
+            "a different key managed to decrypt it — GCM's integrity check is not working, which \
              means a tampered ciphertext would pass too"
         );
     }
@@ -408,7 +424,7 @@ mod tests {
         blob[last] ^= 0x01;
         assert!(
             open_with(&k, &blob).is_err(),
-            "flipping one bit still decrypted —— that means this is not AEAD, and the row in the \
+            "flipping one bit still decrypted — that means this is not AEAD, and the row in the \
              database is replaceable by anyone who can write to it"
         );
     }
@@ -429,7 +445,7 @@ mod tests {
         }
         assert!(
             seal("sk-plain").is_err(),
-            "encryption succeeded without a master key —— the only way that happens is by storing \
+            "encryption succeeded without a master key — the only way that happens is by storing \
              the plaintext, and someone who believes they are protected by encryption is more \
              dangerous than someone who knows there is no protection"
         );

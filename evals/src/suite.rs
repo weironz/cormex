@@ -326,9 +326,13 @@ pub struct Question {
 impl Suite {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("读不到题集文件 {}", path.display()))?;
-        let suite: Self = serde_json::from_str(&raw)
-            .with_context(|| format!("题集 {} 不是合法的 JSON 或字段对不上", path.display()))?;
+            .with_context(|| format!("cannot read the suite file {}", path.display()))?;
+        let suite: Self = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "suite {} is not valid JSON, or its fields do not line up",
+                path.display()
+            )
+        })?;
         suite.validate()?;
         Ok(suite)
     }
@@ -341,15 +345,15 @@ impl Suite {
 
         for sc in &self.scenarios {
             if !seen.insert(format!("scenario:{}", sc.id)) {
-                bail!("场景 id 重复：{}", sc.id);
+                bail!("duplicate scenario id: {}", sc.id);
             }
             if sc.turns.is_empty() {
-                bail!("场景 {} 没有任何对话轮次", sc.id);
+                bail!("scenario {} has no conversation turns at all", sc.id);
             }
             for (i, turn) in sc.turns.iter().enumerate() {
                 parse_date(&turn.occurred_at).with_context(|| {
                     format!(
-                        "场景 {} 第 {} 轮的 occurred_at 不是 YYYY-MM-DD",
+                        "scenario {} turn {}: occurred_at is not YYYY-MM-DD",
                         sc.id,
                         i + 1
                     )
@@ -357,7 +361,7 @@ impl Suite {
                 if let Some(cp) = &turn.checkpoint
                     && !checkpoints.insert(cp.clone())
                 {
-                    bail!("checkpoint 名重复：{cp}");
+                    bail!("duplicate checkpoint name: {cp}");
                 }
                 for f in &turn.facts {
                     validate_fact(&sc.id, i + 1, f)?;
@@ -367,20 +371,23 @@ impl Suite {
         }
 
         if self.questions.is_empty() {
-            bail!("题集里一道题都没有");
+            bail!("the suite has no questions at all");
         }
 
         for q in &self.questions {
             if !seen.insert(format!("question:{}", q.id)) {
-                bail!("题目 id 重复：{}", q.id);
+                bail!("duplicate question id: {}", q.id);
             }
             if q.query.trim().is_empty() {
-                bail!("题目 {} 的 query 为空", q.id);
+                bail!("question {} has an empty query", q.id);
             }
             if let Some(cp) = &q.as_of
                 && !checkpoints.contains(cp)
             {
-                bail!("题目 {} 引用了不存在的 checkpoint「{cp}」", q.id);
+                bail!(
+                    "question {} references checkpoint \"{cp}\", which does not exist",
+                    q.id
+                );
             }
             for group in q
                 .gold
@@ -389,39 +396,44 @@ impl Suite {
                 .chain(q.never_extracted.iter())
             {
                 if group.is_empty() || group.iter().any(|s| s.trim().is_empty()) {
-                    bail!("题目 {} 的匹配组里有空串 —— 空串匹配一切，等于没写", q.id);
+                    bail!(
+                        "question {} has an empty string in a matcher group -- an empty string \
+                         matches everything, which is the same as writing nothing",
+                        q.id
+                    );
                 }
             }
             match q.kind {
                 QuestionKind::Unanswerable => {
                     if !q.gold.is_empty() {
-                        bail!("题目 {} 标为「应当召回不到」却给了 gold", q.id);
+                        bail!("question {} is marked unanswerable yet carries gold", q.id);
                     }
                     if q.forbidden.is_empty() {
                         bail!(
-                            "题目 {} 是「应当召回不到」，必须给 forbidden —— \
-                             否则这道题没有任何可判定的内容",
+                            "question {} is unanswerable and must carry forbidden -- otherwise there is \
+                             nothing in it that can be judged at all",
                             q.id
                         );
                     }
                 }
                 _ => {
                     if q.gold.is_empty() {
-                        bail!("题目 {} 没有 gold", q.id);
+                        bail!("question {} has no gold", q.id);
                     }
                 }
             }
             if q.kind == QuestionKind::TemporalReplay && q.as_of.is_none() {
                 bail!(
-                    "题目 {} 是时间回放题却没有 as_of —— \
-                     四路召回走的是当前有效集，回放不到任何东西",
+                    "question {} is a time-replay question but has no as_of -- the four legs query \
+                     the currently valid set and would replay nothing",
                     q.id
                 );
             }
             if q.kind == QuestionKind::ToolExperience && q.as_of.is_some() {
                 bail!(
-                    "题目 {} 是工具经验题却带了 as_of —— \
-                     回放走的是快照内三路，量到的是「当时库里有什么」而不是「抽取器能不能抽出来」",
+                    "question {} is a tool-experience question but carries as_of -- replay uses the \
+                     three legs inside the snapshot, which measures \"what was in the store then\" \
+                     rather than \"can the extractor extract it\"",
                     q.id
                 );
             }
@@ -432,7 +444,10 @@ impl Suite {
         let counts = self.count_by_kind();
         for kind in QuestionKind::all() {
             if counts.get(&kind).copied().unwrap_or(0) == 0 {
-                bail!("题型「{}」一道题都没有，评测有盲区", kind.label());
+                bail!(
+                    "question kind \"{}\" has no questions at all; the eval has a blind spot",
+                    kind.label()
+                );
             }
         }
 
@@ -448,7 +463,10 @@ impl Suite {
             > 0
             && self.tool_call_count() == 0
         {
-            bail!("题集有工具经验题，却没有任何 tool_calls 语料 —— 这类题永远无解");
+            bail!(
+                "the suite has tool-experience questions but no tool_calls corpus at all -- \
+                 that kind of question is then permanently unanswerable"
+            );
         }
 
         Ok(())
@@ -506,22 +524,25 @@ impl Suite {
 /// message stuck over on the Postgres side.
 fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<()> {
     for (i, c) in turn.tool_calls.iter().enumerate() {
-        let at = format!("场景 {scenario} 第 {turn_idx} 轮第 {} 次调用", i + 1);
+        let at = format!("scenario {scenario} turn {turn_idx} call {}", i + 1);
         if c.name.trim().is_empty() {
-            bail!("{at} 没有工具名");
+            bail!("{at} has no tool name");
         }
         if c.name.chars().count() > cortex_store::TOOL_NAME_MAX_CHARS {
             bail!(
-                "{at} 的工具名超过 {} 字符，落库会被 CHECK 打回",
+                "{at}: the tool name exceeds {} characters and the CHECK would reject the write",
                 cortex_store::TOOL_NAME_MAX_CHARS
             );
         }
         if c.summary.trim().is_empty() {
-            bail!("{at} 没有 summary —— 只剩「跑了个命令」，一点知识都表达不出来");
+            bail!(
+                "{at} has no summary -- all that is left is \"a command ran\", which expresses \
+                 no knowledge whatsoever"
+            );
         }
         if c.summary.chars().count() > cortex_store::TOOL_SUMMARY_MAX_CHARS {
             bail!(
-                "{at} 的 summary 超过 {} 字符，落库会被 CHECK 打回",
+                "{at}: the summary exceeds {} characters and the CHECK would reject the write",
                 cortex_store::TOOL_SUMMARY_MAX_CHARS
             );
         }
@@ -529,7 +550,7 @@ fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<(
             && p.chars().count() > cortex_store::TOOL_PATH_MAX_CHARS
         {
             bail!(
-                "{at} 的 path 超过 {} 字符，落库会被 CHECK 打回",
+                "{at}: the path exceeds {} characters and the CHECK would reject the write",
                 cortex_store::TOOL_PATH_MAX_CHARS
             );
         }
@@ -537,13 +558,16 @@ fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<(
 
     if turn.tool_calls.is_empty() && !(turn.tool_expect.is_empty() && turn.tool_avoid.is_empty()) {
         bail!(
-            "场景 {scenario} 第 {turn_idx} 轮声明了 tool_expect/tool_avoid 却没有 tool_calls —— \
-             那这个「应当抽出来」是凭空写的，不是从轨迹里来的"
+            "scenario {scenario} turn {turn_idx} declares tool_expect/tool_avoid but has no \
+             tool_calls -- that \"ought to be extracted\" is then made up out of thin air \
+             rather than coming from a trace"
         );
     }
     for s in turn.tool_expect.iter().chain(turn.tool_avoid.iter()) {
         if s.trim().is_empty() {
-            bail!("场景 {scenario} 第 {turn_idx} 轮的 tool_expect/tool_avoid 里有空串");
+            bail!(
+                "scenario {scenario} turn {turn_idx}: tool_expect/tool_avoid contains an empty string"
+            );
         }
     }
     Ok(())
@@ -553,22 +577,24 @@ fn validate_fact(scenario: &str, turn: usize, f: &SeedFact) -> Result<()> {
     match (&f.object, &f.object_entity) {
         (Some(_), None) | (None, Some(_)) => {}
         _ => bail!(
-            "场景 {scenario} 第 {turn} 轮的事实「{}」必须且只能给 object 与 object_entity 之一",
+            "scenario {scenario} turn {turn}: fact \"{}\" must give exactly one of object and \
+         object_entity",
             f.statement
         ),
     }
     if f.statement.trim().is_empty() {
-        bail!("场景 {scenario} 第 {turn} 轮有事实缺 statement");
+        bail!("scenario {scenario} turn {turn}: a fact is missing its statement");
     }
     if !(0.0..=1.0).contains(&f.confidence) {
         bail!(
-            "场景 {scenario} 第 {turn} 轮的 confidence {} 超出 schema 的 CHECK 范围",
+            "scenario {scenario} turn {turn}: confidence {} is outside the schema's CHECK range",
             f.confidence
         );
     }
     if let Some(v) = &f.valid_at {
-        parse_date(v)
-            .with_context(|| format!("场景 {scenario} 第 {turn} 轮的 valid_at 不是 YYYY-MM-DD"))?;
+        parse_date(v).with_context(|| {
+            format!("scenario {scenario} turn {turn}: valid_at is not YYYY-MM-DD")
+        })?;
     }
     Ok(())
 }
@@ -576,10 +602,10 @@ fn validate_fact(scenario: &str, turn: usize, f: &SeedFact) -> Result<()> {
 /// `YYYY-MM-DD` → midnight UTC.
 pub fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     let d = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-        .with_context(|| format!("「{s}」不是 YYYY-MM-DD"))?;
+        .with_context(|| format!("\"{s}\" is not YYYY-MM-DD"))?;
     d.and_hms_opt(0, 0, 0)
         .map(|dt| dt.and_utc())
-        .context("日期转不成时间戳")
+        .context("the date cannot be turned into a timestamp")
 }
 
 #[cfg(test)]
@@ -666,7 +692,7 @@ mod tests {
         let mut s = minimal();
         s.questions[1].id = s.questions[0].id.clone();
         let err = s.validate().expect_err("a duplicate id should be an error");
-        assert!(err.to_string().contains("重复"), "actual error: {err}");
+        assert!(err.to_string().contains("duplicate"), "actual error: {err}");
     }
 
     #[test]
@@ -760,7 +786,7 @@ mod tests {
             .validate()
             .expect_err("declaring tool_expect with no trace should be an error");
         assert!(
-            err.to_string().contains("凭空写的"),
+            err.to_string().contains("thin air"),
             "a \"should be extracted\" claim must rest on a trace: {err}"
         );
     }

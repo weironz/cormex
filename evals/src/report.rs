@@ -152,11 +152,11 @@ const WORST_SAMPLE: usize = 12;
 pub fn render_text(report: &Report) -> String {
     let mut s = String::with_capacity(8192);
 
-    let _ = writeln!(s, "# Cortex 检索评测报告");
+    let _ = writeln!(s, "# Cortex retrieval evaluation report");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "题集：{} {}　　{} 场景 / {} 轮对话 / {} 条铺垫事实 / {} 道题",
+        "suite: {} {}    {} scenarios / {} turns / {} seeded facts / {} questions",
         report.suite.name,
         report.suite.version,
         report.suite.scenarios,
@@ -167,7 +167,7 @@ pub fn render_text(report: &Report) -> String {
     let r = &report.run;
     let _ = writeln!(
         s,
-        "配置：mode={}　embedder={}　RRF k={}　召回宽度 bm25/vector/graph/recency = {}/{}/{}/{}",
+        "config: mode={}  embedder={}  RRF k={}  widths bm25/vector/graph/recency = {}/{}/{}/{}",
         r.mode,
         r.embedding_model,
         r.rrf_k,
@@ -178,35 +178,38 @@ pub fn render_text(report: &Report) -> String {
     );
     let _ = writeln!(
         s,
-        "　　　图遍历 {} 跳　近因回看 {} 天　episodes 宽度 {}　context {} token　注入预算 {} token　域加权 {}",
+        "        graph {} hops  recency window {} days  episodes width {}  context {} tokens  \
+         injection budget {} tokens  domain weighting {}",
         r.graph_hops,
         r.recent_days,
         r.width_episode,
         r.context_window,
         r.budget_tokens,
-        if r.domain_boost_off { "关" } else { "开" }
+        if r.domain_boost_off { "off" } else { "on" }
     );
     // This line is the A/B run's identity card: without printing it, two
     // reports side by side cannot be told apart
     let _ = writeln!(
         s,
-        "旋钮：弃权阈值 {:.4}　语义地板 {}　近因形态 {}　episodes 路 {}　强命中补偿 {}　回放 {}",
+        "knobs: abstain below {:.4}  semantic floor {}  recency shape {}  episodes leg {}  \
+         peak bonus {}  replay {}",
         r.abstain_below,
         r.semantic_floor
-            .map_or_else(|| "无".to_owned(), |v| format!("{v:.2}")),
+            .map_or_else(|| "none".to_owned(), |v| format!("{v:.2}")),
         r.recency_mode,
-        if r.episode_channel { "开" } else { "关" },
+        if r.episode_channel { "on" } else { "off" },
         r.peak_bonus,
         if r.replay_ranked {
-            "排序版"
+            "ranked"
         } else {
-            "全貌版"
+            "full-set"
         }
     );
     let c = &report.corpus;
     let _ = writeln!(
         s,
-        "语料：候选 {} → 写入 {}（重复丢弃 {}　被取代 {}　矛盾标记 {}）　实体 {}　最终事实 {}（有效 {}）",
+        "corpus: {} candidates -> {} written (dropped as duplicates {}  superseded {}  \
+         flagged as contradictory {})  entities {}  final facts {} ({} valid)",
         c.ingest.candidates,
         c.ingest.written,
         c.ingest.duplicates,
@@ -223,14 +226,16 @@ pub fn render_text(report: &Report) -> String {
         // and only this number tells them apart
         let _ = writeln!(
             s,
-            "工具轨迹：`episode_tool_calls` 落库 {} 行（抽取器读没读它，看下面 `tool_experience` 那一行的 gold 缺失数）",
+            "tool traces: {} rows landed in `episode_tool_calls` (whether the extractor read them \
+             shows up as the gold-missing count on the `tool_experience` row below)",
             c.tool_calls
         );
     }
     if let Some(cl) = &c.cross_links {
         let _ = writeln!(
             s,
-            "跨域连接：判定 {}　扫描 {} 条事实 → 候选 {} 对 → 接受 {} 对（度数/批次截掉 {}）→ 写入 {} 行",
+            "cross-domain links: judge {}  scanned {} facts -> {} candidate pairs -> {} accepted \
+             ({} cut by degree/batch caps) -> {} rows written",
             cl.judge, cl.scanned, cl.candidates, cl.accepted, cl.degree_capped, cl.written
         );
     }
@@ -241,7 +246,7 @@ pub fn render_text(report: &Report) -> String {
     {
         // The edges themselves have to be printed. "Wrote N" cannot decide
         // whether they are noise; reading them can
-        let _ = writeln!(s, "## 本次新增的跨域连接");
+        let _ = writeln!(s, "## Cross-domain links added by this run");
         let _ = writeln!(s);
         for l in &cl.links {
             let _ = writeln!(s, "- {l}");
@@ -249,38 +254,42 @@ pub fn render_text(report: &Report) -> String {
         let _ = writeln!(s);
     }
 
-    let _ = writeln!(s, "## 总体");
+    let _ = writeln!(s, "## Overall");
     let _ = writeln!(s);
     let _ = write!(
         s,
         "{}",
-        render_table(std::slice::from_ref(&report.overall), "口径")
+        render_table(std::slice::from_ref(&report.overall), "scope")
     );
     let _ = writeln!(s);
 
-    let _ = writeln!(s, "## 分题型");
+    let _ = writeln!(s, "## By question kind");
     let _ = writeln!(s);
-    let _ = write!(s, "{}", render_table(&report.by_kind, "题型"));
+    let _ = write!(s, "{}", render_table(&report.by_kind, "type"));
     let _ = writeln!(s);
 
-    let _ = writeln!(s, "## 分语种");
+    let _ = writeln!(s, "## By language");
     let _ = writeln!(s);
-    let _ = write!(s, "{}", render_table(&report.by_lang, "语种"));
+    let _ = write!(s, "{}", render_table(&report.by_lang, "language"));
     let _ = writeln!(s);
     let _ = writeln!(s, "{TABLE_LEGEND}");
 
-    let _ = writeln!(s, "## 逐路贡献（融合前的原始召回）");
+    let _ = writeln!(s, "## Per-leg contribution (raw retrieval, before fusion)");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "「独占」= 只有这一路捞到了 gold 的题数。**它才是某一路该不该保留的依据** ——"
+        "\"Exclusive\" = the number of questions only this leg caught. **That, and not \
+         coverage, is the basis for whether a leg deserves to stay** --"
     );
-    let _ = writeln!(s, "覆盖数高但独占数为 0，说明这一路完全可以被别的路替代。");
+    let _ = writeln!(
+        s,
+        "high coverage with zero exclusives means the leg can be entirely replaced by the others."
+    );
     let _ = writeln!(s);
     let _ = write!(s, "{}", render_channels(&report.overall));
     let _ = writeln!(s);
 
-    let _ = writeln!(s, "## 逐路贡献 · 分题型独占数");
+    let _ = writeln!(s, "## Per-leg contribution - exclusives by question kind");
     let _ = writeln!(s);
     let _ = write!(s, "{}", render_channel_matrix(&report.by_kind));
     let _ = writeln!(s);
@@ -293,27 +302,31 @@ pub fn render_text(report: &Report) -> String {
         .filter(|q| q.status != Status::Scored)
         .collect();
     if !broken.is_empty() {
-        let _ = writeln!(s, "## 题目问题（不计入检索指标）");
+        let _ = writeln!(
+            s,
+            "## Broken questions (excluded from the retrieval metrics)"
+        );
         let _ = writeln!(s);
         let _ = writeln!(
             s,
-            "gold 压根没落进库 = **抽取或题目**的问题，不是检索的问题。混进指标会让检索背锅。"
+            "gold never reaching the store at all is a problem of **extraction or of the question**, \
+         not of retrieval. Mixing it into the metrics charges retrieval for it."
         );
         let _ = writeln!(s);
         for q in &broken {
             let _ = writeln!(
                 s,
-                "- `{}` [{}] {:?}　gold：{}",
+                "- `{}` [{}] {:?}  gold: {}",
                 q.id,
                 q.kind.label(),
                 q.status,
-                q.gold_labels.join(" ／ ")
+                q.gold_labels.join(" / ")
             );
         }
         let _ = writeln!(s);
     }
 
-    let _ = writeln!(s, "## 最差的题");
+    let _ = writeln!(s, "## Worst questions");
     let _ = writeln!(s);
     let mut worst: Vec<&QuestionResult> = report
         .questions
@@ -341,25 +354,25 @@ pub fn render_text(report: &Report) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "- `{}` [{}/{}] RR={:.2}　gold 名次 {hit}　命中路 {}",
+            "- `{}` [{}/{}] RR={:.2}  gold rank {hit}  hit by {}",
             q.id,
             q.kind.label(),
             q.lang.label(),
             q.reciprocal_rank,
             if channels.is_empty() {
-                "无".to_owned()
+                "none".to_owned()
             } else {
                 channels.join(" ")
             }
         );
-        let _ = writeln!(s, "  查询：{}", q.query);
+        let _ = writeln!(s, "  query: {}", q.query);
         if let Some((i, label)) = q
             .gold_ranks
             .iter()
             .position(Option::is_none)
             .and_then(|i| q.gold_labels.get(i).map(|l| (i, l)))
         {
-            let _ = writeln!(s, "  漏召 gold[{i}]：{label}");
+            let _ = writeln!(s, "  missed gold[{i}]: {label}");
         }
     }
 
@@ -388,22 +401,26 @@ fn render_extraction(questions: &[QuestionResult]) -> String {
     let hit: usize = declared.iter().map(|q| q.leaked.len()).sum();
 
     let mut s = String::new();
-    let _ = writeln!(s, "## 抽取侧：不该被抽出来的东西");
-    let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "比对的是**语料快照**而不是检索结果 —— 排第几名无关紧要，**存在**本身就是失败。"
+        "## Extraction side: things that should never have been extracted"
     );
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "{} 道题声明了 {total} 条断言，泄漏 {hit} 条。",
+        "this compares against the **corpus snapshot**, not the retrieval result -- the rank is \
+         irrelevant, **existing at all** is the failure."
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "{} questions declare {total} assertions; {hit} leaked.",
         declared.len()
     );
     let _ = writeln!(s);
     for q in &leaked {
         for l in &q.leaked {
-            let _ = writeln!(s, "- ✗ `{}` 泄漏：{l}", q.id);
+            let _ = writeln!(s, "- ✗ `{}` leaked: {l}", q.id);
         }
     }
     if !leaked.is_empty() {
@@ -416,7 +433,8 @@ fn render_table(rows: &[Aggregate], head: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "| {head} | 题数 | 计分 | R@1 | R@5 | R@10 | R@∞ | MRR | 命中均名次 | 误召@5 | 平均注入条数 | gold 缺失 |"
+        "| {head} | count | scored | R@1 | R@5 | R@10 | R@∞ | MRR | mean hit rank | mis-retr.@5 \
+         | mean injected | gold missing |"
     );
     let _ = writeln!(
         s,
@@ -445,16 +463,16 @@ fn render_table(rows: &[Aggregate], head: &str) -> String {
 
 /// How to read the tables. Written once, shared by all three — an unexplained
 /// metric leaves nobody able to tell what to fix.
-const TABLE_LEGEND: &str = "> `R@∞` = 不限名次的召回率，与 `R@5` 的差额就是**排序**欠的债；\
-差额大该修融合，差额小该修召回。\n\
-> `平均注入条数` 在 `unanswerable` 那一行不为 0，就说明**检索器无法弃权** —— \
-没有答案时它照样会塞一整块记忆进 prompt。\n";
+const TABLE_LEGEND: &str = "> `R@∞` = recall with no rank limit; the gap from `R@5` is the debt \
+owed by **ranking** -- a large gap means fix the fusion, a small one means fix retrieval.\n\
+> `mean injected` not being 0 on the `unanswerable` row means the retriever **cannot abstain** -- \
+with no answer to give, it still stuffs a whole block of memory into the prompt.\n";
 
 fn render_channels(overall: &Aggregate) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "| 召回路 | 覆盖题数 | 独占题数 | 该路 R@5 | 平均召回条数 | 送进 top5 的干扰项 |"
+        "| leg | covered | exclusive | leg R@5 | mean retrieved | distractors sent into top 5 |"
     );
     let _ = writeln!(s, "|---|---:|---:|---:|---:|---:|");
     for (name, c) in &overall.channels {
@@ -467,7 +485,8 @@ fn render_channels(overall: &Aggregate) -> String {
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "（分母 = 走四路召回且可计分的题数 {}；时间回放题不发四路查询，已剔除）",
+        "(denominator = {} questions that go through the four legs and can be scored; \
+         time-replay questions do not issue a four-leg query and are excluded)",
         overall.channel_scored
     );
     s
@@ -480,9 +499,9 @@ fn render_channel_matrix(by_kind: &[Aggregate]) -> String {
         .map(|a| a.channels.keys().collect())
         .unwrap_or_default();
 
-    let _ = write!(s, "| 题型 |");
+    let _ = write!(s, "| type |");
     for n in &names {
-        let _ = write!(s, " {n} 覆盖/独占 |");
+        let _ = write!(s, " {n} covered/exclusive |");
     }
     let _ = writeln!(s);
     let _ = write!(s, "|---|");
@@ -526,7 +545,7 @@ mod tests {
 
     #[test]
     fn empty_aggregate_renders_without_nan() {
-        let table = render_table(&[aggregate("empty", &[])], "口径");
+        let table = render_table(&[aggregate("empty", &[])], "scope");
         assert!(
             !table.contains("NaN"),
             "a NaN would seep all the way into the CI comparison and must be \

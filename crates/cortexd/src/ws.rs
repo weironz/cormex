@@ -70,7 +70,7 @@ async fn serve(socket: WebSocket, st: AppState) {
                     // backfills from its own cursor — exactly the payoff of
                     // pushing only a signal
                     Err(RecvError::Lagged(n)) => {
-                        tracing::warn!(missed = n, "WS 订阅者滞后，降级为 resync");
+                        tracing::warn!(missed = n, "the WS subscriber fell behind; degrading to resync");
                         SyncEvent::Resync { cursor: st.latest_cursor().await }
                     }
                     // A closed bus means the server is shutting down
@@ -89,7 +89,7 @@ async fn serve(socket: WebSocket, st: AppState) {
                     // the connection hangs around until the heartbeat fails
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => {
-                        tracing::debug!(error = %e, "WS 读取出错，关闭连接");
+                        tracing::debug!(error = %e, "WS read error; closing the connection");
                         break;
                     }
                     Some(Ok(_)) => {}
@@ -114,7 +114,7 @@ async fn send(sink: &mut SplitSink<WebSocket, Message>, event: &SyncEvent) -> Re
     // strings), but if it somehow does, dropping the connection beats sending a
     // malformed frame: the client will at least reconnect
     let Ok(json) = serde_json::to_string(event) else {
-        tracing::error!("SyncEvent 序列化失败");
+        tracing::error!("could not serialize the SyncEvent");
         return Err(());
     };
     sink.send(Message::Text(Utf8Bytes::from(json)))

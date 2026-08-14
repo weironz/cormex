@@ -411,10 +411,11 @@ pub(crate) fn extract_json_blob(raw: &str) -> Option<&str> {
 /// trading accuracy for tidiness.
 pub fn parse_candidates(raw: &str) -> Result<Vec<CandidateFact>> {
     let blob = extract_json_blob(raw)
-        .ok_or_else(|| CortexError::Memory("抽取结果里找不到 JSON".into()))?;
+        .ok_or_else(|| CortexError::Memory("no JSON found in the extraction result".into()))?;
 
-    let value: Value = serde_json::from_str(blob)
-        .map_err(|e| CortexError::Memory(format!("抽取结果不是合法 JSON：{e}")))?;
+    let value: Value = serde_json::from_str(blob).map_err(|e| {
+        CortexError::Memory(format!("the extraction result is not valid JSON: {e}"))
+    })?;
 
     // The top level may be {"facts":[…]}, {"data":[…]}, or just […] directly
     let items = match &value {
@@ -433,7 +434,7 @@ pub fn parse_candidates(raw: &str) -> Result<Vec<CandidateFact>> {
     for item in items.iter().take(MAX_CANDIDATES) {
         match candidate_from_json(item) {
             Some(c) => out.push(c),
-            None => tracing::debug!(?item, "候选事实字段不全，跳过"),
+            None => tracing::debug!(?item, "candidate fact is missing fields, skipping"),
         }
     }
     Ok(out)
@@ -1009,7 +1010,7 @@ impl Extractor {
             tracing::warn!(
                 episode = %ctx.episode_id,
                 rule = rule.name(),
-                "本轮含凭据，跳过抽取（原文照常保留在 episodes）"
+                "this turn contains credentials; skipping extraction (the raw text stays in episodes as usual)"
             );
             return Ok(Vec::new());
         }
@@ -1024,7 +1025,7 @@ impl Extractor {
         tracing::debug!(
             episode = %ctx.episode_id,
             tokens = ?usage.usage.total_tokens,
-            "抽取完成"
+            "extraction finished"
         );
 
         parse_candidates(&raw)
@@ -1077,7 +1078,10 @@ impl Extractor {
         // blocked by it too.
         let source = ctx.episode_id.to_string();
         if store.is_redacted(RedactionTarget::Episode, &source).await? {
-            tracing::warn!(episode = %source, "出处已被抹除，放弃本轮抽取产物");
+            tracing::warn!(
+                episode = %source,
+                "the source has been redacted; dropping this turn's extraction output"
+            );
             return Ok(IngestReport {
                 candidates: candidates.len(),
                 ..IngestReport::default()
@@ -1155,7 +1159,7 @@ impl Extractor {
         let vectors = self.embedder.embed(&statements).await?;
         if vectors.len() != candidates.len() {
             return Err(CortexError::Memory(format!(
-                "embedder 返回 {} 条向量，与 {} 条事实不匹配",
+                "the embedder returned {} vectors, which does not match {} facts",
                 vectors.len(),
                 candidates.len()
             )));
@@ -1303,8 +1307,10 @@ impl Extractor {
                         // it has to be attached to both the old and the new side:
                         // the UI's "awaiting confirmation" list needs to show both
                         // of the mutually contradictory entries at once
-                        let reason =
-                            format!("与 {} 条同主谓事实冲突，事件时间相同", plan.flag.len());
+                        let reason = format!(
+                            "conflicts with {} fact(s) on the same subject and predicate, same event time",
+                            plan.flag.len()
+                        );
                         for old in &plan.flag {
                             let event = NewFactEvent::flag(*old, reason.clone(), device_id.clone());
                             tx.insert_fact_event(&event).await?;
@@ -1373,7 +1379,7 @@ impl Extractor {
                 episode = %ctx.episode_id,
                 calls = calls.len(),
                 candidates = out.len(),
-                "工具轨迹产出候选事实"
+                "tool traces produced candidate facts"
             );
         }
         Ok(out)
@@ -1393,7 +1399,10 @@ impl Extractor {
             // in that case it is better to skip the row than to fail the whole
             // turn's extraction.
             let Ok(fact_id) = f.id.parse::<Id>() else {
-                tracing::warn!(fact = %f.id, "事实 id 不是合法 ULID，矛盾判定跳过它");
+                tracing::warn!(
+                    fact = %f.id,
+                    "fact id is not a valid ULID; the contradiction check skips it"
+                );
                 continue;
             };
             out.push(Rival {
@@ -1438,7 +1447,7 @@ impl Extractor {
                 .await?
                 .unwrap_or_else(|| hit.id.clone());
             let id = canonical.parse::<Id>().map_err(|e| {
-                CortexError::Store(format!("实体 id {canonical} 不是合法 ULID：{e}"))
+                CortexError::Store(format!("entity id {canonical} is not a valid ULID: {e}"))
             })?;
             resolver.resolved.insert(cache_key, id);
             return Ok(id);
@@ -1454,7 +1463,7 @@ impl Extractor {
         {
             tracing::debug!(
                 name = %name, matched = %record.name, score,
-                "实体按向量近似归并"
+                "entity merged by vector approximation"
             );
             resolver.resolved.insert(cache_key, record.id);
             return Ok(record.id);
@@ -1504,10 +1513,9 @@ struct EntityResolution {
 
 impl EntityResolution {
     fn require(&self, r: &EntityRef) -> Result<Id> {
-        self.resolved
-            .get(&r.cache_key())
-            .copied()
-            .ok_or_else(|| CortexError::Memory(format!("实体 {}({}) 未经消解", r.name, r.kind)))
+        self.resolved.get(&r.cache_key()).copied().ok_or_else(|| {
+            CortexError::Memory(format!("entity {}({}) was never resolved", r.name, r.kind))
+        })
     }
 }
 

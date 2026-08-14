@@ -533,13 +533,16 @@ impl SyncNotifications {
                     Ok(listener) => {
                         self.backoff = RECONNECT_MIN;
                         self.listener = Some(listener);
-                        tracing::info!(channel = %channel, "已订阅 Postgres 通知通道");
+                        tracing::info!(
+                            channel = %channel,
+                            "subscribed to the Postgres notification channel"
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             backoff_secs = self.backoff.as_secs(),
-                            "订阅通知通道失败"
+                            "subscribing to the notification channel failed"
                         );
                         self.sleep_backoff().await;
                         continue;
@@ -584,7 +587,10 @@ impl SyncNotifications {
                 // already been reconnected
                 Ok(None) => {
                     let cursor = self.cursor_or_zero().await;
-                    tracing::warn!(cursor, "通知连接曾中断，降级为 resync");
+                    tracing::warn!(
+                        cursor,
+                        "notification connection dropped; degrading to resync"
+                    );
                     return Some(SyncSignal::Resync { cursor });
                 }
                 Err(e) => {
@@ -592,7 +598,10 @@ impl SyncNotifications {
                     // check at the top of the next iteration recognizes it and
                     // wraps up, so no backoff is wasted
                     self.listener = None;
-                    tracing::warn!(error = %e, "通知连接出错，将重连");
+                    tracing::warn!(
+                        error = %e,
+                        "the notification connection errored; will reconnect"
+                    );
                     self.sleep_backoff().await;
                 }
             }
@@ -605,7 +614,7 @@ impl SyncNotifications {
     /// err on the small side.
     async fn cursor_or_zero(&self) -> i64 {
         self.store.latest_seq().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "读取 latest_seq 失败，按 0 下发");
+            tracing::warn!(error = %e, "reading latest_seq failed; sending 0 instead");
             0
         })
     }
@@ -684,7 +693,7 @@ impl Store {
         sqlx::query(CREATE_TRIGGER_SQL).execute(&mut *tx).await?;
 
         tx.commit().await?;
-        tracing::info!(channel = %channel, "sync_log 通知触发器就绪");
+        tracing::info!(channel = %channel, "the sync_log notification trigger is ready");
         Ok(())
     }
 
@@ -700,7 +709,10 @@ impl Store {
     /// doesn't refresh".
     pub async fn listen_sync(&self) -> SyncNotifications {
         if let Err(e) = self.install_sync_notify().await {
-            tracing::error!(error = %e, "安装 sync_log 通知触发器失败，实时推送可能不可用");
+            tracing::error!(
+                error = %e,
+                "installing the sync_log notification trigger failed; live push may be unavailable"
+            );
         }
         SyncNotifications {
             store: self.clone(),

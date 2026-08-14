@@ -200,7 +200,7 @@ impl BlobStore for LocalFsBlobStore {
 
         if buf.is_empty() {
             return Err(BlobError::InvalidRange(format!(
-                "区间 [{}, {}) 完全落在 {hash} 之外",
+                "range [{}, {}) falls entirely outside {hash}",
                 range.start, range.end
             )));
         }
@@ -219,7 +219,7 @@ impl BlobStore for LocalFsBlobStore {
         hash::validate_hash(hash)?;
         validate_ttl(ttl)?;
         Err(BlobError::Unsupported(
-            "LocalFsBlobStore 无法签发 presigned URL，请改走服务端中转或换用 S3BlobStore",
+            "LocalFsBlobStore cannot issue presigned URLs; relay via the server or use S3BlobStore",
         ))
     }
 
@@ -227,7 +227,7 @@ impl BlobStore for LocalFsBlobStore {
         hash::validate_hash(hash)?;
         validate_ttl(ttl)?;
         Err(BlobError::Unsupported(
-            "LocalFsBlobStore 无法签发 presigned URL，请改走服务端中转或换用 S3BlobStore",
+            "LocalFsBlobStore cannot issue presigned URLs; relay via the server or use S3BlobStore",
         ))
     }
 

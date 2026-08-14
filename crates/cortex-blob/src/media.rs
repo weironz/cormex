@@ -117,7 +117,12 @@ pub fn probe(bytes: &[u8]) -> MediaMeta {
             // itself is stored regardless, and missing dimensions only cost the
             // front end one layout hint.
             Err(e) => {
-                tracing::debug!(error = %e, mime = m, "认出是图片但读不出尺寸，按未知处理");
+                tracing::debug!(
+                    error = %e,
+                    mime = m,
+                    "recognized as an image but the dimensions could not be read; \
+                     treating them as unknown"
+                );
                 (None, None)
             }
         },

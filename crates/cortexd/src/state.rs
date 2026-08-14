@@ -118,7 +118,9 @@ impl Accounts {
     pub async fn connect(database_url: &str) -> Result<Self> {
         cortex_store::Store::migrate_global(database_url)
             .await
-            .map_err(|e| cortex_core::CortexError::Store(format!("全局 schema 迁移失败：{e}")))?;
+            .map_err(|e| {
+                cortex_core::CortexError::Store(format!("the global schema migration failed: {e}"))
+            })?;
 
         let options = std::str::FromStr::from_str(database_url)
             .map(|o: sqlx::postgres::PgConnectOptions| {
@@ -128,13 +130,15 @@ impl Accounts {
                 o.options([("search_path", "cortex_auth,public")])
             })
             .map_err(|e: sqlx::Error| {
-                cortex_core::CortexError::Config(format!("DATABASE_URL 不合法：{e}"))
+                cortex_core::CortexError::Config(format!("DATABASE_URL is malformed: {e}"))
             })?;
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect_with(options)
             .await
-            .map_err(|e| cortex_core::CortexError::Store(format!("连 cortex_auth 失败：{e}")))?;
+            .map_err(|e| {
+                cortex_core::CortexError::Store(format!("could not connect to cortex_auth: {e}"))
+            })?;
 
         Ok(Self {
             pool,
@@ -178,7 +182,8 @@ impl AppState {
     pub fn accounts(&self) -> Result<&Accounts, crate::routes::ApiError> {
         self.inner.rt.accounts.as_ref().ok_or_else(|| {
             crate::routes::ApiError::unsupported(
-                "这个部署没有接数据库，账号功能不可用（当前跑在 mock 后端上）",
+                "this deployment has no database attached, so accounts are \
+                 unavailable (it is running on the mock backend)",
             )
         })
     }
@@ -259,7 +264,7 @@ impl BackendChoice {
             "live" | "real" => Ok(Self::Live),
             "mock" | "fake" => Ok(Self::Mock),
             other => Err(cortex_core::CortexError::Config(format!(
-                "未知的 CORTEX_BACKEND={other:?}，可选：live / mock"
+                "unknown CORTEX_BACKEND={other:?}; the choices are live / mock"
             ))),
         }
     }
@@ -353,7 +358,7 @@ impl AppState {
                 tracing::info!(
                     tenants = results.len(),
                     failed = bad,
-                    "已有租户的 migration 跑完"
+                    "finished migrating the existing tenants"
                 );
             }
         }
@@ -470,7 +475,7 @@ impl AppState {
         )
         .fetch_all(&acc.pool)
         .await
-        .map_err(|e| CortexError::Store(format!("列不出租户：{e}")))?;
+        .map_err(|e| CortexError::Store(format!("could not list the tenants: {e}")))?;
 
         Ok(names
             .iter()
@@ -479,7 +484,7 @@ impl AppState {
                 Err(e) => {
                     // Skip rather than failing the whole batch: one bad row
                     // must not halt everybody's backfill
-                    tracing::error!(schema = n, error = %e, "跳过一个 schema 名不合法的租户");
+                    tracing::error!(schema = n, error = %e, "skipping a tenant whose schema name is invalid");
                     None
                 }
             })
@@ -495,16 +500,18 @@ impl AppState {
         schema: &cortex_store::SchemaName,
     ) -> Result<std::sync::Arc<cortex_store::Store>> {
         if schema.as_str() == cortex_store::SchemaName::public().as_str() {
-            return self
-                .public_store()
-                .ok_or_else(|| CortexError::Unavailable("mock 后端没有库".into()));
+            return self.public_store().ok_or_else(|| {
+                CortexError::Unavailable("the mock backend has no database".into())
+            });
         }
         self.accounts()
-            .map_err(|_| CortexError::Unavailable("没接账号体系".into()))?
+            .map_err(|_| CortexError::Unavailable("no accounts system is attached".into()))?
             .tenants
             .get(schema)
             .await
-            .map_err(|e| CortexError::Store(format!("连不上 {}：{e}", schema.as_str())))
+            .map_err(|e| {
+                CortexError::Store(format!("could not connect to {}: {e}", schema.as_str()))
+            })
     }
 
     /// The `public` pool — the one built at startup. Absent under the mock
@@ -625,14 +632,13 @@ impl AppState {
         &self,
         user_id: &str,
     ) -> Result<std::sync::Arc<cortex_store::Store>> {
-        match self
-            .tenant_for_user(user_id)
-            .await
-            .map_err(|e| CortexError::Store(format!("解析 {user_id} 的租户失败：{e:?}")))?
-        {
+        match self.tenant_for_user(user_id).await.map_err(|e| {
+            CortexError::Store(format!("could not resolve the tenant for {user_id}: {e:?}"))
+        })? {
             crate::request_tenant::Tenant::Live { store, .. } => Ok(store),
             crate::request_tenant::Tenant::Mock => Err(CortexError::Unavailable(
-                "本实例跑在 mock 后端上，没有可写的库".into(),
+                "this instance runs on the mock backend, so there is no database to write to"
+                    .into(),
             )),
         }
     }
@@ -680,13 +686,13 @@ impl AppState {
     pub async fn commit_blob(&self, tenant: &Tenant, req: BlobCommitRequest) -> Result<BlobDto> {
         if req.size_bytes < 0 {
             return Err(CortexError::Invalid(format!(
-                "size_bytes 不能为负：{}",
+                "size_bytes must not be negative: {}",
                 req.size_bytes
             )));
         }
         if !self.inner.blobs.exists(&req.hash).await? {
             return Err(CortexError::Invalid(format!(
-                "对象 {} 不在对象存储里；请先 PUT 到 presigned URL 再来登记",
+                "object {} is not in object storage; PUT it to the presigned URL before registering it",
                 req.hash
             )));
         }
@@ -744,7 +750,7 @@ impl AppState {
                         // while the bytes are still referenced by B
                         storage_key: cortex_blob::hash::storage_key(
                             &cortex_blob::TenantPrefix::new(tenant.schema()).map_err(|e| {
-                                CortexError::Invalid(format!("租户前缀不合法：{e}"))
+                                CortexError::Invalid(format!("the tenant prefix is invalid: {e}"))
                             })?,
                             hash,
                         )?,
@@ -842,7 +848,7 @@ impl AppState {
     ) -> Result<EpisodeAck> {
         match &self.inner.backend {
             Backend::Mock => Err(CortexError::Unavailable(
-                "本实例跑在 mock 后端上，没有可写入的记忆库".into(),
+                "this instance runs on the mock backend, so there is no memory database to write to".into(),
             )),
             Backend::Live(l) => l.bind(tenant.store()?).write_episode(req, origin).await,
         }
@@ -866,7 +872,8 @@ impl AppState {
     ) -> Result<MessageStream> {
         match &self.inner.backend {
             Backend::Mock => Err(CortexError::Unavailable(
-                "本实例跑在 mock 后端上，没有可用的 LLM 供应商".into(),
+                "this instance runs on the mock backend, so there is no LLM provider available"
+                    .into(),
             )),
             Backend::Live(l) => l.llm_stream_with_key(req, own).await,
         }
@@ -1040,7 +1047,9 @@ impl AppState {
         match &self.inner.backend {
             Backend::Mock => {
                 let name = patch.name.as_deref().ok_or_else(|| {
-                    CortexError::Invalid("请求体里没有任何要改的字段（name）".into())
+                    CortexError::Invalid(
+                        "the request body contains no field to change (name)".into(),
+                    )
                 })?;
                 let mut p = mock_projects()
                     .into_iter()
@@ -1080,7 +1089,7 @@ impl AppState {
                 s.id = id.to_string();
                 if let Some(t) = patch.title.as_deref() {
                     if t.trim().is_empty() {
-                        return Err(CortexError::Invalid("标题不能为空白".into()));
+                        return Err(CortexError::Invalid("the title must not be blank".into()));
                     }
                     s.title = t.trim().to_string();
                     s.title_is_custom = true;
@@ -1173,7 +1182,9 @@ fn mock_episode(id: &str) -> EpisodeDto {
         id: id.to_string(),
         session_id: "01JSESSION0000000000000001".into(),
         role: "user".into(),
-        text: Some("对象存储先用 RustFS，第一版单卷即可。".into()),
+        text: Some(
+            "Let's start with RustFS for object storage; one volume is enough for v1.".into(),
+        ),
         occurred_at: Utc::now().to_rfc3339(),
         attachments: vec![],
         // Fabricate one injection attribution so the client can actually draw
@@ -1181,7 +1192,7 @@ fn mock_episode(id: &str) -> EpisodeDto {
         // same reasoning as mock_chat_stream fabricating memory events
         memories: vec![InjectedMemoryDto {
             fact_id: "01JFACT00000000000000001".into(),
-            statement: Some("Cortex 的对象存储使用 RustFS".into()),
+            statement: Some("Cortex uses RustFS for object storage".into()),
             domain: Some("coding".into()),
             channels: vec!["bm25".into(), "vector".into()],
             score: Some(0.032),
@@ -1200,7 +1211,7 @@ fn mock_episode(id: &str) -> EpisodeDto {
 fn mock_projects() -> Vec<ProjectDto> {
     vec![ProjectDto {
         id: MOCK_PROJECT.into(),
-        name: "Cortex 自研".into(),
+        name: "Cortex In-House".into(),
         created_at: Utc::now().to_rfc3339(),
         session_count: 1,
     }]
@@ -1216,11 +1227,11 @@ fn mock_sessions() -> Vec<SessionDto> {
     vec![
         SessionDto {
             id: "01JSESSION0000000000000001".into(),
-            title: "技术选型讨论".into(),
+            title: "Picking the tech stack".into(),
             created_at: now.clone(),
             updated_at: now.clone(),
             message_count: 12,
-            preview: Some("那就先按 RustFS 单卷来。".into()),
+            preview: Some("A single RustFS volume it is, then.".into()),
             title_is_custom: false,
             archived: false,
             workspace: None,
@@ -1229,11 +1240,11 @@ fn mock_sessions() -> Vec<SessionDto> {
         },
         SessionDto {
             id: "01JSESSION0000000000000002".into(),
-            title: "记忆 schema 设计".into(),
+            title: "Memory schema design".into(),
             created_at: now.clone(),
             updated_at: now,
             message_count: 34,
-            preview: Some("sync_log 用单游标，跨全部表。".into()),
+            preview: Some("sync_log uses one cursor across every table.".into()),
             title_is_custom: false,
             archived: false,
             // Deliberately no invented path: mock's consumer is the client's
@@ -1261,7 +1272,7 @@ fn mock_facts() -> Vec<FactDto> {
     vec![
         FactDto {
             id: Id::new().to_string(),
-            statement: "Cortex 的对象存储使用 RustFS".into(),
+            statement: "Cortex uses RustFS for object storage".into(),
             predicate: Some("uses_object_storage".into()),
             domain: Some("coding".into()),
             confidence: 0.95,
@@ -1274,7 +1285,7 @@ fn mock_facts() -> Vec<FactDto> {
         },
         FactDto {
             id: Id::new().to_string(),
-            statement: "全部图形界面统一用 Flutter，六端一套代码".into(),
+            statement: "Every GUI is Flutter — one codebase across six platforms".into(),
             predicate: Some("decided".into()),
             domain: Some("coding".into()),
             confidence: 0.9,
@@ -1293,7 +1304,7 @@ fn mock_facts() -> Vec<FactDto> {
         // redacted or superseded
         FactDto {
             id: Id::new().to_string(),
-            statement: "同步协议采用裸 BIGSERIAL 游标".into(),
+            statement: "The sync protocol uses a bare BIGSERIAL cursor".into(),
             predicate: Some("decided".into()),
             domain: Some("coding".into()),
             confidence: 0.72,
@@ -1306,7 +1317,8 @@ fn mock_facts() -> Vec<FactDto> {
         },
         FactDto {
             id: Id::new().to_string(),
-            statement: "同步协议采用 sync_log outbox + advisory lock 串行化".into(),
+            statement: "The sync protocol uses a sync_log outbox serialized by an advisory lock"
+                .into(),
             predicate: Some("decided".into()),
             domain: Some("coding".into()),
             confidence: 1.0,

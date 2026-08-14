@@ -56,7 +56,7 @@ impl SyncBus {
                 // here
                 let _ = bus_tx.send(to_event(signal));
             }
-            tracing::info!("存储层已关闭，同步信号转发任务收工");
+            tracing::info!("the storage layer shut down; the sync-signal forwarder is done");
         });
 
         Self { tx }

@@ -17,7 +17,7 @@ pub enum BlobError {
     /// enters a storage path, and none of `..` / `/` / `\` is a hex character,
     /// so blocking it dead here makes every downstream path concatenation
     /// permanently safe.
-    #[error("非法 blob 哈希：{0}")]
+    #[error("invalid blob hash: {0}")]
     InvalidHash(String),
 
     /// The tenant prefix is not a legal unquoted Postgres identifier.
@@ -29,14 +29,14 @@ pub enum BlobError {
     /// wrong (the prefix never comes from a request body). Blend them into one
     /// log line and "a user sent dirty data" can never again be separated from
     /// "something is wrong with our tenant registry".
-    #[error("非法租户前缀：{0}")]
+    #[error("invalid tenant prefix: {0}")]
     InvalidTenant(String),
 
-    #[error("blob 不存在：{0}")]
+    #[error("no such blob: {0}")]
     NotFound(String),
 
     /// The requested byte range is out of bounds or has its ends reversed.
-    #[error("非法 range：{0}")]
+    #[error("invalid range: {0}")]
     InvalidRange(String),
 
     /// The backend does not support this capability (for instance
@@ -44,13 +44,13 @@ pub enum BlobError {
     /// own so that callers can **degrade explicitly** (falling back to relaying
     /// through the server) rather than treating it as an ordinary failure and
     /// retrying it.
-    #[error("后端不支持：{0}")]
+    #[error("unsupported by this backend: {0}")]
     Unsupported(&'static str),
 
-    #[error("对象存储错误：{0}")]
+    #[error("object storage error: {0}")]
     Backend(String),
 
-    #[error("IO 错误：{0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 

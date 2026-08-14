@@ -83,7 +83,7 @@ impl MediaStore {
                 tracing::info!(
                     endpoint = %config.s3.endpoint,
                     bucket = %config.s3.bucket,
-                    "对象存储已接入 S3 兼容后端"
+                    "object storage is attached to an S3-compatible backend"
                 );
                 return Self {
                     inner: Some(Arc::new(s3)),
@@ -94,8 +94,9 @@ impl MediaStore {
                 tracing::warn!(
                     error = %e,
                     endpoint = %config.s3.endpoint,
-                    "对象存储不可用，回落本地文件系统 —— 上传的媒体只存在于本机，\
-                     不会随对象存储备份，也签不出 presigned URL"
+                    "object storage is unavailable, falling back to the local filesystem \
+                     — uploaded media then exists only on this machine, is not covered \
+                     by the object store's backups, and cannot be signed as a presigned URL"
                 );
             }
         }
@@ -103,7 +104,10 @@ impl MediaStore {
         let root = std::env::var(LOCAL_ROOT_ENV).unwrap_or_else(|_| LOCAL_ROOT_DEFAULT.to_string());
         match LocalFsBlobStore::new(&root, Self::current_tenant()).await {
             Ok(local) => {
-                tracing::warn!(root, "对象存储已回落到本地文件系统");
+                tracing::warn!(
+                    root,
+                    "object storage has fallen back to the local filesystem"
+                );
                 Self {
                     inner: Some(Arc::new(local)),
                     backend: "local_fs",
@@ -114,7 +118,8 @@ impl MediaStore {
                 // filesystem, insufficient permissions). At this point we must
                 // not pretend object storage exists: far better that /blobs
                 // report an error outright than accept the bytes and drop them.
-                tracing::error!(error = %e, root, "本地回落也建不起来，媒体功能不可用");
+                tracing::error!(error = %e, root, "the local fallback could not be created either; media is \
+                     unavailable");
                 Self {
                     inner: None,
                     backend: "unavailable",
@@ -191,7 +196,11 @@ impl MediaStore {
 
     fn store(&self) -> Result<&Arc<dyn BlobStore>> {
         self.inner.as_ref().ok_or_else(|| {
-            CortexError::Store("对象存储不可用：S3 连不上且本地回落目录建不出来".into())
+            CortexError::Store(
+                "object storage unavailable: S3 is unreachable and the local \
+             fallback directory could not be created"
+                    .into(),
+            )
         })
     }
 

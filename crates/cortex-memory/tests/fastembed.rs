@@ -32,7 +32,7 @@ async fn load() -> FastEmbedder {
 }
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn produces_schema_dimension_and_unit_length() {
     let e = load().await;
     let v = e.embed_one("对象存储用 RustFS").await.unwrap();
@@ -57,7 +57,7 @@ async fn produces_schema_dimension_and_unit_length() {
 }
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn is_deterministic() {
     let e = load().await;
     // Two calls on the same text must be bit-identical, otherwise "the same
@@ -87,7 +87,7 @@ async fn is_deterministic() {
 const MAX_BATCH_DRIFT: f32 = 0.03;
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn batch_stays_comparable_with_single() {
     let e = load().await;
     // Backfill runs large batches, queries run batch=1, and the vectors the two
@@ -103,7 +103,7 @@ async fn batch_stays_comparable_with_single() {
         "the batch must return as many results as it had inputs"
     );
     let drift = 1.0 - cosine(&batch[0], &single);
-    println!("batch/single 漂移：{drift:.6}");
+    println!("batch/single drift: {drift:.6}");
     assert!(
         drift < MAX_BATCH_DRIFT,
         "the cosine gap between batch and single, {drift:.6}, exceeds the tolerance \
@@ -113,7 +113,7 @@ async fn batch_stays_comparable_with_single() {
 }
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn same_batch_is_bit_stable() {
     let e = load().await;
     // The previous test tolerates drift; this one draws its boundary:
@@ -130,7 +130,7 @@ async fn same_batch_is_bit_stable() {
 }
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn model_id_identifies_weights() {
     let e = load().await;
     assert_eq!(
@@ -141,7 +141,7 @@ async fn model_id_identifies_weights() {
 }
 
 #[tokio::test]
-#[ignore = "需要下载模型权重"]
+#[ignore = "needs the model weights downloaded"]
 async fn semantics_beat_hashing() {
     let fast = load().await;
     let hash = HashEmbedder::new();
@@ -153,7 +153,10 @@ async fn semantics_beat_hashing() {
         ("对象存储用 RustFS", "今天天气不错", false),
     ];
 
-    println!("\n{:<24} {:<24} {:>10} {:>10}", "左", "右", "fast", "hash");
+    println!(
+        "\n{:<24} {:<24} {:>10} {:>10}",
+        "left", "right", "fast", "hash"
+    );
     let mut scores = Vec::new();
     for (l, r, want_similar) in pairs {
         let f = cosine(
@@ -212,7 +215,7 @@ async fn semantics_beat_hashing() {
         .fold(f32::NEG_INFINITY, f32::max);
     let hash_margin = h_sim_min - h_unrel_max;
 
-    println!("区分度：fast={fast_margin:.4}  hash={hash_margin:.4}\n");
+    println!("separation: fast={fast_margin:.4}  hash={hash_margin:.4}\n");
     assert!(
         fast_margin > hash_margin,
         "the semantic model's separation ({fast_margin:.4}) must beat the hash stub's \

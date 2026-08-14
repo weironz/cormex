@@ -482,11 +482,11 @@ fn build_judge_prompt(chunk: &[Candidate]) -> String {
 /// notices until the following night.
 fn parse_judgements(raw: &str, chunk: &[Candidate]) -> Vec<Accepted> {
     let Some(blob) = crate::extract::extract_json_blob(raw) else {
-        tracing::warn!("跨域连接判定结果里找不到 JSON，本批全部不连");
+        tracing::warn!("no JSON in the cross-domain judgement; linking nothing in this batch");
         return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(blob) else {
-        tracing::warn!("跨域连接判定结果不是合法 JSON，本批全部不连");
+        tracing::warn!("the cross-domain judgement is not valid JSON; linking nothing");
         return Vec::new();
     };
 
@@ -508,7 +508,10 @@ fn parse_judgements(raw: &str, chunk: &[Candidate]) -> Vec<Accepted> {
             continue;
         };
         let Some(candidate) = chunk.get(idx) else {
-            tracing::debug!(idx, "判定结果引用了不存在的候选编号");
+            tracing::debug!(
+                idx,
+                "the judgement references a candidate index that does not exist"
+            );
             continue;
         };
         if !seen.insert(idx) {
@@ -857,7 +860,7 @@ impl Linker {
             let v = embedder.embed(&statements).await?;
             if v.len() != statements.len() {
                 return Err(CortexError::Memory(format!(
-                    "embedder 返回 {} 条向量，与 {} 条 statement 不匹配",
+                    "the embedder returned {} vectors, which does not match {} statements",
                     v.len(),
                     statements.len()
                 )));
@@ -914,14 +917,14 @@ impl Linker {
     ) -> Result<NewFact> {
         let parse = |s: &str, what: &str| -> Result<Id> {
             s.parse::<Id>()
-                .map_err(|e| CortexError::Store(format!("{what} {s} 不是合法 ULID：{e}")))
+                .map_err(|e| CortexError::Store(format!("{what} {s} is not a valid ULID: {e}")))
         };
         Ok(NewFact {
             id: Id::new(),
-            subject_id: parse(&from.entity_id, "实体 id")?,
+            subject_id: parse(&from.entity_id, "entity id")?,
             predicate: RELATES_TO.to_owned(),
             object_text: None,
-            object_entity_id: Some(parse(&to.entity_id, "实体 id")?),
+            object_entity_id: Some(parse(&to.entity_id, "entity id")?),
             // See `Linker::indexed`: neither index by default — this row is an
             // **edge**, meant to be traversed rather than retrieved. Leaving `tsv`
             // NULL is a **decision**, not an omission, and does not conflict with
@@ -966,8 +969,8 @@ impl Linker {
             // prerequisite for fixing that is exactly these two rows (see migration
             // 20260807000006)
             derived_from: vec![
-                ProvenanceRef::fact(parse(&from.fact_id, "事实 id")?),
-                ProvenanceRef::fact(parse(&to.fact_id, "事实 id")?),
+                ProvenanceRef::fact(parse(&from.fact_id, "fact id")?),
+                ProvenanceRef::fact(parse(&to.fact_id, "fact id")?),
             ],
             extracted_by: format!("crosslink/{RELATES_TO}"),
             device_id: self.device_id.clone(),
@@ -993,7 +996,10 @@ impl Linker {
                     .is_redacted(RedactionTarget::Episode, &f.source_episode_id.to_string())
                     .await?
                 {
-                    tracing::warn!(episode = %f.source_episode_id, "出处已被抹除，放弃这条跨域连接");
+                    tracing::warn!(
+                        episode = %f.source_episode_id,
+                        "the source has been redacted; dropping this cross-domain link"
+                    );
                     continue;
                 }
                 rows.push(f);

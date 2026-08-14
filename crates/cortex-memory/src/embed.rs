@@ -76,7 +76,7 @@ pub trait Embedder: Send + Sync {
     async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut v = self.embed(&[text.to_string()]).await?;
         v.pop()
-            .ok_or_else(|| CortexError::Memory("embedder 返回空结果".into()))
+            .ok_or_else(|| CortexError::Memory("the embedder returned nothing".into()))
     }
 }
 
@@ -154,7 +154,7 @@ fn hash_vector(text: &str, dim: usize) -> Vec<f32> {
 pub(crate) fn normalize(v: &mut [f32]) -> std::result::Result<(), String> {
     if v.len() != EMBEDDING_DIM {
         return Err(format!(
-            "维度 {} 与 schema 的 VECTOR({EMBEDDING_DIM}) 不符",
+            "dimension {} does not match the schema's VECTOR({EMBEDDING_DIM})",
             v.len()
         ));
     }
@@ -163,7 +163,7 @@ pub(crate) fn normalize(v: &mut [f32]) -> std::result::Result<(), String> {
     // poisons the entire ORDER BY, which is far harder to track down than an
     // error raised right here
     if !norm.is_finite() || norm <= f32::EPSILON {
-        return Err(format!("模长 {norm} 非法，无法归一化"));
+        return Err(format!("norm {norm} is not usable, cannot normalize"));
     }
     for x in v.iter_mut() {
         *x /= norm;
@@ -230,7 +230,7 @@ impl Backend {
             "hash" | "stub" => Ok(Self::Hash),
             "fast" | "fastembed" | "local" => Ok(Self::Fast),
             other => Err(CortexError::Config(format!(
-                "未知的 CORTEX_EMBED_BACKEND={other:?}，可选：api / hash / fast"
+                "unknown CORTEX_EMBED_BACKEND={other:?}; choices are api / hash / fast"
             ))),
         }
     }
@@ -261,10 +261,11 @@ pub async fn build_embedder(backend: Backend) -> Result<SharedEmbedder> {
         // the name", and the two call for completely different fixes
         #[cfg(not(feature = "local-embed"))]
         Backend::Fast => Err(CortexError::Config(
-            "CORTEX_EMBED_BACKEND=fast 需要 feature `local-embed`，而这个二进制没有编进来。\n\
-             要么改用默认的 api 后端（把 CORTEX_EMBED_ENDPOINT 指向一个 \
-             OpenAI 兼容的 /v1/embeddings 服务），\n\
-             要么自己带 feature 重编：cargo build -p cortexd --features cortex-memory/local-embed"
+            "CORTEX_EMBED_BACKEND=fast needs the `local-embed` feature, and this binary was not \
+             built with it.\n\
+             Either switch to the default api backend (point CORTEX_EMBED_ENDPOINT at an \
+             OpenAI-compatible /v1/embeddings service),\n\
+             or rebuild with the feature: cargo build -p cortexd --features cortex-memory/local-embed"
                 .into(),
         )),
     }

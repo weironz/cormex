@@ -133,7 +133,7 @@ async fn seed(store: &Store, who: &str) -> String {
 #[tokio::test]
 async fn two_tenants_cannot_see_each_others_rows() {
     let Some(url) = database_url() else {
-        eprintln!("跳过：没有 DATABASE_URL");
+        eprintln!("skipped: DATABASE_URL is not set");
         return;
     };
 
@@ -201,7 +201,7 @@ async fn two_tenants_cannot_see_each_others_rows() {
 #[tokio::test]
 async fn asking_twice_for_the_same_tenant_reuses_one_pool() {
     let Some(url) = database_url() else {
-        eprintln!("跳过：没有 DATABASE_URL");
+        eprintln!("skipped: DATABASE_URL is not set");
         return;
     };
 
@@ -238,7 +238,7 @@ async fn asking_twice_for_the_same_tenant_reuses_one_pool() {
 #[tokio::test]
 async fn one_tenants_long_write_does_not_block_another() {
     let Some(url) = database_url() else {
-        eprintln!("跳过：没有 DATABASE_URL");
+        eprintln!("skipped: DATABASE_URL is not set");
         return;
     };
 

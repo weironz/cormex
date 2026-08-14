@@ -117,7 +117,7 @@ impl SchemaName {
                 }));
         if !ok {
             return Err(StoreError::Invalid(format!(
-                "schema 名不合法：{raw}（只允许 public 或 u_ + 26 位**小写** ULID）"
+                "invalid schema name: {raw} (only `public`, or `u_` + a 26-character **lowercase** ULID)"
             )));
         }
         Ok(Self(raw.to_owned()))
@@ -270,8 +270,9 @@ impl TenantPools {
         // low
         if r.pools.len() >= MAX_RESIDENT_TENANTS {
             return Err(StoreError::Invalid(format!(
-                "同时在线的用户已达上限 {MAX_RESIDENT_TENANTS}（每人 {PER_TENANT_CONNECTIONS} 条连接）。\
-                 这是从 Postgres 的 max_connections 倒推出来的 —— 要提高，先调数据库那边"
+                "the cap on simultaneously resident users is reached: {MAX_RESIDENT_TENANTS} \
+                 ({PER_TENANT_CONNECTIONS} connections each). That number is derived backwards \
+                 from Postgres's max_connections -- to raise it, raise that one first"
             )));
         }
         r.pools.insert(schema.clone(), Arc::clone(&store));
@@ -287,7 +288,7 @@ impl TenantPools {
     /// installed". The test harness stepped into this same trap.
     async fn connect(&self, schema: &SchemaName) -> Result<Store> {
         let options = PgConnectOptions::from_str(&self.database_url)
-            .map_err(|e| StoreError::Invalid(format!("DATABASE_URL 不合法：{e}")))?
+            .map_err(|e| StoreError::Invalid(format!("DATABASE_URL is not valid: {e}")))?
             .options([("search_path", format!("{},public", schema.as_str()))]);
 
         let pool = PgPoolOptions::new()
@@ -372,7 +373,10 @@ impl Resident {
         }
         let victim = self.order.remove(0);
         self.pools.remove(&victim);
-        tracing::info!(schema = victim.as_str(), "驻留池已满，淘汰最久未用的租户池");
+        tracing::info!(
+            schema = victim.as_str(),
+            "the resident pool is full; evicting the least recently used tenant pool"
+        );
     }
 }
 

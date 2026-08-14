@@ -41,14 +41,14 @@ const DEMO_HASH: &str = "0000000000000000000000000000000000000000000000000000000
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Err(e) = dotenvy::dotenv() {
-        eprintln!("提示：未加载 .env（{e}），改用进程环境变量");
+        eprintln!("note: .env was not loaded ({e}); using the process environment instead");
     }
 
     let path = std::env::args()
         .nth(1)
         .map_or_else(|| PathBuf::from(DEFAULT_IMAGE), PathBuf::from);
-    let bytes =
-        std::fs::read(&path).map_err(|e| anyhow::anyhow!("读不到图片 {}：{e}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| anyhow::anyhow!("cannot read the image {}: {e}", path.display()))?;
     let mime = match path
         .extension()
         .and_then(|e| e.to_str())
@@ -59,16 +59,16 @@ async fn main() -> anyhow::Result<()> {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
-        other => anyhow::bail!("不认识的扩展名 {other:?}"),
+        other => anyhow::bail!("unrecognized extension {other:?}"),
     };
 
     let transcriber: Arc<dyn Transcriber> = match VisionTranscriber::from_env()? {
         Some(v) => {
-            println!("转录器：{}（真实 vision 模型）", v.model_id());
+            println!("transcriber: {} (a real vision model)", v.model_id());
             Arc::new(v)
         }
         None => {
-            println!("转录器：桩实现（未配置 CORTEX_VISION_PROVIDER）");
+            println!("transcriber: the stub (CORTEX_VISION_PROVIDER is not configured)");
             Arc::new(StubTranscriber::new())
         }
     };
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let pipeline =
         TranscribePipeline::new(Arc::new(HashEmbedder::new())).with_transcriber(transcriber);
 
-    println!("输入：{} （{} 字节，{mime}）", path.display(), bytes.len());
+    println!("input: {} ({} bytes, {mime})", path.display(), bytes.len());
     println!("─────────────────────────────────────────");
     let started = std::time::Instant::now();
     let outcome = pipeline
@@ -85,12 +85,15 @@ async fn main() -> anyhow::Result<()> {
     let elapsed = started.elapsed();
 
     match &outcome {
-        Outcome::Redacted => anyhow::bail!("NeverRedacted 不该报告已抹除"),
-        Outcome::Unsupported { mime } => anyhow::bail!("没有转录器认领 {mime}"),
+        Outcome::Redacted => anyhow::bail!("NeverRedacted should never report a redaction"),
+        Outcome::Unsupported { mime } => anyhow::bail!("no transcriber claims {mime}"),
         Outcome::Ready(rows) => {
-            anyhow::ensure!(!rows.is_empty(), "转录产出为空 —— 这份媒体仍然检索不到");
+            anyhow::ensure!(
+                !rows.is_empty(),
+                "the transcription produced nothing -- this media is still unretrievable"
+            );
             for (i, row) in rows.iter().enumerate() {
-                println!("段落 {}/{}", i + 1, rows.len());
+                println!("segment {}/{}", i + 1, rows.len());
                 println!("  kind           {}", row.kind.as_str());
                 println!("  transcribed_by {}", row.transcribed_by);
                 println!(
@@ -98,13 +101,13 @@ async fn main() -> anyhow::Result<()> {
                     row.span_start_ms, row.span_end_ms
                 );
                 println!(
-                    "  embedding      {} 维（{}）",
+                    "  embedding      {} dims ({})",
                     row.embedding.as_ref().map_or(0, |v| v.as_slice().len()),
                     row.embedding_model
                 );
-                println!("  文本 {} 字：", row.text.chars().count());
+                println!("  text {} chars:", row.text.chars().count());
                 println!("{}", row.text);
-                println!("  tsv 前 20 词：");
+                println!("  first 20 tsv words:");
                 let tsv = row.tsv_source.as_deref().unwrap_or("");
                 println!(
                     "    {}",
@@ -117,6 +120,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    println!("耗时 {:.1}s", elapsed.as_secs_f32());
+    println!("elapsed {:.1}s", elapsed.as_secs_f32());
     Ok(())
 }

@@ -476,7 +476,7 @@ async fn entity_object_becomes_a_graph_edge() {
 /// default; run it by hand locally with
 /// `cargo test -p cortex-memory --test extract -- --ignored --nocapture`.
 #[tokio::test]
-#[ignore = "需要 DEEPSEEK_API_KEY，会产生真实 API 调用"]
+#[ignore = "needs DEEPSEEK_API_KEY; makes real API calls"]
 async fn real_llm_extraction_quality() {
     let _ = dotenvy::dotenv();
     let llm = cortex_llm::LlmClient::from_env().expect("should build an LlmClient from the env");
@@ -503,7 +503,7 @@ async fn real_llm_extraction_quality() {
         .await
         .expect("a real extraction should not fail");
 
-    println!("\n=== 抽出 {} 条事实 ===", facts.len());
+    println!("\n=== extracted {} facts ===", facts.len());
     for f in &facts {
         println!(
             "- [{}] {} --{}--> {:?}\n    statement: {}\n    valid_at: {:?}  conf: {}",
@@ -542,7 +542,7 @@ async fn real_llm_extraction_quality() {
 /// the wiring of `extract → resolution → persistence`.
 /// Requires `DEEPSEEK_API_KEY` and `DATABASE_URL`.
 #[tokio::test]
-#[ignore = "需要 DEEPSEEK_API_KEY 与数据库，会产生真实 API 调用"]
+#[ignore = "needs DEEPSEEK_API_KEY and a database; makes real API calls"]
 async fn real_llm_end_to_end_ingest() {
     let _ = dotenvy::dotenv();
     let Some(db) = setup().await else { return };
@@ -562,7 +562,7 @@ async fn real_llm_end_to_end_ingest() {
         .await
         .expect("the full pipeline should not fail");
 
-    println!("\n=== ingest 报告 ===\n{report:#?}");
+    println!("\n=== ingest report ===\n{report:#?}");
     assert!(
         !report.written.is_empty(),
         "at least one fact should have been persisted"
@@ -574,7 +574,7 @@ async fn real_llm_end_to_end_ingest() {
             .await
             .expect("querying a fact should not fail")
             .expect("a fact just written should be findable");
-        println!("落库：{} | {}", fact.predicate, fact.statement);
+        println!("written: {} | {}", fact.predicate, fact.statement);
         assert!(
             fact.embedding.is_some(),
             "the embedding must be written in the same transaction as the main row, \

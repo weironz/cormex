@@ -426,7 +426,7 @@ mod tests {
         let escaped: Vec<String> = payloads
             .iter()
             .filter(|(evil, _)| TenantPrefix::new(*evil).is_ok())
-            .map(|(evil, why)| format!("  {evil:?} —— {why}"))
+            .map(|(evil, why)| format!("  {evil:?} — {why}"))
             .collect();
         assert!(
             escaped.is_empty(),

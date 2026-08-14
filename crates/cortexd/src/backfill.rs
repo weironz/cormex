@@ -117,7 +117,7 @@ pub fn spawn(st: crate::state::AppState, blobs: MediaStore) {
         return; // mock backend: no database to rescan
     };
     if !live.transcription_enabled() {
-        tracing::info!("未配置 vision 模型，转录回扫器不启动");
+        tracing::info!("no vision model configured; the transcription backfill will not start");
         return;
     }
     tokio::spawn(async move {
@@ -141,13 +141,16 @@ pub fn spawn(st: crate::state::AppState, blobs: MediaStore) {
             let schemas = match st.tenant_schemas().await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, "列不出租户，本轮回扫跳过");
+                    tracing::warn!(error = %e, "could not list the tenants; skipping this backfill round");
                     continue;
                 }
             };
             for schema in &schemas {
                 let Ok(store) = st.tenant_store(schema).await else {
-                    tracing::warn!(schema = schema.as_str(), "连不上这个租户，跳过回扫");
+                    tracing::warn!(
+                        schema = schema.as_str(),
+                        "could not connect to this tenant; skipping its backfill"
+                    );
                     continue;
                 };
                 let bound = live.bind(&store);
@@ -172,7 +175,7 @@ async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
     let candidates = match live.store().blobs_missing_transcript(&prefixes, want).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "回扫候选查询失败，本轮跳过");
+            tracing::warn!(error = %e, "the backfill candidate query failed; skipping this round");
             return;
         }
     };
@@ -186,7 +189,7 @@ async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
         return;
     }
 
-    tracing::info!(count = todo.len(), "开始回扫补转录");
+    tracing::info!(count = todo.len(), "starting the transcription backfill");
 
     // A Semaphore rather than `buffer_unordered`: the gate has to be bypassable
     // for free by the early-return path from `MAX_BYTES` (only a task that
@@ -209,7 +212,7 @@ async fn scan_once(live: &Arc<Live>, blobs: &MediaStore, ledger: &mut Ledger) {
     for t in tasks {
         match t.await {
             Ok((hash, verdict)) => ledger.record(&hash, verdict),
-            Err(e) => tracing::warn!(error = %e, "回扫子任务异常结束"),
+            Err(e) => tracing::warn!(error = %e, "a backfill subtask ended abnormally"),
         }
     }
 }
@@ -231,7 +234,8 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
             hash = %blob.hash,
             size_bytes = blob.size_bytes,
             limit = MAX_BYTES,
-            "对象超过回扫体积上限，永久跳过 —— 转录需要整份字节进内存"
+            "the object is over the backfill size ceiling and is skipped for good — \
+             transcription needs the whole of it in memory"
         );
         return Verdict::Done;
     }
@@ -239,7 +243,7 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
     let bytes = match blobs.get(&blob.hash).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(hash = %blob.hash, error = %e, "回扫取字节失败");
+            tracing::warn!(hash = %blob.hash, error = %e, "the backfill could not fetch the bytes");
             return classify(&e);
         }
     };
@@ -251,16 +255,16 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
         Ok(outcome) => {
             match &outcome {
                 TranscribeOutcome::Stored { segments } => {
-                    tracing::info!(hash = %blob.hash, segments, "回扫补上了转录");
+                    tracing::info!(hash = %blob.hash, segments, "the backfill filled in the transcript");
                 }
                 TranscribeOutcome::Unsupported { mime } => {
                     // The coarse filter let it in but no transcriber claims it
                     // (image/heic, for instance). Any number of retries yields
                     // the same result, so blacklist it
-                    tracing::info!(hash = %blob.hash, mime, "没有转录器认领，回扫不再重试");
+                    tracing::info!(hash = %blob.hash, mime, "no transcriber claimed it; the backfill will not retry");
                 }
                 TranscribeOutcome::Redacted | TranscribeOutcome::Disabled => {
-                    tracing::debug!(hash = %blob.hash, "回扫无需继续");
+                    tracing::debug!(hash = %blob.hash, "nothing left for the backfill to do");
                 }
             }
             // All four outcomes are **deterministic**: running the same bytes
@@ -268,7 +272,7 @@ async fn transcribe_one(live: &Live, blobs: &MediaStore, blob: &cortex_store::Bl
             Verdict::Done
         }
         Err(e) => {
-            tracing::warn!(hash = %blob.hash, error = %e, "回扫转录失败");
+            tracing::warn!(hash = %blob.hash, error = %e, "the backfill transcription failed");
             classify(&e)
         }
     }
@@ -342,7 +346,7 @@ impl Ledger {
                     tracing::warn!(
                         hash,
                         attempts = *n,
-                        "连续失败达到上限，本进程内不再重试该 blob"
+                        "the consecutive-failure ceiling was reached; this process will not retry that blob"
                     );
                     self.blocked.insert(hash.to_owned());
                 }
@@ -376,7 +380,7 @@ mod tests {
             l.record("b", Verdict::Retry);
             assert!(
                 !l.is_blocked("b"),
-                "giving up on failure #{i} is far too early —— provider 5xx and rate limiting \
+                "giving up on failure #{i} is far too early — provider 5xx and rate limiting \
                  both recover on their own"
             );
         }
@@ -395,13 +399,13 @@ mod tests {
         // treating a retryable one as permanent only makes this blob wait for a
         // restart. When in doubt, lean towards "retryable"
         assert!(matches!(
-            classify(&CortexError::Invalid("这不是一张合法的图片".into())),
+            classify(&CortexError::Invalid("that is not a valid image".into())),
             Verdict::Done
         ));
         for transient in [
             CortexError::Provider("429 Too Many Requests".into()),
             CortexError::Store("connection reset".into()),
-            CortexError::Memory("embedder 暂时不可用".into()),
+            CortexError::Memory("the embedder is temporarily unavailable".into()),
         ] {
             assert!(
                 matches!(classify(&transient), Verdict::Retry),

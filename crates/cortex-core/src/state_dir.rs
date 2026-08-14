@@ -43,14 +43,18 @@ pub fn state_dir() -> Result<PathBuf> {
     };
     let base = base.ok_or_else(|| {
         CortexError::Config(
-            "找不到本地状态目录：Windows 上需要 %LOCALAPPDATA%，\
-             其余平台需要 $XDG_DATA_HOME 或 $HOME"
+            "cannot locate the local state directory: Windows needs %LOCALAPPDATA%, \
+             every other platform needs $XDG_DATA_HOME or $HOME"
                 .into(),
         )
     })?;
     let dir = base.join("cortex");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CortexError::Config(format!("建不出本地状态目录 {}：{e}", dir.display())))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        CortexError::Config(format!(
+            "cannot create the local state directory {}: {e}",
+            dir.display()
+        ))
+    })?;
     Ok(dir)
 }
 

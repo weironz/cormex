@@ -62,13 +62,13 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
         match one(raw) {
             Ok(Some(c)) => out.push(c),
             Ok(None) => {}
-            Err(e) => bail!("第 {} 段对话解析失败：{e}", i + 1),
+            Err(e) => bail!("conversation {} failed to parse: {e}", i + 1),
         }
     }
     if out.is_empty() {
         bail!(
-            "{} 段对话里一段都没解析出可用消息。格式很可能变了 —— \
-             这比「你的历史是空的」更可能",
+            "not one of the {} conversations yielded a usable message. The format has most \
+             likely changed — that is far more likely than your history being empty",
             items.len()
         );
     }
@@ -78,7 +78,7 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
 fn one(raw: &Value) -> Result<Option<Conversation>> {
     let Some(list) = raw.get("chat_messages").and_then(Value::as_array) else {
         bail!(
-            "缺少 `chat_messages` 数组。这一段实际有这些键：{}",
+            "no `chat_messages` array. The keys this entry does have: {}",
             keys_of(raw)
         );
     };
@@ -90,8 +90,8 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
         .unwrap_or_default();
     if source_id.is_empty() {
         bail!(
-            "既没有 `uuid` 也没有 `id` —— 没有稳定标识就没法做幂等导入。\
-             这一段实际有这些键：{}",
+            "neither `uuid` nor `id` — without a stable identifier there is no idempotent \
+             import. The keys this entry does have: {}",
             keys_of(raw)
         );
     }

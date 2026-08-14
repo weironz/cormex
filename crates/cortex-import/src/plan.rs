@@ -229,7 +229,10 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
                 Ok(_) => {}
                 Err(e) => {
                     p.failures += 1;
-                    tracing::warn!(error = %e, "写 user episode 失败，跳过这一对");
+                    tracing::warn!(
+                        error = %e,
+                        "failed to write the user episode; skipping this pair"
+                    );
                     continue;
                 }
             }
@@ -242,7 +245,7 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
                 }
                 Err(e) => {
                     p.failures += 1;
-                    tracing::warn!(error = %e, "写 assistant episode 失败");
+                    tracing::warn!(error = %e, "failed to write the assistant episode");
                 }
             }
 
@@ -256,7 +259,7 @@ pub async fn execute<S: Sink, F: FnMut(Progress)>(
             .rename_session(&session, &conv.display_title(plan.platform))
             .await
         {
-            tracing::debug!(error = %e, session, "会话改名失败");
+            tracing::debug!(error = %e, session, "failed to rename the session");
         }
 
         p.conversations_done += 1;
@@ -289,7 +292,7 @@ pub fn plan_from_bytes(
     }
 
     if conversations.is_empty() {
-        bail!("按当前的时间 / 数量筛选条件筛完之后，一段对话都不剩");
+        bail!("no conversation is left after the current time / count filters");
     }
     Ok(Plan {
         platform,
@@ -307,7 +310,7 @@ pub fn load(
     since: Option<DateTime<Utc>>,
     max: Option<usize>,
 ) -> Result<Plan> {
-    let bytes = std::fs::read(path).with_context(|| format!("读不了 {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     plan_from_bytes(&bytes, platform, since, max)
 }
 

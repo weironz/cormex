@@ -51,19 +51,22 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = FastEmbedderConfig::default();
-    println!("模型：{}", cfg.model.model_id());
+    println!("model: {}", cfg.model.model_id());
     println!(
-        "缓存目录：{:?}\n",
+        "cache dir: {:?}\n",
         cortex_memory::embed_local::default_cache_dir()
     );
 
     let t0 = Instant::now();
     let fast = FastEmbedder::new(cfg).await?;
-    println!("加载耗时：{:?}（含首次下载则远不止）", t0.elapsed());
+    println!(
+        "load time: {:?} (far more than this if it downloads first)",
+        t0.elapsed()
+    );
 
     // Warm-up: the first inference has to allocate ONNX's internal arena, and
     // counting it into the latency statistics inflates them
-    let _ = fast.embed_one("预热").await?;
+    let _ = fast.embed_one("warm-up").await?;
 
     let probe = "对象存储用 RustFS";
     let mut single = Vec::new();
@@ -74,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     }
     single.sort_unstable();
     println!(
-        "单条 embed（20 次）：中位 {:?}  p95 {:?}  最快 {:?}",
+        "single embed (20 runs): median {:?}  p95 {:?}  fastest {:?}",
         single[10], single[19], single[0]
     );
 
@@ -85,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = fast.embed(&batch).await?;
     let elapsed = t.elapsed();
     println!(
-        "批量 64 条：{:?}（每条 {:?}）\n",
+        "batch of 64: {:?} ({:?} each)\n",
         elapsed,
         elapsed / batch.len() as u32
     );
@@ -97,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
         ("对象存储用 RustFS", "今天天气不错"),
     ];
 
-    println!("{:<22} {:<24} {:>10} {:>10}", "左", "右", "fast", "hash");
+    println!(
+        "{:<22} {:<24} {:>10} {:>10}",
+        "left", "right", "fast", "hash"
+    );
     println!("{}", "-".repeat(70));
     for (l, r) in pairs {
         let f = cosine(&fast.embed_one(l).await?, &fast.embed_one(r).await?);

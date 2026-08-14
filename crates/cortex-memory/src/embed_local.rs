@@ -115,7 +115,7 @@ impl FastModel {
             "bge-m3-fp32" => Ok(Self::BgeM3Fp32),
             "multilingual-e5-large" | "e5-large" => Ok(Self::MultilingualE5Large),
             other => Err(CortexError::Config(format!(
-                "未知的 embedding 模型 {other:?}，可选：\
+                "unknown embedding model {other:?}; choices are \
                  bge-m3-int8 / bge-m3-fp32 / multilingual-e5-large"
             ))),
         }
@@ -159,7 +159,7 @@ impl Session {
             Self::Joint(m) => m.embed(texts, Some(batch)).map(|o| o.dense),
             Self::Dense(m) => m.embed(texts, Some(batch)),
         };
-        raw.map_err(|e| CortexError::Memory(format!("ONNX 推理失败：{e}")))
+        raw.map_err(|e| CortexError::Memory(format!("ONNX inference failed: {e}")))
     }
 }
 
@@ -217,10 +217,14 @@ impl FastEmbedderConfig {
         }
         if let Some(v) = var("CORTEX_EMBED_BATCH") {
             cfg.backfill_batch = v.trim().parse().map_err(|_| {
-                CortexError::Config(format!("CORTEX_EMBED_BATCH 不是正整数：{v:?}"))
+                CortexError::Config(format!(
+                    "CORTEX_EMBED_BATCH is not a positive integer: {v:?}"
+                ))
             })?;
             if cfg.backfill_batch == 0 {
-                return Err(CortexError::Config("CORTEX_EMBED_BATCH 不能为 0".into()));
+                return Err(CortexError::Config(
+                    "CORTEX_EMBED_BATCH must not be 0".into(),
+                ));
             }
         }
         Ok(cfg)
@@ -230,8 +234,9 @@ impl FastEmbedderConfig {
     /// hundred MB).
     fn load(self) -> Result<Session> {
         let cache = self.cache_dir.unwrap_or_else(default_cache_dir);
-        let map =
-            |e: fastembed::Error| CortexError::Memory(format!("加载 embedding 模型失败：{e}"));
+        let map = |e: fastembed::Error| {
+            CortexError::Memory(format!("loading the embedding model failed: {e}"))
+        };
 
         match self.model {
             FastModel::BgeM3Int8 => Bgem3Embedding::try_new(
@@ -262,7 +267,7 @@ fn text_session(model: EmbeddingModel, cache: PathBuf, max_length: usize) -> Res
             .with_show_download_progress(false),
     )
     .map(|m| Session::Dense(Box::new(m)))
-    .map_err(|e| CortexError::Memory(format!("加载 embedding 模型失败：{e}")))
+    .map_err(|e| CortexError::Memory(format!("loading the embedding model failed: {e}")))
 }
 
 /// The model cache directory.
@@ -353,12 +358,16 @@ impl FastEmbedder {
         // is destined never to fit into VECTOR(1024)
         if declared != EMBEDDING_DIM {
             return Err(CortexError::Config(format!(
-                "模型 {model_id} 是 {declared} 维，但 schema 写死 VECTOR({EMBEDDING_DIM})；\
-                 换维度需要配套 migration（见 memory.md §七）"
+                "model {model_id} is {declared}-dimensional, but the schema hard-codes \
+                 VECTOR({EMBEDDING_DIM}); changing the dimension needs a matching migration \
+                 (see memory.md §7)"
             )));
         }
 
-        tracing::info!(model = model_id, "加载 embedding 模型（首次会下载数百 MB）");
+        tracing::info!(
+            model = model_id,
+            "loading the embedding model (the first time this downloads a few hundred MB)"
+        );
         let started = std::time::Instant::now();
 
         // Loading is pure blocking disk IO plus ONNX graph construction, tens
@@ -367,12 +376,16 @@ impl FastEmbedder {
         // whole time.
         let session = tokio::task::spawn_blocking(move || config.load())
             .await
-            .map_err(|e| CortexError::Memory(format!("加载模型的阻塞任务 panic：{e}")))??;
+            .map_err(|e| {
+                CortexError::Memory(format!(
+                    "the blocking task that loads the model panicked: {e}"
+                ))
+            })??;
 
         tracing::info!(
             model = model_id,
             elapsed_ms = started.elapsed().as_millis(),
-            "embedding 模型就绪"
+            "the embedding model is ready"
         );
 
         Ok(Self {
@@ -417,7 +430,7 @@ impl FastEmbedder {
             return Ok(Vec::new());
         }
         if batch_size == 0 {
-            return Err(CortexError::Invalid("batch_size 不能为 0".into()));
+            return Err(CortexError::Invalid("batch_size must not be 0".into()));
         }
 
         let session = Arc::clone(&self.session);
@@ -433,18 +446,18 @@ impl FastEmbedder {
             guard.run(&owned, batch_size)
         })
         .await
-        .map_err(|e| CortexError::Memory(format!("embedding 任务 panic：{e}")))??;
+        .map_err(|e| CortexError::Memory(format!("the embedding task panicked: {e}")))??;
 
         if vectors.len() != texts.len() {
             return Err(CortexError::Memory(format!(
-                "embedder 返回 {} 条向量，但输入是 {} 条",
+                "the embedder returned {} vectors, but {} texts went in",
                 vectors.len(),
                 texts.len()
             )));
         }
 
         for (i, v) in vectors.iter_mut().enumerate() {
-            normalize(v).map_err(|e| CortexError::Memory(format!("第 {i} 条文本：{e}")))?;
+            normalize(v).map_err(|e| CortexError::Memory(format!("text {i}: {e}")))?;
         }
         Ok(vectors)
     }

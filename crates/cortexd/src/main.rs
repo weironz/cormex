@@ -44,7 +44,7 @@ use cortex_core::Config;
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug)]
-#[command(name = "cortexd", version, about = "Cortex 守护进程")]
+#[command(name = "cortexd", version, about = "Cortex daemon")]
 struct Args {
     /// Listen address.
     #[arg(long, env = "CORTEXD_BIND", default_value = "127.0.0.1:8080")]
@@ -66,7 +66,7 @@ struct Args {
     /// read from stdin, **never from a command-line argument** — arguments end
     /// up in shell history, in the output of `ps`, and in the container's
     /// startup record.
-    #[arg(long, value_name = "用户名")]
+    #[arg(long, value_name = "USERNAME")]
     create_user: Option<String>,
 }
 
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let config = Config::from_env().context("加载配置失败")?;
+    let config = Config::from_env().context("could not load the configuration")?;
 
     if let Some(username) = args.create_user.clone() {
         return create_user(&config, &username).await;
@@ -105,7 +105,8 @@ async fn main() -> anyhow::Result<()> {
     // Auth and confirmation-loop configuration is fixed here. **Misconfiguration
     // exits**, it never degrades: a cortexd that believes auth is on when it is
     // actually off produces no symptom whatsoever (see auth.rs)
-    let mut rt = state::Runtime::from_env().context("加载认证 / 确认回路配置失败")?;
+    let mut rt = state::Runtime::from_env()
+        .context("could not load the authentication / confirmation-loop configuration")?;
     // The accounts pool needs an await, so it is filled in after from_env.
     //
     // **Failing to connect costs you the accounts feature, not startup**: the
@@ -115,17 +116,18 @@ async fn main() -> anyhow::Result<()> {
     // answer 501
     match state::Accounts::connect(&config.database_url).await {
         Ok(accounts) => {
-            tracing::info!("账号体系已接入（cortex_auth）");
+            tracing::info!("the accounts system is attached (cortex_auth)");
             rt.accounts = Some(accounts);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "账号表连不上，/auth/* 将回 501（老的预共享 token 不受影响）");
+            tracing::warn!(error = %e, "the accounts table is unreachable; /auth/* will answer 501 \
+                 (the legacy pre-shared token is unaffected)");
         }
     }
 
     // Same as above: a malformed allow-list fails here, rather than surfacing
     // later as an inscrutable CORS error in the browser
-    let cors = cors::CorsPolicy::from_env().context("加载跨源策略失败")?;
+    let cors = cors::CorsPolicy::from_env().context("could not load the cross-origin policy")?;
 
     // ── Create the first account from .env ──────────────────
     //
@@ -167,8 +169,8 @@ async fn main() -> anyhow::Result<()> {
     let state = match state::BackendChoice::from_env()? {
         state::BackendChoice::Mock => {
             tracing::warn!(
-                "CORTEX_BACKEND=mock：**全部数据都是假的**。\
-                 会话、记忆、检索结果都是编出来的，只用于开发"
+                "CORTEX_BACKEND=mock: **every piece of data is fake**. Sessions, memories \
+                 and retrieval results are all made up; this is for development only"
             );
             state::AppState::new_mock(config, rt).await
         }
@@ -180,13 +182,16 @@ async fn main() -> anyhow::Result<()> {
                 // string carries a password, so it cannot be logged whole
                 .with_context(|| {
                     format!(
-                        "接入真实后端失败（数据库 {}）。\
-                         确认它在跑、地址与凭据对得上；\
-                         开发时想不带数据库跑就设 CORTEX_BACKEND=mock",
+                        "could not attach the real backend (database {}). Check that it \
+                         is running and that the address and credentials match; to \
+                         develop without a database, set CORTEX_BACKEND=mock",
                         redact_db_url(&config.database_url)
                     )
                 })?;
-            tracing::info!("已接入真实后端：Postgres + {}", config.llm.provider);
+            tracing::info!(
+                "attached the real backend: Postgres + {}",
+                config.llm.provider
+            );
             st
         }
     };
@@ -207,13 +212,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
-        .with_context(|| format!("无法绑定到 {}", args.bind))?;
+        .with_context(|| format!("could not bind to {}", args.bind))?;
 
-    tracing::info!(addr = %args.bind, version = cortex_core::VERSION, "cortexd 已启动");
+    tracing::info!(addr = %args.bind, version = cortex_core::VERSION, "cortexd is up");
 
     axum::serve(listener, app)
         .await
-        .context("HTTP 服务异常退出")?;
+        .context("the HTTP service exited abnormally")?;
     Ok(())
 }
 
@@ -225,14 +230,14 @@ async fn main() -> anyhow::Result<()> {
 /// `RUST_LOG`.
 fn print_new_token() {
     let (token, digest) = auth::generate();
-    println!("# ── 服务端：写进 .env（已被 gitignore 排除，绝不入库）──");
+    println!("# ── server: put this in .env (gitignored, never committed) ──");
     println!("{}={digest}", auth::TOKEN_SHA256_ENV);
     println!();
-    println!("# ── 客户端：明文 token，**只显示这一次** ──");
+    println!("# ── client: the plaintext token, **shown this one time only** ──");
     println!("CORTEXD_TOKEN={token}");
     println!();
-    println!("# 服务端只存摘要：.env 被读走也拿不到能用来登录的东西。");
-    println!("# 丢了明文就重新生成一份 —— 它没有别的副本，这是有意的。");
+    println!("# The server keeps only the digest — .env alone cannot log anyone in.");
+    println!("# Lose the plaintext and generate a new one — there is no other copy, by design.");
 }
 
 /// Strip the credentials out of a database connection string, keeping only
@@ -254,7 +259,7 @@ fn redact_db_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         // Not URL-shaped, so nothing can be guaranteed — give away not one
         // character of it
-        return "<无法解析的连接串>".into();
+        return "<unparsable connection string>".into();
     };
     let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
@@ -305,7 +310,8 @@ async fn ensure_admin(acc: &state::Accounts) {
         // for a long while
         if std::env::var(ADMIN_USER_ENV).is_ok() || std::env::var(ADMIN_PASSWORD_ENV).is_ok() {
             tracing::error!(
-                "{ADMIN_USER_ENV} 与 {ADMIN_PASSWORD_ENV} 必须成对配置，现在只有一半 ——                  没有建任何账号"
+                "{ADMIN_USER_ENV} and {ADMIN_PASSWORD_ENV} must be configured as a pair, \
+                 and only one half is set — no account was created"
             );
         }
         return;
@@ -317,11 +323,14 @@ async fn ensure_admin(acc: &state::Accounts) {
     match existing {
         Ok(0) => {}
         Ok(n) => {
-            tracing::debug!(users = n, "已经有账号了，跳过 .env 建号");
+            tracing::debug!(
+                users = n,
+                "accounts already exist; skipping the .env bootstrap"
+            );
             return;
         }
         Err(e) => {
-            tracing::error!(error = %e, "数不出用户数，跳过 .env 建号");
+            tracing::error!(error = %e, "could not count the users; skipping the .env bootstrap");
             return;
         }
     }
@@ -333,7 +342,7 @@ async fn ensure_admin(acc: &state::Accounts) {
     let st_hash = match credentials::hash_password(&password) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(error = %e, "{ADMIN_PASSWORD_ENV} 不合规，没有建账号");
+            tracing::error!(error = %e, "{ADMIN_PASSWORD_ENV} does not meet the requirements; no account was created");
             return;
         }
     };
@@ -352,17 +361,23 @@ async fn ensure_admin(acc: &state::Accounts) {
     match r {
         Ok(res) if res.rows_affected() == 1 => tracing::info!(
             user = %username,
-            "已按 {ADMIN_USER_ENV} / {ADMIN_PASSWORD_ENV} 建好管理员账号（schema=public）。             建议建完之后把 {ADMIN_PASSWORD_ENV} 从 .env 里删掉 ——              它只在第一次启动时被用到"
+            "created the administrator account from {ADMIN_USER_ENV} / \
+             {ADMIN_PASSWORD_ENV} (schema=public). Removing {ADMIN_PASSWORD_ENV} from \
+             .env afterwards is recommended — it is only ever read on the first start"
         ),
-        Ok(_) => tracing::warn!(user = %username, "这个用户名已经存在，没有新建"),
-        Err(e) => tracing::error!(error = %e, "按 .env 建管理员失败"),
+        Ok(_) => {
+            tracing::warn!(user = %username, "that username already exists; nothing was created")
+        }
+        Err(e) => tracing::error!(error = %e, "could not create the administrator from .env"),
     }
 }
 
 async fn create_user(config: &Config, username: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    print!("给 {username} 设个密码（不回显不了，注意旁边有没有人）：");
+    print!(
+        "Set a password for {username} (it cannot be hidden from the screen — mind who is nearby): "
+    );
     std::io::stdout().flush()?;
     let mut password = String::new();
     std::io::stdin().read_line(&mut password)?;
@@ -370,17 +385,17 @@ async fn create_user(config: &Config, username: &str) -> anyhow::Result<()> {
 
     cortex_store::Store::migrate_global(&config.database_url)
         .await
-        .context("全局 schema 迁移失败")?;
+        .context("the global schema migration failed")?;
     let pools = std::sync::Arc::new(cortex_store::TenantPools::new(&config.database_url));
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&config.database_url)
         .await
-        .context("连不上数据库")?;
+        .context("could not connect to the database")?;
 
     let hash = credentials::hash_password(password)
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("密码不合要求")?;
+        .context("the password does not meet the requirements")?;
     let user_id = cortex_core::Id::new().to_string();
     let schema = cortex_store::SchemaName::derive(&user_id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -388,7 +403,7 @@ async fn create_user(config: &Config, username: &str) -> anyhow::Result<()> {
     // account nobody can log into. Same discipline as AppState::create_account
     cortex_store::provision(&pools, &schema)
         .await
-        .context("给新账号开库失败")?;
+        .context("could not provision the database for the new account")?;
     let inserted = sqlx::query(
         "INSERT INTO cortex_auth.users (id, username, password_hash, schema_name)
          VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
@@ -399,14 +414,14 @@ async fn create_user(config: &Config, username: &str) -> anyhow::Result<()> {
     .bind(schema.as_str())
     .execute(&pool)
     .await
-    .context("写用户记录失败")?;
+    .context("could not write the user record")?;
 
     if inserted.rows_affected() == 0 {
         let _ = pools.drop_schema(&schema).await;
-        anyhow::bail!("用户名 {username} 已经有人用了");
+        anyhow::bail!("the username {username} is already taken");
     }
     println!(
-        "已创建：{username}（id {user_id}，schema {}）",
+        "created: {username} (id {user_id}, schema {})",
         schema.as_str()
     );
     Ok(())
@@ -451,8 +466,8 @@ mod tests {
         // verbatim is not an option** — a string we cannot parse may well be
         // entirely credential
         assert_eq!(
-            redact_db_url("这不是一个 URL:p@ssword"),
-            "<无法解析的连接串>"
+            redact_db_url("not-a-url:p@ssword"),
+            "<unparsable connection string>"
         );
     }
 }

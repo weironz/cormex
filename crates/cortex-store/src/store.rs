@@ -136,7 +136,9 @@ impl Store {
         boot.close().await;
 
         let options = sqlx::postgres::PgConnectOptions::from_str(database_url)
-            .map_err(|e| crate::error::StoreError::Invalid(format!("DATABASE_URL 不合法：{e}")))?
+            .map_err(|e| {
+                crate::error::StoreError::Invalid(format!("DATABASE_URL is not valid: {e}"))
+            })?
             // public stays at the tail: the `ulid` and `sha256` DOMAINs live
             // there
             .options([("search_path", "cortex_auth,public")]);
@@ -220,7 +222,10 @@ impl Store {
             }
             Err(err) => {
                 if let Err(rollback_err) = txn.rollback().await {
-                    tracing::warn!(error = %rollback_err, "写事务回滚失败");
+                    tracing::warn!(
+                        error = %rollback_err,
+                        "rolling back the write transaction failed"
+                    );
                 }
                 Err(err)
             }

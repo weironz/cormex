@@ -19,7 +19,11 @@ use cortex_evals::suite::Suite;
 use cortex_memory::retrieval::RecencyMode;
 
 #[derive(Parser)]
-#[command(name = "cortex-evals", about = "Cortex 检索质量评测", version)]
+#[command(
+    name = "cortex-evals",
+    about = "Cortex retrieval-quality evaluation",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -205,7 +209,7 @@ async fn main() -> ExitCode {
     match real_main().await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("错误：{err:#}");
+            eprintln!("error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -226,7 +230,7 @@ async fn real_main() -> Result<ExitCode> {
         Command::Validate { suite } => {
             let s = Suite::load(&suite)?;
             println!(
-                "题集 {} 校验通过：{} 场景 / {} 轮 / {} 条铺垫事实 / {} 道题",
+                "suite {} validated: {} scenarios / {} turns / {} seeded facts / {} questions",
                 s.name,
                 s.scenarios.len(),
                 s.turn_count(),
@@ -234,10 +238,10 @@ async fn real_main() -> Result<ExitCode> {
                 s.questions.len()
             );
             for (kind, n) in s.count_by_kind() {
-                println!("  {:<10} {n} 题", kind.label());
+                println!("  {:<10} {n} questions", kind.label());
             }
             for (lang, n) in s.count_by_lang() {
-                println!("  {:<10} {n} 题", lang.label());
+                println!("  {:<10} {n} questions", lang.label());
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -252,8 +256,9 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
         .ok()
         .filter(|s| !s.is_empty())
         .context(
-            "没有 DATABASE_URL。评测必须连真库 —— 四路召回里三路是 SQL，\
-             脱离 Postgres 测出来的不是这套检索",
+            "DATABASE_URL is not set. The eval must run against a real database -- three of the \
+             four retrieval legs are SQL, and what you measure without Postgres is not this \
+             retrieval system",
         )?;
 
     let opts = RunOptions {
@@ -312,13 +317,13 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
     println!("{text}");
 
     if let Some(path) = &args.md {
-        std::fs::write(path, &text).with_context(|| format!("写不了 {}", path.display()))?;
-        eprintln!("人类可读报告：{}", path.display());
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("human-readable report: {}", path.display());
     }
     if let Some(path) = &args.json {
         std::fs::write(path, report.to_json()?)
-            .with_context(|| format!("写不了 {}", path.display()))?;
-        eprintln!("机器可读报告：{}", path.display());
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("machine-readable report: {}", path.display());
     }
 
     // The regression gate. If the number drops, it goes red — this is the only
@@ -326,7 +331,9 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
     if let Some(min) = args.min_recall5 {
         let actual = report.overall.recall.get(&5).copied().unwrap_or(0.0);
         if actual < min {
-            eprintln!("回归门未过：整体 Recall@5 = {actual:.3}，低于门槛 {min:.3}");
+            eprintln!(
+                "regression gate failed: overall Recall@5 = {actual:.3}, below the {min:.3} threshold"
+            );
             return Ok(ExitCode::FAILURE);
         }
     }

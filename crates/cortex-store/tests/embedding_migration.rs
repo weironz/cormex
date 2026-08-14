@@ -59,7 +59,7 @@ async fn seed(ctx: &common::TestDb, model: &str, n: usize) -> Vec<String> {
 #[tokio::test]
 async fn switching_model_silently_drops_vector_recall_until_backfilled() {
     let Some(ctx) = common::setup().await else {
-        eprintln!("跳过：数据库不可用");
+        eprintln!("skipped: the database is unavailable");
         return;
     };
     let store = &ctx.store;
@@ -152,7 +152,7 @@ async fn switching_model_silently_drops_vector_recall_until_backfilled() {
 #[tokio::test]
 async fn a_fact_present_on_both_sides_is_returned_once() {
     let Some(ctx) = common::setup().await else {
-        eprintln!("跳过：数据库不可用");
+        eprintln!("skipped: the database is unavailable");
         return;
     };
     let store = &ctx.store;
@@ -202,7 +202,7 @@ async fn a_fact_present_on_both_sides_is_returned_once() {
 #[tokio::test]
 async fn census_and_backlog_agree_with_each_other() {
     let Some(ctx) = common::setup().await else {
-        eprintln!("跳过：数据库不可用");
+        eprintln!("skipped: the database is unavailable");
         return;
     };
     let store = &ctx.store;
@@ -320,7 +320,7 @@ async fn census_and_backlog_agree_with_each_other() {
 #[tokio::test]
 async fn the_base_set_is_not_materialized() {
     let Some(ctx) = common::setup().await else {
-        eprintln!("跳过：数据库不可用");
+        eprintln!("skipped: the database is unavailable");
         return;
     };
 

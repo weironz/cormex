@@ -26,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
     match client
         .stream_with(
             &model,
-            "你是助手",
-            &[Message::user().with_text("你好")],
+            "You are an assistant",
+            &[Message::user().with_text("Hello")],
             &[],
         )
         .await
@@ -35,12 +35,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(mut s) => {
             while let Some(item) = s.next().await {
                 match item {
-                    Ok((m, _)) => println!("收到：{m:?}"),
-                    Err(e) => println!("流内错误：{e}"),
+                    Ok((m, _)) => println!("received: {m:?}"),
+                    Err(e) => println!("error inside the stream: {e}"),
                 }
             }
         }
-        Err(e) => println!("调用失败（但请求可能已经打出去了）：{e}"),
+        Err(e) => println!("the call failed (but the request may already have gone out): {e}"),
     }
     Ok(())
 }

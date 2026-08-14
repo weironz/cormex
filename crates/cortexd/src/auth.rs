@@ -156,35 +156,39 @@ impl AuthMode {
             // memory database is running naked), and the latter is not something
             // to be guessed at
             (true, Some(_)) => Err(cortex_core::CortexError::Config(format!(
-                "{AUTH_ENV}={DISABLED_VALUE} 与 {TOKEN_SHA256_ENV} 同时配置了，意图不明。\
-                 想关认证就删掉 {TOKEN_SHA256_ENV}；想开认证就删掉 {AUTH_ENV}。"
+                "{AUTH_ENV}={DISABLED_VALUE} and {TOKEN_SHA256_ENV} are both configured, so \
+                 the intent is ambiguous. To turn authentication off, remove \
+                 {TOKEN_SHA256_ENV}; to turn it on, remove {AUTH_ENV}."
             ))),
             (true, None) => Ok(Self::Disabled),
             (false, Some(hex_digest)) => {
                 let raw = hex::decode(&hex_digest).map_err(|e| {
                     cortex_core::CortexError::Config(format!(
-                        "{TOKEN_SHA256_ENV} 不是合法的十六进制：{e}"
+                        "{TOKEN_SHA256_ENV} is not valid hex: {e}"
                     ))
                 })?;
                 let digest: [u8; 32] = raw.try_into().map_err(|_| {
                     cortex_core::CortexError::Config(format!(
-                        "{TOKEN_SHA256_ENV} 必须是 SHA-256 摘要（64 个十六进制字符）。\
-                         注意这里要填的是**摘要**，不是 token 明文 —— \
-                         用 `cortexd --generate-token` 一次生成两者。"
+                        "{TOKEN_SHA256_ENV} must be a SHA-256 digest (64 hex characters). \
+                         What goes here is the **digest**, not the plaintext token — \
+                         `cortexd --generate-token` produces both at once."
                     ))
                 })?;
                 Ok(Self::Token { digest })
             }
             (false, None) => Err(cortex_core::CortexError::Config(format!(
-                "没有配置任何凭据，cortexd 拒绝启动。\n\
+                "no credential is configured, so cortexd refuses to start.\n\
                  \n\
-                 一个不认证的 cortexd 会把整个记忆库交给任何能连上这个端口的人，\n\
-                 而这件事不会有任何症状 —— 所以这里选择当场失败，而不是默认放行。\n\
+                 An unauthenticated cortexd hands the whole memory database to\n\
+                 anyone who can reach this port, and that has no symptom at all\n\
+                 — so it fails on the spot rather than defaulting to open.\n\
                  \n\
-                 生成一份凭据：  cortexd --generate-token\n\
-                 然后把 {TOKEN_SHA256_ENV}=… 写进 .env（明文 token 给客户端）。\n\
+                 Generate a credential:  cortexd --generate-token\n\
+                 then write {TOKEN_SHA256_ENV}=… into .env (the plaintext token\n\
+                 goes to the client).\n\
                  \n\
-                 只听回环的开发机确实不想要认证，就显式写 {AUTH_ENV}={DISABLED_VALUE}。"
+                 A loopback-only development machine that genuinely wants no\n\
+                 authentication has to say so: {AUTH_ENV}={DISABLED_VALUE}."
             ))),
         }
     }
@@ -202,10 +206,11 @@ impl AuthMode {
     #[must_use]
     pub fn status_line(&self) -> String {
         match self {
-            Self::Token { .. } => "认证：已启用（Bearer token）".into(),
+            Self::Token { .. } => "auth: enabled (Bearer token)".into(),
             Self::Disabled => format!(
-                "认证：⚠ **已关闭**（{AUTH_ENV}={DISABLED_VALUE}）—— \
-                 任何能连上这个端口的人都拥有全部记忆。只有在确认监听地址是回环时才可接受"
+                "auth: ⚠ **disabled** ({AUTH_ENV}={DISABLED_VALUE}) — anyone who can \
+                 reach this port holds all of the memory. Acceptable only once you have \
+                 confirmed the listen address is loopback"
             ),
         }
     }
@@ -369,12 +374,12 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
             }
             tracing::warn!(
                 owner = %scope.owner, session = %scope.session_id, %method, %path,
-                "沙箱令牌够不着这条路由"
+                "the sandbox token cannot reach this route"
             );
             return (
                 StatusCode::FORBIDDEN,
                 axum::Json(crate::dto::ErrorBody {
-                    error: format!("沙箱不能访问 {method} {path}"),
+                    error: format!("the sandbox may not access {method} {path}"),
                 }),
             )
                 .into_response();
@@ -392,13 +397,14 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
     // reporting them separately hands a brute-forcer a progress bar.
     // WWW-Authenticate is still sent — that is the standard shape of a 401, and
     // it is how a client learns what to bring
-    tracing::debug!(path = %req.uri().path(), "未通过认证");
+    tracing::debug!(path = %req.uri().path(), "authentication failed");
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer realm=\"cortexd\"")],
         axum::Json(crate::dto::ErrorBody {
-            error: "未认证：请带上 Authorization: Bearer <token>，\
-                    或对加不了请求头的连接使用 POST /auth/ticket 换到的 ?ticket="
+            error: "unauthenticated: send Authorization: Bearer <token>, or — for a \
+                    connection that cannot set headers — the ?ticket= obtained from \
+                    POST /auth/ticket"
                 .into(),
         }),
     )
@@ -541,7 +547,7 @@ mod tests {
             collided.expect("should have been able to brute-force a token sharing the first byte");
         assert!(
             !mode.verify(&collided),
-            "a token whose digest merely starts the same was admitted —— the credential \
+            "a token whose digest merely starts the same was admitted — the credential \
              comparison is not over the full digest"
         );
     }
@@ -631,7 +637,7 @@ mod tests {
             assert_ne!(
                 v.trim(),
                 DISABLED_VALUE,
-                "{v:?} must never turn authentication off —— the switch has to be something you \
+                "{v:?} must never turn authentication off — the switch has to be something you \
                  only write down after understanding it"
             );
         }
@@ -664,7 +670,7 @@ mod tests {
         assert!(
             !mode.verify(&issued),
             "a freshly issued access token has nothing to do with the pre-shared token, so of \
-             course `verify` does not recognise it —— which is why `require` **must** have a \
+             course `verify` does not recognise it — which is why `require` **must** have a \
              separate branch that asks the AccessBook. This assertion will never go red on its \
              own; it is here to make the next one's meaning clear"
         );

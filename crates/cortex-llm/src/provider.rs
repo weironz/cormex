@@ -168,7 +168,7 @@ pub fn build_with(name: &str, api_key: &str, base_url: Option<&str>) -> Result<B
             let mut v: serde_json::Value =
                 serde_json::from_str(json).map_err(|e| LlmError::Build {
                     name: name.to_string(),
-                    source: anyhow::anyhow!("内置的 {name} 定义不是合法 JSON：{e}"),
+                    source: anyhow::anyhow!("built-in {name} definition is not valid JSON: {e}"),
                 })?;
             // A trailing `/` makes goose assemble `https://x//v1/...`. Some
             // gateways do not care, others return a flat 404 — and that 404

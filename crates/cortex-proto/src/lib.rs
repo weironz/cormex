@@ -113,14 +113,14 @@ const _: () = assert!(
 pub fn check_peer(peer_protocol: u32, peer_min_peer: u32, peer_label: &str) -> Result<(), String> {
     if peer_protocol < MIN_PEER_PROTOCOL {
         return Err(format!(
-            "{peer_label}讲的是协议 v{peer_protocol}，而本端最低只支持 v{MIN_PEER_PROTOCOL}。\
-             请把{peer_label}升级到更新的版本。"
+            "{peer_label} speaks protocol v{peer_protocol}, but this side supports no older \
+             than v{MIN_PEER_PROTOCOL}. Upgrade {peer_label} to a newer version."
         ));
     }
     if PROTOCOL_VERSION < peer_min_peer {
         return Err(format!(
-            "本端讲的是协议 v{PROTOCOL_VERSION}，而{peer_label}最低要求 v{peer_min_peer}。\
-             请把本机这一侧升级到更新的版本。"
+            "this side speaks protocol v{PROTOCOL_VERSION}, but {peer_label} requires no older \
+             than v{peer_min_peer}. Upgrade this machine's side to a newer version."
         ));
     }
     Ok(())
@@ -138,20 +138,21 @@ mod tests {
     /// old clients go right on connecting.
     #[test]
     fn both_directions_are_checked_and_say_which_side_to_upgrade() {
-        assert!(check_peer(PROTOCOL_VERSION, MIN_PEER_PROTOCOL, "远端").is_ok());
+        assert!(check_peer(PROTOCOL_VERSION, MIN_PEER_PROTOCOL, "the remote").is_ok());
 
-        let too_old = check_peer(MIN_PEER_PROTOCOL - 1, 0, "远端")
+        let too_old = check_peer(MIN_PEER_PROTOCOL - 1, 0, "the remote")
             .expect_err("a peer that is too old must be blocked");
         assert!(
-            too_old.contains("升级到"),
+            too_old.contains("Upgrade the remote"),
             "the error has to say which side to upgrade, got: {too_old}"
         );
 
-        let we_are_old = check_peer(PROTOCOL_VERSION, PROTOCOL_VERSION + 1, "远端").expect_err(
-            "must block when the peer no longer supports this side — only the peer knows this",
-        );
+        let we_are_old = check_peer(PROTOCOL_VERSION, PROTOCOL_VERSION + 1, "the remote")
+            .expect_err(
+                "must block when the peer no longer supports this side — only the peer knows this",
+            );
         assert!(
-            we_are_old.contains("本机"),
+            we_are_old.contains("this machine"),
             "in this direction the user should upgrade the **local** side, got: {we_are_old}"
         );
     }
@@ -178,7 +179,7 @@ mod tests {
             serde_json::from_str(real_0_1_3).expect("an old daemon's /health must still parse");
 
         assert!(
-            check_peer(peer.protocol, peer.min_peer_protocol, "远端").is_ok(),
+            check_peer(peer.protocol, peer.min_peer_protocol, "the remote").is_ok(),
             "0.1.3 judged incompatible — the day this check ships it would lock out every \
              desktop client. Parsed protocol={} min_peer={}",
             peer.protocol,
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn a_build_is_always_compatible_with_itself() {
         assert!(
-            check_peer(PROTOCOL_VERSION, MIN_PEER_PROTOCOL, "对端").is_ok(),
+            check_peer(PROTOCOL_VERSION, MIN_PEER_PROTOCOL, "the peer").is_ok(),
             "two processes from the same build cannot shake hands — the comparison in \
              check_peer is the wrong way round"
         );

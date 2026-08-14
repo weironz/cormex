@@ -69,7 +69,7 @@ async fn the_default_page_contains_the_newest_message_not_the_oldest() {
     let page = s
         .episodes_by_session_page("long", 200, None)
         .await
-        .expect("分页查询不该失败");
+        .expect("a paged query should not fail");
     // The shape of the old implementation: ascending + LIMIT
     let old = s
         .episodes_by_session("long", 200)

@@ -124,18 +124,21 @@ impl Segment {
     pub fn validate(&self) -> Result<()> {
         if self.text.trim().is_empty() {
             return Err(CortexError::Invalid(
-                "转录段落文本为空 —— 空转录不会被任何检索命中，等同于没转".into(),
+                "the transcript segment text is empty -- an empty transcript is hit by no retrieval \
+                 at all, which is the same as never transcribing it"
+                    .into(),
             ));
         }
         match (self.span_start_ms, self.span_end_ms) {
             (None, Some(end)) => Err(CortexError::Invalid(format!(
-                "转录段落有终点 {end}ms 却没有起点，违反 blob_transcripts 的 CHECK 约束"
+                "the transcript segment has an end at {end}ms but no start, which violates the \
+                 CHECK constraint on blob_transcripts"
             ))),
-            (Some(start), _) if start < 0 => {
-                Err(CortexError::Invalid(format!("转录段落起点 {start}ms 为负")))
-            }
+            (Some(start), _) if start < 0 => Err(CortexError::Invalid(format!(
+                "transcript segment start {start}ms is negative"
+            ))),
             (Some(start), Some(end)) if end < start => Err(CortexError::Invalid(format!(
-                "转录段落终点 {end}ms 早于起点 {start}ms"
+                "the transcript segment end {end}ms is earlier than its start {start}ms"
             ))),
             _ => Ok(()),
         }
@@ -376,14 +379,17 @@ impl TranscribePipeline {
         guard: &dyn RedactionGuard,
     ) -> Result<Outcome> {
         let Some(transcriber) = self.transcriber_for(mime) else {
-            tracing::debug!(mime, blob_hash, "没有转录器认领这个 MIME，跳过");
+            tracing::debug!(mime, blob_hash, "no transcriber claims this MIME, skipping");
             return Ok(Outcome::Unsupported {
                 mime: mime.to_string(),
             });
         };
 
         if guard.is_redacted(blob_hash).await? {
-            tracing::info!(blob_hash, "blob 已被抹除，转录前即跳过");
+            tracing::info!(
+                blob_hash,
+                "the blob has been redacted; skipped before transcription"
+            );
             return Ok(Outcome::Redacted);
         }
 
@@ -393,13 +399,13 @@ impl TranscribePipeline {
                 blob_hash,
                 mime,
                 transcriber = transcriber.transcribed_by(),
-                "转录器返回空结果，这份媒体仍然是检索黑洞"
+                "the transcriber returned nothing; this media is still a retrieval black hole"
             );
             return Ok(Outcome::Ready(Vec::new()));
         }
         for (i, seg) in segments.iter().enumerate() {
             seg.validate()
-                .map_err(|e| CortexError::Invalid(format!("第 {i} 段：{e}")))?;
+                .map_err(|e| CortexError::Invalid(format!("segment {i}: {e}")))?;
         }
 
         // Embed the whole batch in one call: the chunk count is usually a single
@@ -409,7 +415,7 @@ impl TranscribePipeline {
         let vectors = self.embedder.embed(&texts).await?;
         if vectors.len() != segments.len() {
             return Err(CortexError::Memory(format!(
-                "embedder 返回 {} 条向量，但有 {} 个段落",
+                "the embedder returned {} vectors, but there are {} segments",
                 vectors.len(),
                 segments.len()
             )));
@@ -420,7 +426,7 @@ impl TranscribePipeline {
             tracing::warn!(
                 blob_hash,
                 segments = segments.len(),
-                "转录进行中该 blob 被抹除，整批丢弃"
+                "the blob was redacted while transcription was running; dropping the whole batch"
             );
             return Ok(Outcome::Redacted);
         }
@@ -530,7 +536,7 @@ impl VisionTranscriber {
         let model_config = client.model_config(model).map_err(CortexError::from)?;
         if client.vision_support(&model_config) == VisionSupport::Unsupported {
             return Err(CortexError::Config(format!(
-                "{}/{model} 不支持图像输入，无法用作 vision 转录器",
+                "{}/{model} does not accept image input and cannot be used as a vision transcriber",
                 client.provider_id()
             )));
         }
@@ -559,7 +565,9 @@ impl VisionTranscriber {
     /// variable is missing, or the model does not support vision.
     pub fn from_env() -> Result<Option<Self>> {
         let Ok(provider) = std::env::var("CORTEX_VISION_PROVIDER") else {
-            tracing::info!("未设置 CORTEX_VISION_PROVIDER，图片转录关闭（图片仍会归档）");
+            tracing::info!(
+                "CORTEX_VISION_PROVIDER is not set; image transcription is off (images are still archived)"
+            );
             return Ok(None);
         };
         let provider = provider.trim().to_string();
@@ -569,7 +577,7 @@ impl VisionTranscriber {
 
         let model = std::env::var("CORTEX_VISION_MODEL").map_err(|_| {
             CortexError::Config(
-                "设置了 CORTEX_VISION_PROVIDER 就必须一并设置 CORTEX_VISION_MODEL".into(),
+                "setting CORTEX_VISION_PROVIDER means CORTEX_VISION_MODEL must be set too".into(),
             )
         })?;
 
@@ -579,7 +587,7 @@ impl VisionTranscriber {
         } else {
             std::env::var(&key_var).map_err(|_| {
                 CortexError::Config(format!(
-                    "CORTEX_VISION_PROVIDER={provider} 需要环境变量 {key_var}"
+                    "CORTEX_VISION_PROVIDER={provider} needs the {key_var} environment variable"
                 ))
             })?
         };
@@ -656,12 +664,12 @@ impl Transcriber for VisionTranscriber {
             input_tokens = usage.usage.input_tokens,
             output_tokens = usage.usage.output_tokens,
             chars = text.chars().count(),
-            "vision 转录完成"
+            "vision transcription finished"
         );
 
         if text.is_empty() {
             return Err(CortexError::Memory(format!(
-                "{} 对图像返回了空描述",
+                "{} returned an empty description for the image",
                 self.transcribed_by
             )));
         }
@@ -755,7 +763,9 @@ impl Transcriber for StubTranscriber {
 
     async fn transcribe(&self, bytes: &[u8], mime: &str) -> Result<Vec<Segment>> {
         if bytes.is_empty() {
-            return Err(CortexError::Invalid("转录输入为空".into()));
+            return Err(CortexError::Invalid(
+                "the transcription input is empty".into(),
+            ));
         }
         let fp = fingerprint(bytes);
         let label = self.kind.as_str();

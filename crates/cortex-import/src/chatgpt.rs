@@ -40,25 +40,28 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
             // A conversation with no usable messages (system only, or entirely
             // empty) is not an error
             Ok(None) => skipped += 1,
-            Err(e) => bail!("第 {} 段对话解析失败：{e}", i + 1),
+            Err(e) => bail!("conversation {} failed to parse: {e}", i + 1),
         }
     }
     if out.is_empty() {
         bail!(
-            "{} 段对话里一段都没解析出可用消息。格式很可能变了 —— \
-             这比「你的历史是空的」更可能",
+            "not one of the {} conversations yielded a usable message. The format has most \
+             likely changed — that is far more likely than your history being empty",
             items.len()
         );
     }
     if skipped > 0 {
-        tracing::debug!(skipped, "跳过了没有可用消息的对话");
+        tracing::debug!(skipped, "skipped conversations that had no usable message");
     }
     Ok(out)
 }
 
 fn one(raw: &Value) -> Result<Option<Conversation>> {
     let Some(mapping) = raw.get("mapping").and_then(Value::as_object) else {
-        bail!("缺少 `mapping` 对象。这一段实际有这些键：{}", keys_of(raw));
+        bail!(
+            "no `mapping` object. The keys this entry does have: {}",
+            keys_of(raw)
+        );
     };
 
     let source_id = raw
@@ -68,8 +71,8 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
         .unwrap_or_default();
     if source_id.is_empty() {
         bail!(
-            "既没有 `conversation_id` 也没有 `id` —— 没有稳定标识就没法做\
-             幂等导入。这一段实际有这些键：{}",
+            "neither `conversation_id` nor `id` — without a stable identifier there is no \
+             idempotent import. The keys this entry does have: {}",
             keys_of(raw)
         );
     }
@@ -122,7 +125,7 @@ fn walk_up<'a>(
 
     while let Some(id) = cursor {
         if !seen.insert(id.clone()) {
-            tracing::warn!(node = id, "mapping 里有环，在这里停下");
+            tracing::warn!(node = id, "the mapping has a cycle; stopping here");
             break;
         }
         let Some(node) = mapping.get(&id).and_then(Value::as_object) else {

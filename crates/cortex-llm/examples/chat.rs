@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     // Search upward from the project root for .env; an example's working
     // directory is the workspace root, so it is found directly.
     if let Err(e) = dotenvy::dotenv() {
-        eprintln!("提示：未加载 .env（{e}），改用进程环境变量");
+        eprintln!("note: .env was not loaded ({e}), falling back to the process environment");
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -38,16 +38,20 @@ async fn main() -> anyhow::Result<()> {
     // The smoke test uses the cheap model; do not burn the main model's quota.
     let model = client.cheap_model();
     println!(
-        "供应商 {} / 模型 {}（上下文上限 {}）",
+        "provider {} / model {} (context limit {})",
         client.provider_id(),
         model.model_name,
         model.context_limit()
     );
     println!("─────────────────────────────────────────");
 
-    let messages = [Message::user().with_text("用一句话介绍你自己")];
+    let messages = [Message::user().with_text("Introduce yourself in one sentence")];
     let mut stream = client
-        .stream_text(model, "你是 Cortex 的助手，回答简洁。", &messages)
+        .stream_text(
+            model,
+            "You are Cortex's assistant. Answer concisely.",
+            &messages,
+        )
         .await?;
 
     let mut chunks = 0usize;
@@ -60,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("\n─────────────────────────────────────────");
-    println!("共 {chunks} 个增量块");
-    anyhow::ensure!(chunks > 1, "只收到 {chunks} 块，流式没生效");
+    println!("{chunks} delta chunks in total");
+    anyhow::ensure!(
+        chunks > 1,
+        "only {chunks} chunk(s) arrived — streaming did not take effect"
+    );
     Ok(())
 }

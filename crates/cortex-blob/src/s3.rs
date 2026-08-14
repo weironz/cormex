@@ -208,11 +208,14 @@ impl S3BlobStore {
             // http://) is precisely the one it misses. Hence the explicit
             // demand for http/https plus a host.
             let url = Url::parse(&opts.endpoint).map_err(|e| {
-                BlobError::Backend(format!("S3 endpoint {:?} 非法：{e}", opts.endpoint))
+                BlobError::Backend(format!(
+                    "S3 endpoint {:?} is not a valid URL: {e}",
+                    opts.endpoint
+                ))
             })?;
             if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
                 return Err(BlobError::Backend(format!(
-                    "S3 endpoint {:?} 缺少 http:// 或 https:// 前缀",
+                    "S3 endpoint {:?} is missing the http:// or https:// prefix",
                     opts.endpoint
                 )));
             }
@@ -262,7 +265,7 @@ impl S3BlobStore {
             .await
         {
             Ok(_) => {
-                tracing::info!(bucket = %self.bucket, "已创建对象存储桶");
+                tracing::info!(bucket = %self.bucket, "created the object storage bucket");
                 Ok(())
             }
             Err(e) => {
@@ -278,8 +281,9 @@ impl S3BlobStore {
 
     fn presign_cfg(ttl: Duration) -> Result<PresigningConfig> {
         validate_ttl(ttl)?;
-        PresigningConfig::expires_in(ttl)
-            .map_err(|e| BlobError::Backend(format!("构造 presigning 配置失败：{e}")))
+        PresigningConfig::expires_in(ttl).map_err(|e| {
+            BlobError::Backend(format!("failed to build the presigning configuration: {e}"))
+        })
     }
 
     /// Large objects go through multipart. On failure it **must** abort,
@@ -297,9 +301,9 @@ impl S3BlobStore {
             .await
             .map_err(|e| backend_err("CreateMultipartUpload", e))?;
 
-        let upload_id = created
-            .upload_id()
-            .ok_or_else(|| BlobError::Backend("CreateMultipartUpload 未返回 upload_id".into()))?;
+        let upload_id = created.upload_id().ok_or_else(|| {
+            BlobError::Backend("CreateMultipartUpload returned no upload_id".into())
+        })?;
 
         match self.upload_parts(key, upload_id, bytes).await {
             Ok(parts) => {
@@ -332,7 +336,8 @@ impl S3BlobStore {
                 {
                     tracing::warn!(
                         key, %abort_err,
-                        "multipart 失败后 abort 也失败，桶内可能残留分片，需靠生命周期规则回收"
+                        "the abort after a failed multipart also failed; stray parts may remain \
+                         in the bucket and have to be reclaimed by a lifecycle rule"
                     );
                 }
                 Err(e)
@@ -356,8 +361,8 @@ impl S3BlobStore {
         // matter.
         for (i, chunk) in bytes.chunks(MULTIPART_PART_SIZE).enumerate() {
             // S3 part numbers start at 1, not 0.
-            let part_number =
-                i32::try_from(i + 1).map_err(|_| BlobError::Backend("分片数超出 i32".into()))?;
+            let part_number = i32::try_from(i + 1)
+                .map_err(|_| BlobError::Backend("the part count overflows i32".into()))?;
 
             let out = self
                 .client
@@ -571,7 +576,7 @@ where
         }
         deepest
     });
-    BlobError::Backend(format!("{op} 失败[{code}]：{msg}"))
+    BlobError::Backend(format!("{op} failed [{code}]: {msg}"))
 }
 
 fn map_get_err(hash: &str, e: SdkError<GetObjectError>) -> BlobError {
@@ -579,7 +584,9 @@ fn map_get_err(hash: &str, e: SdkError<GetObjectError>) -> BlobError {
         // 416: the range falls outside the object. Classified as InvalidRange
         // rather than Backend, so that the HTTP layer maps it to 400 and not
         // 500.
-        Some(416) => BlobError::InvalidRange(format!("请求的区间完全落在 {hash} 之外")),
+        Some(416) => {
+            BlobError::InvalidRange(format!("the requested range falls entirely outside {hash}"))
+        }
         // Go by status code rather than only recognizing
         // `GetObjectError::NoSuchKey`: compatible implementations such as
         // RustFS answer a missing object with 404 but do not necessarily attach
@@ -608,14 +615,15 @@ fn is_no_such_bucket<E: ProvideErrorMetadata>(e: &SdkError<E>) -> bool {
 }
 
 fn parse_presigned(uri: &str) -> Result<Url> {
-    Url::parse(uri).map_err(|e| BlobError::Backend(format!("presigned URL {uri:?} 不可解析：{e}")))
+    Url::parse(uri)
+        .map_err(|e| BlobError::Backend(format!("presigned URL {uri:?} cannot be parsed: {e}")))
 }
 
 async fn collect(body: ByteStream) -> Result<Bytes> {
     body.collect()
         .await
         .map(aws_smithy_types::byte_stream::AggregatedBytes::into_bytes)
-        .map_err(|e| BlobError::Backend(format!("读取对象内容失败：{e}")))
+        .map_err(|e| BlobError::Backend(format!("failed to read the object body: {e}")))
 }
 
 #[cfg(test)]

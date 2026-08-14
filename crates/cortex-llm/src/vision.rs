@@ -117,14 +117,14 @@ pub fn to_data_url(bytes: &[u8], mime: &str) -> Result<String> {
 pub fn parse_data_url(url: &str) -> Result<(&'static str, String)> {
     let rest = url
         .strip_prefix("data:")
-        .ok_or_else(|| LlmError::InvalidImage("不是 data: URL".into()))?;
+        .ok_or_else(|| LlmError::InvalidImage("not a data: URL".into()))?;
     let (meta, payload) = rest
         .split_once(',')
-        .ok_or_else(|| LlmError::InvalidImage("data: URL 缺少逗号分隔的载荷".into()))?;
+        .ok_or_else(|| LlmError::InvalidImage("data: URL has no comma-separated payload".into()))?;
     let meta_lower = meta.to_ascii_lowercase();
     if !meta_lower.ends_with(";base64") {
         return Err(LlmError::InvalidImage(
-            "只支持 ;base64 形式的 data: URL".into(),
+            "only the ;base64 form of data: URL is supported".into(),
         ));
     }
     let mime = normalize_image_mime(&meta_lower[..meta_lower.len() - ";base64".len()])?;
@@ -134,7 +134,7 @@ pub fn parse_data_url(url: &str) -> Result<(&'static str, String)> {
     // provider, which is far harder to trace than saying so right here
     let decoded = base64::prelude::BASE64_STANDARD
         .decode(payload.trim())
-        .map_err(|e| LlmError::InvalidImage(format!("base64 解码失败：{e}")))?;
+        .map_err(|e| LlmError::InvalidImage(format!("base64 decode failed: {e}")))?;
     check_size(decoded.len())?;
 
     Ok((mime, payload.trim().to_string()))
@@ -148,7 +148,7 @@ fn check_size(len: usize) -> Result<()> {
         });
     }
     if len == 0 {
-        return Err(LlmError::InvalidImage("图像字节为空".into()));
+        return Err(LlmError::InvalidImage("the image has zero bytes".into()));
     }
     Ok(())
 }
@@ -213,7 +213,7 @@ impl MessageImageExt for Message {
         let mime = normalize_image_mime(mime)?;
         let decoded = base64::prelude::BASE64_STANDARD
             .decode(data.trim())
-            .map_err(|e| LlmError::InvalidImage(format!("base64 解码失败：{e}")))?;
+            .map_err(|e| LlmError::InvalidImage(format!("base64 decode failed: {e}")))?;
         check_size(decoded.len())?;
         Ok(self.with_image(data.trim().to_string(), mime))
     }

@@ -87,11 +87,12 @@ use cortex_proto::llm::{LlmStreamRequest, ModelTier};
 pub(crate) fn workspace_patch(field: Option<Option<&str>>) -> Result<bool> {
     match field {
         Some(Some(_)) => Err(CortexError::Invalid(
-            "cortexd 进程自己不提供文件执行环境，不能在这里绑定一个宿主机路径。\
-             文件与命令有两条路：跑在**你自己的机器**上（桌面端，\
-             或在本机运行 cortex-local —— `cortex` 命令行会自己拉起它），\
-             或者打开**云沙箱** —— 那一轮的工作区是容器里的 /workspace，\
-             由服务端自己管，不需要也不接受外部路径。"
+            "the cortexd process provides no file execution environment of its own, so a \
+             host path cannot be bound here. Files and commands have two routes: run on \
+             **your own machine** (the desktop client, or run cortex-local locally — the \
+             `cortex` command line starts it for you), or turn on the **cloud sandbox** \
+             — that turn's workspace is /workspace inside the container, managed by the \
+             server, which neither needs nor accepts a path from outside."
                 .into(),
         )),
         Some(None) => Ok(true),
@@ -121,11 +122,13 @@ pub(crate) fn workspace_patch(field: Option<Option<&str>>) -> Result<bool> {
 pub(crate) fn validate_project_name(raw: &str) -> Result<String> {
     let name = raw.trim();
     if name.is_empty() {
-        return Err(CortexError::Invalid("项目名不能为空白".into()));
+        return Err(CortexError::Invalid(
+            "a project name must not be blank".into(),
+        ));
     }
     if name.chars().count() > cortex_store::PROJECT_NAME_MAX_CHARS {
         return Err(CortexError::Invalid(format!(
-            "项目名过长（上限 {} 字符）",
+            "the project name is too long (the ceiling is {} characters)",
             cortex_store::PROJECT_NAME_MAX_CHARS
         )));
     }
@@ -176,7 +179,7 @@ fn parse_extract_concurrency(raw: Option<&str>) -> Result<usize> {
     };
     match raw.trim().parse::<usize>() {
         Ok(0) | Err(_) => Err(CortexError::Config(format!(
-            "{EXTRACT_CONCURRENCY_ENV} 必须是正整数，实际是 {raw:?}"
+            "{EXTRACT_CONCURRENCY_ENV} must be a positive integer; it is {raw:?}"
         ))),
         Ok(n) => Ok(n),
     }
@@ -408,10 +411,19 @@ pub enum TranscribeOutcome {
 impl TranscribeOutcome {
     fn log(&self, hash: &str) {
         match self {
-            Self::Stored { segments } => tracing::info!(hash, segments, "媒体转录已落库"),
-            Self::Redacted => tracing::info!(hash, "blob 在转录期间被抹除，结果已丢弃"),
-            Self::Unsupported { mime } => tracing::debug!(hash, mime, "没有转录器认领这个类型"),
-            Self::Disabled => tracing::debug!(hash, "未配置 vision 模型，跳过转录"),
+            Self::Stored { segments } => {
+                tracing::info!(hash, segments, "the media transcript was persisted")
+            }
+            Self::Redacted => tracing::info!(
+                hash,
+                "the blob was redacted while it was being transcribed; the result was discarded"
+            ),
+            Self::Unsupported { mime } => {
+                tracing::debug!(hash, mime, "no transcriber claims this type")
+            }
+            Self::Disabled => {
+                tracing::debug!(hash, "no vision model configured; skipping transcription")
+            }
         }
     }
 }
@@ -450,11 +462,11 @@ impl Live {
         // through creating the account. See the header of migrations-global/
         Store::migrate_global(&config.database_url)
             .await
-            .map_err(|e| CortexError::Store(format!("全局 schema 迁移失败：{e}")))?;
+            .map_err(|e| CortexError::Store(format!("the global schema migration failed: {e}")))?;
 
         let store = Store::connect(&config.database_url)
             .await
-            .map_err(|e| CortexError::Store(format!("连接数据库失败：{e}")))?;
+            .map_err(|e| CortexError::Store(format!("could not connect to the database: {e}")))?;
 
         // User #1's schema is literally public, so this statement doubles as
         // "migrate theirs".
@@ -466,7 +478,7 @@ impl Live {
         store
             .migrate()
             .await
-            .map_err(|e| CortexError::Store(format!("数据库迁移失败：{e}")))?;
+            .map_err(|e| CortexError::Store(format!("the database migration failed: {e}")))?;
 
         // An empty `api_key_env` = this provider requires no credentials (a local
         // Ollama, and any self-hosted endpoint that does not check keys).
@@ -484,7 +496,7 @@ impl Live {
         } else {
             std::env::var(&key_var).map_err(|_| {
                 CortexError::Config(format!(
-                    "缺少 {} 的 API key 环境变量 {key_var}",
+                    "the API key environment variable {key_var} for {} is missing",
                     config.llm.provider
                 ))
             })?
@@ -499,7 +511,7 @@ impl Live {
         // than nothing at all
         let transcribe = match cortex_memory::transcribe::VisionTranscriber::from_env()? {
             Some(v) => {
-                tracing::info!("媒体转录已启用");
+                tracing::info!("media transcription is enabled");
                 Some(Arc::new(
                     cortex_memory::TranscribePipeline::new(embedder.clone())
                         .with_transcriber(Arc::new(v)),
@@ -522,14 +534,14 @@ impl Live {
             tracing::info!(
                 legacy = l.model_id(),
                 current = embedder.model_id(),
-                "挂上了上一个 embedding 模型：回填完成之前，查询会同时在两个空间里捞"
+                "the previous embedding model is attached: until the backfill finishes, queries fish in both spaces"
             );
         }
 
         let extract_permits = extract_concurrency()?;
         tracing::info!(
             concurrent = extract_permits,
-            "抽取并发上限（{EXTRACT_CONCURRENCY_ENV} 可调）"
+            "the extraction concurrency ceiling ({EXTRACT_CONCURRENCY_ENV} adjusts it)"
         );
 
         Ok(Self {
@@ -580,17 +592,17 @@ impl Live {
         req: NewEpisodeRequest,
         origin: TurnOrigin,
     ) -> Result<EpisodeAck> {
-        let episode_id: Id = req
-            .id
-            .parse()
-            .map_err(|_| CortexError::Invalid(format!("episode id 不是合法 ULID：{}", req.id)))?;
+        let episode_id: Id = req.id.parse().map_err(|_| {
+            CortexError::Invalid(format!("the episode id is not a valid ULID: {}", req.id))
+        })?;
         let role = match req.role.as_str() {
             "user" => Role::User,
             "assistant" => Role::Assistant,
             other => {
                 return Err(CortexError::Invalid(format!(
-                    "role 只接受 user / assistant，收到 {other}；\
-                     tool 与 system 不是「一轮对话」，它们由工具归因与系统提示各自表达"
+                    "role accepts only user / assistant, and {other} arrived; tool and \
+                     system are not \"one turn of conversation\" — they are expressed by \
+                     tool attribution and the system prompt respectively"
                 )));
             }
         };
@@ -603,7 +615,7 @@ impl Live {
             .map_err(store_err)?
             .is_some()
         {
-            tracing::debug!(episode = %req.id, "这条 episode 已经写过，本次是空操作");
+            tracing::debug!(episode = %req.id, "this episode has been written before; this call is a no-op");
             return Ok(EpisodeAck {
                 episode_id: req.id,
                 memories: Vec::new(),
@@ -617,7 +629,7 @@ impl Live {
                 .map(|t| t.with_timezone(&Utc))
                 .map_err(|e| {
                     CortexError::Invalid(format!(
-                        "occurred_at 不是合法的 RFC 3339 时间：{raw}（{e}）"
+                        "occurred_at is not a valid RFC 3339 time: {raw} ({e})"
                     ))
                 })?,
         };
@@ -628,7 +640,8 @@ impl Live {
         for a in &attachments {
             if self.store.blob(&a.hash).await.map_err(store_err)?.is_none() {
                 return Err(CortexError::Invalid(format!(
-                    "附件 {} 尚未登记；请先 POST /blobs 上传，或直传后 POST /blobs/commit",
+                    "attachment {} is not registered yet; POST /blobs to upload it, \
+                     or POST /blobs/commit after a direct upload",
                     a.hash
                 )));
             }
@@ -685,7 +698,8 @@ impl Live {
             // the client treat a successful replay as a failure and retry
             // forever
             Err(e) if e.is_duplicate_key() => {
-                tracing::debug!(episode = %req.id, "并发重放撞上唯一约束，按已存在处理");
+                tracing::debug!(episode = %req.id, "a concurrent replay hit the unique constraint; \
+                         treating it as already present");
                 return Ok(EpisodeAck {
                     episode_id: req.id,
                     memories: Vec::new(),
@@ -714,7 +728,7 @@ impl Live {
         if !req.tool_calls.is_empty() {
             let anchor = req.anchor_episode_id.as_deref().unwrap_or(&req.id);
             let anchor: Id = anchor.parse().map_err(|_| {
-                CortexError::Invalid(format!("anchor_episode_id 不是合法 ULID：{anchor}"))
+                CortexError::Invalid(format!("anchor_episode_id is not a valid ULID: {anchor}"))
             })?;
             let rows: Vec<cortex_store::NewEpisodeToolCall> = req
                 .tool_calls
@@ -758,7 +772,7 @@ impl Live {
             // failing to write the attribution is a loss of observability that
             // should not surface as a failed write
             if let Err(e) = res {
-                tracing::warn!(error = %e, calls = n, "工具归因落库失败");
+                tracing::warn!(error = %e, calls = n, "could not persist the tool attribution");
             }
         }
 
@@ -793,11 +807,16 @@ impl Live {
         origin: TurnOrigin,
     ) {
         let Some(anchor) = anchor else {
-            tracing::debug!("assistant episode 没带 anchor_episode_id，跳过抽取");
+            tracing::debug!(
+                "the assistant episode carried no anchor_episode_id; skipping extraction"
+            );
             return;
         };
         let Ok(anchor_id) = anchor.parse::<Id>() else {
-            tracing::warn!(anchor, "anchor_episode_id 不是合法 ULID，跳过抽取");
+            tracing::warn!(
+                anchor,
+                "anchor_episode_id is not a valid ULID; skipping extraction"
+            );
             return;
         };
         let store = self.store.clone();
@@ -812,11 +831,11 @@ impl Live {
                 let user_text = match store.episode(&anchor).await {
                     Ok(Some(ep)) => ep.text.unwrap_or_default(),
                     Ok(None) => {
-                        tracing::warn!(anchor, "抽取找不到对应的 user episode，跳过");
+                        tracing::warn!(anchor, "extraction could not find the matching user episode; skipping");
                         return;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, anchor, "抽取读 user episode 失败，跳过");
+                        tracing::warn!(error = %e, anchor, "extraction could not read the user episode; skipping");
                         return;
                     }
                 };
@@ -832,9 +851,9 @@ impl Live {
                         written = report.written.len(),
                         superseded = report.superseded.len(),
                         duplicates = report.duplicates,
-                        "本轮抽取完成（本地 agent）"
+                        "this turn's extraction is done (local agent)"
                     ),
-                    Err(e) => tracing::warn!(error = %e, "本轮抽取失败（本地 agent）"),
+                    Err(e) => tracing::warn!(error = %e, "this turn's extraction failed (local agent)"),
                 }
             })
             .await;
@@ -891,7 +910,11 @@ impl Live {
 
         let provider: std::sync::Arc<dyn cortex_llm::Provider> =
             cortex_llm::provider::build_with(provider_name, api_key, base_url)
-                .map_err(|e| CortexError::Config(format!("自带 key 建不起供应商：{e}")))?
+                .map_err(|e| {
+                    CortexError::Config(format!(
+                        "could not build a provider from the bring-your-own key: {e}"
+                    ))
+                })?
                 .into();
         // The model configuration stays the server's — what the user supplied is
         // a key, not a model. Letting them swap the model too would require a
@@ -982,7 +1005,7 @@ impl Live {
                 // of /health: this endpoint's consumers are HEALTHCHECK and
                 // probes, and turning a container unhealthy over one diagnostic
                 // field has the priorities backwards. The error goes to the log
-                tracing::warn!(error = %e, "统计 embedding 覆盖率失败");
+                tracing::warn!(error = %e, "could not compute the embedding coverage");
                 (0, 0)
             });
         crate::dto::EmbeddingHealth {
@@ -1003,7 +1026,7 @@ impl Live {
         let census = match self.store.embedding_census().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "embedding 普查失败，跳过启动比对");
+                tracing::warn!(error = %e, "the embedding census failed; skipping the startup comparison");
                 return;
             }
         };
@@ -1019,7 +1042,11 @@ impl Live {
                 .iter()
                 .find(|(m, _)| m == model)
                 .map_or(0, |(_, n)| *n);
-            tracing::info!(model, covered, "向量化：全部事实都在当前模型下");
+            tracing::info!(
+                model,
+                covered,
+                "embeddings: every fact is under the current model"
+            );
             return;
         }
 
@@ -1029,16 +1056,16 @@ impl Live {
             covered,
             stale,
             others = others.join(" "),
-            "换过 embedding 模型：{stale} 条事实在当前模型下**没有向量**，\
-             它们进不了向量召回（BM25 / 图遍历 / 近因三路照常，所以界面上\
-             只表现为「语义召回变差了点」）。回填器会补上；\
-             要关掉它设 CORTEX_REEMBED=off"
+            "the embedding model changed: {stale} facts have **no vector** under the \
+             current model, so they cannot enter vector retrieval (BM25 / graph traversal \
+             / recency carry on as usual, so all the UI shows is \"semantic recall got a \
+             bit worse\"). The backfill will fill them in; CORTEX_REEMBED=off turns it off"
         );
     }
 
     pub async fn latest_cursor(&self) -> i64 {
         self.store.latest_seq().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "读取 latest_seq 失败，按 0 下发");
+            tracing::warn!(error = %e, "could not read latest_seq; serving 0 instead");
             0
         })
     }
@@ -1054,7 +1081,7 @@ impl Live {
         let at = match as_of {
             Some(t) => Some(
                 chrono::DateTime::parse_from_rfc3339(t)
-                    .map_err(|e| CortexError::Invalid(format!("as_of 不是合法的 RFC3339：{e}")))?
+                    .map_err(|e| CortexError::Invalid(format!("as_of is not valid RFC3339: {e}")))?
                     .with_timezone(&Utc),
             ),
             None => None,
@@ -1132,7 +1159,8 @@ impl Live {
                 // omits a badge. The costs of the two directions are
                 // asymmetric, so lean towards saying less
                 Err(e) => {
-                    tracing::warn!(fact = %m.id, error = %e, "取事实状态失败，按未失效下发");
+                    tracing::warn!(fact = %m.id, error = %e, "could not read the fact's status; \
+                         serving it as still valid");
                     false
                 }
             });
@@ -1316,7 +1344,7 @@ impl Live {
     async fn patch_project(&self, id: &str, patch: ProjectPatch) -> Result<ProjectDto> {
         let Some(raw) = patch.name.as_deref() else {
             return Err(CortexError::Invalid(
-                "请求体里没有任何要改的字段（name）".into(),
+                "the request body contains no field to change (name)".into(),
             ));
         };
         let name = validate_project_name(raw)?;
@@ -1419,12 +1447,14 @@ impl Live {
             let title = raw.trim();
             if title.is_empty() {
                 return Err(CortexError::Invalid(
-                    "标题不能为空白；本版不支持「恢复自动标题」，请给一个非空标题".into(),
+                    "the title must not be blank; this version has no \
+                     \"restore the automatic title\" — give a non-empty one"
+                        .into(),
                 ));
             }
             if title.chars().count() > cortex_store::SESSION_TITLE_MAX_CHARS {
                 return Err(CortexError::Invalid(format!(
-                    "标题过长（上限 {} 字符）",
+                    "the title is too long (the ceiling is {} characters)",
                     cortex_store::SESSION_TITLE_MAX_CHARS
                 )));
             }
@@ -1507,7 +1537,7 @@ impl Live {
                     .is_none()
                 {
                     return Err(CortexError::Invalid(format!(
-                        "目标项目不存在或已被删除：{project_id}"
+                        "the target project does not exist or has been deleted: {project_id}"
                     )));
                 }
                 events.push(cortex_store::NewSessionEvent::move_to_project(
@@ -1546,7 +1576,7 @@ impl Live {
 
         if events.is_empty() {
             return Err(CortexError::Invalid(
-                "请求体里没有任何要改的字段（title / archived / workspace / project_id）".into(),
+                "the request body contains no field to change (title / archived / workspace / project_id)".into(),
             ));
         }
 
@@ -1792,7 +1822,8 @@ impl Live {
                     .map_err(store_err)?
                     .is_some()
                 {
-                    tracing::debug!(hash = %new.hash, "并发登记同一份内容，按幂等处理");
+                    tracing::debug!(hash = %new.hash, "the same content was registered concurrently; \
+                         treating it idempotently");
                     Ok(None)
                 } else {
                     Err(store_err(e))
@@ -1825,7 +1856,7 @@ impl Live {
                 Ok(outcome) => outcome.log(&hash),
                 // A failed transcription must not affect an upload that already
                 // succeeded; a log line is enough
-                Err(e) => tracing::warn!(hash, error = %e, "媒体转录失败"),
+                Err(e) => tracing::warn!(hash, error = %e, "the media transcription failed"),
             }
         });
     }
@@ -1947,7 +1978,7 @@ async fn record_injected_memories(
         // roll back the entire transaction and take every other attribution with
         // it
         let Ok(fact_id) = item.id.parse::<Id>() else {
-            tracing::warn!(id = %item.id, "检索结果的 id 不是合法 ULID，跳过这一条归因");
+            tracing::warn!(id = %item.id, "a retrieval result's id is not a valid ULID; skipping that attribution");
             continue;
         };
         let attribution = scores.get(item.id.as_str());
@@ -1979,8 +2010,11 @@ async fn record_injected_memories(
         })
         .await;
     match res {
-        Ok(_) => tracing::debug!(injected = n, "本轮记忆归因已落库"),
-        Err(e) => tracing::warn!(error = %e, injected = n, "记忆归因落库失败，本轮抽屉将是空的"),
+        Ok(_) => tracing::debug!(injected = n, "this turn's memory attribution was persisted"),
+        Err(e) => {
+            tracing::warn!(error = %e, injected = n, "could not persist the memory attribution; \
+             this turn's drawer will be empty")
+        }
     }
 }
 
@@ -2143,7 +2177,7 @@ fn project_dto(p: cortex_store::Project) -> ProjectDto {
 fn session_title(first_user_text: Option<&str>) -> String {
     let trimmed = first_user_text.map(str::trim).unwrap_or_default();
     if trimmed.is_empty() {
-        return "新会话".into();
+        return "New session".into();
     }
     trimmed.chars().take(TITLE_CHARS).collect()
 }
@@ -2181,12 +2215,12 @@ mod tests {
             "replay + no query terms = the whole picture as it stood then"
         );
         assert_eq!(
-            retrieval_plan("对象存储", Some(at)),
+            retrieval_plan("object storage", Some(at)),
             RetrievalPlan::SnapshotRanked(at),
             "replay + query terms = ranked over that snapshot, not degraded to newest-first"
         );
         assert_eq!(
-            retrieval_plan("对象存储", None),
+            retrieval_plan("object storage", None),
             RetrievalPlan::Ranked,
             "now + query terms = all four retrieval paths"
         );
@@ -2199,7 +2233,7 @@ mod tests {
             other => panic!(
                 "now + no query terms must yield \"the most recent whole picture\"; actually got \
                  {other:?}. Going through the four retrieval paths, an empty query returns 0 rows \
-                 every time: the memory panel opens empty and says \"no memories yet\" —— from \
+                 every time: the memory panel opens empty and says \"no memories yet\" — from \
                  which the user concludes the feature is useless"
             ),
         }
@@ -2208,15 +2242,15 @@ mod tests {
     #[test]
     fn a_project_name_must_survive_trimming() {
         assert_eq!(
-            validate_project_name("  记忆引擎  ")
+            validate_project_name("  memory engine  ")
                 .expect("whitespace on both sides should be trimmed, not rejected"),
-            "记忆引擎"
+            "memory engine"
         );
 
         for bad in ["", "   ", "\t\n"] {
             assert!(
                 validate_project_name(bad).is_err(),
-                "{bad:?} should be rejected —— a project whose name is all whitespace is a \
+                "{bad:?} should be rejected — a project whose name is all whitespace is a \
                  clickable row in the sidebar containing nothing, which looks like the UI is \
                  broken"
             );
@@ -2232,7 +2266,7 @@ mod tests {
         let full = "记".repeat(max);
         assert_eq!(
             validate_project_name(&full).expect(
-                "exactly at the limit must pass —— the ceiling counts characters, matching the \
+                "exactly at the limit must pass — the ceiling counts characters, matching the \
                  database's length()"
             ),
             full
@@ -2247,10 +2281,10 @@ mod tests {
 
     #[test]
     fn session_title_falls_back_and_truncates_by_char() {
-        assert_eq!(session_title(None), "新会话");
+        assert_eq!(session_title(None), "New session");
         assert_eq!(
             session_title(Some("   ")),
-            "新会话",
+            "New session",
             "all whitespace must fall back too"
         );
 
@@ -2278,7 +2312,7 @@ mod tests {
         let a = AttachmentRef {
             hash: "a".repeat(64),
             kind: Some("image".into()),
-            filename: Some("设计稿.png".into()),
+            filename: Some("design-draft.png".into()),
         };
         let b = AttachmentRef {
             hash: "b".repeat(64),
@@ -2310,7 +2344,7 @@ mod tests {
             .expect_err("a server-side workspace binding must be refused")
             .to_string();
         assert!(
-            msg.contains("你自己的机器") && msg.contains("cortex-local"),
+            msg.contains("your own machine") && msg.contains("cortex-local"),
             "the refusal must name paths that do work (the desktop client / running cortex-local \
              locally), not merely say no. Actual: {msg}"
         );
@@ -2320,14 +2354,14 @@ mod tests {
         // amount to telling a web user "the thing you want cannot be done here",
         // when in fact flipping one switch provides it
         assert!(
-            msg.contains("云沙箱"),
+            msg.contains("cloud sandbox"),
             "a web user cannot take either of the first two paths (both need a desktop client). \
              Without mentioning the sandbox, this error is a dead end for them. Actual: {msg}"
         );
 
         assert!(
             workspace_patch(Some(None)).expect("unbinding must be permitted"),
-            "unbinding has to keep working —— an older session may still carry a server-side \
+            "unbinding has to keep working — an older session may still carry a server-side \
              binding, and refusing to unbind welds it in place forever"
         );
         assert!(
@@ -2449,7 +2483,7 @@ mod extract_gate_tests {
         let peak = peak.load(Ordering::SeqCst);
         assert!(
             peak <= PERMITS,
-            "{peak} were running at once against a ceiling of {PERMITS} —— the permit was not \
+            "{peak} were running at once against a ceiling of {PERMITS} — the permit was not \
              held until the end"
         );
         assert!(

@@ -147,7 +147,11 @@ impl Conversation {
     #[must_use]
     pub fn display_title(&self, platform: Platform) -> String {
         let t = self.title.trim();
-        let base = if t.is_empty() { "未命名对话" } else { t };
+        let base = if t.is_empty() {
+            "Untitled conversation"
+        } else {
+            t
+        };
         let full = format!("{} · {base}", platform.label());
         // The CHECK on session_events limits titles to 1..=200 characters
         full.chars().take(200).collect()
@@ -254,16 +258,16 @@ pub fn requests_for(
 /// leave someone believing their own history is empty.
 pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<Conversation>)> {
     let root: serde_json::Value =
-        serde_json::from_slice(bytes).context("这个文件不是合法的 JSON")?;
+        serde_json::from_slice(bytes).context("this file is not valid JSON")?;
     let items = root.as_array().ok_or_else(|| {
         anyhow::anyhow!(
-            "导出文件的顶层应当是一个数组，实际是 {}。\
-             确认给的是 conversations.json，而不是压缩包里别的文件",
+            "the top level of an export file has to be an array, but this one is: {}. Check \
+             that this is conversations.json and not some other file from the archive",
             type_name(&root)
         )
     })?;
     if items.is_empty() {
-        bail!("导出文件里一段对话都没有");
+        bail!("the export file contains no conversations at all");
     }
 
     let platform = match platform {
@@ -286,9 +290,9 @@ fn sniff(first: &serde_json::Value) -> Result<Platform> {
         return Ok(Platform::Claude);
     }
     bail!(
-        "认不出这是哪家的导出文件：第一条记录里既没有 `mapping`（ChatGPT）\
-         也没有 `chat_messages`（Claude）。它实际有这些键：{}\n\
-         格式可能变了 —— 用 --platform 指定，或者把这个键列表反馈回来",
+        "cannot tell which vendor this export came from: the first record has neither \
+         `mapping` (ChatGPT) nor `chat_messages` (Claude). The keys it does have: {}\n\
+         The format may have changed — pass --platform, or report this key list back",
         keys_of(first)
     );
 }
@@ -297,20 +301,20 @@ fn sniff(first: &serde_json::Value) -> Result<Platform> {
 /// clue.**
 pub fn keys_of(v: &serde_json::Value) -> String {
     match v.as_object() {
-        Some(m) if m.is_empty() => "（空对象）".into(),
+        Some(m) if m.is_empty() => "(empty object)".into(),
         Some(m) => m.keys().cloned().collect::<Vec<_>>().join(", "),
-        None => format!("（不是对象，是 {}）", type_name(v)),
+        None => format!("(not an object, but: {})", type_name(v)),
     }
 }
 
 fn type_name(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "布尔值",
-        serde_json::Value::Number(_) => "数字",
-        serde_json::Value::String(_) => "字符串",
-        serde_json::Value::Array(_) => "数组",
-        serde_json::Value::Object(_) => "对象",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -423,7 +427,10 @@ mod tests {
 
         let mut empty = conv(vec![]);
         empty.title = "   ".into();
-        assert_eq!(empty.display_title(Platform::Claude), "Claude · 未命名对话");
+        assert_eq!(
+            empty.display_title(Platform::Claude),
+            "Claude · Untitled conversation"
+        );
 
         let mut long = conv(vec![]);
         long.title = "很".repeat(500);

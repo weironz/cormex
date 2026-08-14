@@ -99,7 +99,9 @@ impl EvalDb {
             .max_connections(2)
             .connect(database_url)
             .await
-            .with_context(|| "连不上数据库；先跑 `just up`，并确认 .env 里的 DATABASE_URL")?;
+            .with_context(
+                || "cannot reach the database; run `just up` first, and check DATABASE_URL in .env",
+            )?;
 
         sweep_stale_schemas(&admin).await;
 
@@ -108,26 +110,26 @@ impl EvalDb {
         sqlx::query(AssertSqlSafe(create))
             .execute(&admin)
             .await
-            .context("建不出临时 schema —— 当前用户可能没有 CREATE 权限")?;
+            .context("cannot create a temporary schema -- the current user may lack CREATE")?;
 
         // `public` stays in search_path so the `vector` extension's types
         // remain visible; tables and views are all created in the first schema,
         // i.e. the one dedicated to this eval run
         let options = PgConnectOptions::from_str(database_url)
-            .context("DATABASE_URL 不是合法的连接串")?
+            .context("DATABASE_URL is not a valid connection string")?
             .options([("search_path", format!("{schema},public"))]);
 
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .connect_with(options)
             .await
-            .context("临时 schema 建好之后应当能连上")?;
+            .context("connecting should work once the temporary schema exists")?;
 
         let store = Store::from_pool(pool.clone());
         store
             .migrate()
             .await
-            .context("migration 在临时 schema 里跑不通")?;
+            .context("the migration does not run inside the temporary schema")?;
 
         Ok(Self {
             store,
@@ -152,7 +154,7 @@ impl EvalDb {
         let (now,): (DateTime<Utc>,) = sqlx::query_as("SELECT clock_timestamp()")
             .fetch_one(&self.pool)
             .await
-            .context("取不到数据库时钟")?;
+            .context("cannot read the database clock")?;
         Ok(now)
     }
 
@@ -167,7 +169,7 @@ impl EvalDb {
         )
         .fetch_all(&self.pool)
         .await
-        .context("拉不到事实快照")?;
+        .context("cannot pull the fact snapshot")?;
 
         Ok(rows
             .into_iter()
@@ -206,11 +208,17 @@ impl EvalDb {
     pub async fn cleanup(self, keep: bool) {
         self.store.close().await;
         if keep {
-            eprintln!("已保留临时 schema：{}（记得手工 DROP）", self.schema);
+            eprintln!(
+                "kept the temporary schema: {} (remember to DROP it by hand)",
+                self.schema
+            );
         } else {
             let sql = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema);
             if let Err(err) = sqlx::query(AssertSqlSafe(sql)).execute(&self.admin).await {
-                eprintln!("清理临时 schema {} 失败：{err}", self.schema);
+                eprintln!(
+                    "cleaning up the temporary schema {} failed: {err}",
+                    self.schema
+                );
             }
         }
         self.admin.close().await;
@@ -308,10 +316,12 @@ pub fn build_extractor(
                     .filter(|v| !v.trim().is_empty()),
             };
             LlmClient::from_config(&cfg, "eval-offline-placeholder")
-                .map_err(|e| anyhow::anyhow!("离线构造 LlmClient 失败：{e}"))?
+                .map_err(|e| anyhow::anyhow!("building an offline LlmClient failed: {e}"))?
         }
         ExtractMode::Llm => LlmClient::from_env().map_err(|e| {
-            anyhow::anyhow!("llm 模式需要 .env 里的供应商 API key（如 DEEPSEEK_API_KEY）：{e}")
+            anyhow::anyhow!(
+                "llm mode needs a provider API key in .env (e.g. DEEPSEEK_API_KEY): {e}"
+            )
         })?,
     };
 
@@ -358,12 +368,19 @@ pub async fn ingest_suite(
                     extractor
                         .write_candidates(&db.store, candidates, &ctx)
                         .await
-                        .map_err(|e| anyhow::anyhow!("落库失败（场景 {}）：{e}", scenario.id))?
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "writing to the store failed (scenario {}): {e}",
+                                scenario.id
+                            )
+                        })?
                 }
                 ExtractMode::Llm => extractor
                     .ingest(&db.store, &turn.text, &ctx)
                     .await
-                    .map_err(|e| anyhow::anyhow!("抽取失败（场景 {}）：{e}", scenario.id))?,
+                    .map_err(|e| {
+                        anyhow::anyhow!("extraction failed (scenario {}): {e}", scenario.id)
+                    })?,
             };
 
             stats.candidates += report.candidates;
@@ -448,7 +465,7 @@ async fn insert_episode(
             Ok(())
         })
         .await
-        .context("episode / 工具轨迹落库失败")?;
+        .context("writing the episode / tool traces to the store failed")?;
     Ok(id)
 }
 
@@ -456,7 +473,10 @@ fn candidate_of(f: &SeedFact, scenario_domain: &str) -> Result<CandidateFact> {
     let object = match (&f.object, &f.object_entity) {
         (Some(text), None) => ObjectRef::Literal(text.clone()),
         (None, Some(name)) => ObjectRef::Entity(EntityRef::new(name, &f.object_entity_kind)),
-        _ => bail!("事实「{}」的宾语形式非法（校验应当已挡住）", f.statement),
+        _ => bail!(
+            "fact \"{}\" has an illegal object form (validation should have caught this)",
+            f.statement
+        ),
     };
 
     Ok(CandidateFact {
@@ -573,14 +593,14 @@ pub async fn build_cross_links(
     let judge: Box<dyn LinkJudge> = match opts.judge {
         JudgeKind::Prefilter => Box::new(AcceptAll),
         JudgeKind::Cheap => Box::new(CheapModelJudge::new(LlmClient::from_env().map_err(
-            |e| anyhow::anyhow!("`--cross-link-judge cheap` 需要 .env 里的供应商 API key：{e}"),
+            |e| anyhow::anyhow!("`--cross-link-judge cheap` needs a provider API key in .env: {e}"),
         )?)),
     };
 
     let report = linker
         .run(&db.store, &corpus, judge.as_ref(), embedder)
         .await
-        .map_err(|e| anyhow::anyhow!("跨域连接扫描失败：{e}"))?;
+        .map_err(|e| anyhow::anyhow!("the cross-domain link scan failed: {e}"))?;
 
     let mut links = Vec::new();
     for id in &report.written {
@@ -588,7 +608,7 @@ pub async fn build_cross_links(
             .store
             .fact(&id.to_string())
             .await
-            .map_err(|e| anyhow::anyhow!("读不回刚写的连接：{e}"))?
+            .map_err(|e| anyhow::anyhow!("cannot read back the links just written: {e}"))?
         {
             links.push(f.statement);
         }
@@ -719,7 +739,7 @@ impl EvalRetriever {
             .retriever
             .retrieve(store, query, domain, self.config.context_window)
             .await
-            .map_err(|e| anyhow::anyhow!("检索失败：{e}"))?;
+            .map_err(|e| anyhow::anyhow!("retrieval failed: {e}"))?;
         Ok(zip_items(out))
     }
 
@@ -755,7 +775,7 @@ impl EvalRetriever {
                 )
                 .await
         }
-        .map_err(|e| anyhow::anyhow!("时间回放失败：{e}"))?;
+        .map_err(|e| anyhow::anyhow!("time replay failed: {e}"))?;
         Ok(zip_items(out))
     }
 
@@ -773,7 +793,7 @@ impl EvalRetriever {
             .embedder
             .embed_one(query)
             .await
-            .map_err(|e| anyhow::anyhow!("查询向量化失败：{e}"))?;
+            .map_err(|e| anyhow::anyhow!("vectorizing the query failed: {e}"))?;
         let embedding = Vector::from(qvec);
 
         let terms: Vec<String> = tokenize::to_tsvector_input(query)
@@ -863,7 +883,7 @@ pub async fn default_embedder() -> Result<SharedEmbedder> {
     let backend = Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     build_embedder(backend)
         .await
-        .map_err(|e| anyhow::anyhow!("加载 embedding 后端失败：{e}"))
+        .map_err(|e| anyhow::anyhow!("loading the embedding backend failed: {e}"))
 }
 
 #[cfg(test)]

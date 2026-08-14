@@ -79,7 +79,9 @@ impl LlmClient {
         let pick = |key: &str, fallback: Option<String>| -> Result<String> {
             non_empty(key).or(fallback).ok_or_else(|| LlmError::Build {
                 name: provider_id.clone(),
-                source: anyhow::anyhow!("未设置 {key}，且该供应商定义里没有默认模型"),
+                source: anyhow::anyhow!(
+                    "{key} is not set, and this provider's definition carries no default model"
+                ),
             })
         };
 
@@ -104,7 +106,7 @@ impl LlmClient {
         } else {
             std::env::var(&key_var).map_err(|_| LlmError::Build {
                 name: provider_id.clone(),
-                source: anyhow::anyhow!("缺少环境变量 {key_var}"),
+                source: anyhow::anyhow!("missing environment variable {key_var}"),
             })?
         };
 
@@ -225,7 +227,8 @@ impl LlmClient {
                     provider = %self.provider_id,
                     model = %model.model_name,
                     images,
-                    "模型的 vision 能力未声明，按放行处理，由供应商自行报错"
+                    "the model declares no vision capability; letting it through and leaving the \
+                     provider to report the error"
                 );
             }
             return Ok(());

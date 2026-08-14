@@ -10,19 +10,19 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("数据库错误：{0}")]
+    #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
 
-    #[error("迁移失败：{0}")]
+    #[error("migration failed: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
-    #[error("{ty} 不认识的取值：{value}")]
+    #[error("{ty} has no such value: {value}")]
     UnknownVariant { ty: &'static str, value: String },
 
     /// `sync_log.table_name` points at a table this layer does not recognize.
     /// Seeing this means somebody bypassed [`crate::WriteTxn`] and wrote to the
     /// database directly.
-    #[error("sync_log 引用了未知的表：{0}")]
+    #[error("sync_log references an unknown table: {0}")]
     UnknownTable(String),
 
     /// A derived record failed to declare its sources.
@@ -33,7 +33,9 @@ pub enum StoreError {
     /// reconstructed after the fact** (who summarized it, and from what, is
     /// known only to the step that produced it). So we would rather this
     /// summary never be written at all.
-    #[error("{kind} {id} 没有声明任何源 —— 派生物必须带血缘（docs/memory-content.md §5.3）")]
+    #[error(
+        "{kind} {id} declared no source -- a derived record must carry provenance (docs/memory-content.md §5.3)"
+    )]
     MissingProvenance { kind: &'static str, id: String },
 
     /// The caller handed us something wrong (illegal schema name, tenant pool

@@ -114,7 +114,11 @@ impl AppState {
         // log into
         cortex_store::provision(self.accounts()?.tenants.as_ref(), &schema)
             .await
-            .map_err(|e| ApiError::internal(format!("给新账号开库失败：{e}")))?;
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "could not provision the database for the new account: {e}"
+                ))
+            })?;
 
         let inserted = sqlx::query(
             "INSERT INTO cortex_auth.users (id, username, password_hash, schema_name)
@@ -127,7 +131,7 @@ impl AppState {
         .bind(schema.as_str())
         .execute(&self.accounts()?.pool)
         .await
-        .map_err(|e| ApiError::internal(format!("写用户记录失败：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not write the user record: {e}")))?;
 
         if inserted.rows_affected() == 0 {
             // The schema was created but the account row was not written.
@@ -135,7 +139,7 @@ impl AppState {
             // occupies the catalog forever, and the next registration with the
             // same username would create yet another one
             let _ = self.accounts()?.tenants.as_ref().drop_schema(&schema).await;
-            return Err(ApiError::bad_request("这个用户名已经有人用了"));
+            return Err(ApiError::bad_request("that username is already taken"));
         }
         Ok(user_id)
     }
@@ -152,7 +156,7 @@ impl AppState {
         let row = sqlx::query("SELECT count(*) AS n FROM cortex_auth.users")
             .fetch_one(&self.accounts()?.pool)
             .await
-            .map_err(|e| ApiError::internal(format!("数不出用户数：{e}")))?;
+            .map_err(|e| ApiError::internal(format!("could not count the users: {e}")))?;
         Ok(row.get("n"))
     }
 
@@ -180,7 +184,7 @@ impl AppState {
         .bind(device)
         .execute(&self.accounts()?.pool)
         .await
-        .map_err(|e| ApiError::internal(format!("签发令牌失败：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not issue the token: {e}")))?;
 
         Ok(AuthTokens {
             access_token: self.access_book().issue(
@@ -211,20 +215,22 @@ impl AppState {
         .bind(&digest)
         .fetch_optional(&self.accounts()?.pool)
         .await
-        .map_err(|e| ApiError::internal(format!("查令牌失败：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not look up the token: {e}")))?;
 
         // Not found is not found. **Do not** tell the client the difference
         // between "this token does not exist" and "this token expired" — that
         // hands a brute-forcer a progress bar
         let Some(row) = row else {
-            return Err(ApiError::unauthorized("登录已失效，请重新登录"));
+            return Err(ApiError::unauthorized(
+                "this login is no longer valid; sign in again",
+            ));
         };
 
         let family_raw: String = row.get("family_id");
         let record = RefreshRecord {
-            family: family_raw
-                .parse()
-                .map_err(|_| ApiError::internal("库里的 family_id 不是合法 ULID"))?,
+            family: family_raw.parse().map_err(|_| {
+                ApiError::internal("the family_id stored in the database is not a valid ULID")
+            })?,
             rotated: row.get("rotated"),
             revoked: row.get("revoked"),
             expired: row.get("expired"),
@@ -244,22 +250,23 @@ impl AppState {
                     user = %user_id,
                     family = %family,
                     revoked = n,
-                    "检测到 refresh token 重放，已作废整条链"
+                    "refresh token replay detected; the whole chain has been revoked"
                 );
                 Err(ApiError::unauthorized(
-                    "这个登录凭据已经被使用过了。出于安全，该设备上的所有会话都已注销，请重新登录",
+                    "this login credential has already been used. For safety, every session \
+                     on this device has been signed out; sign in again",
                 ))
             }
             RefreshVerdict::Reject(why) => Err(ApiError::unauthorized(match why {
-                RejectReason::Expired => "登录已过期，请重新登录",
-                RejectReason::FamilyRevoked => "登录已注销，请重新登录",
+                RejectReason::Expired => "this login has expired; sign in again",
+                RejectReason::FamilyRevoked => "this login was signed out; sign in again",
             })),
             RefreshVerdict::Rotate => {
                 sqlx::query("UPDATE cortex_auth.auth_tokens SET rotated_at = now() WHERE id = $1")
                     .bind(&token_id)
                     .execute(&self.accounts()?.pool)
                     .await
-                    .map_err(|e| ApiError::internal(format!("轮转令牌失败：{e}")))?;
+                    .map_err(|e| ApiError::internal(format!("could not rotate the token: {e}")))?;
                 self.issue(&user_id, Some(record.family.to_string()), None)
                     .await
             }
@@ -383,7 +390,7 @@ pub async fn login(
     .bind(&req.username)
     .fetch_optional(&st.accounts()?.pool)
     .await
-    .map_err(|e| ApiError::internal(format!("查用户失败：{e}")))?;
+    .map_err(|e| ApiError::internal(format!("could not look up the user: {e}")))?;
 
     // A nonexistent username and a wrong password return **the same sentence**:
     // distinguishing them hands out a username dictionary.
@@ -392,10 +399,10 @@ pub async fn login(
     // properly would mean running argon2 even for nonexistent users, which turns
     // "guess a random username" into 16ms of CPU — a far better DoS amplifier.
     // The trade-off is written down here; do not mistake it for an oversight
-    let deny = || ApiError::unauthorized("用户名或密码不对");
+    let deny = || ApiError::unauthorized("wrong username or password");
     let Some(row) = row else { return Err(deny()) };
     if row.get::<bool, _>("disabled") {
-        return Err(ApiError::unauthorized("这个账号已被停用"));
+        return Err(ApiError::unauthorized("this account has been disabled"));
     }
     if !verify_password(&req.password, &row.get::<String, _>("password_hash")) {
         return Err(deny());
@@ -467,7 +474,9 @@ pub async fn register(
         // Say plainly that "this deployment has it closed" rather than "you
         // typed something wrong", or the caller will keep retrying
         return Err(ApiError::forbidden(format!(
-            "这个部署没有开放注册。管理员可以设 {OPEN_REGISTRATION_ENV}={OPEN_REGISTRATION_ON} 打开，             或者用 cortexd --create-user 直接建号"
+            "registration is closed on this deployment. An administrator can open it by \
+             setting {OPEN_REGISTRATION_ENV}={OPEN_REGISTRATION_ON}, or create the account \
+             directly with `cortexd --create-user`"
         )));
     }
     let user_id = st.create_account(&req.username, &req.password).await?;
@@ -528,7 +537,7 @@ pub async fn whoami(
         .bind(&user_id)
         .fetch_optional(&st.accounts()?.pool)
         .await
-        .map_err(|e| ApiError::internal(format!("查用户失败：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not look up the user: {e}")))?;
     match row {
         Some(r) => Ok(Json(WhoAmI {
             user_id,
@@ -540,7 +549,7 @@ pub async fn whoami(
         // not an error, it is the normal transitional state
         None => Ok(Json(WhoAmI {
             user_id,
-            username: "(尚未建账号)".into(),
+            username: "(no account yet)".into(),
             schema_name: "public".into(),
         })),
     }
@@ -585,7 +594,7 @@ mod tests {
         let head = &gate[..gate.len().min(2000)];
         assert!(
             !head.contains("user_count"),
-            "register is counting users again —— that usually means the \"treat the first \
+            "register is counting users again — that usually means the \"treat the first \
              account specially\" exception is back, and it brings a race-for-owner window on the \
              public internet with it. The first account should be created from .env \
              (main::ensure_admin) or with --create-user"
@@ -609,7 +618,7 @@ mod tests {
             assert_ne!(
                 v.trim(),
                 OPEN_REGISTRATION_ON,
-                "{v:?} must not count as \"registration open\" —— fat-fingering 1 or true must \
+                "{v:?} must not count as \"registration open\" — fat-fingering 1 or true must \
                  not open the door"
             );
         }
@@ -647,7 +656,7 @@ mod account_schema_tests {
             "public",
             "the first account must land on public. Anywhere else means that someone who used \
              the system for months before registering logs in afterwards to find all their \
-             memory gone —— with no error, the session list is simply empty"
+             memory gone — with no error, the session list is simply empty"
         );
         let second = schema_for_new_account(&id, false).unwrap();
         assert!(

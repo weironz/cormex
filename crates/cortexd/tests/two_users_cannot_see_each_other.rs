@@ -83,7 +83,7 @@ async fn write_one(store: &Store, session: &str, text: &str) -> String {
 #[tokio::test]
 async fn one_users_memory_never_shows_up_in_anothers() {
     let Some(url) = database_url() else {
-        eprintln!("跳过：没有 DATABASE_URL");
+        eprintln!("skipped: no DATABASE_URL");
         return;
     };
     let pools = TenantPools::new(&url);
@@ -106,7 +106,7 @@ async fn one_users_memory_never_shows_up_in_anothers() {
             .await
             .expect("query B's database")
             .is_none(),
-        "B found something using A's episode id —— the two accounts landed in the same schema. \
+        "B found something using A's episode id — the two accounts landed in the same schema. \
          This is exactly what \"two people logged in, both reading the same database\" looks like"
     );
     assert!(
@@ -126,7 +126,7 @@ async fn one_users_memory_never_shows_up_in_anothers() {
     assert!(
         a_sessions.iter().all(|s| s.session_id != "sess-b"),
         "B's session sess-b appeared in A's session list. Invisible by id but visible in the \
-         list is the worse kind of crossover —— it shows up right there in the sidebar"
+         list is the worse kind of crossover — it shows up right there in the sidebar"
     );
     let b_sessions = store_b
         .session_digests(100, true, None)
@@ -211,7 +211,7 @@ fn every_data_path_goes_through_bind() {
         offenders.is_empty(),
         "state.rs has branches calling data methods directly on an unbound Live:\n{}\n\
          Every path that reads or writes data must first call \
-         `l.bind(tenant.store()?)`, or it lands on public —— that is, user #1's \
+         `l.bind(tenant.store()?)`, or it lands on public — that is, user #1's \
          database.\n\
          Methods that genuinely are tenant-independent (the process-level cursor, \
          health checks, pure forwarding) belong in `allowed_unbound`, with the \

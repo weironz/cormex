@@ -113,7 +113,7 @@ pub async fn record(
     .bind(row.taken_at)
     .execute(store.pool())
     .await
-    .map_err(|e| CortexError::Store(format!("快照索引落库失败：{e}")))?;
+    .map_err(|e| CortexError::Store(format!("could not persist the snapshot index: {e}")))?;
     Ok(Json(row))
 }
 
@@ -128,5 +128,5 @@ async fn rows_for(st: &AppState, owner: &str, scope: &str) -> Result<Vec<Snapsho
     .bind(LIST_LIMIT)
     .fetch_all(store.pool())
     .await
-    .map_err(|e| CortexError::Store(format!("列快照失败：{e}")))
+    .map_err(|e| CortexError::Store(format!("could not list the snapshots: {e}")))
 }

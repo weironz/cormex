@@ -11,7 +11,7 @@ use chrono::Utc;
 #[tokio::test]
 async fn four_channels_execute_against_real_schema() {
     let Some(ctx) = common::setup().await else {
-        eprintln!("跳过：数据库不可用");
+        eprintln!("skipped: the database is unavailable");
         return;
     };
     let store = &ctx.store;

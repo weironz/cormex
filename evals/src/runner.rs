@@ -21,7 +21,7 @@ fn describe_recency(mode: RecencyMode) -> String {
         RecencyMode::Decay {
             strength,
             half_life_days,
-        } => format!("decay(强度 {strength}，半衰期 {half_life_days} 天)"),
+        } => format!("decay(strength {strength}, half-life {half_life_days}d)"),
     }
 }
 
@@ -95,8 +95,8 @@ async fn run_inner(db: &EvalDb, suite: &Suite, opts: &RunOptions) -> Result<Repo
     let declared = i64::try_from(suite.tool_call_count()).unwrap_or(i64::MAX);
     anyhow::ensure!(
         tool_calls_in_db == declared,
-        "题集声明 {declared} 次工具调用，库里只有 {tool_calls_in_db} 行 —— \
-         轨迹没落全，工具经验题的结果不可信"
+        "the suite declares {declared} tool calls but the store holds only {tool_calls_in_db} \
+         rows -- traces were lost, so the tool-experience results cannot be trusted"
     );
 
     let retriever = EvalRetriever::new(embedder, opts.retrieval);
@@ -208,10 +208,12 @@ async fn evaluate_one(
 
     let (fused, channels, replay) = match &q.as_of {
         Some(name) => {
-            let at = checkpoints
-                .get(name)
-                .copied()
-                .with_context(|| format!("题目 {} 引用的 checkpoint「{name}」不存在", q.id))?;
+            let at = checkpoints.get(name).copied().with_context(|| {
+                format!(
+                    "question {} references checkpoint \"{name}\", which does not exist",
+                    q.id
+                )
+            })?;
             // Replay uses three paths **within the snapshot** (bm25 / vector /
             // reverse-chronological over the same as-of set), which is not the
             // same body of data the everyday four paths query. Feeding it into

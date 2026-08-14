@@ -177,7 +177,8 @@ impl LlmStreamError {
                 category: self.category,
             },
             unknown => E::ExecutionError(format!(
-                "cortexd 回了一个本地不认识的错误类型 `{unknown}`（两侧版本可能不一致）：{}",
+                "cortexd returned an error kind `{unknown}` this side does not recognize (the two \
+                 versions may not match): {}",
                 self.message
             )),
         }
@@ -252,7 +253,7 @@ mod tests {
     fn an_unknown_kind_keeps_the_original_name_in_the_message() {
         let wire = LlmStreamError {
             kind: "quantum_flux_error".into(),
-            message: "原始消息".into(),
+            message: "the original message".into(),
             retry_delay_ms: None,
             top_up_url: None,
             category: None,
@@ -260,7 +261,7 @@ mod tests {
         let restored = wire.into_provider();
         let text = restored.to_string();
         assert!(
-            text.contains("quantum_flux_error") && text.contains("原始消息"),
+            text.contains("quantum_flux_error") && text.contains("the original message"),
             "an unrecognized error kind must carry both the original kind and the original message, got: {text}"
         );
     }

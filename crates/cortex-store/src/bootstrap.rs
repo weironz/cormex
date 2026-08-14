@@ -47,16 +47,20 @@ pub async fn migrate_all(pools: &TenantPools, schemas: &[SchemaName]) -> Vec<Ten
     let mut out = Vec::with_capacity(schemas.len());
     for schema in schemas {
         let failure = match pools.get(schema).await {
-            Err(e) => Some(format!("取不到连接池：{e}")),
+            Err(e) => Some(format!("cannot obtain a connection pool: {e}")),
             Ok(store) => match store.migrate().await {
                 Ok(()) => None,
-                Err(e) => Some(format!("migration 失败：{e}")),
+                Err(e) => Some(format!("migration failed: {e}")),
             },
         };
         if let Some(why) = &failure {
             // error rather than warn: this tenant is unavailable from now on,
             // and everywhere else it will show up only as scattered SQL errors
-            tracing::error!(schema = schema.as_str(), reason = %why, "租户 schema 迁移失败，该用户暂不可用");
+            tracing::error!(
+                schema = schema.as_str(),
+                reason = %why,
+                "tenant schema migration failed; this user is unavailable for now"
+            );
         }
         out.push(TenantMigration {
             schema: schema.clone(),

@@ -353,7 +353,8 @@ async fn delegation_scope(
     let state = match st.tenant_store_for_user(owner).await {
         Ok(store) => store.session_state(session_id).await.ok().flatten(),
         Err(e) => {
-            tracing::debug!(owner = %owner, error = %e, "取不到租户库，沙箱按未分组算");
+            tracing::debug!(owner = %owner, error = %e, "could not reach the tenant database; \
+                 the sandbox is treated as ungrouped");
             None
         }
     };
@@ -543,7 +544,7 @@ async fn llm_stream(
                     Ok(json) => return Some(Ok(Event::default().data(json))),
                     Err(e) => LlmStreamError {
                         kind: "execution_error".into(),
-                        message: format!("代理侧序列化失败：{e}"),
+                        message: format!("serialization failed on the proxy side: {e}"),
                         retry_delay_ms: None,
                         top_up_url: None,
                         category: None,
@@ -666,10 +667,10 @@ async fn write_episode(
     {
         tracing::warn!(
             owner = %scope.owner, bound = %scope.session_id, attempted = %req.session_id,
-            "被委托的调用方试图写别的会话"
+            "a delegated caller tried to write to a different session"
         );
         return Err(ApiError::bad_request(
-            "这把凭据只能写它绑定的那个会话的对话记录",
+            "this credential may only write conversation records for the session it is bound to",
         ));
     }
     Ok(Json(
@@ -843,7 +844,8 @@ fn ensure_presign_supported(st: &AppState) -> Result<(), ApiError> {
         Ok(())
     } else {
         Err(ApiError::unsupported(format!(
-            "对象存储后端 {} 签不出 presigned URL；请改用 POST /blobs 中转上传、GET /blobs/{{hash}} 取回",
+            "the {} object-storage backend cannot sign presigned URLs; relay the upload \
+             through POST /blobs and fetch it back with GET /blobs/{{hash}} instead",
             st.blob_backend()
         )))
     }
@@ -1070,7 +1072,7 @@ impl IntoResponse for ApiError {
             StatusCode::from_u16(self.inner.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         });
-        tracing::warn!(error = %self.inner, status = code.as_u16(), "请求失败");
+        tracing::warn!(error = %self.inner, status = code.as_u16(), "request failed");
         (
             code,
             Json(ErrorBody {
@@ -1203,7 +1205,7 @@ mod tests {
         let (app, token) = app_with_token();
         assert!(
             !PROTECTED_ROUTES.is_empty(),
-            "the inventory is empty —— the macro generated nothing, so this group of tests did \
+            "the inventory is empty — the macro generated nothing, so this group of tests did \
              not really run"
         );
 
@@ -1221,7 +1223,7 @@ mod tests {
                 .into_iter()
                 .find(|m| !methods.contains(m))
                 .expect(
-                    "DELETE / PUT / PATCH are all taken by some route —— pick another method \
+                    "DELETE / PUT / PATCH are all taken by some route — pick another method \
                      this route does not declare as the probe, or give it a test of its own",
                 );
             let routed = status_of(&app, &unsupported, &path, Some(&token)).await;
@@ -1239,7 +1241,7 @@ mod tests {
                 assert_eq!(
                     anon,
                     StatusCode::UNAUTHORIZED,
-                    "{method} {pattern} returned {anon} without a credential instead of 401 —— \
+                    "{method} {pattern} returned {anon} without a credential instead of 401 — \
                      this route is not behind the authentication middleware. Check whether it was \
                      added to public, or added after route_layer"
                 );
@@ -1248,7 +1250,7 @@ mod tests {
                 assert_ne!(
                     authed,
                     StatusCode::UNAUTHORIZED,
-                    "{method} {pattern} still 401s with a correct credential —— authentication \
+                    "{method} {pattern} still 401s with a correct credential — authentication \
                      itself is broken"
                 );
             }
@@ -1323,7 +1325,7 @@ mod tests {
             assert_eq!(
                 got,
                 StatusCode::NOT_FOUND,
-                "{method} {path} belongs to cortex-agentd —— that process has docker, this one \
+                "{method} {path} belongs to cortex-agentd — that process has docker, this one \
                  does not. Actually returned {got}"
             );
         }
@@ -1338,7 +1340,7 @@ mod tests {
         assert_eq!(
             got,
             StatusCode::OK,
-            "/health must be unauthenticated —— its consumers are container probes that cannot \
+            "/health must be unauthenticated — its consumers are container probes that cannot \
              be given a credential"
         );
     }
@@ -1356,7 +1358,7 @@ mod tests {
         assert_eq!(
             got,
             StatusCode::NOT_FOUND,
-            "an unknown path returned {got} —— was route_layer replaced with layer?"
+            "an unknown path returned {got} — was route_layer replaced with layer?"
         );
     }
 
@@ -1388,7 +1390,7 @@ mod tests {
         // direction (red, not green), but pure noise
         let src = src.replace("\r\n", "\n");
         let start = src.find(from).unwrap_or_else(|| {
-            panic!("cannot find {from:?} in the source —— was it renamed? this test has to follow")
+            panic!("cannot find {from:?} in the source — was it renamed? this test has to follow")
         });
         let rest = &src[start..];
         let end = rest
@@ -1446,7 +1448,7 @@ mod tests {
             ],
             "the unauthenticated inventory changed. Before changing it, go add a sentence to \
              public_routes()'s documentation saying \"why this one cannot require a \
-             credential\" —— if you cannot write one, it belongs in protected_routes!"
+             credential\" — if you cannot write one, it belongs in protected_routes!"
         );
     }
 
@@ -1467,14 +1469,14 @@ mod tests {
         let code = code_between(SRC, "macro_rules! protected_routes", "\n}\n");
         let last_route = code
             .rfind(".route(")
-            .expect("the macro should contain .route() registrations —— without any, the whole macro is empty");
+            .expect("the macro should contain .route() registrations — without any, the whole macro is empty");
         let layer = code.rfind(".route_layer(").expect(
-            "the macro should contain .route_layer() —— without it, no route is authenticated",
+            "the macro should contain .route_layer() — without it, no route is authenticated",
         );
         assert!(
             layer > last_route,
             "the protected_routes! macro has a .route() after .route_layer().\n\
-             axum's route_layer only covers routes registered before it —— the one after has no \
+             axum's route_layer only covers routes registered before it — the one after has no \
              authentication,\n\
              and compilation, clippy and the existing tests are all green. Move .route_layer() \
              back to the final statement."
@@ -1490,7 +1492,7 @@ mod tests {
     fn health_is_not_in_the_protected_list() {
         assert!(
             !PROTECTED_ROUTES.iter().any(|(p, _)| *p == "/health"),
-            "/health has to stay on the public side —— its consumers cannot be given a credential"
+            "/health has to stay on the public side — its consumers cannot be given a credential"
         );
     }
 
@@ -1533,7 +1535,7 @@ mod tests {
         assert!(!plain.is_empty(), "mock retrieval should not be empty");
         assert!(
             plain.iter().all(|f| f["invalidated"] == false),
-            "no invalidated fact may appear in ordinary retrieval —— all four retrieval paths \
+            "no invalidated fact may appear in ordinary retrieval — all four retrieval paths \
              query active_facts only"
         );
 
@@ -1541,7 +1543,7 @@ mod tests {
         assert!(
             replayed.iter().any(|f| f["invalidated"] == true),
             "replay must return facts that were valid then and have since been overturned, and \
-             mark them as such —— \"what did I believe three months ago\" is exactly this \
+             mark them as such — \"what did I believe three months ago\" is exactly this \
              project's selling point, and filtering it out amounts to cutting that point away"
         );
         assert!(

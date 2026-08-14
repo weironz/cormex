@@ -36,7 +36,7 @@ const DEFAULT_IMAGE: &str = "crates/cortex-memory/tests/fixtures/console_screens
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Err(e) = dotenvy::dotenv() {
-        eprintln!("提示：未加载 .env（{e}），改用进程环境变量");
+        eprintln!("note: .env was not loaded ({e}), falling back to the process environment");
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let path = std::env::args()
         .nth(1)
         .map_or_else(|| PathBuf::from(DEFAULT_IMAGE), PathBuf::from);
-    let bytes =
-        std::fs::read(&path).map_err(|e| anyhow::anyhow!("读不到图片 {}：{e}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| anyhow::anyhow!("cannot read the image {}: {e}", path.display()))?;
     let mime = match path
         .extension()
         .and_then(|e| e.to_str())
@@ -60,40 +60,45 @@ async fn main() -> anyhow::Result<()> {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
-        other => anyhow::bail!("不认识的扩展名 {other:?}"),
+        other => anyhow::bail!("unrecognized extension {other:?}"),
     };
 
     let client = LlmClient::from_env()?;
     let model = client.model().clone();
     println!(
-        "供应商 {} / 模型 {} / vision 声明 {:?}",
+        "provider {} / model {} / declared vision {:?}",
         client.provider_id(),
         model.model_name,
         client.vision_support(&model)
     );
-    println!("图片 {} （{} 字节，{mime}）", path.display(), bytes.len());
+    println!("image {} ({} bytes, {mime})", path.display(), bytes.len());
     println!("─────────────────────────────────────────");
 
     let messages = [Message::user()
-        .with_text("这张图里有什么？把你看到的文字逐字念出来。")
+        .with_text("What is in this image? Read out any text you see, verbatim.")
         .with_image_bytes(&bytes, mime)?];
     println!(
-        "消息构造完成：{} 个图像块",
+        "message assembled: {} image block(s)",
         cortex_llm::image_count(&messages)
     );
 
     // ① The local gate
     match client.ensure_can_see(&model, &messages) {
-        Ok(()) => println!("① 本地闸门：放行"),
-        Err(e) => println!("① 本地闸门：拦下 —— {e}"),
+        Ok(()) => println!("(1) local gate: let through"),
+        Err(e) => println!("(1) local gate: blocked — {e}"),
     }
 
     // ② Actually send it. The gate is bypassed only to observe remote
     // behavior; see the note at the top of the file.
-    println!("② 直发供应商（绕过闸门）……");
+    println!("(2) sending straight to the provider (bypassing the gate)...");
     match client
         .provider()
-        .complete(&model, "你是媒体转录器，回答简洁。", &messages, &[])
+        .complete(
+            &model,
+            "You transcribe media. Answer concisely.",
+            &messages,
+            &[],
+        )
         .await
     {
         Ok((reply, usage)) => {
@@ -101,19 +106,19 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", reply.as_concat_text());
             println!("─────────────────────────────────────────");
             println!(
-                "token：入 {:?} 出 {:?}",
+                "tokens: in {:?} out {:?}",
                 usage.usage.input_tokens, usage.usage.output_tokens
             );
             anyhow::ensure!(
                 client.vision_support(&model) != VisionSupport::Unsupported,
-                "声明不支持 vision 的模型却成功返回了 —— 定义 JSON 该更新了"
+                "a vision-incapable model returned successfully — update the definition JSON"
             );
         }
         // The provider refusing the image is also a valid result: it proves the
         // request was assembled and delivered successfully, and the only
         // difference is whether the far side accepts it. The error must be
         // readable, which is exactly what we are here to look at.
-        Err(e) => println!("远端拒绝：{e}"),
+        Err(e) => println!("the remote refused: {e}"),
     }
     Ok(())
 }

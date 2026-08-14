@@ -67,7 +67,8 @@ impl Tenant {
         match self {
             Self::Live { store, .. } => Ok(store),
             Self::Mock => Err(cortex_core::CortexError::Unavailable(
-                "本实例跑在 mock 后端上，没有可访问的记忆库".into(),
+                "this instance runs on the mock backend, so there is no memory database to reach"
+                    .into(),
             )),
         }
     }
@@ -169,14 +170,15 @@ impl AppState {
                 store: public_store,
             });
         }
-        let acc = self
-            .accounts()
-            .map_err(|_| ApiError::internal("没接账号体系却要解析非 public 租户"))?;
-        let store = acc
-            .tenants
-            .get(&schema)
-            .await
-            .map_err(|e| ApiError::internal(format!("连不上 {} 的库：{e}", schema.as_str())))?;
+        let acc = self.accounts().map_err(|_| {
+            ApiError::internal("a non-public tenant was resolved with no accounts system attached")
+        })?;
+        let store = acc.tenants.get(&schema).await.map_err(|e| {
+            ApiError::internal(format!(
+                "could not connect to {}'s database: {e}",
+                schema.as_str()
+            ))
+        })?;
         Ok(Tenant::Live { schema, store })
     }
 }
@@ -196,7 +198,11 @@ async fn resolve_schema(pool: &sqlx::PgPool, user_id: &str) -> Result<SchemaName
             .bind(user_id)
             .fetch_optional(pool)
             .await
-            .map_err(|e| ApiError::internal(format!("查不到这个账号落在哪个 schema：{e}")))?;
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "could not find which schema this account lives in: {e}"
+                ))
+            })?;
 
     // No row means this is the legacy token path — it already passed the
     // inbound gate, and user #1 lives in public
@@ -214,7 +220,9 @@ async fn resolve_schema(pool: &sqlx::PgPool, user_id: &str) -> Result<SchemaName
     // written: the CHECK is in the way, so an invalid name cannot be inserted.
     // `SchemaName::new`'s own boundaries are tested in cortex-store.
     SchemaName::new(&name).map_err(|e| {
-        ApiError::internal(format!("账号 {user_id} 的 schema 名不合法（{name}）：{e}"))
+        ApiError::internal(format!(
+            "account {user_id} has an invalid schema name ({name}): {e}"
+        ))
     })
 }
 
@@ -256,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn each_account_resolves_to_its_own_schema() {
         let Some(pool) = pool().await else {
-            eprintln!("跳过：没有 DATABASE_URL");
+            eprintln!("skipped: no DATABASE_URL");
             return;
         };
         let a_schema = SchemaName::derive(&cortex_core::Id::new().to_string()).unwrap();
@@ -279,7 +287,7 @@ mod tests {
         assert_ne!(
             ra.as_str(),
             rb.as_str(),
-            "two accounts resolved to the same schema —— this is exactly \"two people logged in, \
+            "two accounts resolved to the same schema — this is exactly \"two people logged in, \
              both reading the same database\""
         );
     }

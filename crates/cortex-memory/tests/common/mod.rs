@@ -38,7 +38,10 @@ impl TestDb {
         self.store.close().await;
         let sql = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema);
         if let Err(err) = sqlx::query(AssertSqlSafe(sql)).execute(&self.admin).await {
-            eprintln!("清理临时 schema {} 失败：{err}", self.schema);
+            eprintln!(
+                "cleaning up the temporary schema {} failed: {err}",
+                self.schema
+            );
         }
         self.admin.close().await;
     }
@@ -52,7 +55,7 @@ pub async fn setup() -> Option<TestDb> {
     let admin = match PgPoolOptions::new().max_connections(2).connect(&url).await {
         Ok(pool) => pool,
         Err(err) => {
-            eprintln!("跳过：连不上数据库（{err}）");
+            eprintln!("skipped: cannot reach the database ({err})");
             return None;
         }
     };
@@ -62,7 +65,7 @@ pub async fn setup() -> Option<TestDb> {
     let schema = unique_schema_name();
     let create = format!("CREATE SCHEMA \"{schema}\"");
     if let Err(err) = sqlx::query(AssertSqlSafe(create)).execute(&admin).await {
-        eprintln!("跳过：建不出临时 schema（{err}）");
+        eprintln!("skipped: cannot create a temporary schema ({err})");
         admin.close().await;
         return None;
     }
@@ -96,7 +99,7 @@ fn database_url() -> Option<String> {
     match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => Some(url),
         _ => {
-            eprintln!("跳过：未设置 DATABASE_URL");
+            eprintln!("skipped: DATABASE_URL is not set");
             None
         }
     }

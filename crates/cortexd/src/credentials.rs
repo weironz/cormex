@@ -217,13 +217,16 @@ pub fn hash_password(plain: &str) -> cortex_core::Result<String> {
     let mut salt_bytes = [0u8; SALT_BYTES];
     getrandom::fill(&mut salt_bytes)
         .expect("the kernel entropy source is unavailable; refusing to hash a password with a predictable salt");
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| cortex_core::CortexError::Other(anyhow::anyhow!("盐编码失败：{e}")))?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| {
+        cortex_core::CortexError::Other(anyhow::anyhow!("could not encode the salt: {e}"))
+    })?;
 
     hasher()
         .hash_password(plain.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| cortex_core::CortexError::Other(anyhow::anyhow!("密码哈希失败：{e}")))
+        .map_err(|e| {
+            cortex_core::CortexError::Other(anyhow::anyhow!("could not hash the password: {e}"))
+        })
 }
 
 /// Verify a plaintext password.
@@ -255,7 +258,7 @@ pub fn verify_password(plain: &str, phc: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc) else {
         // This is not "the password is wrong", it is "this row of data is
         // broken". Ops needs to know; the user does not
-        tracing::debug!("PHC 串无法解析 —— 该账号的密码哈希已损坏");
+        tracing::debug!("the PHC string will not parse — this account's password hash is corrupt");
         return false;
     };
 
@@ -273,7 +276,7 @@ pub fn verify_password(plain: &str, phc: &str) -> bool {
     // id is the hybrid of the two — "follow the string while verifying" hands
     // the choice to the attack surface.
     if argon2::Algorithm::try_from(parsed.algorithm) != Ok(argon2::Algorithm::Argon2id) {
-        tracing::debug!(algorithm = %parsed.algorithm, "拒绝非 argon2id 的密码哈希");
+        tracing::debug!(algorithm = %parsed.algorithm, "refusing a password hash that is not argon2id");
         return false;
     }
 
@@ -297,13 +300,14 @@ fn check_password_shape(plain: &str) -> cortex_core::Result<()> {
     let len = plain.len();
     if len < MIN_PASSWORD_LEN {
         return Err(cortex_core::CortexError::Invalid(format!(
-            "密码至少需要 {MIN_PASSWORD_LEN} 个字节。\
-             这里不要求大小写 / 数字 / 符号的组合 —— 长度是唯一真正管用的那一项。"
+            "a password needs at least {MIN_PASSWORD_LEN} bytes. No mixture of upper and \
+             lower case, digits and symbols is demanded here — length is the only one of \
+             those that actually helps."
         )));
     }
     if len > MAX_PASSWORD_LEN {
         return Err(cortex_core::CortexError::Invalid(format!(
-            "密码最长 {MAX_PASSWORD_LEN} 个字节。"
+            "a password is at most {MAX_PASSWORD_LEN} bytes."
         )));
     }
     Ok(())
@@ -507,7 +511,7 @@ mod tests {
             hash_password("correct horse battery staple").expect("a valid password should hash");
         assert_ne!(
             a, b,
-            "hashing the same password twice produced the same string —— which means the salt is \
+            "hashing the same password twice produced the same string — which means the salt is \
              not random, so after the database is stolen one can group by digest and find out \
              who shares a password with whom"
         );
@@ -543,7 +547,7 @@ mod tests {
         );
         assert!(
             !verify_password("Correct horse battery staple", &phc),
-            "a password differing only in case must not verify —— verification has to be \
+            "a password differing only in case must not verify — verification has to be \
              case-sensitive"
         );
     }
@@ -601,7 +605,7 @@ mod tests {
         );
         assert!(
             !verify_password("correct horse battery staple", &weak),
-            "an argon2i hash string was admitted —— that is the entry point for an algorithm \
+            "an argon2i hash string was admitted — that is the entry point for an algorithm \
              downgrade attack"
         );
     }
@@ -616,7 +620,7 @@ mod tests {
         );
         assert!(
             hash_password(&"a".repeat(MIN_PASSWORD_LEN)).is_ok(),
-            "a password exactly at the minimum must be accepted —— the boundary must not be off \
+            "a password exactly at the minimum must be accepted — the boundary must not be off \
              by one"
         );
         assert!(
@@ -666,7 +670,7 @@ mod tests {
         let (other, _) = generate_refresh();
         assert_ne!(
             plain, other,
-            "two issuances must not collide —— only a broken entropy source does that"
+            "two issuances must not collide — only a broken entropy source does that"
         );
     }
 
@@ -750,7 +754,7 @@ mod tests {
         assert_eq!(
             judge_refresh(&rec),
             RefreshVerdict::RevokeFamily { family: rec.family },
-            "both expired and rotated —— expiry must not mask a replay. Every rotation on the \
+            "both expired and rotated — expiry must not mask a replay. Every rotation on the \
              chain signs a successor with a fresh lifetime, so \"the old one expired\" says \
              nothing whatsoever about \"this chain is dead\""
         );

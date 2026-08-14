@@ -120,14 +120,16 @@ impl CorsPolicy {
         for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if item == "*" {
                 return Err(cortex_core::CortexError::Config(format!(
-                    "{ALLOWED_ORIGINS_ENV} 不接受 `*`。\n\
+                    "{ALLOWED_ORIGINS_ENV} does not accept `*`.\n\
                      \n\
-                     允许任意来源意味着任何网页都能拿一张泄露的 ?ticket= 去读你的\n\
-                     记忆库响应 —— 而票据本来就是要进 URL 的东西（见 src/auth.rs）。\n\
+                     Allowing any origin means any web page can take a leaked ?ticket=\n\
+                     and read your memory database's responses — and a ticket is a\n\
+                     thing that goes into a URL by design (see src/auth.rs).\n\
                      \n\
-                     生产部署里 Web 与 cortexd 同源，压根不需要任何 CORS：把这个\n\
-                     变量删掉即可。开发机上 `flutter run -d chrome` 用随机端口，\n\
-                     写 {ALLOWED_ORIGINS_ENV}={LOOPBACK_TOKEN}。"
+                     In production the web app and cortexd are same-origin, so no CORS\n\
+                     is needed at all: delete this variable. On a development machine\n\
+                     `flutter run -d chrome` uses a random port, so write\n\
+                     {ALLOWED_ORIGINS_ENV}={LOOPBACK_TOKEN}."
                 )));
             }
             if item == LOOPBACK_TOKEN {
@@ -207,15 +209,16 @@ impl CorsPolicy {
     pub fn status_line(&self) -> String {
         if self.denies_everything() {
             return format!(
-                "跨源：不允许任何跨源请求（生产形态：Web 与 cortexd 同源）。\
-                 开发机需要跨源时设 {ALLOWED_ORIGINS_ENV}={LOOPBACK_TOKEN}"
+                "cross-origin: no cross-origin request is allowed (the production shape: \
+                 the web app and cortexd are same-origin). A development machine that \
+                 needs one sets {ALLOWED_ORIGINS_ENV}={LOOPBACK_TOKEN}"
             );
         }
         let mut parts: Vec<String> = self.exact.iter().cloned().collect();
         if self.loopback {
-            parts.push(format!("{LOOPBACK_TOKEN}（任意端口的本机回环）"));
+            parts.push(format!("{LOOPBACK_TOKEN} (loopback on any port)"));
         }
-        format!("跨源：仅允许 {}", parts.join("、"))
+        format!("cross-origin: only {} allowed", parts.join(", "))
     }
 }
 
@@ -254,27 +257,27 @@ fn is_loopback_origin(origin: &str) -> bool {
 fn validate_origin(item: &str) -> cortex_core::Result<()> {
     let invalid = |why: &str| {
         cortex_core::CortexError::Config(format!(
-            "{ALLOWED_ORIGINS_ENV} 里的 {item:?} 不是合法的来源：{why}。\
-             来源的形状是 scheme://host[:port]，例如 https://cortex.example.com \
-             或 http://localhost:5000（没有路径，也没有结尾的斜杠）"
+            "{item:?} in {ALLOWED_ORIGINS_ENV} is not a valid origin: {why}. An origin is \
+             shaped scheme://host[:port], for example https://cortex.example.com or \
+             http://localhost:5000 — no path, and no trailing slash"
         ))
     };
 
     let rest = item
         .strip_prefix("http://")
         .or_else(|| item.strip_prefix("https://"))
-        .ok_or_else(|| invalid("缺少 http:// 或 https:// 前缀"))?;
+        .ok_or_else(|| invalid("missing the http:// or https:// prefix"))?;
     if rest.is_empty() {
-        return Err(invalid("没有主机名"));
+        return Err(invalid("no hostname"));
     }
     if rest.contains('/') {
-        return Err(invalid("含有路径或结尾的斜杠"));
+        return Err(invalid("contains a path or a trailing slash"));
     }
     if item.contains('?') || item.contains('#') {
-        return Err(invalid("含有查询串或片段"));
+        return Err(invalid("contains a query string or a fragment"));
     }
     if item.chars().any(char::is_whitespace) {
-        return Err(invalid("含有空白字符"));
+        return Err(invalid("contains whitespace"));
     }
     Ok(())
 }
@@ -307,7 +310,7 @@ mod tests {
         ] {
             assert!(
                 !p.allows(o),
-                "{o} was allowed under the default policy —— production is a same-origin \
+                "{o} was allowed under the default policy — production is a same-origin \
                  deployment and needs no cross-origin access at all"
             );
         }
@@ -344,7 +347,7 @@ mod tests {
         ] {
             assert!(
                 !p.allows(o),
-                "{o} must not pass —— origins have to match exactly"
+                "{o} must not pass — origins have to match exactly"
             );
         }
     }
@@ -408,7 +411,7 @@ mod tests {
         ] {
             assert!(
                 CorsPolicy::parse(bad).is_err(),
-                "{bad:?} is a malformed origin and must error immediately —— dropped silently, \
+                "{bad:?} is a malformed origin and must error immediately — dropped silently, \
                  \"configured but not taking effect\" only drives people to widen the \
                  configuration"
             );
@@ -418,7 +421,11 @@ mod tests {
     /// The status line must always answer "who exactly am I allowing right now".
     #[test]
     fn the_status_line_always_answers_who_is_allowed() {
-        assert!(policy("").status_line().contains("不允许任何跨源"));
+        assert!(
+            policy("")
+                .status_line()
+                .contains("no cross-origin request is allowed")
+        );
         let line = policy("https://a.example,loopback").status_line();
         assert!(line.contains("https://a.example"), "actual: {line}");
         assert!(line.contains(LOOPBACK_TOKEN), "actual: {line}");

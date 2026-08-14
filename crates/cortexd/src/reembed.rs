@@ -81,8 +81,9 @@ const SLOW_AFTER_FAILURES: u32 = 3;
 pub fn spawn(st: crate::state::AppState) {
     if !enabled() {
         tracing::info!(
-            "{ENV_ENABLED}=off：换模型后的向量回填**不会**运行。\
-             旧模型下的事实将一直进不了向量召回"
+            "{ENV_ENABLED}=off: the vector backfill that follows a model change will \
+             **not** run. Facts embedded under the old model stay out of vector \
+             retrieval for good"
         );
         return;
     }
@@ -150,7 +151,7 @@ async fn scan_all_tenants(st: &crate::state::AppState, live: &Arc<Live>, batch: 
     let schemas = match st.tenant_schemas().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "列不出租户，这一轮跳过");
+            tracing::warn!(error = %e, "could not list the tenants; skipping this round");
             return Outcome::Failed;
         }
     };
@@ -161,7 +162,7 @@ async fn scan_all_tenants(st: &crate::state::AppState, live: &Arc<Live>, batch: 
         let store = match st.tenant_store(schema).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(schema = schema.as_str(), error = %e, "连不上这个租户，跳过");
+                tracing::warn!(schema = schema.as_str(), error = %e, "could not connect to this tenant; skipping it");
                 any_failure = true;
                 continue;
             }
@@ -200,7 +201,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
     let todo = match store.facts_missing_embedding(&model, batch as i64).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "回填待办查询失败，本轮跳过");
+            tracing::warn!(error = %e, "the backfill to-do query failed; skipping this round");
             return Outcome::Failed;
         }
     };
@@ -208,7 +209,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
         .entities_missing_embedding(&model, batch as i64)
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "实体回填待办查询失败，本轮只补事实");
+            tracing::warn!(error = %e, "the entity backfill to-do query failed; this round fills in facts only");
             Vec::new()
         });
 
@@ -220,7 +221,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
         facts = todo.len(),
         entities = entities.len(),
         model = %model,
-        "开始回填 embedding"
+        "starting the embedding backfill"
     );
 
     // ── Outside the transaction: compute the vectors ────────
@@ -236,7 +237,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
             // No per-row retry: a whole batch failing is almost always
             // "service unreachable / wrong credentials / wrong model name",
             // and retrying row by row would just print the same error 64 times
-            tracing::warn!(error = %e, "向量化失败，本轮不写入");
+            tracing::warn!(error = %e, "embedding failed; nothing is written this round");
             return Outcome::Failed;
         }
     };
@@ -244,7 +245,8 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
         tracing::warn!(
             got = vectors.len(),
             want = texts.len(),
-            "embedder 返回条数对不上，本轮丢弃 —— 按位置配对会写错行"
+            "the embedder returned a different number of rows; discarding this \
+                 round — pairing by position would write vectors onto the wrong rows"
         );
         return Outcome::Failed;
     }
@@ -259,7 +261,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
                     // inserted a row bypassing the write channel. Skip it
                     // rather than failing the whole batch — one bad row must
                     // not block the rest
-                    tracing::warn!(id, "fact id 不是合法 ULID，跳过");
+                    tracing::warn!(id, "the fact id is not a valid ULID; skipping it");
                     continue;
                 };
                 tx.insert_fact_embedding(&NewFactEmbedding {
@@ -271,7 +273,7 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
             }
             for ((id, _), v) in entities.iter().zip(&vectors[split..]) {
                 let Ok(entity_id) = id.parse() else {
-                    tracing::warn!(id, "entity id 不是合法 ULID，跳过");
+                    tracing::warn!(id, "the entity id is not a valid ULID; skipping it");
                     continue;
                 };
                 tx.insert_entity_embedding(&NewEntityEmbedding {
@@ -293,12 +295,12 @@ async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {
                 entities = entities.len(),
                 covered,
                 stale,
-                "回填完成一轮"
+                "finished one backfill round"
             );
             Outcome::Progressed
         }
         Err(e) => {
-            tracing::warn!(error = %e, "回填写入失败，本轮全部回滚");
+            tracing::warn!(error = %e, "the backfill write failed; the whole round was rolled back");
             Outcome::Failed
         }
     }
@@ -319,8 +321,8 @@ fn enabled() -> bool {
             other => {
                 tracing::warn!(
                     value = other,
-                    "{ENV_ENABLED} 的取值不认识，按**开启**处理。\
-                     要关掉请写 off"
+                    "{ENV_ENABLED} has an unrecognised value and is treated as **on**. \
+                     Write off to turn it off"
                 );
                 true
             }
@@ -335,7 +337,7 @@ fn usize_env(key: &str, default: usize) -> usize {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(n) if n > 0 => n,
             _ => {
-                tracing::warn!(key, value = %v, default, "取值非法，用默认值");
+                tracing::warn!(key, value = %v, default, "the value is invalid; falling back to the default");
                 default
             }
         },
@@ -358,7 +360,7 @@ mod tests {
         unsafe { std::env::remove_var(ENV_ENABLED) };
         assert!(
             enabled(),
-            "with nothing set it must be on —— defaulting to off would leave the silent amnesia \
+            "with nothing set it must be on — defaulting to off would leave the silent amnesia \
              exactly as it was"
         );
 
@@ -369,7 +371,7 @@ mod tests {
 
         // A mistyped value is treated as **on**: silently turning off is
         // precisely the shape of the problem this exists to solve
-        for v in ["yes", "disable", "关"] {
+        for v in ["yes", "disable", "turn-off"] {
             unsafe { std::env::set_var(ENV_ENABLED, v) };
             assert!(
                 enabled(),

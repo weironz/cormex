@@ -51,17 +51,21 @@ pub fn decode(raw: &str) -> Result<EpisodeCursor> {
     // from the left would silently change the meaning here the day a third
     // segment is added to the cursor, whereas splitting from the right only
     // ever has to recognise the last segment
-    let (time_part, id) = raw
-        .rsplit_once(SEP)
-        .ok_or_else(|| CortexError::Invalid(format!("游标格式不对，缺少 {SEP:?}：{raw:?}")))?;
+    let (time_part, id) = raw.rsplit_once(SEP).ok_or_else(|| {
+        CortexError::Invalid(format!("malformed cursor, missing {SEP:?}: {raw:?}"))
+    })?;
 
     let occurred_at = DateTime::parse_from_rfc3339(time_part)
-        .map_err(|e| CortexError::Invalid(format!("游标里的时间不是合法 RFC3339：{e}")))?
+        .map_err(|e| {
+            CortexError::Invalid(format!(
+                "the time part of the cursor is not valid RFC3339: {e}"
+            ))
+        })?
         .with_timezone(&Utc);
 
     if id.len() != ULID_LEN || !id.bytes().all(is_crockford_upper) {
         return Err(CortexError::Invalid(format!(
-            "游标里的 id 不是 26 位大写 Crockford base32 ULID：{id:?}"
+            "the id in the cursor is not a 26-character uppercase Crockford base32 ULID: {id:?}"
         )));
     }
 
@@ -93,7 +97,7 @@ mod tests {
         assert_eq!(got.id, SAMPLE_ID);
         assert_eq!(
             got.occurred_at, t,
-            "microseconds must round-trip losslessly —— losing precision makes messages within \
+            "microseconds must round-trip losslessly — losing precision makes messages within \
              the same second repeat or disappear while paginating"
         );
     }
@@ -124,7 +128,7 @@ mod tests {
             "a cursor with no separator must be rejected"
         );
         assert!(
-            decode(&format!("昨天|{SAMPLE_ID}")).is_err(),
+            decode(&format!("yesterday|{SAMPLE_ID}")).is_err(),
             "a time part that is not RFC3339 must be rejected"
         );
     }

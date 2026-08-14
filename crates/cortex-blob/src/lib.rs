@@ -171,11 +171,11 @@ pub trait BlobStore: Send + Sync {
 /// which is an order of magnitude harder to diagnose than an outright error.
 pub(crate) fn validate_ttl(ttl: Duration) -> Result<()> {
     if ttl.is_zero() {
-        return Err(BlobError::Unsupported("presign ttl 不能为 0"));
+        return Err(BlobError::Unsupported("presign ttl must not be 0"));
     }
     if ttl > MAX_PRESIGN_TTL {
         return Err(BlobError::Backend(format!(
-            "presign ttl {}s 超过 SigV4 上限 {}s（7 天）",
+            "presign ttl {}s exceeds the SigV4 ceiling of {}s (7 days)",
             ttl.as_secs(),
             MAX_PRESIGN_TTL.as_secs()
         )));
@@ -189,7 +189,7 @@ pub(crate) fn validate_ttl(ttl: Duration) -> Result<()> {
 pub(crate) fn validate_range(range: &Range<u64>) -> Result<()> {
     if range.start >= range.end {
         return Err(BlobError::InvalidRange(format!(
-            "空或颠倒的区间 [{}, {})",
+            "empty or reversed range [{}, {})",
             range.start, range.end
         )));
     }

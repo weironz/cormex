@@ -848,7 +848,7 @@ impl<E: Embedder> Retriever<E> {
                 // backfill, and the main path has already returned the current
                 // space's results. Degrade to "query the new space only", which is
                 // exactly the behaviour when no legacy model is attached
-                tracing::warn!("旧模型 embedding 失败，本次只查当前空间");
+                tracing::warn!("legacy-model embedding failed; querying the current space only");
                 return Vec::new();
             };
             let v = cortex_store::Vector::from(qvec);
@@ -856,7 +856,10 @@ impl<E: Embedder> Retriever<E> {
                 .recall_vector_scored(&v, legacy.model_id(), self.width.vector)
                 .await
                 .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "旧空间召回失败，本次只查当前空间");
+                    tracing::warn!(
+                        error = %e,
+                        "recall from the legacy space failed; querying the current space only"
+                    );
                     Vec::new()
                 })
         };

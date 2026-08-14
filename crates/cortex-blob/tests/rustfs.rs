@@ -68,7 +68,7 @@ async fn store() -> Option<S3BlobStore> {
                 "CORTEX_REQUIRE_RUSTFS is set but RustFS is unreachable ({}): {e}",
                 opts.endpoint
             );
-            eprintln!("跳过：连不上 RustFS（{}）：{e}", opts.endpoint);
+            eprintln!("skipped: cannot reach RustFS ({}): {e}", opts.endpoint);
             None
         }
     }

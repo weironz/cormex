@@ -413,7 +413,7 @@ mod tests {
         ] {
             assert!(
                 !s.allows(&m, p),
-                "{m} {p} was admitted —— the first layer of data protection is void as of now: a \
+                "{m} {p} was admitted — the first layer of data protection is void as of now: a \
                  compromised container can list, overwrite and (once purge lands) delete all of \
                  its own backups, and this has no symptom whatsoever"
             );
@@ -438,7 +438,7 @@ mod tests {
         book.revoke(&t);
         assert!(
             book.resolve(&t).is_none(),
-            "once the sandbox stops, its token must be void on the spot —— the container may \
+            "once the sandbox stops, its token must be void on the spot — the container may \
              still be alive (the last instant before stop), and it must no longer be writing \
              memory"
         );
@@ -464,7 +464,7 @@ mod tests {
         assert_ne!(
             in_project("u1", "p1").key(),
             in_project("u1", "p2").key(),
-            "two projects must be separated from each other as well —— that is the thing users \
+            "two projects must be separated from each other as well — that is the thing users \
              actually complained about"
         );
     }
@@ -499,7 +499,7 @@ mod tests {
         assert!(
             name_len <= 63,
             "the container name is {name_len} bytes, over the DNS label limit of 63. The symptom \
-             is not \"creating the container failed\" —— the container comes up, the health check \
+             is not \"creating the container failed\" — the container comes up, the health check \
              passes, and cortexd cannot even resolve its name; what gets reported is \"no \
              response for 30 seconds\""
         );
@@ -512,7 +512,7 @@ mod tests {
             in_project("u1", "p1").key(),
             in_project("u1", "p1").key(),
             "if the key were unstable, every conversational turn would go looking for a \
-             container that does not exist —— so every turn creates a new one, while the old ones \
+             container that does not exist — so every turn creates a new one, while the old ones \
              sit where they were with the files still in them"
         );
     }

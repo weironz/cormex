@@ -78,7 +78,7 @@ fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b)));
     if !ok {
-        return Err(ApiError::bad_request("上传句柄不合法"));
+        return Err(ApiError::bad_request("the upload handle is malformed"));
     }
     Ok(spool_dir().join(handle))
 }
@@ -90,9 +90,11 @@ fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
 /// upload exceeded [`MAX_UPLOAD`].
 pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<UploadAck>, ApiError> {
     let dir = spool_dir();
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| ApiError::internal(format!("建不了上传暂存目录：{e}")))?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        ApiError::internal(format!(
+            "could not create the upload staging directory: {e}"
+        ))
+    })?;
     // Sweep while we are here. A timer would mean one more background task plus
     // its failure path, whereas this code path only runs when somebody is
     // actually uploading a file — when nobody is, there is nothing to sweep
@@ -102,7 +104,7 @@ pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<Upload
     let path = dir.join(&handle);
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|e| ApiError::internal(format!("建不了暂存文件：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not create the staging file: {e}")))?;
 
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
@@ -114,26 +116,31 @@ pub async fn upload(State(_): State<AppState>, body: Body) -> Result<Json<Upload
                 // legitimate input and produce a baffling JSON error. Delete
                 // it, so the failure stops here
                 let _ = tokio::fs::remove_file(&path).await;
-                return Err(ApiError::bad_request(format!("上传中断：{e}")));
+                return Err(ApiError::bad_request(format!(
+                    "the upload was interrupted: {e}"
+                )));
             }
         };
         written += chunk.len() as u64;
         if written > MAX_UPLOAD {
             let _ = tokio::fs::remove_file(&path).await;
             return Err(ApiError::bad_request(format!(
-                "文件超过上限（{} MiB）。导出包里的 conversations.json 通常远小于它 —— \
-                 确认传的是那个文件，而不是整个压缩包",
+                "the file is over the ceiling ({} MiB). The conversations.json inside an \
+                 export archive is normally far smaller — check that what you uploaded \
+                 is that file rather than the whole archive",
                 MAX_UPLOAD / 1024 / 1024
             )));
         }
         if let Err(e) = file.write_all(&chunk).await {
             let _ = tokio::fs::remove_file(&path).await;
-            return Err(ApiError::internal(format!("写暂存文件失败：{e}")));
+            return Err(ApiError::internal(format!(
+                "could not write the staging file: {e}"
+            )));
         }
     }
     file.flush()
         .await
-        .map_err(|e| ApiError::internal(format!("落盘失败：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not flush it to disk: {e}")))?;
 
     Ok(Json(UploadAck {
         handle,
@@ -169,13 +176,15 @@ async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
         .as_deref()
         .filter(|h| !h.trim().is_empty())
         .ok_or_else(|| {
-            ApiError::bad_request("要给 handle —— 先 POST /import/upload 把文件传上来")
+            ApiError::bad_request("a handle is required — POST /import/upload the file first")
         })?;
     let path = path_of(handle)?;
     let bytes = tokio::fs::read(&path).await.map_err(|_| {
         // Do not echo the path back: that is the server's filesystem layout.
         // And there is really only one likely cause
-        ApiError::bad_request("这个上传句柄已经失效了（超过一小时会被清理），请重新上传")
+        ApiError::bad_request(
+            "this upload handle has expired (they are cleaned up after an hour); upload again",
+        )
     })?;
 
     let platform = match req.platform.as_deref() {
@@ -184,7 +193,7 @@ async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
         Some("claude") => Some(cortex_import::Platform::Claude),
         Some(other) => {
             return Err(ApiError::bad_request(format!(
-                "认不出的平台：{other}（只支持 chatgpt / claude）"
+                "unrecognised platform: {other} (only chatgpt / claude are supported)"
             )));
         }
     };
@@ -192,7 +201,7 @@ async fn plan_of(req: &ImportRequest) -> Result<cortex_import::Plan, ApiError> {
         None => None,
         Some(s) => Some(
             chrono::DateTime::parse_from_rfc3339(s)
-                .map_err(|e| ApiError::bad_request(format!("since 不是合法的 RFC 3339：{e}")))?
+                .map_err(|e| ApiError::bad_request(format!("since is not valid RFC 3339: {e}")))?
                 .with_timezone(&chrono::Utc),
         ),
     };
@@ -218,7 +227,7 @@ pub async fn preview(
     Ok(Json(plan.estimate().to_wire(plan.platform)).into_response())
 }
 
-/// `POST /import/run` — SSE。
+/// `POST /import/run` — SSE.
 pub async fn run(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -235,7 +244,10 @@ pub async fn run(
             Err(e) => {
                 let _ = tx
                     .send(ImportEvent::Error {
-                        message: format!("解析不出这次导入属于哪个账号：{}", e.message()),
+                        message: format!(
+                            "could not work out which account this import belongs to: {}",
+                            e.message()
+                        ),
                     })
                     .await;
                 return;
@@ -288,11 +300,11 @@ pub async fn run(
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
-        Ok(Event::default().data(
-            serde_json::to_string(&ev).unwrap_or_else(|e| {
-                format!(r#"{{"type":"error","message":"事件序列化失败：{e}"}}"#)
-            }),
-        ))
+        Ok(
+            Event::default().data(serde_json::to_string(&ev).unwrap_or_else(|e| {
+                format!(r#"{{"type":"error","message":"could not serialize the event: {e}"}}"#)
+            })),
+        )
     });
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
@@ -380,7 +392,7 @@ mod tests {
         ] {
             assert!(
                 path_of(bad).is_err(),
-                "this handle must be rejected: {bad:?} —— it gets joined into a path"
+                "this handle must be rejected: {bad:?} — it gets joined into a path"
             );
         }
 

@@ -81,7 +81,7 @@ fn non_empty(key: &str) -> Option<String> {
 }
 
 fn required(key: &str) -> Result<String> {
-    non_empty(key).ok_or_else(|| CortexError::Config(format!("缺少环境变量 {key}")))
+    non_empty(key).ok_or_else(|| CortexError::Config(format!("missing environment variable {key}")))
 }
 
 fn optional(key: &str, default: &str) -> String {

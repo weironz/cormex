@@ -115,10 +115,14 @@ impl ApiEmbedderConfig {
             None => DEFAULT_BATCH,
             Some(v) => {
                 let n: usize = v.trim().parse().map_err(|_| {
-                    CortexError::Config(format!("CORTEX_EMBED_BATCH 不是正整数：{v:?}"))
+                    CortexError::Config(format!(
+                        "CORTEX_EMBED_BATCH is not a positive integer: {v:?}"
+                    ))
                 })?;
                 if n == 0 {
-                    return Err(CortexError::Config("CORTEX_EMBED_BATCH 不能为 0".into()));
+                    return Err(CortexError::Config(
+                        "CORTEX_EMBED_BATCH must not be 0".into(),
+                    ));
                 }
                 n
             }
@@ -217,7 +221,7 @@ impl std::fmt::Debug for ApiEmbedder {
         f.debug_struct("ApiEmbedder")
             .field("url", &self.url)
             .field("model", &self.cfg.model)
-            .field("api_key", &self.cfg.api_key.as_ref().map(|_| "<已设置>"))
+            .field("api_key", &self.cfg.api_key.as_ref().map(|_| "<set>"))
             .field("batch", &self.cfg.batch)
             .finish()
     }
@@ -238,7 +242,7 @@ impl ApiEmbedder {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .map_err(|e| CortexError::Memory(format!("构造 HTTP 客户端失败：{e}")))?;
+            .map_err(|e| CortexError::Memory(format!("building the HTTP client failed: {e}")))?;
         let url = resolve_url(&cfg.endpoint);
         // The identifier written into the embedding_model column of every
         // table. The `api:` prefix exists so that "same model name, run
@@ -303,9 +307,10 @@ impl ApiEmbedder {
         // cannot be told apart. Better to error on the spot
         let model = var("CORTEX_EMBED_LEGACY_MODEL").ok_or_else(|| {
             CortexError::Config(
-                "设了 CORTEX_EMBED_LEGACY_ENDPOINT 就必须设 CORTEX_EMBED_LEGACY_MODEL：\n\
-                 旧模型名会成为向量查询的过滤条件，猜错的表现是「查到 0 条」，\n\
-                 与「没开这个功能」一模一样，事后分辨不出来"
+                "setting CORTEX_EMBED_LEGACY_ENDPOINT means CORTEX_EMBED_LEGACY_MODEL must be set too:\n\
+                 the old model name becomes a filter on the vector query, and guessing it wrong \
+                 looks like \"0 rows found\",\n\
+                 which is indistinguishable after the fact from \"this feature is off\""
                     .into(),
             )
         })?;
@@ -344,7 +349,7 @@ impl ApiEmbedder {
             match req.send().await {
                 Err(e) => {
                     last = Some(CortexError::Memory(format!(
-                        "请求 embedding 服务失败（{}）：{e}",
+                        "the request to the embedding service failed ({}): {e}",
                         self.url
                     )));
                 }
@@ -352,7 +357,9 @@ impl ApiEmbedder {
                     let status = resp.status();
                     if status.is_success() {
                         let parsed: EmbedResponse = resp.json().await.map_err(|e| {
-                            CortexError::Memory(format!("embedding 响应解析失败：{e}"))
+                            CortexError::Memory(format!(
+                                "parsing the embedding response failed: {e}"
+                            ))
                         })?;
                         return Self::collect(parsed, texts.len(), &self.cfg.model);
                     }
@@ -361,7 +368,7 @@ impl ApiEmbedder {
                         || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     let detail = resp.text().await.unwrap_or_default();
                     let err = CortexError::Memory(format!(
-                        "embedding 服务返回 {status}（{}）：{}",
+                        "the embedding service returned {status} ({}): {}",
                         self.url,
                         detail.trim()
                     ));
@@ -376,14 +383,14 @@ impl ApiEmbedder {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| CortexError::Memory("embedding 请求失败".into())))
+        Err(last.unwrap_or_else(|| CortexError::Memory("the embedding request failed".into())))
     }
 
     /// Validates and sorts back into `index` order.
     fn collect(mut parsed: EmbedResponse, want: usize, model: &str) -> Result<Vec<Vec<f32>>> {
         if parsed.data.len() != want {
             return Err(CortexError::Memory(format!(
-                "embedding 服务返回 {} 条，但请求了 {want} 条",
+                "the embedding service returned {} items, but {want} were requested",
                 parsed.data.len()
             )));
         }
@@ -392,12 +399,15 @@ impl ApiEmbedder {
         for item in &parsed.data {
             if item.embedding.len() != EMBEDDING_DIM {
                 return Err(CortexError::Memory(format!(
-                    "维度不匹配：模型 {model} 返回 {} 维，而 schema 写死 {EMBEDDING_DIM} 维。\n\
-                     换一个 {EMBEDDING_DIM} 维的模型（bge-m3 / text-embedding-v3 / jina-embeddings-v3 都可以），\n\
-                     或者按 docs/memory.md 的「换模型不停机」加一列迁移。\n\
-                     常见的踩法：OpenAI 的 text-embedding-3-small 是 1536 维、\
-                     text-embedding-3-large 是 3072 维 —— 这两家支持 dimensions 参数缩到 {EMBEDDING_DIM}，\
-                     但要在服务端配置里指定，我们不替你猜。",
+                    "dimension mismatch: model {model} returned {} dimensions, but the schema hard-codes \
+                     {EMBEDDING_DIM}.\n\
+                     Either switch to a {EMBEDDING_DIM}-dimension model (bge-m3 / text-embedding-v3 / \
+                     jina-embeddings-v3 all work),\n\
+                     or add a column migration per \"switching models without downtime\" in docs/memory.md.\n\
+                     A common trap: OpenAI's text-embedding-3-small is 1536 dimensions and \
+                     text-embedding-3-large is 3072 -- both accept a dimensions parameter that shrinks \
+                     them to {EMBEDDING_DIM}, but it has to be set in the service configuration; we do \
+                     not guess it for you.",
                     item.embedding.len()
                 )));
             }
@@ -417,7 +427,9 @@ impl ApiEmbedder {
         // inexplicably empty, with no error at all.
         for (i, v) in out.iter_mut().enumerate() {
             normalize(v).map_err(|e| {
-                CortexError::Memory(format!("模型 {model} 返回的第 {i} 条向量无法归一化：{e}"))
+                CortexError::Memory(format!(
+                    "vector {i} returned by model {model} cannot be normalized: {e}"
+                ))
             })?;
         }
         Ok(out)
@@ -473,7 +485,7 @@ mod tests {
         assert_eq!(
             resolve_url("http://embeddings"),
             "http://embeddings/v1/embeddings",
-            "the path must still be completed when the host is named embeddings —— the authority must not be mistaken for the path"
+            "the path must still be completed when the host is named embeddings — the authority must not be mistaken for the path"
         );
         // The same trap, with a port
         assert_eq!(
@@ -501,10 +513,10 @@ mod tests {
         let s = format!("{e:?}");
         assert!(
             !s.contains("sk-super-secret-value"),
-            "the Debug output leaked the API key —— it would ride any {{:?}} log line into the log file: {s}"
+            "the Debug output leaked the API key — it would ride any {{:?}} log line into the log file: {s}"
         );
         assert!(
-            s.contains("<已设置>"),
+            s.contains("<set>"),
             "Debug should still reveal whether a key is configured, just not its value: {s}"
         );
     }
@@ -559,7 +571,7 @@ mod tests {
         assert_eq!(
             (got[0][0], got[0][1]),
             (1.0, 0.0),
-            "the response order must be put back by index —— a misalignment does not error, it just makes retrieval inexplicably bad"
+            "the response order must be put back by index — a misalignment does not error, it just makes retrieval inexplicably bad"
         );
         assert_eq!(
             (got[1][0], got[1][1]),
@@ -608,10 +620,10 @@ mod tests {
             "bge-m3",
         )
         .expect_err(
-            "a zero vector must be rejected —— in pgvector it turns into NaN and poisons the ordering",
+            "a zero vector must be rejected — in pgvector it turns into NaN and poisons the ordering",
         );
         assert!(
-            err.to_string().contains("归一化"),
+            err.to_string().contains("normalize"),
             "the error message must state the reason: {err}"
         );
     }

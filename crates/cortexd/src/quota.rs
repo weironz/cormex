@@ -149,7 +149,8 @@ impl AppState {
         .execute(&acc.pool)
         .await;
         if let Err(e) = r {
-            tracing::warn!(error = %e, user = user_id, "用量没记上（本次不计入配额）");
+            tracing::warn!(error = %e, user = user_id, "the usage was not recorded \
+                 (this call does not count against the quota)");
         }
     }
 
@@ -161,9 +162,10 @@ impl AppState {
         let since = Utc::now() - WINDOW;
         let row = sqlx::query(
             "SELECT
-                 -- ::bigint 是必需的：`sum(bigint)` 在 Postgres 里返回
-                 -- **numeric**，而按 i64 取会在解码时 panic —— 表现是
-                 -- 连接被掐掉（HTTP 000），不是一条能读的错误。实测撞到过
+                 -- The ::bigint is required: `sum(bigint)` returns **numeric** in
+                 -- Postgres, and reading it back as i64 panics at decode time — which
+                 -- shows up as the connection being cut (HTTP 000), not as a readable
+                 -- error. Measured, having actually hit it
                  COALESCE(sum(input_tokens + output_tokens) FILTER (WHERE NOT own_key), 0)::bigint AS billed,
                  COALESCE(sum(input_tokens + output_tokens) FILTER (WHERE own_key), 0)::bigint AS own
                FROM cortex_auth.usage
@@ -173,7 +175,7 @@ impl AppState {
         .bind(since)
         .fetch_one(&self.accounts()?.pool)
         .await
-        .map_err(|e| ApiError::internal(format!("算不出用量：{e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not compute the usage: {e}")))?;
 
         Ok(QuotaStatus {
             used_tokens: row.get("billed"),
@@ -207,9 +209,11 @@ impl AppState {
         // exhausted" leaves people thinking their account is broken, so they
         // retry, restart, and file an issue
         Err(ApiError::too_many_requests(format!(
-            "这个月的用量已经用完了（{} / {} token，按最近 {} 天滚动计算）。\
-             等最早那批用量滑出窗口就会自动恢复；\
-             要立刻继续，可以在**设置 → 模型 → 自己的 API key**里填一把自己的 ——              自带 key 的调用不占这里的配额",
+            "this window's usage is exhausted ({} / {} tokens, over a rolling {}-day \
+             window). It recovers by itself once the oldest usage slides out of the \
+             window; to carry on right now, put your own key in under \
+             **Settings → Model → Your own API key** — calls on your own key do not \
+             count against this quota",
             status.used_tokens,
             status.limit_tokens.unwrap_or(0),
             status.window_days,
@@ -247,7 +251,7 @@ mod tests {
         assert!(!status(99, Some(100)).exceeded());
         assert!(
             status(100, Some(100)).exceeded(),
-            "reaching the limit must block —— letting it through means everyone gets to spend \
+            "reaching the limit must block — letting it through means everyone gets to spend \
              one extra call's worth of money"
         );
         assert!(status(101, Some(100)).exceeded());
