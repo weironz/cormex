@@ -36,10 +36,53 @@ name: cortex
 # **cortexd 自己的端口不在此列**：容器必须够得着它才能回调（记忆写入、
 # 拉历史），那条路由被沙箱令牌收窄到 5 条白名单路由 —— 那是有意留的门。
 services:
+
+  # ─── cortexd：记忆服务本体 ────────────────────────────
+  #
+  # 这一份是**独立可跑**的：Postgres + 对象存储 + 一个 LLM 供应商的 key，
+  # 没有别的前置。agent 那一侧（对话循环、容器编排）不在这个仓库里，
+  # 也不该在 —— 用它做记忆层的人一行都用不上。
+  cortexd:
+    build:
+      context: .
+      dockerfile: scripts/docker/Dockerfile.cortexd
+    image: ${CORTEXD_IMAGE:-cormex/cortexd:local}
+    container_name: cormex-cortexd
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD:-cortex_dev_only}@postgres:5432/${POSTGRES_DB:-cortex}
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: ${S3_BUCKET:-cortex-blobs}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
+      CORTEXD_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
+      # 不配任何凭据时 cortexd **拒绝启动**。要关就得显式说 —— 见 auth.rs
+      CORTEX_AUTH: ${CORTEX_AUTH:-}
+      CORTEX_TOKEN_SHA256: ${CORTEX_TOKEN_SHA256:-}
+      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
+      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
+      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
+      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
+      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
+      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
+      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CORTEX_SECRET_KEY: ${CORTEX_SECRET_KEY:-}
+    ports:
+      - "${CORTEXD_PORT:-8080}:8080"
+    networks:
+      - default
   # ─── Postgres + pgvector ──────────────────────────────
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: cortex-postgres
+    container_name: cormex-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-cortex}
@@ -90,7 +133,7 @@ services:
   # ─── RustFS（S3 兼容对象存储）──────────────────────────
   rustfs:
     image: rustfs/rustfs:latest
-    container_name: cortex-rustfs
+    container_name: cormex-rustfs
     restart: unless-stopped
     security_opt:
       - "no-new-privileges:true"
@@ -144,7 +187,7 @@ services:
   # **模型必须是 1024 维**：schema 写死 VECTOR(1024)。
   embeddings:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
-    container_name: cortex-embeddings
+    container_name: cormex-embeddings
     profiles: [embed]
     restart: unless-stopped
     command: >-
@@ -190,45 +233,3 @@ volumes:
   rustfs_data:
   embed_models:
 
-  # ─── cortexd：记忆服务本体 ────────────────────────────
-  #
-  # 这一份是**独立可跑**的：Postgres + 对象存储 + 一个 LLM 供应商的 key，
-  # 没有别的前置。agent 那一侧（对话循环、容器编排）不在这个仓库里，
-  # 也不该在 —— 用它做记忆层的人一行都用不上。
-  cortexd:
-    build:
-      context: .
-      dockerfile: scripts/docker/Dockerfile.cortexd
-    image: ${CORTEXD_IMAGE:-cormex/cortexd:local}
-    container_name: cormex-cortexd
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD:-cortex_dev_only}@postgres:5432/${POSTGRES_DB:-cortex}
-      S3_ENDPOINT: http://rustfs:9000
-      S3_BUCKET: ${S3_BUCKET:-cortex-blobs}
-      S3_REGION: ${S3_REGION:-us-east-1}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
-      CORTEXD_BIND: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
-      # 不配任何凭据时 cortexd **拒绝启动**。要关就得显式说 —— 见 auth.rs
-      CORTEX_AUTH: ${CORTEX_AUTH:-}
-      CORTEX_TOKEN_SHA256: ${CORTEX_TOKEN_SHA256:-}
-      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
-      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
-      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
-      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
-      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
-      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
-      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      CORTEX_SECRET_KEY: ${CORTEX_SECRET_KEY:-}
-    ports:
-      - "${CORTEXD_PORT:-8080}:8080"
-    networks:
-      - default
