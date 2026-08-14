@@ -1,0 +1,36 @@
+name: cormex_app
+description: "Cormex —— 记忆服务的界面：检索、出处、时间回放"
+publish_to: 'none'
+
+# 与根 Cargo.toml 的 [workspace.package] version 保持一致（`+N` 是 Flutter 的
+# build number，不参与比较）。
+version: 0.1.8+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: 3.4.2
+  http: 1.6.0
+  intl: 0.20.3
+  # 浏览器里 package:http 的默认 BrowserClient 走 XMLHttpRequest，会把整个响应
+  # 缓冲完才算完成。这里用不到流式响应，但 fetch 的 CORS 语义比 XHR 好交代，
+  # 而且这个客户端本来就是要跨源打 cortexd 的。
+  fetch_client: 1.2.1
+  # 只被 auth/credential_store_web.dart 用到（sessionStorage）。虽然
+  # flutter_web_plugins 已经传递依赖了它，还是显式声明：直接 import 一个没有
+  # 声明的传递依赖，等哪天别的包不再依赖它就当场断。
+  web: ^1.1.0
+  flutter_secure_storage: ^10.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
