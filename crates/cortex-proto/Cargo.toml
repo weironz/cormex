@@ -1,0 +1,26 @@
+[package]
+name = "cortex-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cortex 客户端 ↔ 服务端的线协议：DTO 与工具确认回路"
+
+[dependencies]
+cortex-core.workspace = true
+# **这里没有 `cortex-agent`，而且不许加回来。**
+#
+# 曾经有过，为的是 `confirm::risk_str` 要 `cortex_agent::Risk`。代价是这个
+# **线协议** crate 反过来把整个 agent（循环 + 工具 + 沙箱）拖进依赖树 ——
+# 于是只想用记忆那一层的人也得连 agent 一起编，而记忆那一层要独立开源。
+# 那个转换现在是 `Risk::as_wire`，住在枚举自己旁边。
+#
+# `/llm/stream` 直传 goose 的原生 Message / Tool / ProviderUsage（见 src/llm.rs：
+# 翻译成 OpenAI 形状会丢掉 prompt caching 与 thinking 块）。
+cortex-llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true

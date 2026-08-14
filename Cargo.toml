@@ -1,0 +1,122 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cortex-core",
+    "crates/cortex-llm",
+    "crates/cortex-store",
+    "crates/cortex-memory",
+    "crates/cortex-blob",
+    "crates/cortex-proto",
+    "crates/cortex-import",
+    "crates/cortexd",
+]
+
+[workspace.package]
+# 版本号的权威所在。app/pubspec.yaml、git tag、docker 镜像 tag 都必须跟它一致，
+# 由 `just version-check`（= scripts/check-version.sh）在 CI 与发布流水线里把关。
+version = "0.1.8"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/weironz/cormex"
+
+[workspace.dependencies]
+cortex-core = { path = "crates/cortex-core" }
+cortex-import = { path = "crates/cortex-import" }
+cortex-llm = { path = "crates/cortex-llm" }
+cortex-store = { path = "crates/cortex-store" }
+cortex-memory = { path = "crates/cortex-memory" }
+cortex-proto = { path = "crates/cortex-proto" }
+cortex-blob = { path = "crates/cortex-blob" }
+
+# 供应商层：取件自 goose（Apache-2.0）。
+# 只依赖 goose-providers —— 它已 pub use 了 goose-provider-types 的全部类型层，
+# 而 goose-provider-types 本身**没有 rustls-tls feature**（写了会导致依赖解析直接失败），
+# TLS 后端只由 goose-providers 转发给 reqwest。
+goose-providers = { version = "0.1.0-alpha", default-features = false, features = ["rustls-tls"] }
+
+# 异步运行时
+tokio = { version = "1.53", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# 服务端
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# 数据库
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid", "macros", "migrate",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP 客户端
+# 注意 reqwest 0.13 把 TLS feature 改名为 rustls（不再是 rustls-tls）
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "rustls"] }
+
+# Docker API 客户端。cortexd 的 DockerRunner 起 / 停用户沙箱容器用
+# （见 docs/sandbox.md 第七节）。
+#
+# **不自己拿 hyper 撸 unix socket**：Docker 的 API 版本协商有坑，而这正是
+# CLAUDE.md 说的「繁琐但已被工业验证的部分」。
+#
+# 关掉默认 features 再逐个开：默认会拉 ssl（openssl）与 chrono，而我们既不
+# 连远程 daemon 也不需要它的时间类型 —— 多拉一套 TLS 实现会与 reqwest 那份
+# rustls 共存，正是 Cargo.lock 里已经踩过一次的形状
+# `pipe` 是 **Windows 必需**：`connect_with_local_defaults` 在 unix 上走
+# `/var/run/docker.sock`（无条件编译），在 Windows 上走 npipe，而后者藏在
+# 这个 feature 后面。少了它，开发机上编不过，且报错指向 bollard 内部 ——
+# 完全看不出是 feature 少了一个。开发机 Windows、生产 Linux，两边都要能编。
+
+# WebSocket 客户端。本地 agent 反代 /ws 用（见 cortex-local/src/ws_proxy.rs）。
+#
+# **刻意不开任何 TLS feature**：连接不是它建的，是 reqwest 建好之后
+# 交给 `from_raw_socket` 的。开 `rustls-tls-*` 会拉进第二套 rustls 配置，
+# 于是「reqwest 认的证书」与「WS 认的证书」是两套 —— 自签名的自托管部署上，
+# HTTP 通了而 WS 连不上，且没有任何地方能看出这两件事有关系。
+#
+# 版本必须与 axum 内部那份一致（`cargo tree -i tokio-tungstenite` 核对）：
+# 两份共存会让 `bytes::Bytes` 之外的类型对不上，报错在转换处而不在依赖处。
+
+# 记忆引擎
+jieba-rs = "0.10"
+fastembed = "5"
+# 写入侧凭据过滤（cortex-memory/src/redaction.rs）。
+# 版本跟着 jieba-rs 已经拉进来的那一份走，加成直接依赖不增加任何编译量
+regex = "1"
+
+# OS 级沙箱（仅 Linux 目标启用）。
+# 取件自 codex（Apache-2.0）的选型：它的 linux-sandbox 就是这两个 crate 的编排。
+# codex 自身的 crate 未发布到 crates.io 且深度耦合 codex-protocol，只能取底座 + 取策略。
+
+# 文本 diff。Rust 里做这件事的事实标准（highlight.js 之于代码高亮的位置），
+# Apache-2.0。自己写 Myers 属于 CLAUDE.md 第一条明令禁止的那类活 ——
+# 繁琐、已被工业验证、且写错了只会得到一个「看起来对」的 diff。
+#
+# 只开 `text`（`TextDiff` 与 unified diff 就在这个 feature 后面），
+# 关掉默认的 unicode 分词：我们只按**行**比，用不上字素簇那套，
+# 而它会拖进一张几 MB 的 Unicode 表。
+#
+# 注意 `default-features = false` 会把 `text` 一起关掉 —— 那样 `TextDiff`
+# 就不在 crate root 里了，报的是「no TextDiff in the root」，
+# 看着像版本不对，实际是 feature 少了一个。
+
+# 基础设施
+ulid = { version = "3", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

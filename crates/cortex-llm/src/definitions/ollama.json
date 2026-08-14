@@ -1,0 +1,15 @@
+{
+  "name": "ollama",
+  "engine": "ollama",
+  "display_name": "Ollama",
+  "description": "本机 Ollama，无需密钥",
+  "api_key_env": "",
+  "base_url": "http://localhost:11434",
+  "models": [],
+  "headers": null,
+  "timeout_seconds": null,
+  "requires_auth": false,
+  "dynamic_models": true,
+  "preserves_thinking": false,
+  "supports_streaming": true
+}

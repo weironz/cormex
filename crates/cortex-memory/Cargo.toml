@@ -1,0 +1,71 @@
+[package]
+name = "cortex-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cortex 记忆引擎：分词 / embedding / 抽取 / 四路召回"
+
+[dependencies]
+cortex-core.workspace = true
+cortex-store.workspace = true
+cortex-llm.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+jieba-rs.workspace = true
+regex.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+# 进程内 ONNX 推理。**默认不编** —— 见下面 [features] 那段注释
+fastembed = { workspace = true, optional = true }
+
+[features]
+default = []
+
+# 把 embedding 模型直接跑在 cortexd 进程里（fastembed → ONNX Runtime）。
+#
+# 默认关掉，不是因为它不好用，是因为它作为**硬依赖**的三个代价：
+#
+#   1. Intel Mac 根本编不出来：`ort-sys: no prebuilt binaries available
+#      for target x86_64-apple-darwin`。这是构建期失败，
+#      连 CORTEX_EMBED_BACKEND=hash 都救不了
+#   2. 每台机器都要能拿到那 590 MB 权重。生产节点上 Hugging Face
+#      完全不可达时，cortexd 会**照常启动、/health 返回 ok**，
+#      只在日志里留一行「回落到 mock」—— 记忆是假的而没有红灯
+#   3. 冷启动 12 秒、常驻 1.0 GiB
+#
+# 需要「一个进程搞定、不依赖任何外部服务」时打开它：
+#     cargo build -p cortexd --features cortex-memory/local-embed
+local-embed = ["dep:fastembed"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# 集成测试真连数据库：每个测试跑在自己的临时 schema 里（见 tests/common）
+sqlx.workspace = true
+dotenvy.workspace = true
+chrono.workspace = true
+# 起一个假的 /v1/embeddings 服务，验 ApiEmbedder 的线上格式
+# （见 tests/embed_api_wire.rs 的模块注释：单元测试抓不到「请求打到哪」）
+axum.workspace = true
+
+# 这两个只在 local-embed 打开时才编。用 required-features 而不是在文件里写
+# `#![cfg(...)]`：后者会让文件被编成一个空 crate（编译得过、什么也不测），
+# 而 `cargo test --test fastembed` 照样返回成功 —— 一个静默通过的测试
+# 比没有这个测试更糟
+[[example]]
+name = "embed_bench"
+required-features = ["local-embed"]
+
+[[test]]
+name = "fastembed"
+required-features = ["local-embed"]
+
+[[test]]
+name = "embed_env_empty"
+required-features = ["local-embed"]

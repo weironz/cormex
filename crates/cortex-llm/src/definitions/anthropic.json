@@ -1,0 +1,43 @@
+{
+  "name": "anthropic",
+  "engine": "anthropic",
+  "display_name": "Anthropic",
+  "description": "Anthropic Claude 官方 API",
+  "api_key_env": "ANTHROPIC_API_KEY",
+  "base_url": "https://api.anthropic.com",
+  "models": [
+    {
+      "name": "claude-opus-5",
+      "context_limit": 200000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": true,
+      "reasoning": true,
+      "vision": true
+    },
+    {
+      "name": "claude-sonnet-4-5-20250929",
+      "context_limit": 200000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": true,
+      "reasoning": true,
+      "vision": true
+    },
+    {
+      "name": "claude-haiku-4-5-20251001",
+      "context_limit": 200000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": true,
+      "vision": true
+    }
+  ],
+  "headers": null,
+  "timeout_seconds": null,
+  "preserves_thinking": true,
+  "supports_streaming": true
+}

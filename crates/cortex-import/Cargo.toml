@@ -1,0 +1,20 @@
+[package]
+name = "cortex-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortex-core.workspace = true
+# 解析器的产物就是 `NewEpisodeRequest` —— 这个 crate 存在的意义是让
+# CLI、本地 agent、cortexd 三处**产出同一批请求体**
+cortex-proto.workspace = true
+
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true

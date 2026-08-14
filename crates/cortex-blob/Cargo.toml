@@ -1,0 +1,53 @@
+[package]
+name = "cortex-blob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cortex 对象存储：内容寻址的 blob 读写"
+
+[dependencies]
+cortex-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+
+# ── S3 客户端 ──
+# default-features = false 后手工挑选：
+#   rt-tokio                —— 复用 workspace 的 tokio runtime
+#   behavior-version-latest —— 不锁行为版本，否则 Client::from_conf 直接 panic
+#   http-1x                 —— 与 workspace 的 hyper 1.x / reqwest 0.13 同代
+#   default-https-client    —— rustls + aws-lc-rs，与 reqwest 的 TLS 后端同源，
+#                              不额外拖进 ring 与 hyper 0.14
+# 刻意不开 sigv4a：那是 multi-region access point 的签名变体，
+# RustFS / R2 / 单区 S3 都用不上，白背一条加密路径。
+aws-sdk-s3 = { version = "1.141", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+    "http-1x",
+    "default-https-client",
+] }
+aws-credential-types = "1.3"
+aws-smithy-types = "1.6"
+
+bytes = "1.12"
+sha2 = "0.10"
+hex = "0.4"
+url = "2.5"
+
+# 媒体探测：两个都是「只读文件头、不解码」的轻量库。
+# 不用 image crate —— 它为了拿宽高会拖进十几个 codec。
+infer = { version = "0.22", default-features = false }
+imagesize = "0.15"
+
+[dev-dependencies]
+# 只在测试里用：验 BlobRef 的 JSON 契约（生产路径不碰 JSON，
+# 序列化由 cortexd 在自己的响应层做）
+serde_json.workspace = true
+tempfile = "3"
+dotenvy.workspace = true
+reqwest.workspace = true

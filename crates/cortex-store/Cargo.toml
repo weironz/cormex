@@ -1,0 +1,24 @@
+[package]
+name = "cortex-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cortex 存储层：sqlx repository 与 sync_log 写入器"
+
+[dependencies]
+cortex-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+pgvector.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+dotenvy.workspace = true
+futures.workspace = true

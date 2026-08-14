@@ -1,0 +1,71 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+*.iml
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Node / Web
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+
+# 环境与密钥 —— 绝不入库
+#
+# 用后缀而不是逐个文件名列举：`.env` / `.env.*` 两条都匹配不到
+# `secrets.env`，而那个文件里装的是 registry 凭据 —— 距离被一次
+# `git add -A` 永久写进历史只差一个手滑。凭据一旦进历史就不可逆：
+# 改 .gitignore 补不回来，只能轮换密钥 + 重写历史。
+# 所以这里按「任何以 .env 结尾的」拦，不指望以后每个人都记得来加一行。
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.env
+
+# 本地数据与缓存
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log
+logs/
+
+# 编辑器私有配置（Flutter 工程自动生成）
+app/.idea/
+*.iml
+
+# 调研时下载的第三方源码 —— 只读不留
+#
+# 几个 agent 为了读 Graphiti / Mem0 的实现，把它们的 .py 文件下到了仓库根。
+# 那是别人的 Apache-2.0 代码，混进我们的树里既是许可证麻烦，也会让后来者
+# 以为是自己的东西。看完就删；真要留请放 target/ 或仓库外。
+/graphiti_*.py
+/mem0_*.py
+
+# 本地回落的对象存储（RustFS 连不上时 blobs.rs 写在这里）—— 是数据，不是源码
+.cortex/

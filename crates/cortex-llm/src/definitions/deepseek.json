@@ -1,0 +1,51 @@
+{
+  "name": "deepseek",
+  "engine": "openai",
+  "display_name": "DeepSeek",
+  "description": "DeepSeek 官方 API（OpenAI 兼容）",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "base_url": "https://api.deepseek.com",
+  "models": [
+    {
+      "name": "deepseek-v4-pro",
+      "context_limit": 128000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null,
+      "vision": false
+    },
+    {
+      "name": "deepseek-v4-flash",
+      "context_limit": 128000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null,
+      "vision": false
+    },
+    {
+      "name": "deepseek-chat",
+      "context_limit": 128000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null,
+      "vision": false
+    },
+    {
+      "name": "deepseek-reasoner",
+      "context_limit": 128000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null,
+      "reasoning": true,
+      "vision": false
+    }
+  ],
+  "headers": null,
+  "timeout_seconds": null,
+  "preserves_thinking": true,
+  "supports_streaming": true
+}

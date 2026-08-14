@@ -1,0 +1,67 @@
+Cortex
+Copyright 2026 Cortex contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+═══════════════════════════════════════════════════════════════════════
+本项目取件（vendor / 借鉴）了以下 Apache-2.0 项目的成果。
+每一处的具体出处也写在对应源文件的头部注释里 —— 这份文件是索引，
+不是替代品。改动过的地方都在源文件里注明了「与上游的分歧」及理由。
+═══════════════════════════════════════════════════════════════════════
+
+───────────────────────────────────────────────────────────────────────
+goose
+https://github.com/block/goose
+Copyright Block, Inc.
+Licensed under the Apache License, Version 2.0
+───────────────────────────────────────────────────────────────────────
+
+以 crate 依赖方式使用（未修改源码）：
+
+  goose-providers        LLM 供应商适配层。含 39 个声明式 JSON 供应商定义，
+                         已处理 prompt caching 与 thinking / reasoning 不透明块。
+
+`cortex-llm` 直接复用其 `Message` / `MessageContent` 作为内部规范消息格式，
+不再包一层有损转换 —— 中间抽象会丢掉 prompt caching 与 thinking 块，
+那是整条链路上最贵的两样东西。
+
+相关文件：
+  crates/cortex-llm/src/{client,error,provider,vision}.rs
+  crates/cortex-memory/src/transcribe.rs
+
+───────────────────────────────────────────────────────────────────────
+codex
+https://github.com/openai/codex
+Copyright OpenAI
+Licensed under the Apache License, Version 2.0
+───────────────────────────────────────────────────────────────────────
+
+未以 crate 依赖方式使用 —— codex 的 sandboxing crate 未发布到 crates.io，
+且深度耦合其内部类型（codex-protocol / codex-network-proxy 等）。
+因此取的是**策略与设计**，底座直接用上游 crate（landlock / seccompiler）。
+
+  crates/cortex-agent/src/sandbox/seatbelt_base.sbpl
+      macOS Seatbelt 基线策略，近乎原样取自
+      codex-rs/sandboxing/src/seatbelt_base_policy.sbpl
+
+  crates/cortex-agent/src/sandbox/linux.rs
+      seccomp 拦截清单的语义取自 codex-rs/linux-sandbox/src/landlock.rs
+      （socket / socketpair 按 AF_UNIX 分流；recvfrom 绝不拦截）。
+      有意分歧两处，理由写在该文件头部：不用 bubblewrap；读也限而非只限写。
+
+  crates/cortex-agent/src/sandbox/macos.rs
+      sandbox-exec 的调用形状取自 codex-rs/sandboxing/src/seatbelt.rs
+
+═══════════════════════════════════════════════════════════════════════
+明确未取件
+═══════════════════════════════════════════════════════════════════════
+
+  crush (charmbracelet/crush) 是 FSL-1.1-MIT，禁止竞品使用。
+  GitHub 上显示为 NOASSERTION，极易被误认为宽松许可。
+  本项目**一行代码都没有**借鉴自它，仅在 docs/references.md 里作调研记录。
+
+  claude-code 是专有软件，仓库不含源码，无从借鉴。
+
+═══════════════════════════════════════════════════════════════════════
+
+Apache License 2.0 全文见 http://www.apache.org/licenses/LICENSE-2.0
