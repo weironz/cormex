@@ -13,10 +13,11 @@ members = [
 ]
 
 [workspace.package]
-# The authoritative home of the version number. app/pubspec.yaml, the git tag and the docker
-# image tag all have to agree with it, which `just version-check` (= scripts/check-version.sh)
+# The authoritative home of the version number. The git tag and the docker image tag both
+# have to agree with it, which release.yml's preflight checks with tomllib (`just version-check`
+# and scripts/check-version.sh came from the upstream repository and did not follow this one)
 # polices in CI and in the release pipeline.
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
