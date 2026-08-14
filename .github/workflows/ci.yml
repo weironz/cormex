@@ -93,12 +93,18 @@ jobs:
       #   and opens its own connection with `search_path=cortex_auth`, precisely because
       #   `search_path` is a connection-level property and cannot be changed on a live
       #   pool). CI has to mirror it rather than assume two commands are two namespaces.
+      #
+      #   `public` has to stay on the path as well, for a different reason: the `ulid`
+      #   and `sha256` DOMAINs live there and the global set's columns are typed with
+      #   them. Drop it and 20260810000002 fails with `type "ulid" does not exist` --
+      #   which reads like a missing migration rather than a missing schema on the
+      #   path. `state.rs` puts exactly this pair on the accounts pool, same note.
       - name: Apply migrations
         run: |
           psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations-global \
-            --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth"
+            --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth%2Cpublic"
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
           PGPASSWORD: postgres
