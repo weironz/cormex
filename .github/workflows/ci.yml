@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 格式与静态检查 ──────────────────────────────────────
+  lint:
+    name: 格式与 Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 装的是 stable，真正跑的是 rust-toolchain.toml 里钉的 1.97.1 ——
+      # rustup 的代理看到工具链文件会自己把它拉下来（连同文件里声明的
+      # rustfmt / clippy）。这里**刻意不把版本号再写一遍**：写死在 YAML 里
+      # 的那份迟早与工具链文件漂移，而漂移的症状是「CI 过了本机没过」
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` 走命令行而不是 `RUSTFLAGS` 环境变量：RUSTFLAGS 会进入
+      # 编译指纹，于是 lint 与 test 两个 job 各自编一套依赖、Swatinem 的缓存
+      # 互相命中不了；而且它对整棵依赖树生效，第三方 crate 的一条警告就能
+      # 把我们的 CI 弄红。命令行的 `--` 之后只作用于本 workspace 的 crate。
+      #
+      # `--locked`：Cargo.lock 在仓库里就得当真。pgvector 的 sqlx 依赖范围
+      # 跨 semver 组，放开会把 sqlx 拉回 0.8 并造成两份 sqlx-core 共存
+      # （51 个编译错误，见 CLAUDE.md）。不加这个标志，锁文件可以被静默改写，
+      # 而改写发生在 CI 的临时目录里，没人会看见
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ── 测试 ───────────────────────────────────────────────
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 用固定版本而不是 `cargo install sqlx-cli`：后者每次 CI 都要现编
+      # 几分钟，而这里只需要一个能跑 migrate 的二进制
+      - name: 安装 sqlx-cli
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
+
+      # ★ 两份 migration **必须分两次跑，且各自的版本表在各自的 schema 里**。
+      #   混成一套的症状不是「报错」，是在建号中途炸 —— 一半的表建好了、
+      #   `_sqlx_migrations` 记着另一半，之后每次跑都从中间接着来。
+      #   本机等价物是 `just db-migrate`，那边也是分开的两条。
+      - name: 应用 migration
+        run: |
+          sqlx migrate run --source migrations
+          sqlx migrate run --source migrations-global
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
+
+      # ★ `--include-ignored` 不能省。要数据库的测试全都标了 `#[ignore]`，
+      #   默认跑法会跳过它们 —— 而在 CI 的输出里 **「ignored」与「ok」看上去
+      #   一样绿**。没有这个标志时这道门覆盖的只有纯逻辑那一半，
+      #   召回 / 事务 / migration 那一半（也就是这个产品的核心）没有被覆盖。
+      - name: cargo test
+        run: cargo test --workspace --locked -- --include-ignored
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
+
+    # pgvector 而不是官方 postgres 镜像：召回那一路要 `vector` 扩展，
+    # 缺了它 migration 第一条就炸。版本跟着 deploy 的 compose 走（pg17），
+    # 让「CI 绿了但生产上炸」少一个来源
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cormex_test
+        ports: ["5432:5432"]
+        # 没有这个 health-cmd 的话，job 会在 Postgres 还没接受连接时就开始跑
+        # migration —— 失败是间歇性的，而间歇性的 CI 失败没人会去查
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5

@@ -56,7 +56,7 @@ RUN set -eux; \
         echo '' > "$d/src/lib.rs"; \
         echo 'fn main() {}' > "$d/src/main.rs"; \
     done; \
-    cargo build --release -p cortexd 2>/dev/null || true
+    cargo build --release --locked -p cortexd 2>/dev/null || true
 
 # 真正的源码。上面那层的产物在依赖没变时命中缓存
 COPY crates/ crates/
@@ -68,9 +68,15 @@ COPY migrations/ migrations/
 COPY migrations-global/ migrations-global/
 
 # 触碰一下自家 crate 的时间戳，否则 cargo 会拿上一步的空壳当成已构建
+# ★ `--locked` 不能省。这个仓库有一颗**跨 semver 组**的依赖范围：
+#   pgvector 声明的 sqlx 范围会把 sqlx 解回 0.8，于是构建里同时存在两份
+#   sqlx-core，`pgvector::Vector` 实现的是另一份的 `Decode` —— 报出来是
+#   几十条「trait not implemented」，而**本机是绿的**（Cargo.lock 钉住了）。
+#   没有 --locked 时 docker 构建允许重新解析，这个仓库刚从上游拆出来时
+#   就是这么炸的第一次。
 RUN set -eux; \
     find crates evals -name '*.rs' -exec touch {} +; \
-    cargo build --release -p cortexd; \
+    cargo build --release --locked -p cortexd; \
     strip target/release/cortexd target/release/cortex || true
 
 # ── sqlx-cli ──────────────────────────────────────────────
