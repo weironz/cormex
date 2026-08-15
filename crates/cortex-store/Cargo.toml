@@ -22,3 +22,7 @@ chrono.workspace = true
 [dev-dependencies]
 dotenvy.workspace = true
 futures.workspace = true
+# Only for `tests/migrations_are_immutable.rs`, which pins each applied
+# migration by hash. sqlx hashes the whole file, so a comment edit is a schema
+# incident -- see that test's header for the deployment it stopped halfway.
+sha2 = "0.10"

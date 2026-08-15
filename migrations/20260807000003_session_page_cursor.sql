@@ -1,29 +1,24 @@
--- Cursor-pagination index for the session detail view
+-- 会话详情的游标分页索引
 --
--- [Why the existing idx_episodes_sess is not enough]
+-- 【为什么现有的 idx_episodes_sess 不够】
 --
--- It is (session_id, occurred_at), which only reaches as far as the time column. Once
--- session detail became "fetch the newest N by default", the cursor has to sit on the
--- **composite** key (occurred_at, id): occurred_at comes from the client clock, and
--- landing two messages inside the same millisecond is routine (one tool call writing a
--- user row and a tool row back to back is already enough). With occurred_at alone as the
--- cursor, the rows that share an instant get either skipped or sent twice while paging --
--- and both symptoms surface in the UI as nothing more than "the history looks a bit odd",
--- which nobody is going to blame on pagination.
+-- 它是 (session_id, occurred_at)，只覆盖到时间那一列。会话详情改成
+-- 「默认取最新 N 条」之后，游标必须落在 (occurred_at, id) 这个**复合**键上：
+-- occurred_at 来自客户端时钟，同一毫秒里落两条消息是常态（一次工具调用
+-- 连着落 user + tool 两行就够了）。只用 occurred_at 做游标，翻页时同刻的
+-- 那几行要么被跳过、要么被重复发一遍 —— 而两种症状在界面上都表现为
+-- 「历史看着怪怪的」，没人会去怀疑分页。
 --
--- [Why not reuse idx_episodes_sess with a backward scan]
+-- 【为什么不复用 idx_episodes_sess 反向扫描】
 --
--- Postgres can indeed scan a B-tree backwards, but the id column is not in that index, so
--- the same-instant tiebreak can only be done by fetching the heap row and filtering --
--- and "how many rows share one millisecond" is exactly the unbounded dimension here: in
--- the worst case you scan out an entire timestamp before you have a full page.
+-- Postgres 确实能反向扫 B-tree，但 id 这一列不在索引里，
+-- 同刻的 tiebreak 只能靠回表后过滤 —— 而「同一毫秒有多少行」正是无界的
+-- 那一维，最坏情况下要扫完整个时间点才凑够一页。
 --
--- [Why DESC DESC and not the default ascending]
+-- 【为什么是 DESC DESC 而不是默认升序】
 --
--- It lines up column by column with the query's ORDER BY occurred_at DESC, id DESC. For a
--- single column a backward scan of an ascending index is equivalent, and for several
--- columns a backward scan of (ASC, ASC) does yield (DESC, DESC), so that would have been
--- good enough; spelling DESC out explicitly is what makes "the shape of the index" and
--- "the order the query wants" comparable by eye, so that if someone later flips the
--- direction of either ORDER BY column, the mismatch is visible at a glance.
+-- 与查询的 ORDER BY occurred_at DESC, id DESC 逐列对齐。升序索引反向扫
+-- 在单列上等价，多列时 (ASC, ASC) 反向扫得到的是 (DESC, DESC)，本来也够用；
+-- 写成显式 DESC 是为了让「索引长什么样」与「查询要什么顺序」肉眼可对，
+-- 将来有人改了 ORDER BY 的任一列方向，不匹配是一眼能看出来的。
 CREATE INDEX idx_episodes_sess_desc ON episodes (session_id, occurred_at DESC, id DESC);
