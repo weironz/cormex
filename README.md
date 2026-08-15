@@ -95,6 +95,13 @@ cp .env.example .env      # set CORMEX_DOMAIN, CORMEX_VERSION, the token hash
 docker compose up -d
 ```
 
+> ⚠️ **That compose file is our production one and will not start on a fresh
+> machine** — its volumes are declared `external` under names our deployment
+> already has, so you get `external volume "cortex_cortex-prod-postgres" not
+> found`. A self-contained single-host compose is the top item on the
+> [roadmap](docs/roadmap.md); until it lands, take that file as a reference for
+> the shape rather than something to run.
+
 **The web image carries no domain name.** The API address compiled into it is
 the relative prefix `/api`, which the browser resolves against whatever origin
 served the page. So one published image works for every deployment; you route
