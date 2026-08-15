@@ -1,0 +1,359 @@
+# ══════════════════════════════════════════════════════════
+#  Cormex 生产栈 —— 记忆服务、它的数据库、它的对象存储
+#
+#  用法（在节点的 /data/cormex 下）：
+#      docker compose --env-file .env up -d
+#
+#  ── 为什么与 Cortex 分成两个 compose ─────────────────────
+#  它们是两个产品、两条版本线。放在一份文件里时，「发 Cortex」与
+#  「发记忆服务」共用一次 `docker compose up`，于是两者的版本、重启、
+#  回滚全都黏在一起 —— 而拆仓要消灭的正是这种黏连。
+#
+#  分开之后各自 `up` 各自的栈，谁也不重启谁。
+#
+#  ── ★ 卷是 external，且写死了名字 ────────────────────────
+#  生产上这些卷是在 compose 项目 `cortex` 下建的，实际叫
+#  `cortex_cortex-prod-postgres`。换个项目名去 up 会**新建空卷**，
+#  而症状不是报错，是「数据库突然空了」。所以这里 external + 显式 name，
+#  一个字都不能改。
+#
+#  ── 它与 Cortex 那一栈怎么互相看见 ───────────────────────
+#  两者都接 `cortex-sandbox-net`（internal，名字写死在 agentd 的
+#  runner 里）。agentd 打 `http://cormex:8080` 就是走这张网 ——
+#  跨 compose 项目的容器只要在同一张网上，Docker 的内嵌 DNS 就解析得了。
+# ══════════════════════════════════════════════════════════
+
+name: cormex
+# 每个容器的日志都封顶。json-file 默认无上限，一个刷屏的服务
+# （或者一个崩溃重启循环）就能把盘写满，把整台机器一起带走 ——
+# 而这台机器上还有别人的四个服务。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: cortex-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    # 不发布任何端口。要进去排查就 `docker compose exec postgres psql`
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cortex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?在 .env 里设一个真口令}
+      POSTGRES_DB: ${POSTGRES_DB:-cortex}
+      # 只对**新建**的库生效。已有的库用 just pg-enable-checksums 离线补。
+      # 没有它时坏道翻的那一位 Postgres 读出来照样返回，不报错
+      POSTGRES_INITDB_ARGS: --data-checksums
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=mkdir -p /backup/wal && test ! -f /backup/wal/%f && cp %p /backup/wal/%f
+      - -c
+      - archive_timeout=60
+      - -c
+      - wal_level=replica
+      - -c
+      - wal_compression=on
+      - -c
+      - summarize_wal=on
+    shm_size: 256mb
+    volumes:
+      - cortex-prod-postgres:/var/lib/postgresql/data
+      # WAL 归档与全量备份的落点。**指到与数据盘不同的物理盘** ——
+      # 和数据同盘的备份防得住误删，防不住盘坏，而盘坏才是备份存在的理由
+      - ${CORTEX_BACKUP_DIR:-/data/cortex/backup}:/backup
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cortex} -d ${POSTGRES_DB:-cortex}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM_LIMIT:-2g}
+
+  # ── RustFS（S3 兼容对象存储）──────────────────────────
+  rustfs:
+    image: rustfs/rustfs:${RUSTFS_VERSION:-1.0.0-beta.6}
+    container_name: cortex-rustfs
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - "no-new-privileges:true"
+    networks: [default, traefik]
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      # 控制台不开。要开就临时改一次，别长期挂着 ——
+      # 它是这个栈里唯一带管理能力的界面
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?在 .env 里设一个真口令，这个口令是互联网可达的}
+      # ★ 精确到来源，**不能留 `*`**。
+      # Web 与 S3 是两个不同的域名，所以浏览器直传是**跨源**的；
+      # 而 `*` 意味着任何网站的 JS 都能拿着用户的浏览器读写这个桶
+      RUSTFS_CORS_ALLOWED_ORIGINS: "https://${DOMAIN:?在 .env 里设 DOMAIN}"
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+      # 单卷。四卷纠删码要求四块独立物理盘，这台机器上没有 ——
+      # 假装有会让 RustFS 拒绝启动（那是正确行为）。
+      # 冗余由「镜像到第二存储」那条路提供，见 docs/operations.md
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    volumes:
+      - cortex-prod-rustfs:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/ >/dev/null 2>&1 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-network
+      traefik.http.routers.cortex-s3.rule: Host(`${S3_DOMAIN:?在 .env 里设 S3_DOMAIN}`)
+      traefik.http.routers.cortex-s3.entrypoints: websecure
+      traefik.http.routers.cortex-s3.tls: "true"
+      traefik.http.routers.cortex-s3.tls.certresolver: letsencrypt
+      traefik.http.services.cortex-s3.loadbalancer.server.port: "9000"
+
+  # ── embedding 服务（可选，profile `embed`）─────
+  #
+  # 向量化有三条路，**默认走第一条**：
+  #
+  #   1. `=api` + 云服务（默认）—— 见下面 cortexd 的 environment 段。
+  #      零容器、零常驻内存，代价是每次向量化要出网
+  #   2. `=api` + 自建，就是这个服务
+  #   3. `=fast` 进程内 ONNX —— **官方镜像不带**，要自己重编。
+  #      2026-08-13 从镜像里去掉的：它常驻 1.03 GiB，而这台节点 2C/3.5G
+  #      上已跑着 19 个容器 —— 那一个选择单独决定了能跑几个沙箱（1 个）。
+  #      填了它 cortexd 会在启动时直接报错退出，不会静默降级
+  #
+  # ⚠️ **第二条比 cortexd 本身重得多，所以它默认不启动。**
+  # bge-m3 是 5.68 亿参数、fp32 权重约 2.2 GB，TEI 载入后常驻 2.5–3 GB。
+  # 2 核 4 GB 的机器跑不动（这个项目自己那台深圳节点就跑不动，它上面
+  # 还有十几个别的容器）—— 而那正是本项目的目标机型，所以让它默认起来
+  # 等于让参考部署在 `up` 那一刻就 OOM。要自建就显式开：
+  #
+  #     # .env 里：
+  #     COMPOSE_PROFILES=embed
+  #     CORTEX_EMBED_BACKEND=api
+  #     CORTEX_EMBED_ENDPOINT=http://embeddings/v1/embeddings
+  #     CORTEX_EMBED_MODEL=bge-m3          # ← TEI 用这个名字，不是 bge-m3-int8
+  #
+  # **模型必须是 1024 维** —— schema 写死 `VECTOR(1024)`。
+  # OpenAI 的 text-embedding-3-small 是 1536、large 是 3072，直接接会被
+  # cortexd 在第一次响应就拒掉（错误信息里写了怎么办）。
+  #
+  # 不暴露到 traefik：它没有鉴权，只在 compose 内网里被 cortexd 调用。
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    container_name: cortex-embeddings
+    profiles: [embed]
+    restart: unless-stopped
+    logging: *default-logging
+    # 只进默认网络。**别加 traefik** —— TEI 不带任何鉴权，
+    # 暴露出去等于把一个免费的推理端点挂到公网上
+    command: >-
+      --model-id ${CORTEX_EMBED_SERVED_MODEL:-BAAI/bge-m3}
+      --port 80
+      --auto-truncate
+    environment:
+      # 权重从 Hugging Face 拉。国内节点上 HF 常常完全不可达
+      # （DNS 被污染、hf-mirror 也不通），那种情况下要么挂载预先下好的
+      # 权重目录（TEI 支持 --model-id 直接给本地路径），要么就别自建，
+      # 用上面那段的云服务方案
+      HF_HOME: /data
+    volumes:
+      - cortex-prod-embed-models:/data
+    healthcheck:
+      # TEI 的 /health 在权重载入完成前不通，正好当就绪探针。
+      # start_period 给到 5 分钟：第一次要下 2.2 GB
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s
+    deploy:
+      resources:
+        limits:
+          cpus: ${CORTEX_EMBED_CPU_LIMIT:-2}
+          memory: ${CORTEX_EMBED_MEM_LIMIT:-3g}
+
+  # ── 沙箱网段唯一的双宿出口（可选，profile `sandbox`）────
+  #
+  # 沙箱网段是 internal（容器里连默认路由都没有），这个容器同时接
+  # internal 网段与默认网桥，是那张拓扑上唯一两边都够得着的点：
+  #
+  #     沙箱 ──HTTP(S)_PROXY──► 这里 ──► 放行清单内的外网
+  #
+  # 镜像是 `FROM scratch`，2.4 MB，里面只有一个静态二进制，连 sh 都没有 ——
+  # 它跑在信任边界上，多一个可执行文件就多一个被攻陷后能用的东西。
+  #
+  # ⚠️ 与开发机的**两处**差别，别照抄回去：
+  #   1. 不 publish 3129（反向中继）。节点上 cortexd 也在容器里、也接了
+  #      沙箱网段，反代直连容器名，中继那一整层不参与
+  #   2. 放行清单里**没有** host.docker.internal:8080。开发机上沙箱要靠它
+  #      回调跑在宿主进程里的记忆服务；这里回调走 `cormex:8080`（同网段，
+  #      在 NO_PROXY 里，压根不经代理）。留着它等于白送一条打向宿主的路
+  cormex:
+    image: ${CORMEX_IMAGE:-${CORMEX_REGISTRY:-registry.cn-shenzhen.aliyuncs.com/willspace}/cormex:${CORMEX_VERSION:?记忆服务的版本，与 CORTEX_VERSION 独立。过渡期可改用 CORMEX_IMAGE 指向旧的 cortexd 镜像}}
+    container_name: cormex
+    restart: unless-stopped
+    logging: *default-logging
+    # 接进 sandbox 网段 ⇒ same_network=1 ⇒ 反代直连容器名。
+    #
+    # 接一张 internal 网**不会**让 cortexd 失去出网：多网络时默认路由来自
+    # 非 internal 的那张（这里是 default）。沙箱容器只接 sandbox 一张，
+    # 所以它没有默认路由 —— 那才是隔离本身。
+    #
+    # 沙箱没开时这一张网是空的，代价为零，所以不跟着 profile 走 ——
+    # 让 compose 里「cortexd 接哪几张网」是一个常量，少一处条件分支
+    networks: [default, traefik, sandbox]
+    # ⚠️ **数据库连不上时 cortexd 会退出**（0.1.4 起），于是这里会看到一个
+    # 重启循环。那是**预期行为**，不是故障 —— 别去加 `CORTEX_BACKEND=mock`
+    # 把它「修好」，那会让它带着一库假数据对外服务。
+    #
+    # 下面这个 depends_on 只在 `docker compose up` 那一刻管用；cortexd 自己
+    # 崩溃后的**自动重启不走它**。所以「Postgres 恢复期间 cortexd 重启」
+    # 这条路必须由 cortexd 自己挡住，而它现在挡住了。
+    # 完整理由见 crates/cortexd/src/state.rs 的 `BackendChoice`
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    environment:
+      # 容器内走服务名，不走 localhost —— 这是把 cortexd 搬进容器后
+      # 最容易忘的一处，症状是「连不上数据库」但配置看着都对
+      DATABASE_URL: postgres://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-cortex}
+      # 服务端自己访问对象存储走内网一跳，不绕 traefik。
+      # 浏览器那侧用的是 https://${S3_DOMAIN}，两者指向同一个桶
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: https://${S3_DOMAIN}
+      S3_BUCKET: ${S3_BUCKET:-cortex-blobs}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+
+      CORTEXD_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
+
+      # ★ 认证。**没有它 cortexd 会拒绝启动**，这是刻意的。
+      # 上面那行 0.0.0.0:8080 正是它要防的场景。
+      # 生成：docker compose run --rm --entrypoint cortexd cormex --generate-token
+      # （服务叫 cormex，镜像里的二进制仍叫 cortexd —— 这两个名字还没统一）
+      # 服务端只放**摘要**；明文 token 给客户端，不要也留在这台机器上
+      CORTEX_AUTH_TOKEN_SHA256: ${CORTEX_AUTH_TOKEN_SHA256:?必填，用 cortexd --generate-token 生成}
+      # 高风险工具确认的超时（秒）。超时按**拒绝**处理 ——
+      # 没人回答意味着没人看见，而「关掉笔记本盖子等于把 shell 交出去」
+      # 是不可挽回的错误方向
+      CORTEX_CONFIRM_TIMEOUT_SECS: ${CORTEX_CONFIRM_TIMEOUT_SECS:-180}
+
+      # 向量后端。默认 `api` —— cortexd 只发一个 HTTP POST 到 endpoint，
+      # 对面是云还是自建的 TEI 容器它不关心（见上面 embeddings 一段）。
+      #
+      # **这四项没有可用的默认值，必须在 .env 里填。** 空 endpoint 会在
+      # 第一次向量化时失败，不是在启动时 —— 所以部署后先看 `/health` 的
+      # `embedding.model`，它应该是 `api:<你填的模型名>`。
+      #
+      #   CORTEX_EMBED_BACKEND=api
+      #   CORTEX_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+      #   CORTEX_EMBED_MODEL=text-embedding-v3
+      #   CORTEX_EMBED_API_KEY=sk-...
+      #
+      # **模型必须是 1024 维**（schema 写死 VECTOR(1024)）。维度不符时
+      # cortexd 在第一次响应就报错并说明怎么办，不会静默写坏数据。
+      #
+      # ⚠️ 换后端 = 换 `model_id`，已有事实会退出向量召回。cortexd 启动时
+      # 会 WARN 报出数量、`/health` 有 `embedding.stale`，后台回填器自动补。
+      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
+      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
+      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
+      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
+      # 单次请求最多几条。默认 10 不是性能调优，是兼容性下限 ——
+      # TEI 允许 32，阿里百炼 text-embedding-v3/v4 只到 10
+      CORTEX_EMBED_BATCH: ${CORTEX_EMBED_BATCH:-}
+
+      # LLM 供应商。密钥只从环境来，绝不写进任何被 git 跟踪的文件。
+      #
+      # 这一段是显式**允许清单**：.env 里设了但没在这里列出来的变量
+      # 根本到不了进程。清单的陷阱正在于此 —— 没列的旋钮在生产上
+      # 「不存在」，而它暴露的方式是运维改了、重启了、什么都没变
+      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
+      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
+      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+    volumes:
+      - cortex-prod-workspace:/var/lib/cortex/workspace
+    deploy:
+      resources:
+        limits:
+          # embedding 挪出进程之后 cortexd 只剩 I/O 与 SQL，常驻从 1.03 GiB
+          # 降到 ~120 MiB。上限跟着降 —— 留 4g 不会更安全，只会让真正的
+          # 泄漏拖到把整台机器压垮才被看见。
+          #
+          # cpus 不得超过节点核数：这台是 2 核，原先那个 4 被 daemon 拒过
+          cpus: ${CORTEXD_CPU_LIMIT:-1.5}
+          memory: ${CORTEXD_MEM_LIMIT:-768m}
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-network
+      # ── /api 分流 ──────────────────────────────────────
+      # cortexd 的路由是 /health /chat /sessions 这种**裸路径**，
+      # 所以要把 /api 剥掉再转进去。
+      #
+      # 与 web 同一个域名是刻意的：同源之后 cortexd 完全不需要 CORS。
+      # traefik 默认按规则长度算优先级，带 PathPrefix 的这条本来就比
+      # 只有 Host 的那条长；但优先级这种东西不该靠「本来就」——
+      # 显式写死，免得哪天 web 那条规则变长了就悄悄抢走 /api
+      traefik.http.routers.cortex-api.rule: Host(`${DOMAIN}`) && PathPrefix(`/api`)
+      traefik.http.routers.cortex-api.entrypoints: websecure
+      traefik.http.routers.cortex-api.tls: "true"
+      traefik.http.routers.cortex-api.tls.certresolver: letsencrypt
+      traefik.http.routers.cortex-api.priority: "100"
+      traefik.http.routers.cortex-api.middlewares: cortex-api-strip
+      traefik.http.middlewares.cortex-api-strip.stripprefix.prefixes: /api
+      traefik.http.services.cortex-api.loadbalancer.server.port: "8080"
+
+  # ── agent 编排 ────────────────────────────────────────
+  #
+  # 按需拉起沙箱容器、把请求逐字节反代进去、闲了回收。**对话循环不在这儿**
+  # —— 那在容器里那个 cortex-local 上（同一个二进制，--exec-env=container）。
+  #
+  # 它与 cormex 是**两个产品**：cormex 是记忆服务，在另一个仓库
+  # （github.com/weironz/cormex）独立发版。这份 compose 把两个镜像放在同
+  # 一台机器上，那是**部署的选择**，不是代码上的依赖 —— 两边只有 HTTP。
+networks:
+  traefik:
+    external: true
+    name: traefik-network
+
+  # 与 Cortex 那一栈共用。**在这里是 external** —— 它由 Cortex 的 compose
+  # 建立（agentd 与沙箱容器都在上面），这一侧只是接上去。
+  # 名字写死在 agentd 的 `runner.rs::NETWORK` 里，两边必须一致。
+  sandbox:
+    external: true
+    name: cortex-sandbox-net
+
+volumes:
+  # ★ external + 显式 name：它们是在 compose 项目 `cortex` 下建的。
+  #   去掉 external 会让这一栈新建三个空卷，而那看起来就是「数据没了」。
+  cortex-prod-postgres:
+    external: true
+    name: cortex_cortex-prod-postgres
+  cortex-prod-rustfs:
+    external: true
+    name: cortex_cortex-prod-rustfs
+  cortex-prod-workspace:
+    external: true
+    name: cortex_cortex-prod-workspace
+  cortex-prod-embed-models:
+    external: true
+    name: cortex_cortex-prod-embed-models
