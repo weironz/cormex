@@ -26,6 +26,16 @@
 //!
 //! Reformatting an applied migration -- even fixing a typo in a comment -- is
 //! not a thing you may do. Write the correction into the next migration.
+//!
+//! # These hashes are of LF bytes, and `.gitattributes` is what makes that true
+//!
+//! The first version of this test pinned the hashes of a Windows working copy,
+//! where git had handed out CRLF. Every one of them was wrong: the deployed
+//! database records the LF bytes that a Linux CI checkout produced. An image
+//! built from a CRLF working tree fails to migrate against a database that was
+//! migrated from an LF one -- **with byte-identical content**, which is what
+//! makes it so hard to read. `.gitattributes` pins `*.sql` to `eol=lf` so the
+//! working tree matches the blob on every platform; these hashes assume it.
 
 use std::collections::BTreeSet;
 
@@ -33,67 +43,67 @@ use std::collections::BTreeSet;
 const PINNED: &[(&str, &str)] = &[
     (
         "migrations/20260807000001_init.sql",
-        "d225b441f5b4bfaa9a3e0e2a1f67466a0b8a4287c99eb38acc0d9296545479f8",
+        "fc5db4761f4963f43f569fae05feb40a356ebab3865dea82a324b21881723047",
     ),
     (
         "migrations/20260807000002_session_events.sql",
-        "4150d0db0df5e332d539f37a7c084d407b01957d204c5892d2b0df16b927c473",
+        "8182768c03062d227c31b1383e3e9e3044a0387e3c65396ab548fd7f0db3be31",
     ),
     (
         "migrations/20260807000003_session_page_cursor.sql",
-        "64e69f97f344cadd2f2851fd0e77308c10520298b96f637d027d85e7979f032a",
+        "d275809569a5877a9b2400a24e830ad2840a9ae8d1b2f96843ef533fd21c477a",
     ),
     (
         "migrations/20260807000004_attachment_filename.sql",
-        "e65d5d9200b589ab353086486fd7403915f763d0ca6ff2a65333a5540a31ce12",
+        "e6dcbe789821eb0587afbe9cf360092dbdaa21714ea2521ee3cd7775618ce02f",
     ),
     (
         "migrations/20260807000005_episode_replay.sql",
-        "cbbb7fdb6a96c54d19785aa77dc7d1ebcd580bf58d86a8afd0260ae00b5b00e0",
+        "62dccd542a6407f966d23008bb7cac41152f8be19254248b0ff68b33f33ca7a5",
     ),
     (
         "migrations/20260807000006_fact_provenance.sql",
-        "3860596583cfdfd299271340d9cabf5ac13adbd5a21f9ad12591824ce55c4fe7",
+        "5d3bc188c6bb51742f347f1424892da21a331300736a7bf7a130f6717fa1d7ad",
     ),
     (
         "migrations/20260808000001_embedding_backfill.sql",
-        "e289414209527f0e790b023f5fadbb7810260258d14b19a61b631cfcb0ea6d32",
+        "a0db2ab2a7efaf1612fd9f52c5fff86105950c4d68039862cbbe09ff6d4a8b37",
     ),
     (
         "migrations/20260810000001_active_facts_uses_the_index.sql",
-        "f21e61693d02f05045e91343b16d1707c35e5f98aa5b97e9a1774abea0a28d0d",
+        "ecd298a1f32e829e4ec5df023c3d9fb5444c6b12e384baa1f70f26480b2252aa",
     ),
     (
         "migrations/20260812000001_byo_llm_key.sql",
-        "f451eea97c3b754143ec05199975493fb940d6f9ca82018c39f74cef3b9465a7",
+        "e4c37ddfa93bc2b9d07ad9f70a70dc65fb14cd5cce0c795896e8b419ce60f857",
     ),
     (
         "migrations/20260812000002_byo_key_base_url.sql",
-        "2ca2cb721a65e46899015d42d9797bcb96b260851faebf59771e4c712c520992",
+        "6af94b142e60ad608cef486aaaf01013e10a679ec26782b0c6e68d160ada1fe1",
     ),
     (
         "migrations/20260812000003_projects.sql",
-        "912ee1cb3e39f11aea5ce74c01103056ba02afee24f35d50f6cb0f166c31f45d",
+        "4d35ffe5ba59339e7dba60a15b6655ed8b9d3ff25119331904de1f5df3040777",
     ),
     (
         "migrations/20260813000001_tool_call_diff.sql",
-        "6399549ff613fc89a3bb017396a98ab45a2c06be7ba175030f86d610b38d5c90",
+        "449b009830bbe9f9c1264a44126591c58999f8e95f98db27d713dc796bc9b281",
     ),
     (
         "migrations/20260813000002_sandbox_snapshots.sql",
-        "c6a61accd81993e7f90d911b0fa58f47ecd38e1ef96ed5c987418bcc65047a29",
+        "8665bbdd8820e0556de84e14113b88ce73434a184123826e539143583a7afc8f",
     ),
     (
         "migrations/20260813000003_snapshots_per_scope.sql",
-        "290f00a2e26fc569b72291d4f8bbdd5ce882758903c877ad5ead14d0bc3a70c0",
+        "1d2581fa8fcec60c143cee4c2e984d315702bd158d79af486d0eb35499a4bc67",
     ),
     (
         "migrations/20260814000001_session_runtime.sql",
-        "14efb26bea364e1981dce75b3e17616f5b1d3209f4d2188ba7c5142b30583112",
+        "c225bc98cbcc8a24e53e974d4d04200ae8316472d2480f923652a9e7610b6a7f",
     ),
     (
         "migrations-global/20260810000002_auth_schema.sql",
-        "9f9ea8e13b5a3873f8d0f6ec84651fa08288ef074cdb2a25cce930425a71ef32",
+        "3de8739b14fddac88f77a658cbde6af97f44a9389577627f28043f2401830fc0",
     ),
 ];
 

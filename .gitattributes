@@ -1,0 +1,22 @@
+# ── 行尾 ────────────────────────────────────────────────
+#
+# ★ `*.sql` 必须是 LF，**且这不是风格问题**。
+#
+# sqlx 用文件的 sha256 记录一个 migration 是否已应用。在 Windows 上 checkout
+# 得到 CRLF，于是同一份 migration 的字节与 Linux 上不同 —— 拿这样的工作区
+# 构建镜像，部署时会停在
+#
+#     migration 20260807000001 was previously applied but has been modified
+#
+# 而内容其实一个字都没改。2026-08-15 上线时实测撞到：本地构建的镜像里
+# 那个文件是 d225b441…，生产当初应用的是 fc5db476…，两者只差行尾。
+#
+# 一并钉住 shell 脚本与 Dockerfile：它们会被复制进 Linux 镜像里执行，
+# CRLF 的 shebang 会让内核报 `bad interpreter: No such file or directory`。
+*.sql text eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf
+justfile text eol=lf
+
+# 其余交给 git 自动判断
+* text=auto
