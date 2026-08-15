@@ -101,6 +101,16 @@ class CormexApi {
     return Uri.parse(s);
   }
 
+  /// 这一端能不能靠同源解析出地址 —— 也就是「连接页要不要问地址」。
+  ///
+  /// 浏览器里是能的（页面自己就在某个源上），桌面端不能：那儿的 `Uri.base`
+  /// 是进程工作目录（`file:`），没有源可言，不问就只能猜本机 8080。
+  ///
+  /// **判据是「有没有页面源」而不是 `kIsWeb`** —— 与 [resolveBase] 同一条，
+  /// 两处要是各判各的，就会出现「地址栏藏起来了，但解析回落到了 localhost」
+  /// 这种页面上完全看不出来的错位。
+  static bool get canUseSameOrigin => _pageOrigin(Uri.base) != null;
+
   /// 页面所在的源，只留 scheme + host + port；不在浏览器里时为 null。
   ///
   /// **重新构造，不能用 `page.replace(query: null)`** —— `Uri.replace` 里的
