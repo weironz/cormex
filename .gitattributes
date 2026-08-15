@@ -17,6 +17,10 @@
 *.sh text eol=lf
 Dockerfile* text eol=lf
 justfile text eol=lf
+# nginx.conf 同理 —— 也是被 COPY 进 Linux 镜像里读的。nginx 对行尾比 shell
+# 宽容（`\r` 落在分号之后，不会解析失败），所以这条防的不是一次响亮的崩溃，
+# 而是「本机构建的镜像与 CI 构建的不是同一份字节」这件事本身
+*.conf text eol=lf
 
 # 其余交给 git 自动判断
 * text=auto

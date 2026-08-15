@@ -17,7 +17,7 @@ members = [
 # have to agree with it, which release.yml's preflight checks with tomllib (`just version-check`
 # and scripts/check-version.sh came from the upstream repository and did not follow this one)
 # polices in CI and in the release pipeline.
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
