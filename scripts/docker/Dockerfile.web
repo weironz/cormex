@@ -1,0 +1,109 @@
+# ══════════════════════════════════════════════════════════
+#  cormex-web 生产镜像 —— Flutter Web 静态产物 + nginx
+#
+#  构建（在仓库根执行）：
+#    docker build -f scripts/docker/Dockerfile.web -t cormex/cormex-web .
+#
+#  这个镜像**不认识任何域名**，见下面 CORMEX_BASE_URL 那段。
+# ══════════════════════════════════════════════════════════
+
+# ── 构建阶段 ──────────────────────────────────────────────
+# Flutter 官方没有出 docker 镜像，社区镜像质量参差。这里从 debian 起手
+# 自己拉 SDK：多几行，但能把版本钉死，而且不引入一个来路不明的第三方镜像
+# 到发布链路里。
+FROM debian:trixie-slim AS builder
+
+ARG FLUTTER_VERSION=3.44.1
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git unzip xz-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+# 官方 tar 包而不是 `git clone -b`：clone 会拉整个 flutter 仓库历史
+# （几百 MB 且每次构建都变），tar 包是固定内容，层缓存才有意义
+RUN set -eux; \
+    curl -fsSL -o /tmp/flutter.tar.xz \
+      "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"; \
+    tar -xf /tmp/flutter.tar.xz -C /opt; \
+    rm /tmp/flutter.tar.xz
+ENV PATH="/opt/flutter/bin:${PATH}"
+
+# flutter 3.x 起会拒绝在「别人的」git 仓库里跑。容器里是 root 且
+# /opt/flutter 是解压出来的，声明一下 safe.directory 免得每条命令都警告
+RUN git config --global --add safe.directory /opt/flutter \
+    && flutter --version \
+    && flutter config --no-analytics
+
+WORKDIR /build
+
+# 先只拷 pubspec，让依赖解析层在业务代码改动时命中缓存
+COPY app/pubspec.yaml app/pubspec.lock* ./app/
+WORKDIR /build/app
+RUN flutter pub get
+
+# 真正的源码
+WORKDIR /build
+COPY app/ ./app/
+WORKDIR /build/app
+
+# ── 唯一的旋钮：API 挂在哪个路径前缀下 ────────────────────
+#
+# **这个值是编译期钉死的，运行期改不了**（dart2js 把
+# `String.fromEnvironment` 当常量折叠进 main.dart.js，nginx 启动时替换
+# 字符串那一套在压缩混淆后的 JS 里没有稳定占位符可替）。
+#
+# 但它是一个**路径**，不是一个地址 —— `/api` 由 `CormexApi.resolveBase`
+# 接到页面自己的源上。于是同一个镜像在 cormex.cloudcele.com、在别人的
+# memory.example.com、在 localhost 上都对。
+#
+# ★ 这是与 Cortex 那份 Dockerfile.web 唯一实质不同的地方，值得说清楚。
+#   那边烧的是完整地址 `https://cortex.cloudcele.com/api`，因为它的
+#   `_normalise` 只接受绝对地址（相对路径会被拼成 `http:///api` 这种没有
+#   host 的废 URI）。Cormex 要开源：**一个烧死了我们域名的 Web 镜像，
+#   别人拉下来第一件事是重建**。所以这边先改了客户端，让路径前缀走得通。
+#
+# 留空 = 同源根（API 就在页面根上，没有前缀）。想指向另一台机器时仍然可以
+# 传完整地址 —— resolveBase 三种写法都认。
+ARG CORMEX_BASE_URL="/api"
+
+RUN set -eux; \
+    if [ -n "$CORMEX_BASE_URL" ]; then \
+        echo "API base 钉为 $CORMEX_BASE_URL"; \
+        flutter build web --release --dart-define=CORMEX_BASE_URL="$CORMEX_BASE_URL"; \
+    else \
+        echo "API base 留空 —— 同源根"; \
+        flutter build web --release; \
+    fi
+
+# 构建期就验一次，别等部署完才发现 define 没生效。
+#
+# **连引号一起 grep**，不是裸值。`/api` 这种短字符串在 mB 级的 main.dart.js
+# 里撞上一次几乎是必然的，于是裸 grep 在「define 名字拼错、常量折叠成空串」
+# 这个正要防的情形下会照样绿。dart2js 保留字符串字面量原样，两种引号都试。
+RUN set -eux; \
+    if [ -n "$CORMEX_BASE_URL" ]; then \
+        f=build/web/main.dart.js; \
+        grep -qF "\"$CORMEX_BASE_URL\"" "$f" || grep -qF "'$CORMEX_BASE_URL'" "$f" \
+          || { echo "错误：main.dart.js 里找不到字面量 $CORMEX_BASE_URL —— dart-define 没有生效"; exit 1; }; \
+    fi; \
+    test -f build/web/index.html
+
+# ── 运行阶段 ──────────────────────────────────────────────
+FROM nginx:1.29-alpine AS runtime
+
+# 默认站点配置会与我们的冲突（两个 server 抢 80），删掉而不是覆盖 ——
+# 覆盖时如果文件名写错，生效的是默认那份，而它「看起来也能工作」
+RUN rm -f /etc/nginx/conf.d/default.conf
+COPY scripts/docker/nginx.conf /etc/nginx/conf.d/cormex.conf
+COPY --from=builder /build/app/build/web /usr/share/nginx/html
+
+# nginx:alpine 的 master 需要 root 起（要 bind :80 并写 pid），
+# worker 已经降到 nginx 用户。这里不改成非 root：改了要连带调端口、
+# 调 pid 路径、调临时目录，而这个容器不接触任何数据 ——
+# 它只发静态文件，攻击面本来就只有 nginx 自己。
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://127.0.0.1/healthz || exit 1

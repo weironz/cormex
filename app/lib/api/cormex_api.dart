@@ -64,31 +64,55 @@ class CormexApi {
   ///
   /// 提出来只为一件事：**能测同源那一支**。`Uri.base` 在测试进程里恒为
   /// `file:`，直接测 `_normalise` 只能验到桌面端那条回落。
+  ///
+  /// # 三种写法，两条语义
+  ///
+  /// | 写进来的 | 意思 |
+  /// |---|---|
+  /// | `''` | 同源，API 就在页面根上 |
+  /// | `/api` | 同源，但 API 挂在一段前缀后面 |
+  /// | `memory.example.com/api` | 另一个源 |
+  ///
+  /// **纯路径那一支是 Web 镜像能开源的原因。** 换成「构建时把
+  /// `https://自己的域名/api` 编译进 `main.dart.js`」也能跑通同一套部署，
+  /// 但那样发出去的镜像烧着我们的域名，别人拿到手第一件事是重建。
+  /// 而路径前缀是同源相对的：谁的域名都对。
   @visibleForTesting
   static Uri resolveBase(String raw, Uri page) {
     var s = raw.trim();
-    if (s.isEmpty) {
-      if (page.scheme == 'http' || page.scheme == 'https') {
-        // 只保留 scheme + host + port。页面的路径与查询串不属于 API 根。
-        //
-        // **重新构造，不能用 `replace(query: null)`** —— `Uri.replace` 里的
-        // null 是「这一项不动」而不是「清空」，于是 `…/app/?x=1#frag` 的
-        // 查询串会原样留在 API 根上，之后每个请求都带着它。
-        return Uri(
-          scheme: page.scheme,
-          host: page.host,
-          port: page.hasPort ? page.port : null,
-        );
-      }
-      s = 'http://127.0.0.1:8080';
+
+    // 先削尾斜杠。`length > 1` 是为了让 `/` 活到下一行被当成「同源根」——
+    // 无条件削会把它变成空串，那正好也是同源根，但绕了一圈且看不出是有意的。
+    while (s.length > 1 && s.endsWith('/')) {
+      s = s.substring(0, s.length - 1);
     }
+    if (s == '/') s = '';
+
+    if (s.isEmpty || s.startsWith('/')) {
+      // 同源。没有页面源（桌面端的 `file:`）时回落到本机 daemon，
+      // **路径前缀仍然保留** —— 那是「API 挂在哪」，与「哪台机器」无关。
+      final root = _pageOrigin(page) ?? Uri.parse('http://127.0.0.1:8080');
+      return s.isEmpty ? root : root.replace(path: s);
+    }
+
     if (!s.startsWith('http://') && !s.startsWith('https://')) {
       s = 'http://$s';
     }
-    while (s.endsWith('/')) {
-      s = s.substring(0, s.length - 1);
-    }
     return Uri.parse(s);
+  }
+
+  /// 页面所在的源，只留 scheme + host + port；不在浏览器里时为 null。
+  ///
+  /// **重新构造，不能用 `page.replace(query: null)`** —— `Uri.replace` 里的
+  /// null 是「这一项不动」而不是「清空」，于是 `…/app/?x=1#frag` 的查询串会
+  /// 原样留在 API 根上，之后每个请求都带着它。
+  static Uri? _pageOrigin(Uri page) {
+    if (page.scheme != 'http' && page.scheme != 'https') return null;
+    return Uri(
+      scheme: page.scheme,
+      host: page.host,
+      port: page.hasPort ? page.port : null,
+    );
   }
 
   Uri _uri(String path, [Map<String, String>? query]) => _base.replace(

@@ -4,8 +4,8 @@
 
 A memory server for AI agents. Bitemporal, provenance-tracked, MCP-native.
 
-> ⚠️ Early. Extracted from a working product, but the packaging is not done yet —
-> no releases, no stable API guarantees. See [Status](#status).
+> ⚠️ Early. Extracted from a working product. Docker images are published; the
+> API is not frozen. See [Status](#status).
 
 ---
 
@@ -78,9 +78,32 @@ cortex-blob     content-addressed blob storage (S3 / local)
 cortex-proto    the wire protocol
 cortex-import   importers for ChatGPT / Claude conversation exports
 cortexd         the server: HTTP + SSE + WebSocket + MCP
+app/            the memory browser (Flutter — web and desktop from one source)
 ```
 
 Postgres with pgvector. That is the only hard dependency.
+
+## Running it
+
+Two images: `cormex` (the server) and `cormex-web` (the browser). They are
+separate containers because they are separate concerns — you can run the server
+alone and talk to it over MCP, and never deploy the browser at all.
+
+```bash
+cd deploy
+cp .env.example .env      # set CORMEX_DOMAIN, CORMEX_VERSION, the token hash
+docker compose up -d
+```
+
+**The web image carries no domain name.** The API address compiled into it is
+the relative prefix `/api`, which the browser resolves against whatever origin
+served the page. So one published image works for every deployment; you route
+`/api` to the server and everything else to the browser, at your edge proxy.
+The compose file does that with traefik labels, and they are the only place a
+hostname appears.
+
+That relative-prefix detail is the difference between an image anyone can pull
+and an image whose first job is to be rebuilt.
 
 ## Status
 
@@ -89,11 +112,10 @@ It was extracted into its own repository so it can be used on its own.
 
 **Not done yet:**
 
-- The Flutter memory browser (search, provenance, the draggable timeline) still
-  lives in the parent repo and has to be carved out.
-- No published releases, no Docker image, no `cargo install` path.
-- Comments and docs are in Chinese. They are unusually thorough — they explain
-  *why not the obvious thing* at every non-obvious decision — and translating
+- No `cargo install` path, and no published crates. Docker is the only packaging.
+- Comments in `app/` and `deploy/` are still Chinese. The Rust crates have been
+  translated; those two have not. They are unusually thorough — they explain
+  *why not the obvious thing* at every non-obvious decision — so translating
   them without losing that is a real task, not a `sed`.
 - API is not frozen.
 

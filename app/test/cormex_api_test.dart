@@ -36,6 +36,55 @@ void main() {
         'http://memory.example.com/api',
       );
     });
+
+    // 纯路径 = 同源 + 前缀。这是 Web 镜像不必烧死域名的那个机制：
+    // 换成构建期编译一个绝对地址也能跑通同一套部署，但发出去的镜像
+    // 就只对我们这一个域名有用了。
+    test('纯路径解析为同源加前缀', () {
+      final base = CormexApi.resolveBase(
+        '/api',
+        Uri.parse('https://cormex.cloudcele.com/app/?x=1#frag'),
+      );
+      expect(
+        base.toString(),
+        'https://cormex.cloudcele.com/api',
+        reason: '前缀要接在页面的源上，而页面自己的路径/查询串/锚点一概不要',
+      );
+    });
+
+    test('纯路径在没有页面源时仍然保住前缀', () {
+      expect(
+        CormexApi.resolveBase('/api', Uri.parse('file:///C:/app/')).toString(),
+        'http://127.0.0.1:8080/api',
+        reason: '「API 挂在哪个前缀下」与「哪台机器」是两件事 —— '
+            '回落换的是主机，不该把前缀一起丢掉',
+      );
+    });
+
+    test('尾斜杠削干净后单独一个斜杠就是同源根', () {
+      expect(
+        CormexApi.resolveBase('/', Uri.parse('https://cormex.example.com/'))
+            .toString(),
+        'https://cormex.example.com',
+        reason: '`/` 与空串是同一件事，不能变成一个尾巴上挂着斜杠的 base —— '
+            '那之后每个请求的路径都会是 //health',
+      );
+    });
+
+    // `_uri` 拼的是 `_base.path + path`。前缀那一支要是把 path 丢了，
+    // 这里就会静默变成打根路径 —— 而 traefik 的 StripPrefix 只匹配
+    // /api，于是请求直接落到 Web 那个 router 上，拿回一份 index.html。
+    // 症状是「JSON 解析失败」，读起来完全不像路由配错。
+    test('前缀 base 拼出来的请求路径带着前缀', () {
+      final base = CormexApi.resolveBase(
+        '/api',
+        Uri.parse('https://cormex.cloudcele.com/'),
+      );
+      expect(
+        base.replace(path: '${base.path}/health').toString(),
+        'https://cormex.cloudcele.com/api/health',
+      );
+    });
   });
 
   group('StoredCredential', () {

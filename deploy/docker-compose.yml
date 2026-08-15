@@ -321,15 +321,53 @@ services:
       traefik.http.routers.cortex-api.middlewares: cortex-api-strip
       traefik.http.middlewares.cortex-api-strip.stripprefix.prefixes: /api
       traefik.http.services.cortex-api.loadbalancer.server.port: "8080"
+      # ── 自己那个域名下的同一件事 ────────────────────────
+      #
+      # **同一个服务，第二个 router**（不是第二个 service）。`${DOMAIN}` 那条
+      # 是给 Cortex 的 Web 端用的 —— 它在另一个栈里，仍然要到这里来取记忆；
+      # 这条是给下面那个 cormex-web 用的。
+      #
+      # `.service` 必须显式写：traefik 靠**同名**把 router 关联到 service，
+      # 而这个 router 叫 cormex-api、service 叫 cortex-api。不写的症状是
+      # 一条报「service cormex-api not found」的 500 —— 而它只在这一个域名上
+      # 出现，另一个域名照常工作，于是看起来像 DNS 或证书的问题。
+      traefik.http.routers.cormex-api.rule: Host(`${CORMEX_DOMAIN:?独立 Web 的域名，例如 cormex.example.com}`) && PathPrefix(`/api`)
+      traefik.http.routers.cormex-api.entrypoints: websecure
+      traefik.http.routers.cormex-api.tls: "true"
+      traefik.http.routers.cormex-api.tls.certresolver: letsencrypt
+      traefik.http.routers.cormex-api.priority: "100"
+      traefik.http.routers.cormex-api.middlewares: cortex-api-strip
+      traefik.http.routers.cormex-api.service: cortex-api
 
-  # ── agent 编排 ────────────────────────────────────────
+  # ── Web 界面 ──────────────────────────────────────────
   #
-  # 按需拉起沙箱容器、把请求逐字节反代进去、闲了回收。**对话循环不在这儿**
-  # —— 那在容器里那个 cortex-local 上（同一个二进制，--exec-env=container）。
+  # 记忆浏览器：检索、provenance、时间回放。纯静态，一个 nginx 发文件。
   #
-  # 它与 cormex 是**两个产品**：cormex 是记忆服务，在另一个仓库
-  # （github.com/weironz/cormex）独立发版。这份 compose 把两个镜像放在同
-  # 一台机器上，那是**部署的选择**，不是代码上的依赖 —— 两边只有 HTTP。
+  # 与 API **同源**（同一个域名，API 在 /api 前缀下），于是记忆服务这边
+  # 完全不需要 CORS。镜像里不认识任何域名 —— 客户端拿到的是 `/api` 这个
+  # 相对前缀，由浏览器接到当前页面的源上（见 Dockerfile.web）。
+  web:
+    image: ${CORMEX_WEB_IMAGE:-${CORMEX_REGISTRY:-registry.cn-shenzhen.aliyuncs.com/willspace}/cormex-web:${CORMEX_VERSION:?记忆服务的版本}}
+    container_name: cormex-web
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [default, traefik]
+    # **不 depends_on cormex**：静态资源起得比谁都早也没关系。API 还没就绪时
+    # 界面显示「连不上」并重试，而不是白屏 —— 而 depends_on 会把「记忆服务在
+    # 重启循环里」放大成「连页面都打不开」，那时候恰恰最需要能打开页面看一眼。
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-network
+      # priority 1：把整个域名兜底给 Web。上面 /api 那条是 100，
+      # 显式写死而不是靠 traefik「规则越长优先级越高」的默认 ——
+      # 那个默认哪天因为规则改写变了，症状是 API 请求拿回一份 index.html。
+      traefik.http.routers.cormex-web.rule: Host(`${CORMEX_DOMAIN}`)
+      traefik.http.routers.cormex-web.entrypoints: websecure
+      traefik.http.routers.cormex-web.tls: "true"
+      traefik.http.routers.cormex-web.tls.certresolver: letsencrypt
+      traefik.http.routers.cormex-web.priority: "1"
+      traefik.http.services.cormex-web.loadbalancer.server.port: "80"
+
 networks:
   traefik:
     external: true

@@ -138,3 +138,35 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
+  # ── The web client ─────────────────────────────────────
+  #
+  # Its own job rather than a step of the Rust ones: nothing is shared, and running it in
+  # parallel keeps the wall clock at max() instead of the sum.
+  #
+  # Worth stating why this exists at all -- until the browser was published as an image,
+  # nothing in CI ever looked at those 3000-odd lines of Dart. A Rust-only pipeline going
+  # green said precisely nothing about whether the page still compiled.
+  #
+  # The Flutter version is pinned to the same one Dockerfile.web builds with. Letting CI
+  # float to whatever `stable` means today produces the worst kind of disagreement: CI
+  # green, release image red, and the difference invisible in the diff.
+  app:
+    name: Web client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.1"
+          channel: stable
+          cache: true
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: flutter analyze
+        working-directory: app
+        run: flutter analyze
+      - name: flutter test
+        working-directory: app
+        run: flutter test

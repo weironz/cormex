@@ -200,3 +200,91 @@ jobs:
           docker run --rm --entrypoint /bin/sh "$img" -c \
             'test -d /opt/cortex/migrations && test -d /opt/cortex/migrations-global' \
             || { echo "::error::the migration directories are missing from the image"; exit 1; }
+
+  # ══════════════════════════════════════════════════════════
+  #  The web image -- the memory browser, static files behind nginx
+  #
+  #  It is a separate job, not a second step of the one above, for one reason: it shares
+  #  nothing with it. Different builder (Flutter, not Rust), different cache scope, and a
+  #  failure in one says nothing about the other. Running them in parallel also keeps the
+  #  wall clock at max(rust, flutter) instead of their sum.
+  #
+  #  ★ This image carries **no domain name**. The API base compiled into it is the relative
+  #    prefix `/api`, which the browser resolves against whatever origin the page was served
+  #    from. That is what makes one published image usable by anyone -- see the long comment
+  #    in Dockerfile.web, and `CormexApi.resolveBase` on the client side.
+  # ══════════════════════════════════════════════════════════
+  web-image:
+    name: Image cormex-web
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: registry.cn-shenzhen.aliyuncs.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scripts/docker/Dockerfile.web
+          platforms: linux/amd64
+          push: true
+          # Same reason as the job above: ACR rejects the OCI index buildx produces when
+          # provenance attestation is on, with `denied: unknown manifest class`
+          provenance: false
+          tags: |
+            willdockerhub/cormex-web:v${{ needs.preflight.outputs.version }}
+            registry.cn-shenzhen.aliyuncs.com/willspace/cormex-web:v${{ needs.preflight.outputs.version }}
+          # A cache scope of its own. Sharing one with the Rust image would have the two
+          # jobs evicting each other's layers on every single release
+          cache-from: type=gha,scope=cormex-web
+          cache-to: type=gha,mode=max,scope=cormex-web
+
+      # Serving static files is a low bar, and precisely for that reason the failures here
+      # are the quiet ones: nginx comes up fine while the document root is empty, or the
+      # build produced a bundle that has lost the API prefix. Both look like a healthy
+      # container, and both are only noticed by a human opening the page.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          img="registry.cn-shenzhen.aliyuncs.com/willspace/cormex-web:v$v"
+          docker pull "$img"
+          docker run -d --name web -p 8099:80 "$img"
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' web)" = healthy ] && break
+            sleep 2
+          done
+          [ "$(docker inspect -f '{{.State.Health.Status}}' web)" = healthy ] \
+            || { docker logs web; echo "::error::the container never became healthy"; exit 1; }
+
+          # The document root is actually populated. `try_files ... /index.html` means an
+          # empty root still answers every request -- with a 404 from nginx's own page,
+          # which is a 404 that looks like a routing problem rather than an empty image
+          curl -fsS http://127.0.0.1:8099/ | grep -qi '<title>' \
+            || { echo "::error::/ did not return an HTML document"; exit 1; }
+
+          # ★ The API prefix survived the compile. If it did not, every request from the
+          #   browser lands on the SPA fallback and comes back as a 200 carrying
+          #   index.html -- the client then reports a JSON parse error, which reads
+          #   nothing like "the routing prefix is missing".
+          #
+          #   Grep for the quoted literal, not the bare value: `/api` is four characters
+          #   and will collide by chance somewhere in a multi-megabyte bundle, so a bare
+          #   grep stays green in exactly the case this is meant to catch
+          curl -fsS http://127.0.0.1:8099/main.dart.js -o /tmp/main.js
+          grep -qF '"/api"' /tmp/main.js || grep -qF "'/api'" /tmp/main.js \
+            || { echo "::error::the API prefix /api is not in the bundle"; exit 1; }
+
+          docker rm -f web

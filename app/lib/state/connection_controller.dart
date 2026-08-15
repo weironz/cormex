@@ -6,6 +6,7 @@ import '../api/api_exception.dart';
 import '../api/cormex_api.dart';
 import '../auth/credential_store.dart';
 import '../auth/stored_credential.dart';
+import '../core/app_config.dart';
 import '../models/account.dart';
 import '../models/health_status.dart';
 
@@ -101,7 +102,11 @@ class ConnectionController extends Notifier<ConnectionState> {
     final credential = await readCredential();
     if (!ref.mounted) return;
 
-    final baseUrl = storedUrl ?? '';
+    // 存过的优先，没存过用构建期默认值。**判据是 `?? `不是 `isEmpty`**：
+    // 空串是一个合法的、用户可能真的存下来的配置（同源根）。用 `isEmpty`
+    // 兜底，会让「在 Web 镜像里手动把地址清空」这个动作在下次启动时
+    // 被静默还原成 `/api`。
+    final baseUrl = storedUrl ?? AppConfig.defaultBaseUrl;
     if (credential == null) {
       // 地址仍然填回表单里：没有凭据不等于地址也白填一次。
       state = state.copyWith(
