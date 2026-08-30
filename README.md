@@ -90,17 +90,27 @@ separate containers because they are separate concerns — you can run the serve
 alone and talk to it over MCP, and never deploy the browser at all.
 
 ```bash
+docker run --rm willdockerhub/cormex:v0.1.11 --generate-token
+
 cd deploy
-cp .env.example .env      # set CORMEX_DOMAIN, CORMEX_VERSION, the token hash
+cp .env.example .env      # paste the hash it printed, set two passwords
 docker compose up -d
 ```
 
-> ⚠️ **That compose file is our production one and will not start on a fresh
-> machine** — its volumes are declared `external` under names our deployment
-> already has, so you get `external volume "cortex_cortex-prod-postgres" not
-> found`. A self-contained single-host compose is the top item on the
-> [roadmap](docs/roadmap.md); until it lands, take that file as a reference for
-> the shape rather than something to run.
+Then open <http://127.0.0.1:8080>. Everything binds to the loopback, so the
+host is the boundary — put a proxy with TLS in front before exposing any of it.
+
+`docker-compose.prod.yml` beside it is our own deployment, and shows the shape
+a real one takes: an edge proxy splitting `/api` from the browser, WAL
+archiving to a separate disk, volumes that already exist under names nobody can
+change. Read it; do not run it.
+
+> ⚠️ **Known gap: this does not yet come up against an empty database.**
+> The two migration sets have an ordering bug — the global set (accounts) runs
+> first, but uses the `ulid` domain that the per-tenant set creates, so a fresh
+> database stops at `type "ulid" does not exist` and the server restart-loops.
+> Our own deployment never hit it: its `public` schema predates the accounts
+> tables by three days. It is the top item on the [roadmap](docs/roadmap.md).
 
 **The web image carries no domain name.** The API address compiled into it is
 the relative prefix `/api`, which the browser resolves against whatever origin

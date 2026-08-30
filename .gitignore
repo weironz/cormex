@@ -26,7 +26,12 @@ dist/
 .env
 .env.*
 *.env
+# ⚠️ 放行是**逐个**写的，因为上面按后缀拦得很宽 —— 新加一份
+# `.env.<什么>.example` 而忘了来这里加一行，症状是它在本机好好地待着、
+# `git status` 干净、提交也成功，而 clone 下来的人根本没有那个文件。
+# 2026-08-30 撞过一次（`.env.prod.example`）。
 !.env.example
+!.env.prod.example
 *.pem
 *.key
 credentials.json

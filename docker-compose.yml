@@ -1,4 +1,16 @@
-name: cortex
+# The compose project name. It prefixes every volume this file creates, which
+# is why it matters more than a label: for a long time it said `cortex`, left
+# over from before the memory service moved out of that repo, and the volumes
+# on disk were called `cortex_pg_data` and friends. Production inherited the
+# same prefix and is now stuck with it -- see the ★ section in
+# `deploy/docker-compose.prod.yml`, where four volumes have to be declared
+# `external` under names nobody can change.
+#
+# ⚠️ Renaming the project **orphans any dev volumes you already have**. That is
+# fine here and only here: dev data is disposable, `just up` re-seeds it. Doing
+# the same to production would create empty volumes, and the symptom would not
+# be an error -- it would be "the database is suddenly empty".
+name: cormex
 
 # ─── About every `${CORTEX_BIND_ADDR:-127.0.0.1}:` below ────────────────────
 #

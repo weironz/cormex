@@ -37,34 +37,82 @@
 
 ## A. 这个仓库现在对外是坏的（P0）
 
-**别人 clone 下来跑不起来。** 这不是「文档不够」，是一条实测的失败：
+**2026-08-30：compose 那一半做完了，而做的过程中撞出一个更硬的。**
+
+### ✅ 做完的：入口文件不再是「保证失败」的那一份
+
+原来的失败是第一步就撞墙，而且看不出是为什么：
 
 ```console
 $ cd deploy && docker compose up -d
 external volume "cortex_cortex-prod-postgres" not found
 ```
 
-`deploy/docker-compose.yml` 是**我们生产那一份**：卷声明成 `external` 且写死了
-历史名字（compose 项目前缀留下的）。那对生产是**必须的** —— 去掉 external 会让
-compose 新建空卷，症状是「数据库突然空了」。但对一个新用户，它是一份**保证失败**
-的入口文件，而 README 的 quickstart 正指着它。
+现在 `deploy/` 里是三份职责分明的东西：
 
-还有两处同源的混乱：
+| | 是什么 |
+|---|---|
+| `docker-compose.yml` | **自足**。自建卷、无 traefik、端口发到 127.0.0.1、镜像默认指 Docker Hub。README 指的就是它 |
+| `docker-compose.prod.yml` | 我们生产那份，原样搬过来 + 一段英文抬头写清「别跑这个」 |
+| `proxy.conf` | 自足那份缺的那一块 —— 见下 |
 
-- 根 `docker-compose.yml` 是**开发**用的（`just up` 用它），但它 `name: cortex`、
-  服务叫 `cortexd`。两份 compose、两个名字体系、职责重叠
-- `README.md` 的 Running it 一节是照生产那份写的
+`.env.example` 跟着拆成两份（`.env.example` / `.env.prod.example`）。
+根那份 dev compose 的 `name:` 从 `cortex` 改成 `cormex` —— **那才是所有
+`cortex_` 卷名前缀的来源**，也是 Cortex 那侧 roadmap 里「compose 项目重名」
+指的这一条。
 
-**要做的**：
+**自足那份必须自带一层薄反代，这不是可选项。** `cormex-web` 镜像刻意不反代
+API（部署事实不该编进镜像），生产上那一刀是 traefik 切的。没有它的话，浏览器
+的 `/api` 请求会落到 web 镜像的 SPA 回落上，**回 200 + index.html** ——
+客户端随即报「JSON 解析失败」，一句完全不像路由配错的错。`proxy.conf` 里还
+钉了两件同类的坑：SSE 必须 `proxy_buffering off`（否则整轮答案憋到结束才
+一次吐出来，功能「正常」只是不再是流），以及 upstream 走变量 + resolver
+（否则服务端还没起来时 nginx 直接 `host not found in upstream` 退出，且不重试）。
 
-1. 新写一份 `deploy/docker-compose.yml` —— 单机自足：卷自建（无 external）、
-   无 traefik（发布端口到 127.0.0.1）、无跨栈网络。**这一份是 README 指的那份**
-2. 生产那份改名 `deploy/docker-compose.prod.yml`，文件头写清「卷是 external
-   且名字不能改」的理由
-3. 根那份改名 `docker-compose.dev.yml` 或并进 `deploy/`，`name:` 改成 `cormex`
-4. 真的验一次：在一台干净机器上照 README 走一遍，能起、能开第一个账号、能搜到东西
+顺带修了一处静默的：`.gitignore` 按「任何以 `.env` 结尾的」拦，只放行了
+`.env.example`，于是新加的 `.env.prod.example` **会被静默忽略** ——
+本机好好的、`git status` 干净、提交也成功，而 clone 的人没有那个文件。
 
-做完这条之前，「已开源」在实质上只是「代码可读」。
+### ❌ 撞出来的：**全新数据库上根本起不来**
+
+照着新 README 从零跑一遍（这是这一条一直缺的那次验证），服务端进了重启循环：
+
+```
+the global schema migration failed: while executing migration 20260810000002:
+type "ulid" does not exist
+```
+
+两套 migration 的**顺序**错了，而它错得只在干净库上现形：
+
+- `ulid` / `sha256` 两个 DOMAIN 由**租户**那套建在 `public`
+  （`migrations/20260807000001_init.sql`，08-07）
+- **全局**那套（`migrations-global/`，08-10）用 `ulid`，而启动时它**先跑**
+  （`Live::new` 与 `Accounts::connect` 都是先 global）
+
+**我们自己的部署永远撞不到**：那个库的 `public` 比账号表早三天，DOMAIN 早就在。
+所以这条路自从多租户落地以来，一次都没有在空库上跑过。
+
+⚠️ 症状还分两段，别只看后一段：`main.rs` 里 `Accounts::connect` 先失败，
+但那里**只 WARN**（「账号表不可达，/auth/* 答 501」），于是就算后面把 global
+跑通了，**这一轮启动的账号功能已经废了**。所以只在 `Live::new` 里调个序是
+半个修复。
+
+**怎么修要定一次，别顺手**（migration 是不可变的，有 sha256 测试钉着）：
+
+1. 让 `migrate_global` **自足** —— 跑自己那套之前先幂等地建出两个 DOMAIN。
+   覆盖所有调用点，但把 DOMAIN 定义抄成了两份，正是这个仓库盯得最紧的
+   「同一个定义两处」。要配一条比对两处文本的测试
+2. 把租户那套排到全局前面。SQL 层面**没有**反向依赖（核过：`migrations/`
+   里唯一提到 `cortex_auth` 的地方是一句注释），但调用点有三处，漏一处就是
+   上面那个「账号这一轮废了」
+3. 新加一条编号更早的全局 migration —— 与 sqlx 的顺序检查冲突
+
+### 还欠的
+
+- **在一台干净机器上完整走一遍**：能起、能开第一个账号、能搜到东西。
+  上面第 ❌ 条挡着，修完再验
+- README 的 quickstart 现在如实挂着那个「Known gap」。**修好之前不要摘掉它**
+  —— 一份声称能跑而跑不起来的 quickstart，比一份诚实说明卡在哪的更糟
 
 ## B. 第一次用的人卡在哪
 
