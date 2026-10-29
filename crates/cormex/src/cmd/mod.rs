@@ -5,6 +5,9 @@
 //! three copies of "load the config, resolve the directories, load the key".
 
 pub mod detect;
+pub mod doctor;
+pub mod init;
 pub mod login;
 pub mod logout;
 pub mod status;
+pub mod uninstall;
