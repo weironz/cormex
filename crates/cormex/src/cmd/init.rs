@@ -191,8 +191,16 @@ mod tests {
     /// `CODEX_HOME`, which are process-global, so three parallel `#[test]`s
     /// would each see whichever value another one last set. Same shape as
     /// `reembed.rs`'s switch test.
+    ///
+    /// The lock is for the same reason at a larger scale: the `cormex` crate's
+    /// other tests read those variables too, and `cargo test` runs them in
+    /// parallel within one binary. Without it this test is **flaky** — it
+    /// passes alone and fails in a full run, which is the worst shape a test
+    /// can have.
     #[tokio::test]
     async fn init_plans_estimates_and_respects_declines() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
         // Point the installers at the temp home so the real one is untouched

@@ -381,6 +381,20 @@ pub struct NewAccessLog {
     pub unmasked: bool,
 }
 
+/// One row of the archive's session list.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ArchiveSessionRow {
+    pub id: String,
+    pub agent: String,
+    pub first_at: Option<DateTime<Utc>>,
+    pub last_at: Option<DateTime<Utc>>,
+    pub event_count: i64,
+    /// The first user message's text, for deriving a title.
+    pub title_source: Option<String>,
+    pub project_key: Option<String>,
+    pub devices: Option<Vec<String>>,
+}
+
 /// One mask interval.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct CaptureMask {

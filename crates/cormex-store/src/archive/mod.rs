@@ -50,11 +50,11 @@ use crate::model::table;
 use crate::store::Store;
 
 pub use model::{
-    AppendOutcome, CaptureChunk, CaptureFile, CaptureMask, CaptureSession, ChunkEncoding,
-    FileEventOp, FileRole, Framing, Generation, GenerationReason, NewAccessLog, NewArchiveChunk,
-    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession,
-    NewMaskProgress, NewProjection, NewTranscriptEvent, Projection, ProjectionStatus,
-    RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    AppendOutcome, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, CaptureSession,
+    ChunkEncoding, FileEventOp, FileRole, Framing, Generation, GenerationReason, NewAccessLog,
+    NewArchiveChunk, NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask,
+    NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEvent, Projection,
+    ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
 
 /// The advisory lock class for archive-generation appends.

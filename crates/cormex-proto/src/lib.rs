@@ -26,6 +26,7 @@
 //! their rustdoc links pointed at nothing. An integrator reading a memory
 //! service's wire protocol should not have to work out which half applies.
 
+pub mod archive;
 pub mod auth;
 pub mod capture;
 pub mod catalog;

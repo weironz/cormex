@@ -6,8 +6,11 @@
 //! for the same reason [`crate::txn`] has no read methods — a transaction that
 //! holds a lock stays short and write-only.
 
+use chrono::{DateTime, Utc};
+
 use crate::archive::model::{
-    CaptureChunk, CaptureFile, CaptureMask, Generation, Projection, TranscriptEvent,
+    ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, Generation, Projection,
+    TranscriptEvent,
 };
 use crate::error::Result;
 use crate::store::Store;
@@ -111,6 +114,146 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
+    }
+
+    /// The archive's session list, filtered and paginated.
+    ///
+    /// # Why the filters are in SQL
+    ///
+    /// Same reason as `session_digests`: take `limit` rows first and filter in
+    /// memory, and the filtered-out ones **consume the quota** — filter by
+    /// agent and the list shows fewer sessions than it should, with nothing
+    /// saying why.
+    ///
+    /// # The cursor
+    ///
+    /// `(last_at DESC, id DESC)`, encoded as `"<rfc3339>|<id>"`. A bare
+    /// timestamp cursor repeats or skips rows when two sessions share one, and
+    /// two sessions finishing in the same second is ordinary.
+    pub async fn archive_sessions(
+        &self,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        after: Option<(&DateTime<Utc>, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ArchiveSessionRow>> {
+        let rows = sqlx::query_as::<_, ArchiveSessionRow>(
+            "WITH agg AS (
+                 SELECT s.id, s.agent,
+                        min(e.occurred_at) AS first_at,
+                        max(e.occurred_at) AS last_at,
+                        count(*)           AS event_count
+                   FROM capture_sessions s
+                   JOIN transcript_events e ON e.session_id = s.id
+                  GROUP BY s.id, s.agent
+             )
+             SELECT a.id, a.agent, a.first_at, a.last_at, a.event_count,
+                    (SELECT e.text FROM transcript_events e
+                      WHERE e.session_id = a.id AND e.kind = 'user_message'
+                        AND e.text IS NOT NULL AND e.text <> ''
+                      ORDER BY e.seq ASC LIMIT 1) AS title_source,
+                    (SELECT min(f.project_key) FROM capture_files f
+                      WHERE f.session_id = a.id AND f.project_key IS NOT NULL) AS project_key,
+                    (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f
+                      WHERE f.session_id = a.id) AS devices
+               FROM agg a
+              WHERE ($1::text IS NULL OR a.agent = $1)
+                AND ($2::text IS NULL OR EXISTS (
+                        SELECT 1 FROM capture_files f
+                         WHERE f.session_id = a.id AND f.project_key = $2))
+                AND ($3::timestamptz IS NULL OR a.last_at >= $3)
+                AND ($4::timestamptz IS NULL OR a.first_at <= $4)
+                AND ($5::timestamptz IS NULL OR (a.last_at, a.id) < ($5, $6))
+              ORDER BY a.last_at DESC, a.id DESC
+              LIMIT $7",
+        )
+        .bind(agent)
+        .bind(project_key)
+        .bind(since)
+        .bind(until)
+        .bind(after.map(|(t, _)| *t))
+        .bind(after.map(|(_, id)| id))
+        .bind(limit.clamp(1, 200))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// One archive session's aggregate, or `None` if it has no events.
+    pub async fn archive_session(&self, session_id: &str) -> Result<Option<ArchiveSessionRow>> {
+        let row = sqlx::query_as::<_, ArchiveSessionRow>(
+            "SELECT s.id, s.agent,
+                    min(e.occurred_at) AS first_at,
+                    max(e.occurred_at) AS last_at,
+                    count(*)           AS event_count,
+                    (SELECT e.text FROM transcript_events e
+                      WHERE e.session_id = s.id AND e.kind = 'user_message'
+                        AND e.text IS NOT NULL AND e.text <> ''
+                      ORDER BY e.seq ASC LIMIT 1) AS title_source,
+                    (SELECT min(f.project_key) FROM capture_files f
+                      WHERE f.session_id = s.id AND f.project_key IS NOT NULL) AS project_key,
+                    (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f
+                      WHERE f.session_id = s.id) AS devices
+               FROM capture_sessions s
+               JOIN transcript_events e ON e.session_id = s.id
+              WHERE s.id = $1
+              GROUP BY s.id, s.agent",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Every file of a session, with its generations.
+    pub async fn archive_files(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(CaptureFile, Vec<Generation>)>> {
+        let files = self.capture_files_of_session(session_id).await?;
+        let mut out = Vec::with_capacity(files.len());
+        for f in files {
+            let gens = sqlx::query_as::<_, Generation>(
+                "SELECT id, file_id, ordinal, reason, created_at
+                   FROM capture_generations WHERE file_id = $1 ORDER BY ordinal ASC",
+            )
+            .bind(&f.id)
+            .fetch_all(self.pool())
+            .await?;
+            out.push((f, gens));
+        }
+        Ok(out)
+    }
+
+    /// Whether this session is Cormex's **only copy**.
+    ///
+    /// True when every file of the session, on every device, has `missing` as
+    /// its newest lifecycle event. A file with no event at all is **not**
+    /// missing: it has never been observed to disappear.
+    ///
+    /// # Why this is a question worth answering
+    ///
+    /// The host deletes its own sessions after `cleanupPeriodDays`. Once that
+    /// happens Cormex is the only copy, and a user who deletes the session here
+    /// is deleting the last one. The UI has to say so before the click, not
+    /// after.
+    pub async fn session_is_sole_copy(&self, session_id: &str) -> Result<bool> {
+        let (total, missing): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) AS total,
+                    count(*) FILTER (
+                        WHERE (SELECT ev.op FROM capture_file_events ev
+                                WHERE ev.file_id = f.id
+                                ORDER BY ev.created_at DESC, ev.id DESC LIMIT 1) = 'missing'
+                    ) AS missing
+               FROM capture_files f WHERE f.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?;
+        // An empty session is not "the only copy of anything"
+        Ok(total > 0 && total == missing)
     }
 
     /// Every file of a session.

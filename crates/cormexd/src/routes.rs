@@ -131,6 +131,17 @@ protected_routes! {
     "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
     "/capture/generations/{id}/chunks/{offset}" [PUT] => axum::routing::put(crate::capture::put_chunk)
         .layer(DefaultBodyLimit::max(MAX_CAPTURE_BODY)),
+    // ── The archive browser (§7.2) ─────────────────────────
+    //
+    // `/archive/raw` is the one endpoint that can hand out unmasked original
+    // bytes. It requires `raw:read`, which `cormex login` does not ask for by
+    // default — the check is in the handler, because the allow-list answers
+    // "may this credential reach this path" and this answers "may it see
+    // unmasked bytes", and the two differ per call.
+    "/archive/sessions" [GET] => get(crate::archive_api::list_sessions),
+    "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
+    "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
+    "/archive/raw/{generation_id}" [GET] => get(crate::archive_api::get_raw),
     // Bring-your-own API key. Three actions on one path: read status / store /
     // withdraw
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)

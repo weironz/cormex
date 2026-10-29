@@ -172,7 +172,12 @@ impl DeviceScope {
                 || ((is(Method::POST) || is(Method::GET) || is(Method::DELETE)) && path == "/mcp")
                 || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _]))
                 || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _, "events"]))
-                || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _, "brief"]));
+                || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _, "brief"]))
+                // The archive browser's own routes (P2-5). `/archive/raw` is
+                // **not** here: it needs `raw:read`, and the handler checks
+                // that per call
+                || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions"]))
+                || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _, "events"]));
             if session {
                 return true;
             }
