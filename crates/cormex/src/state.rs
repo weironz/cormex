@@ -111,6 +111,30 @@ impl StateDb {
         Ok(db)
     }
 
+    /// Open with a **short** busy timeout, for the hook path.
+    ///
+    /// The hook has a 100 ms budget for its queue write: a sync holding the
+    /// database must not block the host's turn. When the write cannot happen,
+    /// the caller spools instead.
+    ///
+    /// # Errors
+    /// The directory cannot be created, the database cannot be opened, or its
+    /// schema is newer than this build understands.
+    pub fn open_quick(data_dir: &Path, busy: std::time::Duration) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("could not create {}", data_dir.display()))?;
+        let path = data_dir.join("state.db");
+        let conn = Connection::open(&path)
+            .with_context(|| format!("could not open {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("could not switch to WAL")?;
+        conn.busy_timeout(busy)
+            .context("could not set busy_timeout")?;
+        let mut db = Self { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
     fn migrate(&mut self) -> Result<()> {
         let version: i32 = self
             .conn
@@ -379,6 +403,59 @@ impl StateDb {
             .optional()
             .context("could not read the last run")?;
         Ok(row)
+    }
+
+    /// Record one change `init` made, so `uninstall` can undo it.
+    ///
+    /// # Errors
+    /// The write failed.
+    pub fn record_install(
+        &self,
+        kind: &str,
+        target: &str,
+        backup_path: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO installs (kind, target, backup_path, installed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![kind, target, backup_path, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("could not record the install")?;
+        Ok(())
+    }
+
+    /// The backup path for one change, if there was one.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub fn install_backup(&self, kind: &str, target: &str) -> Result<Option<String>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT backup_path FROM installs
+                  WHERE kind = ?1 AND target = ?2 AND backup_path IS NOT NULL
+                  ORDER BY id DESC LIMIT 1",
+                params![kind, target],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("could not read the install record")?;
+        Ok(row)
+    }
+
+    /// Forget one change, after it has been undone.
+    ///
+    /// # Errors
+    /// The delete failed.
+    pub fn forget_install(&self, kind: &str, target: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM installs WHERE kind = ?1 AND target = ?2",
+                params![kind, target],
+            )
+            .context("could not forget the install")?;
+        Ok(())
     }
 
     /// How many queue entries are waiting.

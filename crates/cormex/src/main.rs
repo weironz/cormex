@@ -73,6 +73,11 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         budget_secs: u64,
     },
+    /// Called by the host's hooks. Reads stdin, queues, exits 0 -- always.
+    Hook {
+        /// Which agent's hook this is.
+        agent: String,
+    },
     /// List the agents and session files found on this machine.
     ///
     /// Reads paths and metadata only -- never a session's contents.
@@ -167,6 +172,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 logout::run(&cfg, &dirs.config).await?;
             }
+            Ok(ExitCode::Ok)
+        }
+        Command::Hook { agent } => {
+            // **Always exit 0.** A hook is in the host's critical path: a
+            // non-zero exit can make the host treat the turn as failed, and the
+            // next scheduled sync finds the file anyway because discovery is
+            // not driven by the queue
+            let stdin = cormex::hook::read_stdin(cormex::hook::STDIN_TIMEOUT);
+            cormex::hook::run_hook(&agent, &dirs.config, &dirs.data, &stdin);
             Ok(ExitCode::Ok)
         }
         Command::Sync {
