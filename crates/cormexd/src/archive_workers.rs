@@ -103,15 +103,11 @@ const DISTILL_IDLE_MINUTES: i64 = 30;
 /// this one stopped.
 const DISTILL_BATCH: i64 = 200;
 
-/// What `summaries.embedding_model` holds when there is no vector.
-///
-/// The column is `NOT NULL` and the four vector channels filter on it, so this
-/// value is never matched by a query — which is exactly right for a row with no
-/// vector.
-const NO_EMBEDDING: &str = "none";
-
 /// The `device_id` on rows the server itself produced.
-const SERVER_DEVICE: &str = "server";
+///
+/// Not a device: the server produced this. Recording a device id here would
+/// attribute the observation to whichever machine happened to run the worker.
+pub(crate) const SERVER_DEVICE: &str = "server";
 
 /// Spawn both workers.
 ///
@@ -499,7 +495,7 @@ async fn write_observations(
             // rather than an empty string — an empty string reads like a model
             // whose name failed to be filled in
             embedding: None,
-            embedding_model: NO_EMBEDDING.to_owned(),
+            embedding_model: cormex_memory::brief::NO_EMBEDDING.to_owned(),
             covers_from: Some(entry.at),
             covers_to: Some(entry.at),
             sources: entry
@@ -555,7 +551,7 @@ fn tenant_schema(tenant: &Tenant) -> cormex_store::SchemaName {
     }
 }
 
-fn distill_event_of(e: &TranscriptEvent) -> DistillEvent {
+pub(crate) fn distill_event_of(e: &TranscriptEvent) -> DistillEvent {
     DistillEvent {
         id: e.id.parse().unwrap_or_else(|_| Id::new()),
         seq: e.seq,

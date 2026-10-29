@@ -26,6 +26,7 @@
 /// here so existing call sites don't have to move.
 pub use cormex_core::injection;
 
+pub mod brief;
 pub mod crosslink;
 pub mod distill;
 pub mod embed;
@@ -42,6 +43,7 @@ pub mod tokenize;
 pub mod trace;
 pub mod transcribe;
 
+pub use brief::{Brief, BriefLine, Briefer, CheapModelBriefer};
 pub use crosslink::{
     AcceptAll, Accepted, Candidate, CheapModelJudge, LinkCorpus, LinkJudge, LinkReport, Linker,
     RELATES_TO, StoreCorpus,

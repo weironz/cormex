@@ -129,6 +129,10 @@ const PINNED: &[(&str, &str)] = &[
         "migrations/20261125000002_distill_progress.sql",
         "66c94d5c2fc7ff7695bac0df7ce842958b7a80103fc475556c1179169c4864ee",
     ),
+    (
+        "migrations/20261125000003_session_briefs.sql",
+        "08ef74941cb50fd23d91789803099e2b82c0283c8d480e876ba64fa894f164d9",
+    ),
 ];
 
 fn sha256_hex(bytes: &[u8]) -> String {

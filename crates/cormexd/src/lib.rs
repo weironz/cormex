@@ -21,6 +21,7 @@ pub mod archive_workers;
 pub mod auth;
 pub mod backfill;
 pub mod blobs;
+pub mod brief;
 pub mod byo_key;
 pub mod capture;
 pub mod cors;

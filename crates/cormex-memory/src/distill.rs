@@ -301,7 +301,7 @@ fn parse_day(raw: &str) -> Option<DateTime<Utc>> {
 /// Models wrap their answer in prose and fences even when told not to; taking
 /// "the first `{` through the last `}`" would swallow a trailing explanation
 /// that happens to contain braces.
-fn extract_json_blob(raw: &str) -> Option<&str> {
+pub(crate) fn extract_json_blob(raw: &str) -> Option<&str> {
     let start = raw.find(['{', '['])?;
     let open = raw.as_bytes()[start];
     let close = if open == b'{' { b'}' } else { b']' };

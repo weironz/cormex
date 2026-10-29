@@ -520,6 +520,29 @@ impl ArchiveTxn {
         Ok(())
     }
 
+    /// Record that a summary is the session's current brief.
+    ///
+    /// The summary itself is written through `write_txn` (it is a synchronous
+    /// table); this row is archive-layer bookkeeping and does not sync.
+    pub async fn insert_session_brief(
+        &mut self,
+        session_id: &str,
+        summary_id: &str,
+        through_seq: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO session_briefs (id, session_id, summary_id, through_seq)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(cormex_core::Id::new().to_string())
+        .bind(session_id)
+        .bind(summary_id)
+        .bind(through_seq)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(())
+    }
+
     /// Record an exclusion or an inclusion of a project's archive index.
     pub async fn insert_archive_index_event(&mut self, new: &NewArchiveIndexEvent) -> Result<()> {
         sqlx::query("INSERT INTO archive_index_events (id, project_key, op) VALUES ($1, $2, $3)")

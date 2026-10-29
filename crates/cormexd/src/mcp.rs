@@ -353,13 +353,24 @@ impl MemoryMcp {
             summary: None,
         };
 
-        // `brief` has no generator until phase 5. Saying so is the honest
-        // answer: returning an empty block would read as "this session has
-        // nothing in it"
         if view == "brief" {
-            let body = "（简报尚未生成 —— 它是阶段 5 的内容。先看 view=digest。）";
+            let answer = crate::brief::brief_for(&self.state, &tenant, &p.id)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("could not build the brief: {e}"), None)
+                })?;
+            let body = if answer.body.is_empty() {
+                "（还没有交接简报 —— 这段会话还没有可交接的内容。先看 view=digest。）".to_owned()
+            } else if answer.stale {
+                format!(
+                    "（注意：这段会话在简报生成之后又有新事件，下面是上一版简报。）\n\n{}",
+                    answer.body
+                )
+            } else {
+                answer.body
+            };
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                cormex_core::injection::render_session_excerpt(&meta, body, None),
+                cormex_core::injection::render_session_excerpt(&meta, &body, None),
             )]));
         }
 
@@ -571,14 +582,34 @@ impl MemoryMcp {
             last_at: row.last_at.map(|t| t.format("%Y-%m-%d").to_string()),
             summary: None,
         };
-        let body = "（简报尚未生成 —— 它是阶段 5 的内容。下面是这段会话的开头。）";
-        let text = cormex_core::injection::render_session_excerpt(&meta, body, None);
+        // The brief is generated on first request and cached; see
+        // `crate::brief`. `ttlMs` is short because a session can gain events at
+        // any moment, and a brief that has gone stale must not be served from a
+        // host's cache as if it were current
+        let answer = crate::brief::brief_for(&self.state, &tenant, id)
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("could not build the brief: {e}"), None)
+            })?;
+        let body = if answer.body.is_empty() {
+            // Nothing to hand over yet. Saying so is the honest answer: an empty
+            // block would read as "this session has nothing in it"
+            "（还没有交接简报 —— 这段会话还没有可交接的内容。先看 view=digest。）".to_owned()
+        } else if answer.stale {
+            format!(
+                "（注意：这段会话在简报生成之后又有新事件，下面是上一版简报。）\n\n{}",
+                answer.body
+            )
+        } else {
+            answer.body
+        };
+        let text = cormex_core::injection::render_session_excerpt(&meta, &body, None);
         Ok(
             rmcp::model::ReadResourceResult::new(vec![ResourceContents::text(
                 text,
                 format!("cormex://session/{id}/brief"),
             )])
-            .with_ttl_ms(5 * 60 * 1000)
+            .with_ttl_ms(60 * 1000)
             .with_cache_scope(rmcp::model::CacheScope::Private)
             .into(),
         )
@@ -778,10 +809,10 @@ impl ServerHandler for MemoryMcp {
             resource_templates: vec![
                 rmcp::model::ResourceTemplate::new(SESSION_BRIEF_TEMPLATE, "session brief")
                     .with_description(
-                        "A handover brief for one captured session: what it was about, \
-                         what was decided, where it left off. Until phase 5 generates \
-                         briefs, this returns a placeholder and the first part of the \
-                         digest.",
+                        "A handover brief for one captured session: the goal, the \
+                         constraints, the decisions already made (with dates), where it \
+                         stands, the next step, the open questions, and the files and \
+                         commands that matter. Generated on first request.",
                     )
                     .with_mime_type("text/plain"),
                 rmcp::model::ResourceTemplate::new(PROJECT_BRIEF_TEMPLATE, "project brief")

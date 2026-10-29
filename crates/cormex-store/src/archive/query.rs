@@ -633,6 +633,60 @@ impl Store {
         Ok(rows)
     }
 
+    // ── the handover brief ─────────────────────────────────
+
+    /// The newest brief for a session, if it still covers every event.
+    ///
+    /// "Covers every event" is a `through_seq` comparison, not a timestamp
+    /// one: a brief generated at 10:00 for events up to seq 40 is stale the
+    /// moment seq 41 is projected, whatever the clock says. Comparing
+    /// `created_at` would call it fresh whenever the two landed in the same
+    /// second.
+    ///
+    /// Returns `(summary_id, through_seq)`.
+    pub async fn current_brief(&self, session_id: &str) -> Result<Option<(String, i64)>> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT b.summary_id, b.through_seq
+               FROM session_briefs b
+              WHERE b.session_id = $1
+                AND b.through_seq >= coalesce(
+                        (SELECT max(e.seq) FROM transcript_events e
+                          WHERE e.session_id = $1), 0)
+              ORDER BY b.created_at DESC, b.id DESC
+              LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// The newest brief for a session **regardless of whether it is current**.
+    ///
+    /// Used when generation times out: a stale brief is a far better answer
+    /// than none, as long as the caller says it is stale.
+    pub async fn latest_brief(&self, session_id: &str) -> Result<Option<(String, i64)>> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT summary_id, through_seq FROM session_briefs
+              WHERE session_id = $1
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// The highest `seq` a session has, or `-1` when it has no events.
+    pub async fn session_max_seq(&self, session_id: &str) -> Result<i64> {
+        let (max,): (Option<i64>,) =
+            sqlx::query_as("SELECT max(seq) FROM transcript_events WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(self.pool())
+                .await?;
+        Ok(max.unwrap_or(-1))
+    }
+
     // ── the distiller ──────────────────────────────────────
 
     /// Sessions that are **idle** and have events the distiller has not seen.

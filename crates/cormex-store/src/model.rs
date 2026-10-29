@@ -125,8 +125,9 @@ pub mod table {
         "archive_chunks",
         "archive_access_log",
         "archive_index_events",
-        // Phase 5: the distiller's progress
+        // Phase 5: the distiller's progress, and the brief pointers
         "distill_progress",
+        "session_briefs",
     ];
 }
 

@@ -85,18 +85,25 @@ pub struct SearchQuery {
 
 /// `GET /archive/sessions/{id}/brief` — the handover brief.
 ///
-/// Phase 5 generates briefs. Until then this returns a placeholder that says so
-/// plus the session's header — an empty body would read as "this session has
-/// nothing in it", and the actual situation is "the generator does not exist
-/// yet".
+/// Generated on first request and cached as a summary; see
+/// [`crate::brief`] for why generation is lazy and why a stale brief is still
+/// an answer. `stale: true` means the session has events newer than the brief —
+/// the caller should say so rather than present it as current.
 ///
 /// # Errors
-/// The session does not exist, or the caller may not read it.
+/// The session does not exist, or the caller may not read it. A model failure
+/// is **not** an error: the answer comes back stale instead.
 pub async fn get_brief(
     State(st): State<AppState>,
     axum::Extension(principal): axum::Extension<Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = principal.tenant(&st).await?;
+    if !principal.has_scope(crate::device_keys::Scope::SessionRead) {
+        return Err(ApiError::forbidden(
+            "this credential does not carry session:read",
+        ));
+    }
     let store = archive_store(&st, &principal).await?;
     let row = store
         .archive_session(&id)
@@ -104,11 +111,18 @@ pub async fn get_brief(
         .map_err(store_err)?
         .ok_or_else(|| ApiError::not_found("no such session, or it has no events yet"))?;
 
+    let answer = crate::brief::brief_for(&st, &tenant, &id)
+        .await
+        .map_err(|e| ApiError::internal(format!("could not build the brief: {e}")))?;
+
     Ok(Json(serde_json::json!({
         "session_id": row.id,
-        "generated": false,
-        "brief": serde_json::Value::Null,
-        "note": "briefs are generated in phase 5; until then use view=digest",
+        "generated": answer.generated,
+        "stale": answer.stale,
+        // The body is the rendered seven sections. Empty means "there is
+        // nothing to hand over yet" -- the caller falls back to view=digest
+        "brief": if answer.body.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(answer.body) },
+        "summary_id": answer.summary_id,
         "title": row.title_source.map(|t| t.chars().take(TITLE_CHARS).collect::<String>()),
         "agent": row.agent,
         "event_count": row.event_count,

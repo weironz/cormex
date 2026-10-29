@@ -41,6 +41,11 @@ use crate::state::AppState;
 ///
 /// **Holding one means resolution already happened.** There is no
 /// "not yet resolved" state, and therefore no "forgot to resolve" bug.
+///
+/// `Clone` so a background task can outlive the request that started it (the
+/// brief generator's). Cloning it is an `Arc` clone plus a schema name — the
+/// isolation is a property of the pool inside, not of the handle.
+#[derive(Clone)]
 pub enum Tenant {
     /// Live backend: a pool already connected to some schema.
     Live {
