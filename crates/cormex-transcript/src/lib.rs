@@ -9,12 +9,19 @@
 //! every already-captured conversation — the raw bytes are kept, so a
 //! re-projection is always possible.
 //!
-//! # What is in this crate today
+//! # What is in this crate
 //!
-//! [`anonymize`], the structure-preserving anonymizer that produces the test
-//! fixtures (P2-0). The parsers themselves land in P2-1, on top of this
-//! skeleton.
+//! - [`anonymize`]: the structure-preserving anonymizer that produces the test
+//!   fixtures
+//! - [`jsonl`]: line splitting across chunk boundaries, shared by every parser
+//! - [`parser`]: the [`parser::Parser`] trait and the shared event shape
+//! - [`claude_code`] and [`codex`]: the two parsers
 
 pub mod anonymize;
+pub mod claude_code;
+pub mod codex;
+pub mod jsonl;
+pub mod parser;
 
 pub use anonymize::{Anonymizer, RULES_VERSION, synthetic_text};
+pub use parser::{ParsedEvent, Parser, parser_for};

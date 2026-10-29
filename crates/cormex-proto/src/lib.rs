@@ -39,6 +39,7 @@ pub mod import;
 /// that goose-providers and a TLS stack stay out of its binary. See `Cargo.toml`.
 #[cfg(feature = "llm")]
 pub mod llm;
+pub mod transcript;
 
 /// The wire protocol version this side speaks. **Bump it only when the
 /// contract changes incompatibly.**
