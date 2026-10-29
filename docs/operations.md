@@ -62,6 +62,51 @@ docker compose up -d cormex
 
 ---
 
+## 一·五、擦除一个采集会话（P6-2）
+
+```bash
+curl -X DELETE "https://<域名>/api/archive/sessions/<session_id>?confirm=<session_id>" \
+  -H "Authorization: Bearer <token>"
+```
+
+两道闸：`raw:read` scope，以及 `?confirm=` 必须重复目标 id。
+
+### 顺序与崩溃
+
+```
+1. 销毁数据密钥  → 对象立刻是随机字节
+2. 删对象
+3. 删 P 层（事件、投影、索引块）
+4. 删派生行（summaries、derivations、晋升出的 episodes）
+5. 写墓碑        ← 最后
+```
+
+墓碑最后写是有意的：中途崩溃留下的是「部分消失、但仍被列出」的会话，运维看得见、
+能接着做。反过来会留下「看起来已擦除、字节还在」，而那样就再没人会看第二眼。
+
+### ⚠️ 它**没有**清理抽出来的事实
+
+purge 删掉晋升出的 `episodes` 行，但**由它们抽出、已经写进 `facts` 的记忆仍然
+可读**。清理那些需要 memory 层的 redact 执行器，而它尚未实现（只有墓碑写入）。
+
+要彻底擦除，现在只能手工：
+
+```sql
+-- 找出从某个采集会话晋升出来的 episode，再顺着它们找 facts
+SELECT id FROM episodes WHERE session_id = '<capture_session_id>';
+SELECT * FROM facts WHERE source_episode_id = ANY('<上面那些 id>');
+```
+
+然后按 `docs/memory.md` §十一 的级联表逐项清（statement 写占位、tsv/embedding 置
+NULL、追加 `fact_events` 的 `invalidate`）。**这一步没有自动化**，也没有 CLI 入口。
+
+### 响应里的 `objects_failed`
+
+如果非 0，说明有对象没删掉。这是 purge 唯一可能「部分成功」的地方，而且**不会
+被静默忽略** —— 响应里如实报出来。重跑同一个请求是安全的（幂等）。
+
+---
+
 ## 二、备份与恢复演练（P6-3）
 
 > **状态：步骤已写，尚未在真实部署上演练过。** 演练一次之后把日期和结果补在这里。
