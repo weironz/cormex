@@ -484,3 +484,50 @@ async fn ensure_bucket_is_idempotent() {
         .await
         .expect("repeated bucket creation should be idempotent");
 }
+
+/// Keyed access round-trips through RustFS, and the key is used **verbatim**.
+///
+/// `#[ignore]` because it needs a live RustFS, like the rest of this file --
+/// but unlike them it is also the only test that exercises the `capture/`
+/// namespace against a real S3 implementation. The local backend cannot catch
+/// "S3 rejects a key containing something we think is fine".
+#[tokio::test]
+#[ignore = "needs a live RustFS; run with just test-db or CORTEX_REQUIRE_RUSTFS=1"]
+async fn keyed_capture_object_round_trips() {
+    let s = skip_unless_rustfs!();
+    let payload = unique_payload("capture-keyed", 4096);
+    let digest = sha256_hex(&payload);
+    let key = hash::capture_key(s.tenant(), &digest).expect("a legal capture key");
+
+    s.put_keyed(&key, payload.clone(), "application/zstd")
+        .await
+        .expect("the keyed upload failed");
+
+    assert!(
+        s.exists_keyed(&key).await.expect("exists failed"),
+        "the object was uploaded at {key} and HeadObject says it is not there"
+    );
+    assert_eq!(
+        s.get_keyed(&key).await.expect("the keyed read failed"),
+        payload,
+        "the bytes fetched back differ from the ones uploaded"
+    );
+
+    // The key really is the capture layout, not the media one: if the backend
+    // had prepended its own prefix the object would be somewhere else entirely,
+    // and a tenant reading its own data would find nothing
+    assert!(
+        key.contains("/capture/"),
+        "the key should carry the capture namespace, got {key}"
+    );
+
+    s.delete_keyed(&key).await.expect("cleanup failed");
+    assert!(
+        !s.exists_keyed(&key).await.expect("exists failed"),
+        "the object is still there after delete_keyed"
+    );
+    // Idempotent
+    s.delete_keyed(&key)
+        .await
+        .expect("deleting a missing object must succeed");
+}

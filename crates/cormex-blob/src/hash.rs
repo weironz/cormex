@@ -22,6 +22,18 @@ pub const HASH_HEX_LEN: usize = 64;
 /// later (export bundles, thumbnails) will not collide with the bytes.
 const KEY_PREFIX: &str = "blobs";
 
+/// The namespace for captured session chunks, beside [`KEY_PREFIX`] inside the
+/// tenant.
+///
+/// Separate from `blobs/` because the two are unlike in every way that matters:
+/// media is content-addressed by the hash of the **stored** bytes and is
+/// referenced from the `blobs` table (and therefore synced); capture chunks are
+/// keyed by the hash of the **logical (uncompressed)** bytes and are never
+/// synced (D3). Sharing one namespace would make "delete everything under
+/// `blobs/`" — which is what a media GC does — silently take captured
+/// conversations with it.
+const CAPTURE_PREFIX: &str = "capture";
+
 /// The upper bound on a tenant prefix's length, taken from Postgres's
 /// `NAMEDATALEN - 1`.
 ///
@@ -237,6 +249,82 @@ pub fn storage_key(tenant: &TenantPrefix, hash: &str) -> Result<String> {
     ))
 }
 
+/// Derive the object key for a captured session chunk:
+/// `<tenant>/capture/ab/cd/<64-char hash>.zst`.
+///
+/// # Why the hash is of the logical bytes, not the stored object
+///
+/// The same file can be captured as plaintext (`.jsonl`) or as a zstd frame
+/// (Codex's `.jsonl.zst`), and both must land on **one** key — otherwise the
+/// client's "plaintext wins, drop the compressed duplicate" rule would still
+/// upload the same conversation twice, and the two copies would be
+/// indistinguishable afterwards.
+///
+/// # Why `.zst` is in the key rather than a separate field
+///
+/// The encoding is a property of the stored object, and the key names the
+/// stored object. A future `identity` encoding gets its own suffix; the
+/// database row records which one it used (`capture_chunks.encoding`), so the
+/// key and the row cannot disagree about what is inside.
+///
+/// # Errors
+/// [`BlobError::InvalidHash`] when the hash is illegal — the same fence against
+/// path traversal as [`storage_key`].
+pub fn capture_key(tenant: &TenantPrefix, sha256: &str) -> Result<String> {
+    validate_hash(sha256)?;
+    Ok(format!(
+        "{tenant}/{CAPTURE_PREFIX}/{}/{}/{sha256}.zst",
+        &sha256[0..2],
+        &sha256[2..4]
+    ))
+}
+
+/// Check that a string is a well-formed capture key **and** that its two
+/// directory levels agree with the hash they claim to bucket.
+///
+/// # Why the bucket check is not redundant
+///
+/// The shape alone admits `ab/cd/<hash starting with 11>`. Such a key is legal
+/// to write, and then the object is unreachable by
+/// [`capture_key`] — so a typo in the bucketing step produces "the chunk was
+/// uploaded, and the reader cannot find it", with the upload reporting success.
+///
+/// # Errors
+/// [`BlobError::InvalidHash`] when the key does not have the capture layout.
+pub fn validate_capture_key(key: &str) -> Result<()> {
+    // Split from the right: the tenant prefix may itself contain no `/` (it is
+    // a Postgres identifier), but splitting from the left would let a
+    // malformed key with an extra segment pass by shifting everything along
+    let mut parts = key.split('/');
+    let (Some(tenant), Some(capture), Some(aa), Some(bb), Some(file), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(BlobError::InvalidHash(key.to_owned()));
+    };
+
+    let stem = file
+        .strip_suffix(".zst")
+        .ok_or_else(|| BlobError::InvalidHash(key.to_owned()))?;
+
+    let ok = capture == CAPTURE_PREFIX
+        && aa.len() == 2
+        && bb.len() == 2
+        && validate_tenant(tenant).is_ok()
+        && validate_hash(stem).is_ok()
+        && stem.starts_with(aa)
+        && stem[2..4] == *bb;
+    if ok {
+        Ok(())
+    } else {
+        Err(BlobError::InvalidHash(key.to_owned()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +440,59 @@ mod tests {
             "the key layout is a contract shared by both backends; changing it makes every \
              storage_key already in the database point at the wrong place"
         );
+    }
+
+    #[test]
+    fn capture_key_layout_is_stable() {
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            capture_key(&tenant("public"), hash).unwrap(),
+            format!("public/capture/e3/b0/{hash}.zst"),
+            "the capture layout is what `capture_chunks.storage_key` already holds for every \
+             chunk uploaded so far; changing it makes those rows point at nothing"
+        );
+        assert!(
+            capture_key(&tenant("public"), hash).unwrap()
+                != storage_key(&tenant("public"), hash).unwrap(),
+            "capture chunks and media must not share a namespace: a media GC that deletes \
+             everything under blobs/ would otherwise take captured conversations with it"
+        );
+    }
+
+    #[test]
+    fn capture_keys_round_trip_through_the_validator() {
+        let hash = sha256_hex(b"a captured chunk");
+        let key = capture_key(&tenant("u_01abc"), &hash).unwrap();
+        assert!(
+            validate_capture_key(&key).is_ok(),
+            "a key this module produced was rejected by its own validator: {key}"
+        );
+    }
+
+    #[test]
+    fn capture_key_validation_rejects_traversal_and_mismatched_buckets() {
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for bad in [
+            // The bucket directories disagree with the hash they claim to
+            // bucket. Legal to write, and then unreachable by capture_key --
+            // the upload reports success and the reader finds nothing
+            format!("public/capture/00/00/{hash}.zst"),
+            // A traversal payload in the tenant segment
+            format!("../../etc/capture/e3/b0/{hash}.zst"),
+            // Missing the .zst suffix
+            format!("public/capture/e3/b0/{hash}"),
+            // An extra segment
+            format!("public/capture/e3/b0/extra/{hash}.zst"),
+            // The wrong namespace
+            format!("public/blobs/e3/b0/{hash}.zst"),
+            // A traversal payload in the hash position
+            "public/capture/e3/b0/../../../etc/passwd.zst".to_owned(),
+        ] {
+            assert!(
+                validate_capture_key(&bad).is_err(),
+                "this key should have been rejected: {bad}"
+            );
+        }
     }
 
     #[test]
