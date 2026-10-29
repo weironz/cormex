@@ -472,6 +472,7 @@ mod tests {
             "roo_code",
             "opencode",
             "goose",
+            "qwen_code",
             "chatgpt_export",
             "claude_export",
         ];

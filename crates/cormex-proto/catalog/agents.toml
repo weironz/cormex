@@ -270,3 +270,20 @@ import_only = true
   framing = "snapshot"
   session_id = { from = "stem" }
 
+[[agents]]
+id = "qwen_code"
+name = "Qwen Code"
+home = [
+  { env = "QWEN_HOME" },
+  { path = "~/.qwen" },
+]
+
+  # 上游 `QwenLM/qwen-code`（Apache-2.0）
+  # `packages/core/src/services/chatRecordingService.ts`：`~/.qwen/tmp/<project_id>/chats/<sessionId>.jsonl`，
+  # 一行一个 `ChatRecord`，append-only。记录是**树**（`parentUuid`），不是列表
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+

@@ -25,6 +25,7 @@ pub mod export;
 pub mod gemini;
 pub mod jsonl;
 pub mod parser;
+pub mod qwen;
 pub mod rows;
 
 pub use anonymize::{Anonymizer, RULES_VERSION, synthetic_text};
