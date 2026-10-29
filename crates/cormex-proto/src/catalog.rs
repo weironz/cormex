@@ -319,7 +319,16 @@ mod tests {
                  `cormex import` rather than by reading the disk, set `import_only = true`",
                 a.id
             );
-            assert!(!a.sources.is_empty(), "agent {:?} has no sources", a.id);
+            // An agent may legitimately have no sources yet: Cursor's hooks are
+            // installed and queue the transcript path, but its transcript
+            // format is undocumented, so registering a source without a parser
+            // would capture files that never project. `hooks.is_some()` is the
+            // other way an agent can be useful before it has a parser
+            assert!(
+                !a.sources.is_empty() || a.hooks.is_some(),
+                "agent {:?} has neither sources nor hooks, so it does nothing at all",
+                a.id
+            );
         }
     }
 

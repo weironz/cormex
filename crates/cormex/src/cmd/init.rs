@@ -62,6 +62,9 @@ fn installers(cfg: &Config, agents: &[String]) -> Vec<Box<dyn Installer>> {
     if wants("codex") {
         out.push(Box::new(Codex::discover()));
     }
+    if wants("cursor") {
+        out.push(Box::new(crate::install::cursor::Cursor::discover()));
+    }
     if wants("gemini_cli") {
         out.push(Box::new(crate::install::gemini::Gemini::discover()));
     }

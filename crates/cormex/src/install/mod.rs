@@ -16,6 +16,7 @@
 pub mod backup;
 pub mod claude_code;
 pub mod codex;
+pub mod cursor;
 pub mod gemini;
 pub mod mcp_register;
 pub mod retention;
