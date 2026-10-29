@@ -449,7 +449,18 @@ impl Parser for CopilotChatParser {
             applied += 1;
         }
 
-        if !saw_initial || applied == 0 {
+        // **The pre-1.109 flat format**: a whole `ISerializableChatData` object
+        // with no log entries at all. It is the initial state, so the replay is
+        // "one `kind: 0`" — which is what writing it through the same path
+        // means, and why there is no second parser for it
+        if !saw_initial
+            && let Ok(whole) = serde_json::from_slice::<Value>(trim_ascii(bytes))
+            && whole.get("requests").is_some()
+        {
+            self.state = whole;
+            applied = 1;
+        }
+        if applied == 0 {
             return Ok(vec![ParsedEvent::malformed(offset, len)]);
         }
         if self.emitted {
@@ -702,5 +713,35 @@ mod tests {
             "the replayed object did not survive the checkpoint"
         );
         assert_eq!(restored.state["requests"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// The pre-1.109 flat `.json` format parses too.
+    ///
+    /// It is a whole `ISerializableChatData` object with no log entries — the
+    /// initial state written as one document. The replay is "one `kind: 0`",
+    /// which is why there is no second parser for it.
+    #[test]
+    fn the_flat_json_format_parses() {
+        let whole = json!({
+            "version": 2,
+            "sessionId": "s1",
+            "requests": [{
+                "requestId": "r1",
+                "message": "flat format question",
+                "response": [{ "kind": "markdownContent", "content": { "value": "flat answer" } }]
+            }]
+        });
+        let events = parse(&whole.to_string());
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].kind, TranscriptKind::UserMessage);
+        assert_eq!(events[0].text, "flat format question");
+        assert_eq!(events[1].text, "flat answer");
+    }
+
+    /// Something that is neither a log nor a flat session is malformed.
+    #[test]
+    fn neither_shape_is_malformed() {
+        let events = parse(r#"{"not":"a session"}"#);
+        assert_eq!(events[0].kind, TranscriptKind::Unknown);
     }
 }
