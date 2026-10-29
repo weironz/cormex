@@ -21,6 +21,15 @@ use futures::stream::Stream;
 use tokio_stream::StreamExt as _;
 
 use crate::blobs::{DIRECT_UPLOAD_LIMIT, RangeSpec, parse_range};
+
+/// The body ceiling on `PUT /capture/generations/{id}/chunks/{offset}`.
+///
+/// A chunk is at most 4 MiB of **logical** bytes; the client may send it zstd
+/// compressed, so the wire body is smaller still. The headroom above
+/// `MAX_CHUNK_BYTES` covers a chunk that does not compress at all plus the
+/// frame header — and the handler enforces the logical ceiling itself, because
+/// this one cannot see through the compression.
+const MAX_CAPTURE_BODY: usize = cormex_proto::capture::MAX_CHUNK_BYTES + (64 << 10);
 use crate::dto::*;
 use crate::state::AppState;
 use cormex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
@@ -105,6 +114,23 @@ protected_routes! {
     // *meaning*, not on its path.
     "/devices" [GET, POST] => get(crate::devices_api::list).post(crate::devices_api::create),
     "/devices/{id}" [DELETE] => axum::routing::delete(crate::devices_api::revoke),
+    // ── Capture (D2 / D3 / D16 / D23) ──────────────────────
+    //
+    // What the `cormex` CLI sends. Every one of these requires a **device key**
+    // carrying `capture:write`; the handler checks that rather than the route
+    // allow-list, because the allow-list answers "may this credential reach this
+    // path" and the answer here is "only if it is a device key at all" — a user
+    // token is more privileged everywhere else but is not a capture client.
+    //
+    // The chunk ceiling is raised on the PUT only: a chunk is up to 4 MiB of
+    // logical bytes, and axum's 2 MiB default would reject it before the handler
+    // could say why.
+    "/capture/catalog" [GET] => get(crate::capture::get_catalog),
+    "/capture/files" [POST] => post(crate::capture::register_file),
+    "/capture/files/{id}/generations" [POST] => post(crate::capture::open_generation),
+    "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
+    "/capture/generations/{id}/chunks/{offset}" [PUT] => axum::routing::put(crate::capture::put_chunk)
+        .layer(DefaultBodyLimit::max(MAX_CAPTURE_BODY)),
     // Bring-your-own API key. Three actions on one path: read status / store /
     // withdraw
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)
@@ -1039,6 +1065,43 @@ impl ApiError {
     }
 
     /// 500: something went wrong on our side.
+    /// 404: the thing named in the path does not exist (or is not this
+    /// caller's — the two are reported identically, so that a probe cannot
+    /// enumerate what exists).
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            inner: cormex_core::CormexError::Invalid("not found".into()),
+            status: Some(StatusCode::NOT_FOUND),
+        }
+    }
+
+    /// 413: the body is larger than this endpoint accepts.
+    ///
+    /// Distinct from 400: the request is well-formed, and a client that chunks
+    /// smaller will succeed. Retrying the same body is pointless, which is what
+    /// the status code tells it.
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            inner: cormex_core::CormexError::Invalid("payload too large".into()),
+            status: Some(StatusCode::PAYLOAD_TOO_LARGE),
+        }
+    }
+
+    /// 422: the body parsed, but its contents are wrong.
+    ///
+    /// Used for the sha256 mismatch: the JSON/bytes are readable, the declared
+    /// hash simply does not describe them. 400 would suggest the request shape
+    /// was wrong, which sends the client looking in the wrong place.
+    pub fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            inner: cormex_core::CormexError::Invalid("unprocessable".into()),
+            status: Some(StatusCode::UNPROCESSABLE_ENTITY),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         cormex_core::CormexError::Store(message.into()).into()
     }

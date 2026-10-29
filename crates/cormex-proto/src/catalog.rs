@@ -51,7 +51,13 @@ pub struct Catalog {
     pub schema: u32,
     /// The data's own version, for "is the server's copy newer than mine".
     pub version: String,
-    #[serde(default, rename = "agent")]
+    /// The agents.
+    ///
+    /// `agents` in both the TOML and the JSON: the wire shape in the design is
+    /// `{"schema":1,"version":…,"agents":[…]}` (`GET /capture/catalog`), and
+    /// having the TOML spell it `[[agent]]` would mean two names for one thing —
+    /// with the JSON one silently wrong, since nothing deserialises it back.
+    #[serde(default)]
     pub agents: Vec<AgentEntry>,
 }
 
@@ -370,7 +376,7 @@ mod tests {
             "truncated TOML must be reported, not accepted"
         );
         assert!(
-            Catalog::parse("schema = 1\nversion = \"x\"\n[[agent]]\nid = 3").is_err(),
+            Catalog::parse("schema = 1\nversion = \"x\"\n[[agents]]\nid = 3").is_err(),
             "an agent id of the wrong type must be reported"
         );
     }

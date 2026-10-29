@@ -18,6 +18,28 @@ pub struct Config {
     /// This machine's identity, written on every row for auditing and sync
     /// provenance.
     pub device_id: String,
+    /// Capture settings. See [`CaptureConfig`].
+    pub capture: CaptureConfig,
+}
+
+/// The capture endpoints' settings.
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    /// A newer source catalog than the one compiled into the binary.
+    ///
+    /// `None` = use the built-in. A path that does not exist or does not parse
+    /// is an **error**, not a fallback: falling back would leave the operator
+    /// believing their update took effect, and the symptom would be "some files
+    /// stopped being found", which points at the catalog's contents rather than
+    /// at the file never having been read.
+    pub catalog_path: Option<String>,
+    /// The largest logical chunk the server accepts.
+    ///
+    /// Defaults to 4 MiB, matching the client's chunk size. Raising it is
+    /// legitimate for a host that writes very long lines; lowering it below the
+    /// client's chunk size makes every upload fail with a 413, which is why the
+    /// value is printed at startup.
+    pub max_chunk_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +133,43 @@ impl Config {
                 provider,
             },
             device_id: optional("CORMEX_DEVICE_ID", "dev-local"),
+            capture: CaptureConfig {
+                catalog_path: non_empty("CORMEX_CAPTURE_CATALOG"),
+                max_chunk_bytes: parse_max_chunk()?,
+            },
         })
     }
+}
+
+/// The default ceiling on a logical capture chunk: 4 MiB.
+///
+/// Lives here rather than in `cormex-proto` because the dependency direction is
+/// `cormex-core ← cormex-proto`, and the config layer must not reach upward.
+/// `cormex_proto::capture::MAX_CHUNK_BYTES` carries the same value for the wire
+/// side; `the_two_chunk_ceilings_agree` pins them together.
+pub const DEFAULT_CAPTURE_MAX_CHUNK: usize = 4 << 20;
+
+/// Parse `CORMEX_CAPTURE_MAX_CHUNK`.
+///
+/// A bad value **errors** rather than falling back to the default: the setting
+/// exists to match the client's chunk size, and silently using a different one
+/// turns every upload above the smaller of the two into a 413 that looks like a
+/// client bug.
+fn parse_max_chunk() -> Result<usize> {
+    let Some(raw) = non_empty("CORMEX_CAPTURE_MAX_CHUNK") else {
+        return Ok(DEFAULT_CAPTURE_MAX_CHUNK);
+    };
+    let n: usize = raw.trim().parse().map_err(|_| {
+        CormexError::Config(format!(
+            "CORMEX_CAPTURE_MAX_CHUNK is not a positive integer: {raw:?}"
+        ))
+    })?;
+    if n == 0 {
+        return Err(CormexError::Config(
+            "CORMEX_CAPTURE_MAX_CHUNK must not be 0: that refuses every chunk".into(),
+        ));
+    }
+    Ok(n)
 }
 
 fn default_model(provider: &str) -> &'static str {

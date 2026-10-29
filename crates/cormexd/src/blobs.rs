@@ -244,20 +244,13 @@ impl MediaStore {
     // key from it would put every tenant's captured conversations under user
     // #1's namespace, with no error.
     //
-    // `#[allow(dead_code)]` is scaffolding, not a permanent exemption: the
-    // callers are the `/capture/*` handlers, which land in P1-6. cortexd is a
-    // bin crate, so `pub` does not exempt anything here, and `-D warnings`
-    // would otherwise fail the build over four methods whose only callers are
-    // in the test target. Delete these four attributes when P1-6 wires the
-    // routes in; anything still reporting dead_code then genuinely has no
-    // caller.
-    //
-    // `#[expect]` was not used for the same reason as in `credentials.rs`:
-    // these are used inside `#[cfg(test)]`, so in the test target the
-    // expectation would be unfulfilled and `unfulfilled_lint_expectations`
-    // would fire instead.
+    // `get_keyed` / `exists_keyed` / `delete_keyed` have no caller yet: reading
+    // the raw bytes back is P2-5 (`/archive/raw`), and deletion is P6-2 (purge).
+    // They are kept here rather than deleted because the trait methods they
+    // forward to exist and are tested, and re-adding a two-line passthrough is
+    // pure friction. `put_keyed` is used by `put_capture_object` and needs no
+    // exemption.
 
-    #[allow(dead_code)]
     pub async fn put_keyed(&self, key: &str, bytes: axum::body::Bytes, mime: &str) -> Result<()> {
         Ok(self.store()?.put_keyed(key, bytes, mime).await?)
     }

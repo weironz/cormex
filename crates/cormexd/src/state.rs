@@ -418,6 +418,30 @@ impl AppState {
         Self::for_tests_with(Backend::Live(Arc::new(live)), rt, config)
     }
 
+    /// The same, with a **real** object store.
+    ///
+    /// The capture tests need one: `put_chunk` writes the object before the row,
+    /// and with `unavailable_for_tests` the very first upload fails with "object
+    /// storage unavailable" — which would make those tests assert nothing about
+    /// the ordering they exist to check.
+    #[cfg(test)]
+    pub fn for_tests_live_with_blobs(
+        live: crate::live::Live,
+        rt: Runtime,
+        config: Config,
+        blobs: crate::blobs::MediaStore,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                config,
+                backend: Backend::Live(Arc::new(live)),
+                bus: SyncBus::inert(),
+                blobs,
+                rt,
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn for_tests_with(backend: Backend, rt: Runtime, config: Config) -> Self {
         Self {
@@ -451,6 +475,10 @@ impl AppState {
                 base_url: None,
             },
             device_id: "test".into(),
+            capture: cormex_core::config::CaptureConfig {
+                catalog_path: None,
+                max_chunk_bytes: cormex_core::config::DEFAULT_CAPTURE_MAX_CHUNK,
+            },
         }
     }
 
@@ -626,7 +654,12 @@ impl AppState {
         }
     }
 
+    /// The capture settings.
     #[must_use]
+    pub fn capture_config(&self) -> &cormex_core::config::CaptureConfig {
+        &self.inner.config.capture
+    }
+
     pub fn blob_backend(&self) -> &'static str {
         self.inner.blobs.backend()
     }
@@ -839,6 +872,21 @@ impl AppState {
     /// The total length is the denominator of `Content-Range` — without it a
     /// 206 is impossible, and without a 206 a player can only pull the whole
     /// file from the start.
+    /// Store one captured chunk's bytes at an exact key (D16).
+    ///
+    /// Deliberately **not** tenant-parameterized the way the media methods are:
+    /// the key is complete, and it was built from the request's tenant. The
+    /// media path derives its key from `MediaStore::current_tenant()`, which is
+    /// hard-coded to `public` until multi-tenancy reaches object storage —
+    /// deriving a capture key from that would file every tenant's conversations
+    /// under user #1.
+    pub async fn put_capture_object(&self, key: &str, bytes: Bytes) -> Result<()> {
+        self.inner
+            .blobs
+            .put_keyed(key, bytes, "application/zstd")
+            .await
+    }
+
     pub async fn blob_meta(&self, tenant: &Tenant, hash: &str) -> Result<(String, i64)> {
         // Validate the shape before querying the database. Skipping it would not
         // be unsafe (the storage layer stops it anyway), but a malformed hash

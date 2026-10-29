@@ -72,8 +72,46 @@ pub(crate) fn database_url() -> Option<String> {
     std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())
 }
 
-/// Build a live state on `url`, with the accounts system attached.
+/// A live state backed by a **temporary local object store**.
+///
+/// The capture tests need real bytes to land somewhere: `put_chunk` writes the
+/// object before the row, and with the "unavailable" store the first upload
+/// fails before any of the ordering it exists to check can be observed.
+pub(crate) async fn live_state_with_blobs(
+    url: &str,
+) -> (
+    crate::state::AppState,
+    crate::state::Runtime,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let local = cormex_blob::LocalFsBlobStore::new(
+        dir.path(),
+        cormex_blob::TenantPrefix::new("public").expect("a legal tenant prefix"),
+    )
+    .await
+    .expect("the local backend should come up");
+    let blobs = crate::blobs::MediaStore::with_backend(std::sync::Arc::new(local));
+
+    let (config, rt, live) = build_live(url).await;
+    let st = crate::state::AppState::for_tests_live_with_blobs(live, rt.clone(), config, blobs);
+    (st, rt, dir)
+}
+
 pub(crate) async fn live_state(url: &str) -> (crate::state::AppState, crate::state::Runtime) {
+    let (config, rt, live) = build_live(url).await;
+    let st = crate::state::AppState::for_tests_live(live, rt.clone(), config);
+    (st, rt)
+}
+
+/// The pieces every live test state is built from.
+async fn build_live(
+    url: &str,
+) -> (
+    cormex_core::config::Config,
+    crate::state::Runtime,
+    crate::live::Live,
+) {
     let config = cormex_core::config::Config {
         database_url: url.to_owned(),
         bind: "127.0.0.1:0".into(),
@@ -93,6 +131,10 @@ pub(crate) async fn live_state(url: &str) -> (crate::state::AppState, crate::sta
             base_url: Some("http://127.0.0.1:1".into()),
         },
         device_id: "principal-test".into(),
+        capture: cormex_core::config::CaptureConfig {
+            catalog_path: None,
+            max_chunk_bytes: cormex_core::config::DEFAULT_CAPTURE_MAX_CHUNK,
+        },
     };
 
     // The hash embedder: no model download, no network. Retrieval quality is
@@ -119,8 +161,41 @@ pub(crate) async fn live_state(url: &str) -> (crate::state::AppState, crate::sta
         access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
         delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
     };
-    let st = crate::state::AppState::for_tests_live(live, rt.clone(), config);
-    (st, rt)
+    (config, rt, live)
+}
+
+/// Send a request with **raw bytes** and extra headers.
+///
+/// The capture endpoints take a byte body with metadata in headers, so the JSON
+/// helper cannot express them. Returns the status and the raw response body.
+pub(crate) async fn call_bytes(
+    app: &axum::Router,
+    method: Method,
+    path: &str,
+    bearer: &str,
+    headers: &[(&str, String)],
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let req = req
+        .body(Body::from(body))
+        .expect("building the request must not fail");
+    let resp = app
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("the router's error type is Infallible");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("the response body should be readable");
+    (status, bytes.to_vec())
 }
 
 pub(crate) async fn call(

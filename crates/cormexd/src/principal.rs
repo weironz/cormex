@@ -79,12 +79,11 @@ impl Principal {
     /// A full user credential (and the legacy operator token) has **every**
     /// scope: scopes exist to narrow a machine's key, not to narrow a person.
     ///
-    /// Used by the archive and MCP handlers (P2-5 / P3-4), which have to answer
-    /// "may this caller see the raw bytes" per call rather than per route. Those
-    /// callers do not exist yet, so this is allowed as scaffolding rather than
-    /// deleted — deleting it would mean writing it again in P2-5, and unlike a
-    /// dead route it cannot go stale in the meantime.
-    #[allow(dead_code)]
+    /// The capture handlers ask it per call (`capture::capture_caller`), because
+    /// "may this credential reach `/capture/*`" and "may it capture at all" are
+    /// two different questions — a device key can reach the route and still lack
+    /// `capture:write`. The archive and MCP handlers will ask the same question
+    /// for `raw:read` in P2-5 / P3-4.
     pub fn has_scope(&self, scope: crate::device_keys::Scope) -> bool {
         match self {
             Self::LegacyOwner | Self::User { .. } => true,

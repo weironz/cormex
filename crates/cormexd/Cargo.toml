@@ -14,6 +14,11 @@ cormex-memory.workspace = true
 # with the container orchestration. This process starts no containers, unpacks no tars and
 # initiates no HTTP of its own (requests on the LLM side are sent by goose's provider layer).
 bytes = "1"
+# zstd on the capture path: the client may send a compressed chunk, and the R layer stores
+# every chunk compressed whatever the client sent (JSONL compresses ~3.5x, and the archive is
+# written once and read many times). Already in the dependency tree through cortex-blob's S3
+# transport? No -- declared explicitly here, and the version matches the CLI's.
+zstd = "0.14"
 cormex-llm.workspace = true
 cormex-store.workspace = true
 # **There is no `cormex-agent` here, and it must not be added back.**

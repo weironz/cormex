@@ -13,7 +13,7 @@
 schema = 1
 version = "2026-11-01"
 
-[[agent]]
+[[agents]]
 id = "claude_code"
 name = "Claude Code"
 home = [
@@ -22,7 +22,7 @@ home = [
 ]
 
   # 主 transcript。Claude Code 一个项目一个目录，目录名是 cwd 把 `/` 换成 `-`
-  [[agent.source]]
+  [[agents.source]]
   role = "transcript"
   glob = "projects/*/*.jsonl"
   framing = "append"
@@ -30,7 +30,7 @@ home = [
   cwd = { from = "parent_dir", decode = "claude_project_dir" }
 
   # 子 agent 的 transcript：projects/<项目>/<父会话>/subagents/<子会话>.jsonl
-  [[agent.source]]
+  [[agents.source]]
   role = "subagent"
   glob = "projects/*/*/subagents/*.jsonl"
   framing = "append"
@@ -38,29 +38,29 @@ home = [
   parent_session_id = { from = "path_segment", index = 2 }
 
   # 溢出的工具输出。归属父会话；用正向下标，因为 `**` 的深度不定
-  [[agent.source]]
+  [[agents.source]]
   role = "sidecar"
   glob = "projects/*/*/tool-results/**"
   framing = "snapshot"
   session_id = { from = "path_segment", index = 2 }
 
   # 每个项目一个 memory 伪会话。`prefix` 拼在前面，避免伪会话 id 与真实会话 id 撞车
-  [[agent.source]]
+  [[agents.source]]
   role = "memory"
   glob = "projects/*/memory/**"
   framing = "snapshot"
   session_id = { from = "path_segment", index = 1, prefix = "memory:" }
 
-  [agent.hooks]
+  [agents.hooks]
   kind = "claude_code_settings"
   events = ["Stop", "SubagentStop", "PreCompact", "SessionEnd"]
 
-  [agent.retention]
+  [agents.retention]
   setting = "cleanupPeriodDays"
   file = "settings.json"
   default_days = 30
 
-[[agent]]
+[[agents]]
 id = "codex"
 name = "Codex CLI"
 home = [
@@ -70,7 +70,7 @@ home = [
 
   # rollout 文件。`also_compressed` 说同名 `.jsonl.zst` 是**同一个逻辑文件**：
   # 采集端只保留一个（明文优先），逻辑路径一律是明文名
-  [[agent.source]]
+  [[agents.source]]
   role = "transcript"
   glob = "{sessions,archived_sessions}/**/rollout-*.jsonl"
   framing = "append"
@@ -79,12 +79,12 @@ home = [
 
   # 全局记忆。每台机器各一份，所以 `per_device`：不拼的话两台机器的记忆会被
   # 合并成一个会话，而它们的内容并不相同
-  [[agent.source]]
+  [[agents.source]]
   role = "memory"
   glob = "memories/{raw_memories.md,rollout_summaries/**}"
   framing = "snapshot"
   session_id = { from = "const", value = "memory", per_device = true }
 
-  [agent.hooks]
+  [agents.hooks]
   kind = "codex_hooks_json"
   events = ["Stop", "PreCompact", "SessionEnd"]

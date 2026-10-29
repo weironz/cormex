@@ -269,6 +269,22 @@ mod tests {
         }
     }
 
+    /// The wire ceiling and the config default are the same number.
+    ///
+    /// They live in two crates (`cormex-proto` for the wire, `cormex-core` for
+    /// the config, because the dependency direction is core ← proto). Two copies
+    /// of one number drift, and the drift is silent: a server configured from
+    /// the config default would accept a chunk the wire type says is too large,
+    /// or reject one it says is fine.
+    #[test]
+    fn the_two_chunk_ceilings_agree() {
+        assert_eq!(
+            MAX_CHUNK_BYTES,
+            cormex_core::config::DEFAULT_CAPTURE_MAX_CHUNK,
+            "the wire ceiling and the config default disagree"
+        );
+    }
+
     /// The header names are lowercase, as HTTP/2 requires and as axum's header
     /// map normalises to. A constant spelled `X-Content-SHA256` would still work
     /// for lookups (the map is case-insensitive) but would read wrong at every

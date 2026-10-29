@@ -9,6 +9,7 @@ mod auth;
 mod backfill;
 mod blobs;
 mod byo_key;
+mod capture;
 mod cors;
 mod credentials;
 mod cursor;
@@ -158,6 +159,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("{}", rt.auth.status_line());
     tracing::info!("{}", cors.status_line());
+    // The capture settings, stated at startup. `max_chunk_bytes` in particular:
+    // if it is below the client's chunk size, every upload above it is a 413
+    // that reads like a client bug, and the only place the two numbers can be
+    // compared is here
+    tracing::info!(
+        max_chunk_bytes = config.capture.max_chunk_bytes,
+        catalog = config.capture.catalog_path.as_deref().unwrap_or("built-in"),
+        "capture: /capture/* accepts device keys carrying capture:write"
+    );
     // This used to print `cormex_agent::status_line()` (whether landlock /
     // seccomp were in place). That line describes the capabilities of an
     // **execution** environment, and this process no longer executes anything —

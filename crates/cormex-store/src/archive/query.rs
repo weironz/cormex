@@ -32,6 +32,34 @@ impl Store {
         Ok(row)
     }
 
+    /// One capture file by its id.
+    ///
+    /// Used by the capture API to answer "does this file belong to the device
+    /// asking" before it writes anything into it.
+    pub async fn capture_file_by_id(&self, file_id: &str) -> Result<Option<CaptureFile>> {
+        let row = sqlx::query_as::<_, CaptureFile>(
+            "SELECT id, session_id, device_id, agent, logical_path, role, framing,
+                    cwd, project_key, first_seen_at
+               FROM capture_files WHERE id = $1",
+        )
+        .bind(file_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// One generation by its id.
+    pub async fn generation_by_id(&self, generation_id: &str) -> Result<Option<Generation>> {
+        let row = sqlx::query_as::<_, Generation>(
+            "SELECT id, file_id, ordinal, reason, created_at
+               FROM capture_generations WHERE id = $1",
+        )
+        .bind(generation_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// The newest generation of a file, and how far it currently extends.
     ///
     /// `None` means the file has no generation at all, which the registration
