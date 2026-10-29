@@ -426,4 +426,55 @@ mod tests {
             "an agent id of the wrong type must be reported"
         );
     }
+
+    /// Every agent in the built-in catalog has a parser for its conversation
+    /// roles.
+    ///
+    /// The failure this catches is the one that has no symptom: a catalog entry
+    /// whose agent id does not match any parser means the files are captured,
+    /// stored, and **never projected** — the archive fills up and every session
+    /// reads as empty.
+    #[test]
+    fn every_catalogued_agent_has_a_parser() {
+        // The parser crate depends on this one, so the check lives here as a
+        // list rather than a call: adding an agent to `agents.toml` without
+        // adding it here is exactly the omission this test exists to catch
+        const PARSED: &[&str] = &["claude_code", "codex", "gemini_cli"];
+        for agent in &Catalog::builtin().agents {
+            let conversation_roles = agent
+                .sources
+                .iter()
+                .any(|s| matches!(s.role, crate::capture::FileRole::Transcript));
+            if !conversation_roles {
+                continue;
+            }
+            assert!(
+                PARSED.contains(&agent.id.as_str()),
+                "the catalog captures {} but no parser handles it, so its sessions would be \
+                 stored and never projected. Add a parser, or add the id to PARSED here if one \
+                 already exists",
+                agent.id
+            );
+        }
+    }
+
+    /// The SQLite sources all name a database, not a pattern.
+    ///
+    /// A `glob` with a wildcard in a SQLite source would be read as a literal
+    /// path, and the failure is "the database does not exist" for every run.
+    #[test]
+    fn a_sqlite_source_names_one_database() {
+        for agent in &Catalog::builtin().agents {
+            for source in &agent.sources {
+                if source.sqlite.is_some() {
+                    assert!(
+                        !source.glob.contains('*') && !source.glob.contains('?'),
+                        "agent {} has a SQLite source whose glob is a pattern: {}",
+                        agent.id,
+                        source.glob
+                    );
+                }
+            }
+        }
+    }
 }

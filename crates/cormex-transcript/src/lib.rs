@@ -20,6 +20,7 @@
 pub mod anonymize;
 pub mod claude_code;
 pub mod codex;
+pub mod gemini;
 pub mod jsonl;
 pub mod parser;
 

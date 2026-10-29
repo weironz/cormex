@@ -80,6 +80,23 @@ pub fn merge(settings: &mut Value, command: &str) -> bool {
 /// such event.
 #[must_use]
 pub fn merge_events(settings: &mut Value, command: &str, events: &[&str]) -> bool {
+    // Claude Code's timeout is in **seconds**
+    merge_events_with_timeout(settings, command, events, 5)
+}
+
+/// The same merge, with the timeout supplied.
+///
+/// Split out because the timeout's **unit differs per host**: Claude Code and
+/// Codex take seconds, Gemini CLI takes milliseconds. Reusing the 5-second
+/// constant for Gemini would set a 5 **millisecond** timeout, and the hook
+/// would be killed before it could start — with the host reporting a warning
+/// rather than an error.
+pub fn merge_events_with_timeout(
+    settings: &mut Value,
+    command: &str,
+    events: &[&str],
+    timeout: u64,
+) -> bool {
     let root = settings
         .as_object_mut()
         .expect("the caller checks that settings is an object");
@@ -112,9 +129,9 @@ pub fn merge_events(settings: &mut Value, command: &str, events: &[&str]) -> boo
             "hooks": [{
                 "type": "command",
                 "command": command,
-                // 5 seconds: the hook itself returns in ~50 ms, and the
-                // timeout is the host's backstop for a hung binary
-                "timeout": 5
+                // The hook itself returns in ~50 ms; the timeout is the
+                // host's backstop for a hung binary
+                "timeout": timeout
             }]
         }));
         changed = true;

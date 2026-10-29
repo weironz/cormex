@@ -88,3 +88,43 @@ home = [
   [agents.hooks]
   kind = "codex_hooks_json"
   events = ["Stop", "PreCompact", "SessionEnd"]
+
+[[agents]]
+id = "gemini_cli"
+name = "Gemini CLI"
+home = [
+  { env = "GEMINI_CLI_HOME" },
+  { path = "~/.gemini" },
+]
+
+  # `~/.gemini/tmp/<project hash>/chats/session-<timestamp>-<short id>.jsonl`.
+  # 上游 `packages/core/src/services/chatRecordingService.ts`：文件名是
+  # `session-` + `YYYY-MM-DDTHH-MM` + `-` + 会话 id 前 8 位，撞名时插一个序号。
+  # 会话 id 只在前 8 位里，所以 `stem_regex` 取不到完整 id —— 用整个 stem 当
+  # 会话 id：它唯一、稳定，而且跨设备一致（同一台机器上同一个文件）
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/session-*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+
+  # 子 agent 的会话：`tmp/<project hash>/chats/<父会话 id>/<子会话 id>.jsonl`
+  # （上游注释：`subagents are nested under the complete parent session id`）
+  [[agents.source]]
+  role = "subagent"
+  glob = "tmp/*/chats/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 3 }
+
+  # 旧版本的 `.json` 是整个会话对象，走 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/session-*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+  [agents.hooks]
+  kind = "gemini_settings"
+  events = ["AfterAgent", "SessionEnd"]
+

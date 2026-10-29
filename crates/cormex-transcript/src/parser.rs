@@ -126,6 +126,9 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
             Some(Box::new(crate::claude_code::ClaudeCodeParser::new()))
         }
         ("codex", FileRole::Transcript) => Some(Box::new(crate::codex::CodexParser::new())),
+        ("gemini_cli", FileRole::Transcript | FileRole::Subagent) => {
+            Some(Box::new(crate::gemini::GeminiParser::new()))
+        }
         _ => None,
     }
 }
@@ -140,6 +143,8 @@ mod tests {
         assert!(parser_for("claude_code", FileRole::Transcript).is_some());
         assert!(parser_for("claude_code", FileRole::Subagent).is_some());
         assert!(parser_for("codex", FileRole::Transcript).is_some());
+        assert!(parser_for("gemini_cli", FileRole::Transcript).is_some());
+        assert!(parser_for("gemini_cli", FileRole::Subagent).is_some());
     }
 
     /// A role with no parser is `None`, not a panic.
