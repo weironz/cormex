@@ -69,4 +69,18 @@ pub struct WhoAmI {
     /// glance: "is what I am looking at actually my own database" is a question
     /// people really do ask out loud in a multi-tenant system.
     pub schema_name: String,
+    /// Which device key is asking, when the caller is a device key.
+    ///
+    /// `None` for a user token or the legacy pre-shared token.
+    ///
+    /// # Why this is here rather than only in `GET /devices`
+    ///
+    /// A device key cannot list the other devices — that would tell a
+    /// compromised machine which others exist. But `cormex logout` runs on the
+    /// machine holding the key, and it needs **its own** id to revoke itself.
+    /// Without this field it would have to either list devices (denied) or
+    /// revoke blindly (wrong). "Who am I" is the right question to answer it
+    /// with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
