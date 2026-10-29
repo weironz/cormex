@@ -287,3 +287,31 @@ home = [
   framing = "append"
   session_id = { from = "stem" }
 
+[[agents]]
+id = "copilot_chat"
+name = "VS Code Copilot Chat"
+# VS Code 的 workspaceStorage：每个工作区一个目录，里面是 chatSessions/
+home = [
+  { env = "VSCODE_WORKSPACE_STORAGE" },
+  { path = "~/.config/Code/User/workspaceStorage" },
+  { path = "~/Library/Application Support/Code/User/workspaceStorage" },
+  { path = "~/.vscode-server/data/User/workspaceStorage" },
+]
+
+  # 上游 `microsoft/vscode`（MIT）`chatSessionStore.ts`：1.109 起是
+  # `<sessionId>.jsonl` 的**对象变更日志**（`objectMutationLog.ts`）：
+  # kind 0 初始快照、1 设值、2 数组追加（`i` 表示先截断）、3 删除。
+  # 解析器要先重放成会话对象才能出事件
+  [[agents.source]]
+  role = "transcript"
+  glob = "*/chatSessions/*.jsonl"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+  # 1.109 之前的扁平 JSON。整份重写，同样 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "*/chatSessions/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+

@@ -473,6 +473,7 @@ mod tests {
             "opencode",
             "goose",
             "qwen_code",
+            "copilot_chat",
             "chatgpt_export",
             "claude_export",
         ];

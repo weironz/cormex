@@ -21,6 +21,7 @@ pub mod anonymize;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;
+pub mod copilot_chat;
 pub mod export;
 pub mod gemini;
 pub mod jsonl;

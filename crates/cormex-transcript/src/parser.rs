@@ -140,6 +140,11 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("goose", FileRole::Row) => Some(Box::new(crate::rows::RowParser::new(
             crate::rows::RowFormat::Goose,
         ))),
+        // VS Code Copilot Chat (P4-3): a mutation log, replayed before it can
+        // be projected
+        ("copilot_chat", FileRole::Transcript) => {
+            Some(Box::new(crate::copilot_chat::CopilotChatParser::new()))
+        }
         // Qwen Code (P4-6). Same family as Gemini CLI, different record shape
         ("qwen_code", FileRole::Transcript) => Some(Box::new(crate::qwen::QwenParser::new())),
         // Export files (P4-7). The client splits `conversations.json` into one
