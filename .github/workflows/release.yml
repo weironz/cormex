@@ -202,6 +202,177 @@ jobs:
             || { echo "::error::the migration directories are missing from the image"; exit 1; }
 
   # ══════════════════════════════════════════════════════════
+  #  The capture CLI -- one static binary per platform
+  #
+  #  A separate job from the images because it shares nothing with them: a
+  #  different target set, a different toolchain (musl for Linux, so the binary
+  #  runs on any distribution regardless of its glibc), and a failure here says
+  #  nothing about the server.
+  #
+  #  ★ **`--locked` is mandatory.** `Cargo.lock` is what makes the released
+  #    binary reproducible; without it a dependency that floated between the tag
+  #    and the build would be compiled in silently.
+  #
+  #  ★ **The Linux targets are musl, built with `cargo-zigbuild`.** A glibc
+  #    binary built on `ubuntu-latest` refuses to start on an older
+  #    distribution with `GLIBC_2.xx not found` -- and that is the failure a
+  #    user meets on the first run, with no way to tell it from "the binary is
+  #    corrupt".
+  # ══════════════════════════════════════════════════════════
+  cli:
+    name: CLI ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the others: a Windows-only
+      # breakage should still ship the Linux binaries
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            zigbuild: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            zigbuild: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            zigbuild: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            zigbuild: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            zigbuild: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --locked -p cormex --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p cormex --target ${{ matrix.target }}
+          fi
+
+      # The binary has to answer `--version` **on the platform it was built
+      # for**. For the two cross-compiled targets that cannot be checked here
+      # (no emulator), so the check runs on the four native ones and the cross
+      # ones are covered by the installers' smoke test on a real machine.
+      - name: Smoke test
+        if: ${{ !matrix.zigbuild }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          bin="target/${{ matrix.target }}/release/cormex"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out=$("$bin" --version)
+          echo "$out"
+          echo "$out" | grep -qF "$v" \
+            || { echo "::error::the version in the binary is not $v"; exit 1; }
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          name="cormex-$v-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          bin="target/${{ matrix.target }}/release/cormex"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          cp "$bin" "dist/$name/"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            # `zip` is on every GitHub runner; `7z` is not
+            (command -v zip >/dev/null && zip -qr "$name.zip" "$name") \
+              || powershell -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════
+  #  Publishing the CLI -- checksums, the Release, and npm
+  #
+  #  Its own job, `needs: cli`, because the checksums cover **all** the
+  #  artefacts: computing them per matrix entry would produce six files that
+  #  each list one binary.
+  # ══════════════════════════════════════════════════════════
+  cli-release:
+    name: Publish the CLI
+    needs: [preflight, cli]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cli-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          # The tag already exists (it is what triggered this run); this only
+          # attaches the files to it
+          fail_on_unmatched_files: true
+
+      # npm is **optional**: without `NPM_TOKEN` the step is skipped and the
+      # release still succeeds. A missing secret must not turn "the binaries
+      # shipped" into "the release failed" -- the npm package is a convenience,
+      # and `install.sh` is the primary path.
+      - name: Publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          cd npm
+          node ./publish.mjs "${{ needs.preflight.outputs.version }}" ../dist
+
+  # ══════════════════════════════════════════════════════════
   #  The web image -- the memory browser, static files behind nginx
   #
   #  It is a separate job, not a second step of the one above, for one reason: it shares

@@ -115,6 +115,51 @@ hostname appears.
 That relative-prefix detail is the difference between an image anyone can pull
 and an image whose first job is to be rebuilt.
 
+## Capture your agent sessions
+
+A small CLI reads the session files your AI agents already write to disk and
+sends them, byte for byte, to your Cormex server. It never modifies them and
+never parses what it reads — parsing happens on the server, so twenty hosts'
+worth of format churn is maintained in one place rather than in every installed
+binary.
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.ps1 | iex
+```
+
+Then:
+
+```bash
+cormex login --server https://memory.example.com   # asks for your account password
+cormex init                                        # hooks, scheduler, backfill
+```
+
+`cormex init` shows every change before making it: hooks in the agent's own
+settings file, a periodic sync, and a raised `cleanupPeriodDays` (the host
+deletes old sessions, and a capture client cannot recover what is already gone).
+`cormex uninstall` restores each file from a backup — byte for byte, not
+"removes what it thinks it added".
+
+### What it reads, and what it does not
+
+| | |
+|---|---|
+| **Reads** | the agent's own directories: `~/.claude/projects`, `~/.codex/sessions`, and so on |
+| **Does not read** | your project directories, your source code, anything outside those homes |
+| **The one exception** | `git remote get-url origin` and `git rev-parse HEAD` in a session's working directory, for the project filter. Turn it off with `git_metadata = false` |
+
+The device key is scoped: `capture:write` by default, plus `session:read` and
+`memory:read`. `raw:read` — the original, unmasked bytes — has to be asked for
+explicitly, so a lost laptop does not hand over every conversation.
+
+`cormex doctor` answers "why is this machine not capturing": server
+reachability, credential storage, queue backlog, last successful run, whether
+the hooks are still in place.
+
 ## Status
 
 This code runs in production as the memory layer of a private agent product.
