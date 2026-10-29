@@ -12,7 +12,7 @@
 //! already there — and then "A's database does not contain B's row" is measured
 //! against somebody else's data.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -24,14 +24,14 @@ use tower::ServiceExt as _;
 /// in `public` by design, so the test would write into whatever memory is
 /// already there, and the assertion "A's database does not contain B's row"
 /// would be measured against somebody else's data.
-pub(crate) struct FreshDb {
-    pub(crate) url: String,
+pub struct FreshDb {
+    pub url: String,
     admin: sqlx::PgPool,
     name: String,
 }
 
 impl FreshDb {
-    pub(crate) async fn create(base_url: &str) -> Self {
+    pub async fn create(base_url: &str) -> Self {
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(base_url)
@@ -41,7 +41,12 @@ impl FreshDb {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("the clock should not predate 1970")
             .as_millis();
-        let name = format!("cormex_principal_{}_{}", std::process::id(), millis);
+        // A counter as well as the clock: two tests in the same process can
+        // start in the same millisecond, and `CREATE DATABASE` then collides on
+        // the name
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("cormex_principal_{}_{}_{seq}", std::process::id(), millis);
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
             .execute(&admin)
             .await
@@ -56,7 +61,7 @@ impl FreshDb {
         }
     }
 
-    pub(crate) async fn drop(self) {
+    pub async fn drop(self) {
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
             self.name
@@ -67,9 +72,16 @@ impl FreshDb {
     }
 }
 
-pub(crate) fn database_url() -> Option<String> {
+pub fn database_url() -> Option<String> {
     let _ = dotenvy::dotenv();
     std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())
+}
+
+/// Build a live state on `url`, with the accounts system attached.
+pub async fn live_state(url: &str) -> (crate::state::AppState, crate::state::Runtime) {
+    let (config, rt, live) = build_live(url).await;
+    let st = crate::state::AppState::for_tests_live(live, rt.clone(), config);
+    (st, rt)
 }
 
 /// A live state backed by a **temporary local object store**.
@@ -77,7 +89,7 @@ pub(crate) fn database_url() -> Option<String> {
 /// The capture tests need real bytes to land somewhere: `put_chunk` writes the
 /// object before the row, and with the "unavailable" store the first upload
 /// fails before any of the ordering it exists to check can be observed.
-pub(crate) async fn live_state_with_blobs(
+pub async fn live_state_with_blobs(
     url: &str,
 ) -> (
     crate::state::AppState,
@@ -96,12 +108,6 @@ pub(crate) async fn live_state_with_blobs(
     let (config, rt, live) = build_live(url).await;
     let st = crate::state::AppState::for_tests_live_with_blobs(live, rt.clone(), config, blobs);
     (st, rt, dir)
-}
-
-pub(crate) async fn live_state(url: &str) -> (crate::state::AppState, crate::state::Runtime) {
-    let (config, rt, live) = build_live(url).await;
-    let st = crate::state::AppState::for_tests_live(live, rt.clone(), config);
-    (st, rt)
 }
 
 /// The pieces every live test state is built from.
@@ -168,7 +174,7 @@ async fn build_live(
 ///
 /// The capture endpoints take a byte body with metadata in headers, so the JSON
 /// helper cannot express them. Returns the status and the raw response body.
-pub(crate) async fn call_bytes(
+pub async fn call_bytes(
     app: &axum::Router,
     method: Method,
     path: &str,
@@ -198,7 +204,7 @@ pub(crate) async fn call_bytes(
     (status, bytes.to_vec())
 }
 
-pub(crate) async fn call(
+pub async fn call(
     app: &axum::Router,
     method: Method,
     path: &str,

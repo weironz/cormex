@@ -1,0 +1,28 @@
+[package]
+name = "e2e-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "End-to-end tests for the capture path: CLI sync engine against a real server"
+
+[dependencies]
+
+[dev-dependencies]
+cormex = { workspace = true }
+cormexd = { workspace = true, features = ["test-support"] }
+cormex-core.workspace = true
+cormex-proto.workspace = true
+cormex-store.workspace = true
+cormex-blob.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tempfile = "3"
+sha2 = "0.10"
+zstd = "0.14"
+reqwest.workspace = true
+sqlx.workspace = true

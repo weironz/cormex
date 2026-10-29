@@ -166,8 +166,8 @@ impl MediaStore {
     /// endpoints report an explicit error, which conveniently turns "a test
     /// accidentally reached real blob logic" into a loud failure rather than a
     /// quietly successful illusion.
-    #[cfg(test)]
-    pub(crate) const fn unavailable_for_tests() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn unavailable_for_tests() -> Self {
         Self {
             inner: None,
             backend: "unavailable",
@@ -176,8 +176,8 @@ impl MediaStore {
 
     /// A store backed by whatever the caller hands over, for tests that need
     /// real bytes without a network round trip.
-    #[cfg(test)]
-    pub(crate) fn with_backend(store: std::sync::Arc<dyn cormex_blob::BlobStore>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_backend(store: std::sync::Arc<dyn cormex_blob::BlobStore>) -> Self {
         Self {
             inner: Some(store),
             backend: "test",

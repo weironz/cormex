@@ -400,7 +400,7 @@ impl AppState {
     /// The contract is identical to the mock backend's (`Backend::Mock`), so
     /// what the tests hit is still the **real** [`crate::routes::router`] and the
     /// real handlers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(rt: Runtime) -> Self {
         Self::for_tests_with(Backend::Mock, rt, Self::test_config())
     }
@@ -413,18 +413,14 @@ impl AppState {
     /// the test database for the rest of the binary's lifetime. The tests that
     /// need this (tenant isolation by principal) want the request path, not the
     /// background jobs.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests_live(live: crate::live::Live, rt: Runtime, config: Config) -> Self {
         Self::for_tests_with(Backend::Live(Arc::new(live)), rt, config)
     }
 
-    /// The same, with a **real** object store.
-    ///
-    /// The capture tests need one: `put_chunk` writes the object before the row,
-    /// and with `unavailable_for_tests` the very first upload fails with "object
     /// storage unavailable" — which would make those tests assert nothing about
     /// the ordering they exist to check.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests_live_with_blobs(
         live: crate::live::Live,
         rt: Runtime,
@@ -442,7 +438,7 @@ impl AppState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn for_tests_with(backend: Backend, rt: Runtime, config: Config) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -456,7 +452,7 @@ impl AppState {
     }
 
     /// A `Config` that reaches nothing.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_config() -> Config {
         Config {
             database_url: "postgres://tests-never-connect".into(),

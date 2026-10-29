@@ -335,7 +335,7 @@ impl AccessBook {
     /// `issue` is private (issuing goes through the full login flow), but the
     /// authentication middleware's invariant needs a real token that the book
     /// recognises — hand-rolling a hex string would test nothing at all.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn issue_for_test(&self, user_id: &str, ttl: std::time::Duration) -> String {
         self.issue(user_id, ttl)
     }

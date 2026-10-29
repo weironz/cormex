@@ -7,6 +7,27 @@ license.workspace = true
 repository.workspace = true
 description = "The Cormex daemon: the memory engine and the sync service"
 
+# A lib **and** a bin. The lib exists so the end-to-end capture test (P1-12) can
+# stand the real router up in-process; the bin is the process entry point and
+# nothing else.
+[lib]
+name = "cormexd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cormexd"
+path = "src/main.rs"
+
+[features]
+# Exposes the test scaffolding (`test_support`) to another crate's tests.
+#
+# `#[cfg(test)]` does not do this: it compiles the module only for **this**
+# crate's own test target, so `crates/e2e-capture` cannot see it. A feature is
+# the only mechanism cargo offers for "this module exists when somebody else
+# asks for it", and it is off by default so a release build never carries
+# "create a database, migrate it, drop it".
+test-support = ["dep:tower", "dep:tempfile"]
+
 [dependencies]
 cormex-core.workspace = true
 cormex-memory.workspace = true
@@ -53,6 +74,10 @@ tokio-stream = { workspace = true, features = ["time"] }
 futures.workspace = true
 axum.workspace = true
 tower-http.workspace = true
+# Optional: `test_support` (exposed through the `test-support` feature) needs
+# both, and a release build must not carry them
+tower = { version = "0.5", features = ["util"], optional = true }
+tempfile = { version = "3", optional = true }
 
 serde.workspace = true
 serde_json.workspace = true

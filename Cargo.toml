@@ -10,6 +10,7 @@ members = [
     "crates/cormex-import",
     "crates/cormexd",
     "crates/cormex",
+    "crates/e2e-capture",
     "evals",
 ]
 
@@ -32,6 +33,7 @@ cormex-store = { path = "crates/cormex-store" }
 cormex-memory = { path = "crates/cormex-memory" }
 cormex-proto = { path = "crates/cormex-proto", default-features = false }
 cormex = { path = "crates/cormex" }
+cormexd = { path = "crates/cormexd" }
 cormex-blob = { path = "crates/cormex-blob" }
 
 # Provider layer: lifted from goose (Apache-2.0).

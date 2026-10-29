@@ -4,45 +4,9 @@
 //! and multi-device sync. CLI / desktop / mobile / web are all HTTP + WebSocket
 //! clients of this process — every one of them speaks the same protocol.
 
-mod accounts;
-mod auth;
-mod backfill;
-mod blobs;
-mod byo_key;
-mod capture;
-mod cors;
-mod credentials;
-mod cursor;
-mod delegated_token;
-mod device_keys;
-mod devices_api;
-mod import;
-mod live;
-/// Memory's outward-facing MCP frontage. See that module's header comment.
-mod mcp;
-mod principal;
-mod quota;
-mod reembed;
-mod request_tenant;
-mod routes;
-mod snapshots;
-mod state;
-mod sync_notify;
-mod sync_payload;
-#[cfg(test)]
-mod test_support;
-mod ws;
-
-// The wire protocol lives in `cormex-proto`, because the agent side has to
-// speak the **same** protocol (see that crate's module comment). Re-exporting
-// it here as `crate::dto` keeps every existing call site untouched while
-// confining "the protocol is not cormexd's private property" to this one line.
-//
-// `confirm` is no longer re-exported: that ledger moved to `cormex-local`.
-// cormexd does not run an agent, so it has no confirmation loop. A re-export
-// that resolves to no call site at all would only make the next person believe
-// a copy still lives here.
-pub use cormex_proto::dto;
+// The modules live in `lib.rs`, so that the end-to-end test can reach the
+// router. `main` is the process entry point and nothing else.
+use cormexd::{auth, cors, credentials, device_keys, routes, state};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -125,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("the accounts system is attached (cormex_auth)");
             // Device keys live in `cormex_auth`, so they exist exactly when the
             // accounts database does
-            rt.device_keys = Some(std::sync::Arc::new(crate::device_keys::DeviceKeys::new(
+            rt.device_keys = Some(std::sync::Arc::new(device_keys::DeviceKeys::new(
                 accounts.pool.clone(),
             )));
             rt.accounts = Some(accounts);
@@ -159,15 +123,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("{}", rt.auth.status_line());
     tracing::info!("{}", cors.status_line());
-    // The capture settings, stated at startup. `max_chunk_bytes` in particular:
-    // if it is below the client's chunk size, every upload above it is a 413
-    // that reads like a client bug, and the only place the two numbers can be
-    // compared is here
-    tracing::info!(
-        max_chunk_bytes = config.capture.max_chunk_bytes,
-        catalog = config.capture.catalog_path.as_deref().unwrap_or("built-in"),
-        "capture: /capture/* accepts device keys carrying capture:write"
-    );
     // This used to print `cormex_agent::status_line()` (whether landlock /
     // seccomp were in place). That line describes the capabilities of an
     // **execution** environment, and this process no longer executes anything —
