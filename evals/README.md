@@ -181,6 +181,44 @@ appear nowhere in the conversation is exactly what D4's two indexes exist to sep
 `the_archive_only_questions_are_really_archive_only` asserts that property rather than
 assuming it.
 
+## LongMemEval-S retrieval recall (P7-3)
+
+```bash
+# The dataset is 277 MB and MIT-licensed but not ours; it is not in this repo.
+curl -L -o longmemeval_s_cleaned.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+
+cargo run -p cormex-evals -- run --target longmemeval \
+  --dataset longmemeval_s_cleaned.json --json lme.json --md lme.md
+```
+
+**What this measures, stated plainly: retrieval recall (R@k), not
+question-answering accuracy.** For each question, its haystack is loaded into a
+fresh schema, the question is used as a search query, and the top-k sessions are
+checked for the one the dataset says holds the answer.
+
+That number is **not comparable** to the QA accuracies other systems publish for
+LongMemEval, and the report prints that warning above its own table. A system
+can score 96% recall and 60% QA accuracy on the same data; the survey in
+`docs/research/` records exactly how the two get conflated in public
+comparisons, and the rule this project took from it is: say which one, never put
+them in one table.
+
+One schema per question, because each question carries its **own** haystack: a
+shared schema would let question A's answer session be retrieved for question B.
+
+### Two things the dataset does that the loader has to handle
+
+- **Duplicate session ids.** A handful of questions list the same
+  `haystack_session_ids` entry twice, with identical content at two dates. The
+  archive's unique key is `(agent, native_session_id)`, so the second
+  registration returns the same session and its events collide. The loader keeps
+  the first — the content is identical, so retrieval cannot differ.
+- **Non-string fields.** Some `answer` values are numbers and some turn
+  `content` values are lists of parts. Both are read as `Value` and flattened;
+  deserializing them as strings fails on a 277 MB file with a line number and no
+  hint that one question is the problem.
+
 ## Question set format
 
 The question set is a single JSON file (`suites/cormex-zh-en-v1.json`).

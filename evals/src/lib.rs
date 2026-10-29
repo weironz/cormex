@@ -32,6 +32,7 @@
 //! - [`report`] the report (why both JSON and text are needed)
 
 pub mod harness;
+pub mod longmemeval;
 pub mod matcher;
 pub mod metrics;
 pub mod report;

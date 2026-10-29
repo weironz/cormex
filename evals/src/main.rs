@@ -96,6 +96,17 @@ struct RunArgs {
     #[arg(long)]
     keep_schema: bool,
 
+    /// `--target longmemeval` only: the dataset file.
+    ///
+    /// Not in the repository: 277 MB, MIT-licensed but not ours. Get it from
+    /// `xiaowu0162/longmemeval-cleaned` on Hugging Face.
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+
+    /// `--target longmemeval` only: which k values to score.
+    #[arg(long, value_delimiter = ',', default_value = "1,5,10")]
+    ks: Vec<usize>,
+
     /// `--target sessions` only: also build conversation vectors and fuse the
     /// vector leg with BM25 (P5-6). Off matches the production default; on is
     /// the A/B that decides whether the leg is worth its cost.
@@ -191,6 +202,8 @@ struct RunArgs {
 enum Target {
     Memory,
     Sessions,
+    /// LongMemEval-S retrieval recall (P7-3).
+    Longmemeval,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -292,6 +305,9 @@ async fn real_main() -> Result<ExitCode> {
 async fn run_command(args: RunArgs) -> Result<ExitCode> {
     if args.target == Target::Sessions {
         return run_sessions(args).await;
+    }
+    if args.target == Target::Longmemeval {
+        return run_longmemeval(args).await;
     }
     let suite = Suite::load(&args.suite)?;
 
@@ -456,6 +472,67 @@ async fn run_sessions(args: RunArgs) -> Result<ExitCode> {
             eprintln!(
                 "regression gate failed: session accuracy = {actual:.3}, below the {min:.3} \
                  threshold"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The LongMemEval-S target (P7-3).
+///
+/// Its own function for the same reason as `run_sessions`: the three targets
+/// share no suite type, no report type and no gate metric.
+async fn run_longmemeval(args: RunArgs) -> Result<ExitCode> {
+    let Some(path) = args.dataset.clone() else {
+        anyhow::bail!(
+            "--target longmemeval needs --dataset <longmemeval_s_cleaned.json>. The file is \
+             277 MB and not in this repository; get it from \
+             https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned"
+        );
+    };
+    let questions = cormex_evals::longmemeval::load(&path)?;
+    if questions.is_empty() {
+        anyhow::bail!("{} holds no questions", path.display());
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("DATABASE_URL is not set. The search is SQL, and what you measure without                   Postgres is not this search system")?;
+
+    let report = cormex_evals::longmemeval::run(
+        &database_url,
+        &path.display().to_string(),
+        &questions,
+        &args.ks,
+    )
+    .await?;
+
+    let text = report.render();
+    println!("{text}");
+    if let Some(path) = &args.md {
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    if let Some(path) = &args.json {
+        let json =
+            serde_json::to_string_pretty(&report).context("the report could not be serialized")?;
+        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+
+    // **The gate is R@k, and the flag is named for what it measures.** Reusing
+    // `--min-recall5` would be a lie in the other two targets' direction; a
+    // separate name keeps the two numbers apart even in a shell history
+    if let Some(min) = args.min_recall5 {
+        let actual = report
+            .recall
+            .iter()
+            .find(|(k, _)| *k == 5)
+            .map_or(0.0, |(_, r)| *r);
+        if actual < min {
+            eprintln!(
+                "regression gate failed: LongMemEval-S R@5 = {actual:.3}, below the {min:.3} \
+                 threshold (this is retrieval recall, not QA accuracy)"
             );
             return Ok(ExitCode::FAILURE);
         }
