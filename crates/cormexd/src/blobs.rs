@@ -174,6 +174,16 @@ impl MediaStore {
         }
     }
 
+    /// A store backed by whatever the caller hands over, for tests that need
+    /// real bytes without a network round trip.
+    #[cfg(test)]
+    pub(crate) fn with_backend(store: std::sync::Arc<dyn cormex_blob::BlobStore>) -> Self {
+        Self {
+            inner: Some(store),
+            backend: "test",
+        }
+    }
+
     /// The backend identifier reported to `/health`. Seeing `local_fs` in a
     /// production log is itself an alert.
     #[must_use]
@@ -223,6 +233,48 @@ impl MediaStore {
 
     pub async fn exists(&self, hash: &str) -> Result<bool> {
         Ok(self.store()?.exists(hash).await?)
+    }
+
+    // ── Keyed access for captured session chunks (D16) ─────────
+    //
+    // Pure passthrough: the key is complete (`hash::capture_key` built it from
+    // the **request's** tenant), and the backend must not prepend anything.
+    // `MediaStore::current_tenant()` is hard-coded to `public` because
+    // multi-tenancy has not reached object storage yet; deriving the capture
+    // key from it would put every tenant's captured conversations under user
+    // #1's namespace, with no error.
+    //
+    // `#[allow(dead_code)]` is scaffolding, not a permanent exemption: the
+    // callers are the `/capture/*` handlers, which land in P1-6. cortexd is a
+    // bin crate, so `pub` does not exempt anything here, and `-D warnings`
+    // would otherwise fail the build over four methods whose only callers are
+    // in the test target. Delete these four attributes when P1-6 wires the
+    // routes in; anything still reporting dead_code then genuinely has no
+    // caller.
+    //
+    // `#[expect]` was not used for the same reason as in `credentials.rs`:
+    // these are used inside `#[cfg(test)]`, so in the test target the
+    // expectation would be unfulfilled and `unfulfilled_lint_expectations`
+    // would fire instead.
+
+    #[allow(dead_code)]
+    pub async fn put_keyed(&self, key: &str, bytes: axum::body::Bytes, mime: &str) -> Result<()> {
+        Ok(self.store()?.put_keyed(key, bytes, mime).await?)
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_keyed(&self, key: &str) -> Result<axum::body::Bytes> {
+        Ok(self.store()?.get_keyed(key).await?)
+    }
+
+    #[allow(dead_code)]
+    pub async fn exists_keyed(&self, key: &str) -> Result<bool> {
+        Ok(self.store()?.exists_keyed(key).await?)
+    }
+
+    #[allow(dead_code)]
+    pub async fn delete_keyed(&self, key: &str) -> Result<()> {
+        Ok(self.store()?.delete_keyed(key).await?)
     }
 
     pub async fn presign_put(&self, hash: &str) -> Result<String> {
@@ -346,6 +398,93 @@ pub fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyed path round-trips against the local backend, and **the key is
+    /// used verbatim**.
+    ///
+    /// The second half is the point. `MediaStore` is built with the `public`
+    /// tenant prefix (that is what `current_tenant()` returns until
+    /// multi-tenancy reaches object storage), so a backend that prepended its
+    /// own prefix would write this chunk under `public/` — and a tenant `u_…`
+    /// reading its own capture data would find nothing, with the upload having
+    /// reported success.
+    #[tokio::test]
+    async fn keyed_access_uses_the_key_verbatim_and_round_trips() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let local = cormex_blob::LocalFsBlobStore::new(
+            dir.path(),
+            cormex_blob::TenantPrefix::new("public").expect("a legal tenant prefix"),
+        )
+        .await
+        .expect("the local backend should come up");
+        let store = MediaStore::with_backend(std::sync::Arc::new(local));
+
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let tenant = cormex_blob::TenantPrefix::new("u_01abc").expect("a legal tenant prefix");
+        let key = cormex_blob::hash::capture_key(&tenant, hash).expect("a legal capture key");
+
+        let body = axum::body::Bytes::from_static(b"a captured chunk");
+        store
+            .put_keyed(&key, body.clone(), "application/zstd")
+            .await
+            .expect("the write should succeed");
+
+        assert!(
+            store.exists_keyed(&key).await.expect("exists should work"),
+            "the object was written at {key} and is not there"
+        );
+        assert_eq!(
+            store
+                .get_keyed(&key)
+                .await
+                .expect("the read should succeed"),
+            body,
+            "the bytes that came back are not the bytes that went in"
+        );
+
+        // Verbatim: the object is at `<root>/u_01abc/capture/...`, not under
+        // the store's own `public/` prefix
+        assert!(
+            dir.path().join(&key).exists(),
+            "the object is not at the key it was given; the backend prepended its own tenant              prefix, which would put every tenant's capture data under user #1's namespace"
+        );
+
+        store
+            .delete_keyed(&key)
+            .await
+            .expect("the delete should work");
+        assert!(
+            !store.exists_keyed(&key).await.expect("exists should work"),
+            "the object is still there after delete"
+        );
+        // Idempotent, like `delete`
+        store
+            .delete_keyed(&key)
+            .await
+            .expect("deleting a missing object must succeed");
+    }
+
+    #[tokio::test]
+    async fn keyed_access_refuses_a_traversal_key() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let local = cormex_blob::LocalFsBlobStore::new(
+            dir.path(),
+            cormex_blob::TenantPrefix::new("public").expect("a legal tenant prefix"),
+        )
+        .await
+        .expect("the local backend should come up");
+        let store = MediaStore::with_backend(std::sync::Arc::new(local));
+
+        for bad in [
+            "../../etc/passwd",
+            "public/capture/00/00/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.zst",
+        ] {
+            assert!(
+                store.get_keyed(bad).await.is_err(),
+                "a malformed key was accepted: {bad}"
+            );
+        }
+    }
 
     #[test]
     fn absent_or_unparsable_range_means_the_whole_object() {

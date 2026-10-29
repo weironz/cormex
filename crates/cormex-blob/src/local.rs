@@ -165,6 +165,68 @@ impl BlobStore for LocalFsBlobStore {
         })
     }
 
+    async fn put_keyed(&self, key: &str, bytes: Bytes, _mime: &str) -> Result<()> {
+        // The key is used verbatim (see the trait's comment). It is validated
+        // here because this is the only place that turns it into a filesystem
+        // path -- `root.join(key)` with a `..` in it escapes root silently
+        hash::validate_capture_key(key)?;
+        let path = self.root.join(key);
+        let dir = path
+            .parent()
+            .expect("validate_capture_key guarantees at least two levels of prefix directory");
+        tokio::fs::create_dir_all(dir).await?;
+
+        // Temp file + rename, for the same reason as `put`: a half-written
+        // object seen by a reader is corrupt data that vouches for itself
+        // The temp name has to be unique per writer: two concurrent writers of
+        // the same key would otherwise share one temp file and interleave their
+        // bytes. The process id separates processes, the counter separates
+        // tasks within one
+        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".tmp-{}-{seq}", std::process::id()));
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(&bytes).await?;
+            f.flush().await?;
+        }
+        match tokio::fs::rename(&tmp, &path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                if tokio::fs::metadata(&path).await.is_err() {
+                    return Err(BlobError::Io(e));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn get_keyed(&self, key: &str) -> Result<Bytes> {
+        hash::validate_capture_key(key)?;
+        let path = self.root.join(key);
+        match tokio::fs::read(&path).await {
+            Ok(v) => Ok(Bytes::from(v)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(BlobError::NotFound(key.to_owned())),
+            Err(e) => Err(BlobError::Io(e)),
+        }
+    }
+
+    async fn exists_keyed(&self, key: &str) -> Result<bool> {
+        hash::validate_capture_key(key)?;
+        Ok(tokio::fs::metadata(self.root.join(key)).await.is_ok())
+    }
+
+    async fn delete_keyed(&self, key: &str) -> Result<()> {
+        hash::validate_capture_key(key)?;
+        let path = self.root.join(key);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(BlobError::Io(e)),
+        }
+    }
+
     async fn get(&self, hash: &str) -> Result<Bytes> {
         let path = self.path_of(hash)?;
         match tokio::fs::read(&path).await {

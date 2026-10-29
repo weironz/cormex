@@ -148,6 +148,50 @@ pub trait BlobStore: Send + Sync {
     /// Whether the object exists.
     async fn exists(&self, hash: &str) -> Result<bool>;
 
+    // ── Keyed access: the caller supplies the whole key ─────────
+    //
+    // Everything above derives the key from a content hash, which is right for
+    // media: the tenant prefix is welded into the store at construction and the
+    // hash is the only variable.
+    //
+    // Capture chunks cannot use that path. Their key is
+    // `<tenant>/capture/ab/cd/<hash>.zst` where the tenant is **the tenant of
+    // the request**, not the one the store was built with — and
+    // `MediaStore::current_tenant()` currently hard-codes `public` because
+    // multi-tenancy has not reached object storage yet. Deriving the key inside
+    // the backend would therefore write every tenant's captured conversations
+    // into user #1's namespace: no error, and the data is there, just under the
+    // wrong tenant.
+    //
+    // So these four take the **complete** key and the implementation must not
+    // prepend anything. `hash::capture_key` builds it; `hash::validate_capture_key`
+    // is the fence against traversal, and every implementation has to run it.
+
+    /// Write bytes at an exact key.
+    ///
+    /// # Errors
+    /// [`BlobError::InvalidHash`] when the key is not a well-formed capture key.
+    async fn put_keyed(&self, key: &str, bytes: Bytes, mime: &str) -> Result<()>;
+
+    /// Read the bytes at an exact key.
+    ///
+    /// # Errors
+    /// [`BlobError::InvalidHash`] when the key is malformed, or the backend's
+    /// own error when the object is missing.
+    async fn get_keyed(&self, key: &str) -> Result<Bytes>;
+
+    /// Whether an object exists at an exact key.
+    ///
+    /// # Errors
+    /// [`BlobError::InvalidHash`] when the key is malformed.
+    async fn exists_keyed(&self, key: &str) -> Result<bool>;
+
+    /// Delete the object at an exact key. Idempotent, like [`Self::delete`].
+    ///
+    /// # Errors
+    /// [`BlobError::InvalidHash`] when the key is malformed.
+    async fn delete_keyed(&self, key: &str) -> Result<()>;
+
     /// Delete the object. **For purge only** (`docs/memory.md` §11).
     ///
     /// # The caller's obligations

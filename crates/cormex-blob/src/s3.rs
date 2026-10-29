@@ -538,6 +538,71 @@ impl BlobStore for S3BlobStore {
         }
     }
 
+    async fn put_keyed(&self, key: &str, bytes: Bytes, mime: &str) -> Result<()> {
+        // The key is used **verbatim**: prepending `self.tenant` here would
+        // put every tenant's capture chunks under the store's construction-time
+        // prefix (see the trait's comment)
+        hash::validate_capture_key(key)?;
+        if bytes.len() >= MULTIPART_THRESHOLD {
+            self.put_multipart(key, &bytes, mime).await?;
+        } else {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type(mime)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await
+                .map_err(|e| backend_err("PutObject", e))?;
+        }
+        Ok(())
+    }
+
+    async fn get_keyed(&self, key: &str) -> Result<Bytes> {
+        hash::validate_capture_key(key)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| map_get_err(key, e))?;
+        collect(out.body).await
+    }
+
+    async fn exists_keyed(&self, key: &str) -> Result<bool> {
+        hash::validate_capture_key(key)?;
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+                Ok(false)
+            }
+            Err(e) if is_no_such_bucket(&e) => Ok(false),
+            Err(e) => Err(backend_err("HeadObject", e)),
+        }
+    }
+
+    async fn delete_keyed(&self, key: &str) -> Result<()> {
+        hash::validate_capture_key(key)?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| backend_err("DeleteObject", e))?;
+        Ok(())
+    }
+
     async fn delete(&self, hash: &str) -> Result<()> {
         let key = self.key_of(hash)?;
         // S3's DeleteObject returns 204 even for a key that does not exist, so
