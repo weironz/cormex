@@ -14,7 +14,9 @@
 2. 设计文档 §0–§1（一页纸 + 决定表）
 3. 你领到的任务卡；卡里「依赖」列出的卡必须已经合并
 
-### 0.2 一张卡 = 一个分支 = 一个 PR
+### 0.2 一张卡 = 一个分支 = 一个 PR（人工逐张分派时）
+
+> **一次性自主执行全部开发时，改用 §12 的规则**（一个集成分支、一卡一提交、每阶段一个 PR）。
 
 - 分支名 `feat/<卡号小写>-<短名>`，例如 `feat/p1-3-archive-txn`
 - 只做卡片范围内的事。发现范围外的问题：写进 PR 描述的「顺带发现」一节，**不要顺手改**
@@ -634,15 +636,22 @@
 
 ---
 
-## 10. 所有者需要提供的东西
+## 10. 开工前的决定（2026-10-29 已全部拍板）
 
-| 什么 | 给谁用 | 什么时候 | 备注 |
-|---|---|---|---|
-| ~~真实会话样本~~ | — | — | **不需要**：执行者用 P2-0 的工具扫描所在机器自动取样并脱敏（2026-10-29 决定）。所有者愿意的话，之后在自己的机器上跑一次同一个工具，把 `synthetic` 夹具换成真实来源的 |
-| ~~容量测量~~ | — | — | **不需要手工做**：`cormex detect`（P1-8）会报每个 agent 的会话数和字节数，`cormex init`（P1-11）在回填前给出估算 |
-| 是否有多用户部署 | P0-2 的紧急程度 | 尽快 | 「多用户」= Cormex 服务端里有两个及以上账号。只影响 P0-2 要不要当作紧急安全修复先做；无论答案如何，P0-2 都要做（P1-1 依赖它） |
-| `NPM_TOKEN`（可选） | P6-5 | 阶段 6 | 没有就跳过 npm 分发 |
-| 晋升策略的默认值确认（默认：用户消息 + 每轮最后一条 agent 消息） | P5-4 | 阶段 5 前 | |
+所有者把剩下的问题交给设计方决定，结论如下。执行者**不必再询问**。
+
+| # | 问题 | 决定 |
+|---|---|---|
+| O1 | 真实会话样本从哪来 | 执行者用 P2-0 的工具扫描所在机器自动取样并做结构保持匿名化；本机没装的 agent 按上游开源类型手写，标 `synthetic` |
+| O2 | 容量 | 不人工测量；`cormex detect` / `cormex init` 自动报告和估算；规划按压缩 3 倍算（设计 §9.4） |
+| O3 | 是否多用户部署 | **按「是」处理**：P0-2 是整个计划的**第一张卡**，当作安全修复。查不到部署情况时，按最坏情况处理是对的 |
+| O4 | `NPM_TOKEN` | 现在没有。P6-5 照样实现，发布步骤在没有 token 时跳过并在日志里说明 |
+| O5 | 晋升策略默认值 | 确认默认「每个用户消息 + 每轮最后一条 agent 消息；工具输出不晋升」；做成配置 `CORMEX_PROMOTE_POLICY = user_and_final（默认）\| user_only \| off` |
+| O6 | 对话轮向量（P5-6） | 实现，但默认关闭（`CORMEX_SESSION_VECTORS=off`）；P7-2 的评测证明有提升才在文档里建议打开 |
+| O7 | `restore` 是否改写会话里的旧 cwd | 不改写；`claude --resume` 的实际表现记进验收记录（§12.6） |
+| O8 | Cortex 仓库里那份 `injection.rs`（P3-3） | 执行者对 `weironz/cortex` 开一个独立分支和 PR，只改 `injection.rs`，**不合并**；拿不到写权限就把补丁放到 `docs/plan/patches/cortex-injection-session.patch` |
+| O9 | 平台相关的安装器（launchd / schtasks / systemd） | P1-13 在 CI 里加 `macos-latest`、`windows-latest` 两个 job 跑 `cargo test -p cormex`；本地只能测 Linux 的部分 |
+| O10 | CLI 发布流水线怎么验证 | P1-13 让 `cli` 矩阵在 PR 上也构建（只构建、不发布）；真正发布只在打 tag 时，**tag 只由所有者打** |
 
 ## 11. 交接提示词模板
 
@@ -661,3 +670,86 @@
 并单列「顺带发现」和「与设计不一致之处」。不要修改设计文档里已拍板的决定（D1–D23）；
 认为需要改的，在 PR 里写明证据和建议。
 ```
+
+---
+
+## 12. 一次性自主执行全部开发的规则
+
+所有者要求一个 agent 设定目标、一次性完成 P0-1 … P7-3。下面的规则**覆盖** §0.2（其余 §0 照旧有效）。
+
+### 12.1 环境准备（每个新会话开始时检查一遍）
+
+云端开发环境的实测（2026-10-29）：有 Rust 工具链、Postgres 16 和 `psql`、Docker CLI（**没有** Docker daemon）、Node（可以 `npm install -g` 装 Codex / Gemini CLI，但没有它们的登录凭据）、`claude` CLI；**没有** pgvector、`just`、`sqlx-cli`、Flutter。
+
+```bash
+# 1. pgvector：优先用包，不行就从源码编
+sudo apt-get update && sudo apt-get install -y postgresql-16-pgvector \
+  || { sudo apt-get install -y postgresql-server-dev-16 build-essential git && \
+       git clone --depth 1 --branch v0.8.7 https://github.com/pgvector/pgvector /tmp/pgvector && \
+       make -C /tmp/pgvector && sudo make -C /tmp/pgvector install; }
+
+# 2. 起库、建用户和测试库
+sudo pg_ctlcluster 16 main start
+sudo -u postgres psql -c "CREATE USER cormex WITH SUPERUSER PASSWORD 'cormex';"
+sudo -u postgres psql -c "CREATE DATABASE cormex_test OWNER cormex;"
+export DATABASE_URL=postgres://cormex:cormex@127.0.0.1:5432/cormex_test
+
+# 3. 工具
+cargo install just --locked
+cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
+
+# 4. 迁移（与 CI 的顺序和 search_path 完全一致）
+psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
+sqlx migrate run --source migrations
+sqlx migrate run --source migrations-global \
+  --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth%2Cpublic"
+```
+
+- **这套步骤 2026-10-29 在云端环境实测过**：Ubuntu 24.04 的 `postgresql-16-pgvector` 包是 0.6.0，现有全部 migration（含 HNSW + `vector_cosine_ops`）按 CI 的顺序在 Postgres 16 上都能跑通。CI 和生产用的是 `pgvector/pgvector:pg17`（更新的 pgvector）；如果某张卡用到 0.6 没有的特性（`halfvec`、`sparsevec`、二值量化），改走上面的源码编译分支
+- `just test-db` 依赖 `docker compose`，在没有 daemon 的环境里不能用；改为直接运行 `cargo test --workspace --locked -- --include-ignored`（`DATABASE_URL` 已设置）。**要在输出里看到带数据库的测试真的跑了**，而不是全部 `ignored`
+- Flutter：尝试装 CI 用的版本（`3.44.1`，见 `.github/workflows/ci.yml`）；装不上就依赖 CI 的 `app` job，并在验收记录里注明
+- RustFS：本地测试用对象存储的本地文件后端；需要 RustFS 的 `#[ignore]` 测试若因没有 RustFS 而跳过，在验收记录里注明
+
+### 12.2 分支、提交、PR、合并
+
+- 每个阶段一个分支：`feat/session-archive-p<阶段号>`，从**最新的 `main`** 切出
+- **一张卡一个提交**（卡内需要拆分时可以多个，但不跨卡）。提交信息第一行 `feat(<卡号>): <中文短句>`，正文写清改了什么、为什么、怎么验证；结尾带你所在环境要求的署名行
+- 每完成一张卡：跑完 §0.3 的检查 → 提交 → `git push` → 更新 `docs/plan/progress.md`（同一个提交里，或紧跟着的一个 `docs(progress)` 提交）
+- 一个阶段的全部卡完成后：开一个 PR（标题「会话档案 阶段 N：<目标>」，正文列出本阶段的卡和验收情况，链接 `progress.md` 与 `verification-log.md`）→ 等 CI 全绿 → **用 merge commit 合并到 `main`**（不 squash，保留一卡一提交）→ 下一阶段从新的 `main` 切分支
+- CI 红了：先修再前进，**不许**跳过、禁用、`#[ignore]` 测试来变绿；确认是与本改动无关的既有失败时，在 PR 里写明证据再合并
+- **绝不**：打 tag、发 Release、改部署文件里的生产配置、连接任何生产节点、force-push `main`
+
+### 12.3 执行顺序（已按依赖排好，照着走）
+
+```
+阶段 0：P0-2 → P0-1 → P0-4 → P0-3 → P0-5
+阶段 1：P1-2 → P1-4 → P1-5 → P1-3 → P1-1 → P1-6 → P1-7 → P1-8 → P1-9 → P1-10 → P1-11 → P1-12 → P1-13
+阶段 2：P2-3 → P2-0 → P2-1 → P2-2 → P2-4 → P2-5 → P2-7 → P2-6
+阶段 3：P3-1 → P3-2 → P3-3 → P3-4 → P3-5 → P3-6 → P3-7
+阶段 4：P4-0 → P4-1 → P4-2 → P4-3 → P4-4 → P4-5 → P4-6 → P4-7
+阶段 5：P5-1 → P5-2 → P5-3 → P5-4 → P5-5 → P5-6
+阶段 6：P6-1 → P6-2 → P6-3 → P6-4 → P6-5
+阶段 7：P7-1 → P7-2 → P7-3
+```
+
+### 12.4 卡住了怎么办
+
+- **外部条件缺失**（没有某个凭据、某个宿主装不上、某个网站访问不到）：在 `progress.md` 把这张卡标 `blocked` 并写明缺什么，**跳到下一张不依赖它的卡**继续；阶段结束时在 PR 里汇总
+- **设计与现实冲突**（上游格式和设计假设不符、某个决定实现不了）：选一个最小的、可回退的偏离，在 `progress.md` 的「偏离设计」一栏写清证据和做法，同时**在同一个提交里更新设计文档**对应段落（设计文档是权威，不能让代码和文档分家）。D1–D23 的**原则**不得推翻
+- **不确定某个改动是否越界**：按 CLAUDE.md 和设计 §12 的约束对照表判断；仍不确定就选更保守的做法并记录
+
+### 12.5 进度文件 `docs/plan/progress.md`
+
+每张卡一行：状态（`todo` / `doing` / `done` / `blocked`）、提交、备注。会话被压缩或重启后，**先读这个文件**，从第一张不是 `done` 的卡继续。
+
+### 12.6 验收记录 `docs/plan/verification-log.md`
+
+卡片里写着「手动验证」「PR 里贴步骤」的验收项，能自动化的写成测试；不能自动化的（比如 `claude --resume` 的真实行为、Claude Code 连上 `/mcp`、三平台安装）在这个文件里逐条记录：做了什么、结果、或者「待所有者验证」以及验证步骤。
+
+### 12.7 完成的定义
+
+- `progress.md` 里所有卡都是 `done`，或是 `blocked` 且原因属于 §12.4 的「外部条件缺失」
+- 每个阶段的 PR 都已合并进 `main`，`main` 上 CI 全绿
+- `docs/roadmap.md` 的 F 节更新为实际完成情况；`README.md` 有采集、浏览、MCP 接入的英文说明
+- 最后在 `docs/plan/progress.md` 末尾写一段总结：完成了什么、`blocked` 了什么、偏离了设计的哪些地方、所有者还需要做的事（按优先级排）
+
