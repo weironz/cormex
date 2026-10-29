@@ -393,6 +393,7 @@ mod tests {
             name: "Claude Code".into(),
             home: Vec::new(),
             sources: Vec::new(),
+            import_only: false,
             hooks: None,
             retention: None,
         }
@@ -540,6 +541,7 @@ mod tests {
                     busy_timeout_ms: 1000,
                 }),
             }],
+            import_only: false,
             hooks: None,
             retention: None,
         };
@@ -594,6 +596,7 @@ mod tests {
                         busy_timeout_ms: 1000,
                     }),
                 }],
+                import_only: false,
                 hooks: None,
                 retention: None,
             }],
@@ -646,6 +649,7 @@ mod tests {
                     busy_timeout_ms: 1000,
                 }),
             }],
+            import_only: false,
             hooks: None,
             retention: None,
         };

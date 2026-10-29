@@ -77,6 +77,18 @@ pub struct AgentEntry {
     pub hooks: Option<HookSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionSpec>,
+    /// This agent has **no home to discover**: its files are produced by
+    /// `cormex import`, not read off the disk (P4-7).
+    ///
+    /// Without the flag, "no home" and "a home that was forgotten" look the
+    /// same, and the catalog test that catches the latter would have to be
+    /// weakened to accept both.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub import_only: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One candidate home directory.
@@ -302,8 +314,9 @@ mod tests {
                 a.id
             );
             assert!(
-                !a.home.is_empty(),
-                "agent {:?} has no home; discovery would find nothing",
+                a.import_only || !a.home.is_empty(),
+                "agent {:?} has no home; discovery would find nothing. If it is fed by \
+                 `cormex import` rather than by reading the disk, set `import_only = true`",
                 a.id
             );
             assert!(!a.sources.is_empty(), "agent {:?} has no sources", a.id);
@@ -459,6 +472,8 @@ mod tests {
             "roo_code",
             "opencode",
             "goose",
+            "chatgpt_export",
+            "claude_export",
         ];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent

@@ -140,6 +140,14 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("goose", FileRole::Row) => Some(Box::new(crate::rows::RowParser::new(
             crate::rows::RowFormat::Goose,
         ))),
+        // Export files (P4-7). The client splits `conversations.json` into one
+        // file per conversation before uploading, so one file is one session
+        ("chatgpt_export", FileRole::Transcript) => Some(Box::new(
+            crate::export::ExportParser::new(crate::export::ExportPlatform::ChatGpt),
+        )),
+        ("claude_export", FileRole::Transcript) => Some(Box::new(
+            crate::export::ExportParser::new(crate::export::ExportPlatform::Claude),
+        )),
         _ => None,
     }
 }

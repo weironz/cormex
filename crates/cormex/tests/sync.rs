@@ -34,6 +34,7 @@ fn catalog(home: &std::path::Path) -> cormex_proto::catalog::Catalog {
                 cwd: None,
                 sqlite: None,
             }],
+            import_only: false,
             hooks: None,
             retention: None,
         }],

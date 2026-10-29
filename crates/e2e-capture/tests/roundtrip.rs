@@ -51,6 +51,7 @@ fn catalog(home: &std::path::Path) -> Catalog {
                 cwd: None,
                 sqlite: None,
             }],
+            import_only: false,
             hooks: None,
             retention: None,
         }],

@@ -245,3 +245,28 @@ home = [
      ORDER BY session_id, created_timestamp, id
   """
 
+# 导出文件（P4-7）。**不是**从某个 agent 的 home 里发现的：用户显式 `cormex import`
+# 一个导出，客户端把 `conversations.json` 拆成每个会话一个文件再上传。所以这里
+# 没有 `home`，也没有 glob 会让 `discover` 找到它们 —— 它们是导入器的产物
+[[agents]]
+id = "chatgpt_export"
+name = "ChatGPT export"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "claude_export"
+name = "Claude export"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+

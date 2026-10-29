@@ -10,6 +10,11 @@ description = "Server-side parsers: logical bytes from an agent's session file t
 [dependencies]
 cormex-proto.workspace = true
 cormex-core.workspace = true
+# The ChatGPT / Claude export parser (P4-7). Reused rather than reimplemented:
+# two parsers for one file format is one parser that drifts, and the import path
+# already handles the format drift this format is prone to
+cormex-import.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
