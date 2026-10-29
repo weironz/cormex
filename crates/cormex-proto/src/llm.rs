@@ -4,7 +4,7 @@
 //!
 //! "Have cormexd speak `/v1/chat/completions` and the local side can use any
 //! off-the-shelf client" sounds like a labour saver. The price is translating
-//! goose's [`Message`] into OpenAI's shape and back again. That round trip
+//! goose's `Message` into OpenAI's shape and back again. That round trip
 //! loses **prompt caching markers and thinking blocks** — the two most
 //! expensive things in the whole arrangement — and losing them produces no
 //! symptom at all, just a bigger bill and worse reasoning.
@@ -17,7 +17,7 @@
 //!
 //! # The client cannot name a model
 //!
-//! The request carries only a [`ModelTier`] (main / cheap), never a model name.
+//! The request carries only a `ModelTier` (main / cheap), never a model name.
 //! This is not laziness — letting the client pick the model means letting it
 //! **spend the server's money with the server's key** on any model it likes,
 //! while the server pays the bill.
