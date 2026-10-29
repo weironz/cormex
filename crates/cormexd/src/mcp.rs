@@ -1149,6 +1149,7 @@ mod protocol_tests {
             access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
             delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
             device_keys: None,
+            device_codes: std::sync::Arc::new(crate::device_codes::DeviceCodes::default()),
         };
         (
             crate::routes::router(crate::state::AppState::for_tests(rt)),

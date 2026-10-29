@@ -45,6 +45,10 @@ enum Command {
         /// A device key minted in the Web UI, for machines with no terminal.
         #[arg(long)]
         key: Option<String>,
+        /// Log in with a short code typed into a browser on another machine,
+        /// instead of a password. For a headless box (P6-4).
+        #[arg(long)]
+        device_code: bool,
         /// The account username. Prompted for when omitted.
         #[arg(long)]
         username: Option<String>,
@@ -202,6 +206,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             label,
             scopes,
             key,
+            device_code,
             username,
         } => {
             if let Some(server) = server {
@@ -213,6 +218,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
             let outcome = match key {
                 Some(key) => login::login_with_key(&mut cfg, &dirs.config, &key)?,
+                None if device_code => {
+                    let scopes = if scopes.is_empty() {
+                        login::DEFAULT_SCOPES
+                            .iter()
+                            .map(|s| (*s).to_owned())
+                            .collect()
+                    } else {
+                        scopes
+                    };
+                    login::login_with_device_code(&mut cfg, &dirs.config, &scopes).await?
+                }
                 None => {
                     let username = match username {
                         Some(u) => u,

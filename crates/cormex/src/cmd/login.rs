@@ -135,6 +135,103 @@ pub async fn login_with_password(
     })
 }
 
+/// Log in with a device code, for a machine with no browser (P6-4).
+///
+/// # The flow, and why it is this shape
+///
+/// The machine asks the server for a short code, prints it, and polls. The
+/// person types that code into a browser **they are already logged into**. The
+/// machine never sees a password, and the person never types a long token into
+/// a shell.
+///
+/// # Why it prints the code rather than opening a browser
+///
+/// This is the headless path. `xdg-open` on a server with no display fails
+/// silently, and the person is then staring at a command that appears to be
+/// waiting for nothing. Printing the code and the URL works everywhere; a
+/// person with a browser on the same machine can copy it.
+///
+/// # Errors
+/// The server is unreachable, the code expired, or the key cannot be stored.
+pub async fn login_with_device_code(
+    cfg: &mut Config,
+    config_dir: &std::path::Path,
+    scopes: &[String],
+) -> Result<LoginOutcome> {
+    if cfg.server_url.trim().is_empty() {
+        anyhow::bail!("no server URL; pass --server <URL> the first time");
+    }
+    let anon = ApiClient::new(&cfg.server_url, "")?;
+
+    let started: cormex_proto::devices::AuthorizationStarted = anon
+        .post_json(
+            "/devices/authorize",
+            &cormex_proto::devices::AuthorizeRequest {
+                label: cfg.device_label.clone(),
+                scopes: scopes.to_vec(),
+                platform: Some(platform()),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("could not start a device-code login")?;
+
+    println!();
+    println!(
+        "  Open {} in a browser and enter:",
+        started.verification_uri
+    );
+    println!();
+    println!("      {}", started.user_code);
+    println!();
+    println!(
+        "  The code expires in {} minutes. This machine is called {:?}.",
+        started.expires_in / 60,
+        cfg.device_label
+    );
+    println!();
+
+    // Poll until it is approved or the code expires. The interval comes from
+    // the server (RFC 8628): a client that polls faster than the server asks
+    // can be used to brute-force a short code
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(started.expires_in.saturating_add(5));
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("the device code expired before it was confirmed");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(started.interval.max(1))).await;
+
+        let poll: cormex_proto::devices::TokenPoll = anon
+            .post_json(
+                "/devices/token",
+                &cormex_proto::devices::TokenRequest {
+                    device_code: started.device_code.clone(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("polling for the device key failed")?;
+
+        match poll {
+            cormex_proto::devices::TokenPoll::Pending => {}
+            cormex_proto::devices::TokenPoll::Expired => {
+                anyhow::bail!("the device code expired; run `cormex login --device-code` again");
+            }
+            cormex_proto::devices::TokenPoll::Issued { key } => {
+                let source = credentials::store(config_dir, &cfg.server_url, &key.key)?;
+                cfg.save(config_dir)?;
+                return Ok(LoginOutcome {
+                    device_id: key.id,
+                    label: cfg.device_label.clone(),
+                    scopes: key.scopes,
+                    stored_in: source.as_str(),
+                });
+            }
+        }
+    }
+}
+
 /// `linux-x86_64` / `macos-aarch64` / …, for diagnosis only.
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)

@@ -138,6 +138,14 @@ cormex login --server https://memory.example.com   # asks for your account passw
 cormex init                                        # hooks, scheduler, backfill
 ```
 
+On a machine with no browser (a server, a container), use the device-code flow
+instead — it prints a short code, you type it into a browser you are already
+logged into, and the machine polls until a key appears:
+
+```bash
+cormex login --server https://memory.example.com --device-code
+```
+
 `cormex init` shows every change before making it: hooks in the agent's own
 settings file, a periodic sync, and a raised `cleanupPeriodDays` (the host
 deletes old sessions, and a capture client cannot recover what is already gone).

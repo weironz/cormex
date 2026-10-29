@@ -126,3 +126,61 @@ mod tests {
         assert_eq!(back.scopes.len(), 2);
     }
 }
+
+// ══════════════════════════════════════════════════════════
+//  Device-code login (P6-4)
+// ══════════════════════════════════════════════════════════
+
+/// `POST /devices/authorize` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizeRequest {
+    /// What this machine calls itself, shown on the confirmation screen.
+    pub label: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+/// `POST /devices/authorize` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizationStarted {
+    /// The short code the person types. **Not** the polling credential.
+    pub user_code: String,
+    /// The long secret the machine polls with.
+    pub device_code: String,
+    /// Where to send the person. Relative, so the CLI can print it against
+    /// whatever server it is talking to.
+    pub verification_uri: String,
+    pub expires_in: u64,
+    /// Minimum seconds between polls (RFC 8628).
+    pub interval: u64,
+}
+
+/// `POST /devices/token` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRequest {
+    pub device_code: String,
+}
+
+/// `POST /devices/token` response.
+///
+/// Tagged, so a client cannot mistake "still waiting" for a key: an untagged
+/// struct with an optional field would make a missing key look like a parse
+/// problem rather than a state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TokenPoll {
+    /// Nobody has confirmed yet. Poll again after `interval`.
+    Pending,
+    /// Confirmed and issued.
+    Issued { key: DeviceKeyIssued },
+    /// The code expired or was never valid. Start over.
+    Expired,
+}
+
+/// `POST /devices/confirm` body — a logged-in person approving a code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmRequest {
+    pub user_code: String,
+}

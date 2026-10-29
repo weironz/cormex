@@ -173,6 +173,7 @@ async fn build_live(
         accounts: Some(accounts),
         access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
         delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
+        device_codes: std::sync::Arc::new(crate::device_codes::DeviceCodes::default()),
     };
     (config, rt, live)
 }

@@ -114,6 +114,10 @@ protected_routes! {
     // *meaning*, not on its path.
     "/devices" [GET, POST] => get(crate::devices_api::list).post(crate::devices_api::create),
     "/devices/{id}" [DELETE] => axum::routing::delete(crate::devices_api::revoke),
+    // Device-code login (P6-4). `confirm` is the protected half and the one
+    // that decides whose account the machine lands on; the other two are on the
+    // public side -- see `public_routes()`
+    "/devices/confirm" [POST] => post(crate::devices_api::confirm),
     // ── Capture (D2 / D3 / D16 / D23) ──────────────────────
     //
     // What the `cormex` CLI sends. Every one of these requires a **device key**
@@ -344,6 +348,15 @@ fn public_routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)>
         ("/auth/refresh", post(crate::accounts::refresh)),
         ("/auth/logout", post(crate::accounts::logout)),
         ("/auth/register", post(crate::accounts::register)),
+        // Device-code login (P6-4). The machine has no credential yet --
+        // obtaining one is what these two calls do -- so requiring one here is
+        // the same deadlock as `/auth/login`.
+        //
+        // What they hand out is inert: `authorize` returns two codes that are
+        // worthless until a **logged-in person** confirms the short one at
+        // `/devices/confirm`, which is protected. The account is decided there.
+        ("/devices/authorize", post(crate::devices_api::authorize)),
+        ("/devices/token", post(crate::devices_api::token)),
     ]
 }
 
@@ -1263,6 +1276,7 @@ mod tests {
             access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
             delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
             device_keys: None,
+            device_codes: std::sync::Arc::new(crate::device_codes::DeviceCodes::default()),
             // The route tests do not touch docker. A request with
             // `sandbox: true` gets "this deployment has no cloud sandbox" here,
             // which is exactly what it should get
@@ -1566,6 +1580,8 @@ mod tests {
                 "/auth/refresh",
                 "/auth/logout",
                 "/auth/register",
+                "/devices/authorize",
+                "/devices/token",
             ],
             "the unauthenticated inventory changed. Before changing it, go add a sentence to \
              public_routes()'s documentation saying \"why this one cannot require a \

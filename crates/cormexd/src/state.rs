@@ -99,6 +99,10 @@ pub struct Runtime {
     /// lives in `cormex_auth`, so a deployment without one cannot have device
     /// keys at all, and the branch in `auth::require` is simply not taken.
     pub device_keys: Option<Arc<crate::device_keys::DeviceKeys>>,
+    /// Pending device-code logins (P6-4). In memory, because a pending
+    /// authorization is worthless after ten minutes and there is nothing to
+    /// audit about one that never completed.
+    pub device_codes: Arc<crate::device_codes::DeviceCodes>,
 }
 
 /// The two account-related handles.
@@ -170,6 +174,9 @@ impl Runtime {
             // taken over again anyway
             delegations: Arc::new(crate::delegated_token::DelegatedTokens::default()),
             device_keys: None,
+            // In memory too, and for the same reason: a pending authorization
+            // that outlived a restart would be one nobody is watching any more
+            device_codes: Arc::new(crate::device_codes::DeviceCodes::default()),
         })
     }
 }
@@ -543,6 +550,12 @@ impl AppState {
     #[must_use]
     pub fn delegations(&self) -> &crate::delegated_token::DelegatedTokens {
         &self.inner.rt.delegations
+    }
+
+    /// Pending device-code logins (P6-4).
+    #[must_use]
+    pub fn device_codes(&self) -> &crate::device_codes::DeviceCodes {
+        &self.inner.rt.device_codes
     }
 
     /// The device-key store.

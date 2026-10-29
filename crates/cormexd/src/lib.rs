@@ -29,6 +29,7 @@ pub mod cors;
 pub mod credentials;
 pub mod cursor;
 pub mod delegated_token;
+pub mod device_codes;
 pub mod device_keys;
 pub mod devices_api;
 pub mod import;
