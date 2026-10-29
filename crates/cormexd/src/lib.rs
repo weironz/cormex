@@ -38,6 +38,7 @@ pub mod live;
 pub mod mcp;
 pub mod principal;
 pub mod purge;
+pub mod redact;
 pub mod quota;
 pub mod reembed;
 pub mod request_tenant;

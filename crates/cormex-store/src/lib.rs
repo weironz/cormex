@@ -62,6 +62,7 @@ mod error;
 mod model;
 mod query;
 mod recall;
+mod redact;
 mod store;
 mod sync;
 mod tenant;
@@ -92,6 +93,7 @@ pub use model::{
     TranscriptKind, WORKSPACE_PATH_MAX_CHARS, table,
 };
 pub use query::EpisodeCursor;
+pub use redact::ArchiveClearCounts;
 #[doc(hidden)]
 pub use recall::RECALL_VECTOR_SQL;
 pub use store::{SessionDigest, Store};
