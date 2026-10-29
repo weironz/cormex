@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{detect, doctor, init, login, logout, restore, sessions, status, uninstall};
+use cormex::cmd::{detect, doctor, init, login, logout, mcp, restore, sessions, status, uninstall};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -105,6 +105,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Speak MCP over stdio, forwarding to the server's `/mcp`.
+    ///
+    /// For hosts that can only spawn a child process (Codex, and anything else
+    /// without an HTTP transport).
+    Mcp,
     /// Browse the sessions captured on the server.
     Sessions {
         #[command(subcommand)]
@@ -352,6 +357,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 ExitCode::PartialFailure
             })
+        }
+        Command::Mcp => {
+            let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
+            let client = cormex::ApiClient::new(&cfg.server_url, &key)?;
+            mcp::run(client).await?;
+            Ok(ExitCode::Ok)
         }
         Command::Sessions { command } => {
             let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;

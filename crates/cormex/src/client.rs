@@ -202,6 +202,51 @@ impl ApiClient {
         Ok(resp.bytes().await.map_err(unreachable)?.to_vec())
     }
 
+    /// `POST` raw bytes with extra headers, returning the content type, the body
+    /// and the `Mcp-Session-Id` header if there is one.
+    ///
+    /// The MCP bridge needs all three: the content type decides whether the
+    /// body is JSON or SSE, and the session id is what the legacy protocol
+    /// hands back on `initialize`.
+    ///
+    /// # Errors
+    /// As [`Self::get_json`].
+    pub async fn post_raw(
+        &self,
+        path: &str,
+        headers: &[(&str, String)],
+        body: Vec<u8>,
+    ) -> Result<(String, String, Option<String>), ClientError> {
+        let mut req = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.key)
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        let resp = req.send().await.map_err(unreachable)?;
+        self.check_status(resp.status(), path)?;
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_owned();
+        let session = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = resp.bytes().await.map_err(unreachable)?;
+        Ok((
+            content_type,
+            String::from_utf8_lossy(&bytes).into_owned(),
+            session,
+        ))
+    }
+
     /// `DELETE`, expecting no body.
     ///
     /// # Errors
