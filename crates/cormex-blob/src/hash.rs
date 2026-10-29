@@ -289,14 +289,31 @@ pub fn capture_key(tenant: &TenantPrefix, sha256: &str) -> Result<String> {
 /// [`capture_key`] — so a typo in the bucketing step produces "the chunk was
 /// uploaded, and the reader cannot find it", with the upload reporting success.
 ///
+/// # Two layouts
+///
+/// ```text
+/// {tenant}/capture/aa/bb/{sha}.zst                 plaintext (P1)
+/// {tenant}/capture/{key_id}/aa/bb/{sha}.zst.enc    encrypted  (P6-1)
+/// ```
+///
+/// Both are accepted because both exist: a deployment that turns on
+/// `CORMEX_SECRET_KEY` keeps reading every chunk written before it, and the
+/// old keys must stay valid — the alternative is a migration that rewrites
+/// every object, which is precisely what content addressing cannot do.
+///
+/// The key id is validated as strictly as the hash: it becomes a path segment,
+/// and this function is the only thing standing between an outside value and
+/// `root.join(key)`.
+///
 /// # Errors
-/// [`BlobError::InvalidHash`] when the key does not have the capture layout.
+/// [`BlobError::InvalidHash`] when the key does not have either capture layout.
 pub fn validate_capture_key(key: &str) -> Result<()> {
     // Split from the right: the tenant prefix may itself contain no `/` (it is
     // a Postgres identifier), but splitting from the left would let a
     // malformed key with an extra segment pass by shifting everything along
     let mut parts = key.split('/');
-    let (Some(tenant), Some(capture), Some(aa), Some(bb), Some(file), None) = (
+    let (Some(tenant), Some(capture), Some(third), Some(fourth), Some(fifth), sixth, seventh) = (
+        parts.next(),
         parts.next(),
         parts.next(),
         parts.next(),
@@ -307,22 +324,54 @@ pub fn validate_capture_key(key: &str) -> Result<()> {
         return Err(BlobError::InvalidHash(key.to_owned()));
     };
 
-    let stem = file
+    if capture != CAPTURE_PREFIX || validate_tenant(tenant).is_err() {
+        return Err(BlobError::InvalidHash(key.to_owned()));
+    }
+
+    // ── encrypted: tenant/capture/{key_id}/aa/bb/{sha}.zst.enc ──
+    if let (Some(sixth), None) = (sixth, seventh) {
+        let stem = sixth
+            .strip_suffix(".zst.enc")
+            .ok_or_else(|| BlobError::InvalidHash(key.to_owned()))?;
+        let ok = is_safe_segment(third)
+            && fourth.len() == 2
+            && fifth.len() == 2
+            && validate_hash(stem).is_ok()
+            && stem.starts_with(fourth)
+            && &stem[2..4] == fifth;
+        return if ok {
+            Ok(())
+        } else {
+            Err(BlobError::InvalidHash(key.to_owned()))
+        };
+    }
+
+    // ── plaintext: tenant/capture/aa/bb/{sha}.zst ──
+    if seventh.is_some() {
+        return Err(BlobError::InvalidHash(key.to_owned()));
+    }
+    let stem = fifth
         .strip_suffix(".zst")
         .ok_or_else(|| BlobError::InvalidHash(key.to_owned()))?;
-
-    let ok = capture == CAPTURE_PREFIX
-        && aa.len() == 2
-        && bb.len() == 2
-        && validate_tenant(tenant).is_ok()
+    let ok = third.len() == 2
+        && fourth.len() == 2
         && validate_hash(stem).is_ok()
-        && stem.starts_with(aa)
-        && stem[2..4] == *bb;
+        && stem.starts_with(third)
+        && &stem[2..4] == fourth;
     if ok {
         Ok(())
     } else {
         Err(BlobError::InvalidHash(key.to_owned()))
     }
+}
+
+/// Whether a string is safe to splice into a storage path as one segment.
+///
+/// ASCII alphanumerics only: no `.`, `/`, `\`, `%` or NUL, so no traversal and
+/// no escaping. A key id is a ULID in practice, and this is deliberately
+/// narrower than "whatever a ULID happens to be".
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -333,6 +382,48 @@ mod tests {
         TenantPrefix::new(s).unwrap_or_else(|e| {
             panic!("{s:?} should have been a legal tenant prefix, but was rejected: {e}")
         })
+    }
+
+    /// Both capture layouts validate, and the encrypted one keeps the hash
+    /// buckets honest too.
+    #[test]
+    fn both_capture_layouts_validate() {
+        let sha = "ab".to_owned() + &"cd".repeat(31);
+        assert!(validate_capture_key(&format!("public/capture/ab/cd/{sha}.zst")).is_ok());
+        assert!(validate_capture_key(&format!("public/capture/01ABC/ab/cd/{sha}.zst.enc")).is_ok());
+
+        // The bucket check applies to the encrypted layout as well: a key whose
+        // levels disagree with its hash is legal to write and then unreachable
+        assert!(
+            validate_capture_key(&format!("public/capture/01ABC/zz/cd/{sha}.zst.enc")).is_err(),
+            "the encrypted layout skipped the bucket check"
+        );
+    }
+
+    /// A key id that could escape the root is refused.
+    #[test]
+    fn an_unsafe_key_id_is_refused() {
+        let sha = "ab".to_owned() + &"cd".repeat(31);
+        for bad in ["..", ".", "a/b", "a.b", "a%2f", ""] {
+            assert!(
+                validate_capture_key(&format!("public/capture/{bad}/ab/cd/{sha}.zst.enc")).is_err(),
+                "the key id {bad:?} was accepted as a path segment"
+            );
+        }
+    }
+
+    /// An extra segment is refused in both layouts.
+    #[test]
+    fn an_extra_segment_is_refused() {
+        let sha = "ab".to_owned() + &"cd".repeat(31);
+        assert!(
+            validate_capture_key(&format!("public/capture/x/ab/cd/{sha}.zst.enc")).is_ok(),
+            "a well-formed encrypted key was rejected"
+        );
+        assert!(
+            validate_capture_key(&format!("public/capture/x/ab/cd/extra/{sha}.zst.enc")).is_err(),
+            "an extra segment was accepted"
+        );
     }
 
     #[test]

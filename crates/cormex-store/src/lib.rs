@@ -71,9 +71,10 @@ pub use archive::{
     AppendOutcome, ArchiveHit, ArchiveSessionRow, ArchiveTxn, CaptureChunk, CaptureFile,
     CaptureMask, CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing,
     Generation, GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent,
-    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession,
-    NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent, Projection,
-    ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind, session_id_for,
+    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureKey, NewCaptureMask,
+    NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent,
+    Projection, ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    session_id_for,
 };
 pub use bootstrap::{TenantMigration, migrate_all, provision};
 pub use error::{Result, StoreError};

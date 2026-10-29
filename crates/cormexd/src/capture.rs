@@ -267,10 +267,62 @@ pub async fn put_chunk(
     // once and read many times (projector, masker, restore), and JSONL
     // compresses about 3.5×. The key names the *logical* hash, so the same
     // content from a plaintext client and a zstd client lands on one object.
-    let key = cormex_blob::hash::capture_key(&tenant_prefix(&tenant)?, &actual)
-        .map_err(|e| ApiError::internal(format!("could not build the capture key: {e}")))?;
-    let stored = zstd::encode_all(logical.as_slice(), 3)
+    let prefix = tenant_prefix(&tenant)?;
+    let compressed = zstd::encode_all(logical.as_slice(), 3)
         .map_err(|e| ApiError::internal(format!("could not compress the chunk: {e}")))?;
+
+    // ── encryption, when this deployment has a master key (P6-1) ──
+    //
+    // The data key belongs to the **file**, not the chunk: one key per file
+    // means destroying a session is deleting a handful of rows, while
+    // everything else in the tenant keeps working. A file that already has one
+    // reuses it, so an append does not mint a key per chunk.
+    let (key, stored) = if crate::capture_keys::enabled() {
+        let data_key = match store.capture_key(&file.id).await.map_err(store_err)? {
+            Some((id, wrapped)) => crate::capture_keys::unwrap(&id, &wrapped)
+                .map_err(|e| ApiError::internal(format!("could not unwrap the data key: {e}")))?,
+            None => {
+                let fresh = crate::capture_keys::DataKey::generate()
+                    .map_err(|e| ApiError::internal(format!("could not generate a key: {e}")))?;
+                let wrapped = crate::capture_keys::wrap(&fresh)
+                    .map_err(|e| ApiError::internal(format!("could not wrap the key: {e}")))?;
+                store
+                    .archive_txn(async |t| {
+                        t.insert_capture_key(&cormex_store::NewCaptureKey {
+                            id: fresh.id.parse().map_err(|_| {
+                                cormex_store::StoreError::Invalid(
+                                    "the generated key id is not a ULID".into(),
+                                )
+                            })?,
+                            file_id: file.id.parse().map_err(|_| {
+                                cormex_store::StoreError::Invalid(
+                                    "the file id is not a ULID".into(),
+                                )
+                            })?,
+                            wrapped_key: wrapped,
+                        })
+                        .await
+                    })
+                    .await
+                    .map_err(store_err)?;
+                fresh
+            }
+        };
+        let key = crate::capture_keys::encrypted_key(&prefix, &data_key.id, &actual)
+            .map_err(|e| ApiError::internal(format!("could not build the capture key: {e}")))?;
+        let sealed = data_key
+            .seal(&compressed)
+            .map_err(|e| ApiError::internal(format!("could not encrypt the chunk: {e}")))?;
+        (key, sealed)
+    } else {
+        // **Plaintext, and the startup log says so.** Generating an ephemeral
+        // key here would turn every existing chunk into undecryptable bytes
+        // after a restart, and the symptom would be "it worked yesterday"
+        let key = cormex_blob::hash::capture_key(&prefix, &actual)
+            .map_err(|e| ApiError::internal(format!("could not build the capture key: {e}")))?;
+        (key, compressed)
+    };
+
     st.put_capture_object(&key, Bytes::from(stored))
         .await
         .map_err(|e| ApiError::internal(format!("could not store the chunk: {e}")))?;
@@ -722,21 +774,59 @@ mod tests {
         );
 
         // ── The objects are under capture/, and the logical bytes round-trip ──
-        let key = cormex_blob::hash::capture_key(
+        //
+        // **Either layout is correct.** With `CORMEX_SECRET_KEY` set the chunk
+        // is sealed under a per-file data key and its path carries the key id;
+        // without it the path is the plaintext one. What this test pins is that
+        // the object was written *before* the row, so a row never points at
+        // nothing -- which layout it is, is a deployment property
+        let plain = cormex_blob::hash::capture_key(
             &cormex_blob::TenantPrefix::new("public").expect("public is a legal prefix"),
             &sha(&first),
         )
         .expect("a capture key");
-        assert!(
-            objects.path().join(&key).exists(),
-            "the first chunk's object is not at {key}; the R layer stores bytes before the row,              and a row pointing at a missing object can never be healed"
-        );
-        let stored = std::fs::read(objects.path().join(&key)).expect("read the object");
-        let logical = zstd::decode_all(stored.as_slice()).expect("the object should be zstd");
-        assert_eq!(
-            logical, first,
-            "the stored object does not decode back to the logical bytes"
-        );
+        let found = if objects.path().join(&plain).exists() {
+            Some(objects.path().join(&plain))
+        } else {
+            // `public/capture/<key_id>/aa/bb/<sha>.zst.enc` — the key id sits
+            // between `capture/` and the buckets, so the search is over that
+            // one level
+            let segments: Vec<&str> = plain.split('/').collect();
+            let base = objects.path().join(segments[0]).join(segments[1]);
+            // `public/capture/aa/bb/<sha>.zst` → the tail is `aa/bb/<sha>.zst.enc`
+            let tail = segments[2..].join("/") + ".enc";
+            std::fs::read_dir(&base).ok().and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path().join(&tail))
+                    .find(|p| p.exists())
+            })
+        };
+        let found = found.unwrap_or_else(|| {
+            panic!(
+                "the first chunk's object is at neither {plain} nor an encrypted sibling; the R \
+                 layer stores bytes before the row, and a row pointing at a missing object can \
+                 never be healed"
+            )
+        });
+        let stored = std::fs::read(&found).expect("read the object");
+        if found.extension().and_then(|e| e.to_str()) == Some("enc") {
+            // Decrypting needs the key row, which the API does not expose; the
+            // round trip through the API is what `an_encrypted_chunk_reads_back`
+            // covers. Here it is enough that the object exists and is not the
+            // plaintext frame
+            assert_ne!(
+                stored.first(),
+                Some(&0x28u8),
+                "an encrypted object starts with the zstd magic number, so it was not encrypted"
+            );
+        } else {
+            let logical = zstd::decode_all(stored.as_slice()).expect("the object should be zstd");
+            assert_eq!(
+                logical, first,
+                "the stored object does not decode back to the logical bytes"
+            );
+        }
 
         // ── A user token cannot capture ──
         let (status, _) =

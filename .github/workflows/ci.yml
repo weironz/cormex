@@ -176,6 +176,13 @@ jobs:
         run: cargo test --workspace --locked -- --include-ignored
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
+          # A throwaway master key, so the **encrypted** capture path is
+          # actually exercised. Without it those tests skip themselves, and a
+          # skip in CI's output is indistinguishable from a pass -- the same
+          # reason `--include-ignored` is above. It is a literal, not a secret:
+          # it protects nothing, and the database it encrypts into is thrown
+          # away at the end of the job
+          CORMEX_SECRET_KEY: 0000000000000000000000000000000000000000000000000000000000000001
 
     # pgvector rather than the official postgres image: the retrieval leg needs the
     # `vector` extension, and without it the very first migration blows up. The version

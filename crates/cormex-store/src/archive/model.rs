@@ -416,6 +416,14 @@ pub struct ArchiveHit {
     pub score: f32,
 }
 
+/// One wrapped data key for a capture file (P6-1).
+#[derive(Debug, Clone)]
+pub struct NewCaptureKey {
+    pub id: cormex_core::Id,
+    pub file_id: cormex_core::Id,
+    pub wrapped_key: Vec<u8>,
+}
+
 /// One conversation turn's vector (P5-6).
 #[derive(Debug, Clone)]
 pub struct NewTranscriptEmbedding {

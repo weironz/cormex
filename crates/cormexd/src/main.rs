@@ -123,6 +123,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("{}", rt.auth.status_line());
     tracing::info!("{}", cors.status_line());
+    // **Said out loud, at startup.** A deployment that believes its captured
+    // conversations are encrypted when they are not is more dangerous than one
+    // that knows they are plaintext -- the same argument as `byo_key`'s
+    tracing::info!("{}", capture_encryption_status());
     // This used to print `cormex_agent::status_line()` (whether landlock /
     // seccomp were in place). That line describes the capabilities of an
     // **execution** environment, and this process no longer executes anything —
@@ -400,6 +404,27 @@ async fn create_user(config: &Config, username: &str) -> anyhow::Result<()> {
         schema.as_str()
     );
     Ok(())
+}
+
+/// Whether captured chunks are encrypted at rest, in one line.
+///
+/// Printed at startup and repeated by `cormex doctor` (which reads it from
+/// `/health`). Silence would be the wrong default: "encrypted" and "not
+/// encrypted" have to be distinguishable without reading the source.
+fn capture_encryption_status() -> String {
+    if cormexd::capture_keys::enabled() {
+        format!(
+            "captured chunks are encrypted at rest (AES-256-GCM, per-file keys wrapped by {})",
+            cormexd::capture_keys::SECRET_KEY_ENV
+        )
+    } else {
+        format!(
+            "captured chunks are stored in PLAINTEXT: {} is not set, so there is no key to \
+             encrypt them with. Setting it encrypts new chunks only; existing ones stay \
+             readable because their storage keys carry no key id",
+            cormexd::capture_keys::SECRET_KEY_ENV
+        )
+    }
 }
 
 #[cfg(test)]

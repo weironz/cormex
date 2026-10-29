@@ -1028,7 +1028,7 @@ async fn project_session(
         let mut projected_to = through;
 
         for chunk in chunks {
-            let bytes = read_chunk_logical(st, &chunk).await?;
+            let bytes = read_chunk_logical(st, store, &chunk).await?;
             // The chunk may start before `through` when it straddles the resume
             // point; slice to the part not yet consumed
             let skip = usize::try_from((through - chunk.byte_offset).max(0)).unwrap_or(0);
@@ -1127,8 +1127,8 @@ async fn project_session(
 }
 
 /// Read one chunk's logical bytes from object storage.
-async fn read_chunk_logical(st: &AppState, chunk: &CaptureChunk) -> Result<Vec<u8>> {
-    let stored = st.get_capture_object(&chunk.storage_key).await?;
+async fn read_chunk_logical(st: &AppState, store: &Store, chunk: &CaptureChunk) -> Result<Vec<u8>> {
+    let stored = st.get_capture_chunk(store, chunk).await?;
     match chunk.encoding {
         ChunkEncoding::Zstd => Ok(zstd::decode_all(&stored[..])?),
         ChunkEncoding::Identity => Ok(stored.to_vec()),
@@ -1146,7 +1146,7 @@ async fn read_logical_range(
     let chunks = store.chunks_overlapping(generation_id, offset, len).await?;
     let mut out = Vec::new();
     for chunk in chunks {
-        let bytes = read_chunk_logical(st, &chunk).await?;
+        let bytes = read_chunk_logical(st, store, &chunk).await?;
         // The chunk may start before `offset`; slice to the window
         let start = usize::try_from((offset - chunk.byte_offset).max(0)).unwrap_or(0);
         let end = usize::try_from((offset + len - chunk.byte_offset).min(chunk.byte_length))
@@ -1326,6 +1326,32 @@ mod tests {
             .await
             .expect("append");
         (session_id, generation_id)
+    }
+
+    /// Register a file **without** appending a chunk, returning
+    /// `(session_id, generation_id)`.
+    ///
+    /// `seed` writes a plaintext chunk as well, and the encryption tests need a
+    /// generation whose only chunk is theirs — otherwise the chunk they read
+    /// back is the seed's, and the test would pass while measuring nothing.
+    async fn register_only(store: &Store, agent: &str) -> (String, String) {
+        let new = NewCaptureFile {
+            id: Id::new(),
+            native_session_id: format!("native-{}", Id::new()),
+            parent_native_session_id: None,
+            device_id: Id::new().to_string(),
+            agent: agent.into(),
+            logical_path: "projects/-p/s1.jsonl".into(),
+            role: FileRole::Transcript,
+            framing: Framing::Append,
+            cwd: None,
+            project_key: None,
+        };
+        let registered = store
+            .archive_txn(async |t| t.register_capture_file(&new).await)
+            .await
+            .expect("register");
+        (registered.session.id, registered.generation.id)
     }
 
     /// Put the chunk's bytes into the object store, zstd-compressed.
@@ -2077,6 +2103,195 @@ mod tests {
             .await
             .expect("both");
         assert_eq!(both.len(), 1, "session {session}");
+
+        db.drop().await;
+    }
+
+    // ── per-file data keys (P6-1) ──────────────────────────
+
+    /// A chunk written under a data key reads back byte for byte.
+    ///
+    /// This is the property the whole feature rests on: the bytes on disk are
+    /// ciphertext, and the reader still gets the conversation back. The test
+    /// writes through `get_capture_chunk` rather than `get_capture_object`
+    /// because the latter is exactly the path that would silently hand back
+    /// ciphertext.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn an_encrypted_chunk_reads_back_unchanged() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        // Skip rather than fail when the deployment has no master key: this
+        // test is about the encrypted path, and there is no encrypted path
+        // without one. CI sets `CORMEX_SECRET_KEY` in the test job so the path
+        // is actually exercised there
+        if !crate::capture_keys::enabled() {
+            eprintln!("skipped: CORMEX_SECRET_KEY is not set, so nothing is encrypted");
+            return;
+        }
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let (_session, generation) = register_only(&store, "claude_code").await;
+
+        // Write the chunk **encrypted**, the way `put_chunk` does when the
+        // deployment has a master key
+        let data_key = crate::capture_keys::DataKey::generate().expect("key");
+        let compressed = zstd::encode_all(&body[..], 3).expect("compress");
+        let sealed = data_key.seal(&compressed).expect("seal");
+        let sha = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(body))
+        };
+        let key = crate::capture_keys::encrypted_key(
+            &cormex_blob::hash::TenantPrefix::new("public").expect("tenant"),
+            &data_key.id,
+            &sha,
+        )
+        .expect("key");
+        st.put_capture_object(&key, axum::body::Bytes::from(sealed.clone()))
+            .await
+            .expect("store");
+
+        let file_id = store
+            .generation_by_id(&generation)
+            .await
+            .expect("generation")
+            .expect("a generation")
+            .file_id;
+        let wrapped = crate::capture_keys::wrap(&data_key).expect("wrap");
+        store
+            .archive_txn(async |t| {
+                t.insert_capture_key(&cormex_store::NewCaptureKey {
+                    id: data_key.id.parse().expect("a ULID"),
+                    file_id: file_id.parse().expect("a ULID"),
+                    wrapped_key: wrapped,
+                })
+                .await
+            })
+            .await
+            .expect("store the key");
+        store
+            .archive_txn(async |t| {
+                t.append_chunk(&NewCaptureChunk {
+                    id: Id::new(),
+                    generation_id: generation.parse().expect("a ULID"),
+                    byte_offset: 0,
+                    byte_length: i64::try_from(body.len()).expect("fits"),
+                    content_sha256: sha.clone(),
+                    storage_key: key.clone(),
+                    encoding: ChunkEncoding::Zstd,
+                    observed_at: chrono::Utc::now(),
+                })
+                .await
+            })
+            .await
+            .expect("append");
+
+        let chunk = store
+            .chunks_overlapping(&generation, 0, 100)
+            .await
+            .expect("chunks")
+            .into_iter()
+            .next()
+            .expect("a chunk");
+        let read = st
+            .get_capture_chunk(&store, &chunk)
+            .await
+            .expect("read back");
+        // What was encrypted is the **compressed** frame (`put_chunk` seals
+        // after zstd), so that is what comes back; decompressing it is the
+        // reader's next step, and the original bytes are what matter
+        assert_eq!(
+            &read[..],
+            &compressed[..],
+            "the decrypted bytes do not match what was sealed"
+        );
+        let logical = zstd::decode_all(&read[..]).expect("decompress");
+        assert_eq!(&logical[..], &body[..], "the conversation did not survive");
+
+        // And the object on disk really is ciphertext
+        let stored = st.get_capture_object(&key).await.expect("raw");
+        assert_ne!(&stored[..], &compressed[..], "the object is not encrypted");
+
+        db.drop().await;
+    }
+
+    /// A chunk whose data key is gone fails loudly rather than returning
+    /// ciphertext.
+    ///
+    /// That is what a purge leaves behind, and handing the caller ciphertext
+    /// would turn "this was erased" into "this is corrupt".
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_chunk_without_its_key_fails() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        if !crate::capture_keys::enabled() {
+            eprintln!("skipped: CORMEX_SECRET_KEY is not set, so nothing is encrypted");
+            return;
+        }
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let (_session, generation) = register_only(&store, "claude_code").await;
+
+        let data_key = crate::capture_keys::DataKey::generate().expect("key");
+        let compressed = zstd::encode_all(&body[..], 3).expect("compress");
+        let sealed = data_key.seal(&compressed).expect("seal");
+        let sha = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(body))
+        };
+        let key = crate::capture_keys::encrypted_key(
+            &cormex_blob::hash::TenantPrefix::new("public").expect("tenant"),
+            &data_key.id,
+            &sha,
+        )
+        .expect("key");
+        st.put_capture_object(&key, axum::body::Bytes::from(sealed))
+            .await
+            .expect("store");
+        store
+            .archive_txn(async |t| {
+                t.append_chunk(&NewCaptureChunk {
+                    id: Id::new(),
+                    generation_id: generation.parse().expect("a ULID"),
+                    byte_offset: 0,
+                    byte_length: i64::try_from(body.len()).expect("fits"),
+                    content_sha256: sha.clone(),
+                    storage_key: key.clone(),
+                    encoding: ChunkEncoding::Zstd,
+                    observed_at: chrono::Utc::now(),
+                })
+                .await
+            })
+            .await
+            .expect("append");
+
+        let chunk = store
+            .chunks_overlapping(&generation, 0, 100)
+            .await
+            .expect("chunks")
+            .into_iter()
+            .next()
+            .expect("a chunk");
+        let err = st
+            .get_capture_chunk(&store, &chunk)
+            .await
+            .expect_err("a chunk with no key must not read");
+        assert!(
+            err.to_string().contains("data key is gone"),
+            "the error should say the key is gone rather than reporting corrupt bytes: {err}"
+        );
 
         db.drop().await;
     }

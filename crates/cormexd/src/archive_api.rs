@@ -693,8 +693,10 @@ async fn read_range(
         .map_err(store_err)?;
     let mut out = Vec::new();
     for chunk in chunks {
+        // Decrypting when the chunk carries a data key (P6-1). A plaintext
+        // chunk -- every one written before that feature -- passes through
         let stored = st
-            .get_capture_object(&chunk.storage_key)
+            .get_capture_chunk(store, &chunk)
             .await
             .map_err(|e| ApiError::internal(format!("could not read the object: {e}")))?;
         let logical = match chunk.encoding {

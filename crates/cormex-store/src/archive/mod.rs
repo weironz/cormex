@@ -53,9 +53,9 @@ pub use model::{
     AppendOutcome, ArchiveHit, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask,
     CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing, Generation,
     GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent, NewCaptureChunk,
-    NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession, NewMaskProgress,
-    NewProjection, NewTranscriptEmbedding, NewTranscriptEvent, Projection, ProjectionStatus,
-    RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    NewCaptureFile, NewCaptureFileEvent, NewCaptureKey, NewCaptureMask, NewCaptureSession,
+    NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent, Projection,
+    ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
 
 /// How far a conversation neighbour may be before the vector leg drops it.
@@ -626,6 +626,20 @@ impl ArchiveTxn {
             .execute(&mut *self.inner.tx)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Store a file's wrapped data key.
+    pub async fn insert_capture_key(
+        &mut self,
+        new: &crate::archive::model::NewCaptureKey,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO capture_keys (id, file_id, wrapped_key) VALUES ($1, $2, $3)")
+            .bind(new.id.to_string())
+            .bind(new.file_id.to_string())
+            .bind(&new.wrapped_key)
+            .execute(&mut *self.inner.tx)
+            .await?;
         Ok(())
     }
 

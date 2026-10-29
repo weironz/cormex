@@ -60,7 +60,9 @@ fn catalog(home: &std::path::Path) -> Catalog {
 struct Harness {
     st: cormexd::state::AppState,
     db: cormexd::test_support::FreshDb,
-    objects: tempfile::TempDir,
+    /// Kept alive for the test's lifetime: dropping it deletes the object
+    /// store's directory, and the server still has rows pointing into it
+    _objects: tempfile::TempDir,
     base_url: String,
     _server: tokio::task::JoinHandle<()>,
 }
@@ -91,7 +93,7 @@ impl Harness {
         Some(Self {
             st,
             db,
-            objects,
+            _objects: objects,
             base_url: format!("http://{addr}"),
             _server: server,
         })
@@ -147,10 +149,17 @@ impl Harness {
                 "the chunks are not contiguous: expected an offset of {expected_offset}, got {}",
                 c.byte_offset
             );
-            let path = self.objects.path().join(&c.storage_key);
-            let stored = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-            let logical = zstd::decode_all(stored.as_slice()).expect("the object is zstd");
+            // **Through the server's own reader**, not the filesystem: with
+            // `CORMEX_SECRET_KEY` set the object is ciphertext under a per-file
+            // data key, and reading the file directly would decode random
+            // bytes. What this test checks is that the server's copy
+            // reassembles, so the server's reader is the right one to use
+            let stored = self
+                .st
+                .get_capture_chunk(&store, c)
+                .await
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", c.storage_key));
+            let logical = zstd::decode_all(&stored[..]).expect("the object is zstd");
             assert_eq!(
                 logical.len() as i64,
                 c.byte_length,

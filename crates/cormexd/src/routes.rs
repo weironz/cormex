@@ -357,6 +357,14 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
         blob_backend: Some(st.blob_backend().into()),
         auth: Some(st.auth_mode().as_str().into()),
         embedding: st.embedding_health().await,
+        capture_encryption: Some(
+            if crate::capture_keys::enabled() {
+                "encrypted"
+            } else {
+                "plaintext"
+            }
+            .into(),
+        ),
         // The server has neither of these: sandbox status is carried by the
         // startup log, and the memory database is this process itself
         sandbox: None,

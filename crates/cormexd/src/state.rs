@@ -1003,6 +1003,48 @@ impl AppState {
         self.inner.blobs.get_keyed(key).await
     }
 
+    /// Read a captured chunk, decrypting it when it was written with a data
+    /// key (P6-1).
+    ///
+    /// # Why the key id is in the storage path
+    ///
+    /// A reader that had to ask the database "which key does this chunk use"
+    /// would need a query per chunk, and the projector reads chunks in a loop.
+    /// The path carries it, so the lookup is one per **file** and the chunk
+    /// itself says whether it is encrypted at all.
+    ///
+    /// # Errors
+    /// The object is missing, the key row is gone (which is what a purge leaves
+    /// behind), or decryption failed.
+    pub async fn get_capture_chunk(
+        &self,
+        store: &cormex_store::Store,
+        chunk: &cormex_store::CaptureChunk,
+    ) -> Result<Bytes> {
+        let stored = self.get_capture_object(&chunk.storage_key).await?;
+        let Some(key_id) = crate::capture_keys::key_id_of(&chunk.storage_key) else {
+            return Ok(stored);
+        };
+
+        // The file is the unit that owns a key, so it has to be resolved first
+        let generation = store
+            .generation_by_id(&chunk.generation_id)
+            .await?
+            .ok_or_else(|| CormexError::Store("the chunk's generation is gone".into()))?;
+        let (_, wrapped) = store
+            .capture_key(&generation.file_id)
+            .await?
+            .ok_or_else(|| {
+                CormexError::Store(format!(
+                    "chunk {} is encrypted under {key_id}, but its data key is gone — this is                      what a purge leaves behind",
+                    chunk.id
+                ))
+            })?;
+        let data_key = crate::capture_keys::unwrap(key_id, &wrapped).map_err(CormexError::Store)?;
+        let plain = data_key.open(&stored).map_err(CormexError::Store)?;
+        Ok(Bytes::from(plain))
+    }
+
     pub async fn blob_meta(&self, tenant: &Tenant, hash: &str) -> Result<(String, i64)> {
         // Validate the shape before querying the database. Skipping it would not
         // be unsafe (the storage layer stops it anyway), but a malformed hash

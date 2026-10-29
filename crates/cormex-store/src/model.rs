@@ -130,6 +130,7 @@ pub mod table {
         "session_briefs",
         "promote_progress",
         "transcript_embeddings",
+        "capture_keys",
     ];
 }
 

@@ -24,6 +24,7 @@ pub mod blobs;
 pub mod brief;
 pub mod byo_key;
 pub mod capture;
+pub mod capture_keys;
 pub mod cors;
 pub mod credentials;
 pub mod cursor;

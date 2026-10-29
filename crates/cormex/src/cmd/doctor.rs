@@ -130,6 +130,42 @@ pub async fn run(
                 false
             }
         };
+        // ── Whether the archive is encrypted at rest (P6-1) ──
+        //
+        // Asked of the server rather than assumed: the answer depends on the
+        // **server's** CORMEX_SECRET_KEY, and a person who believes their
+        // captured conversations are encrypted when they are not is worse off
+        // than one who knows they are plaintext
+        if reachable
+            && let Ok(client) = ApiClient::new(&cfg.server_url, key)
+            && let Ok(health) = client
+                .get_json::<cormex_proto::dto::Health>("/health")
+                .await
+        {
+            match health.capture_encryption.as_deref() {
+                Some("encrypted") => checks.push(Check {
+                    name: "capture encryption".into(),
+                    ok: true,
+                    detail: "captured chunks are encrypted at rest".into(),
+                    fix: None,
+                }),
+                Some(other) => checks.push(Check {
+                    name: "capture encryption".into(),
+                    ok: false,
+                    detail: format!("the server reports {other:?}"),
+                    fix: Some(
+                        "the server has no CORMEX_SECRET_KEY, so captured conversations are                          stored in plaintext. Set it (openssl rand -hex 32) and restart; new                          chunks are then encrypted, and existing ones stay readable"
+                            .into(),
+                    ),
+                }),
+                None => checks.push(Check {
+                    name: "capture encryption".into(),
+                    ok: false,
+                    detail: "the server does not report it (older than this client)".into(),
+                    fix: Some("upgrade the server".into()),
+                }),
+            }
+        }
         let _ = reachable;
     }
 

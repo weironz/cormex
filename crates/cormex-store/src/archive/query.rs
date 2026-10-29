@@ -1026,6 +1026,25 @@ impl Store {
         Ok(max.unwrap_or(-1))
     }
 
+    // ── data keys (P6-1) ───────────────────────────────────
+
+    /// A file's newest wrapped data key, or `None` when it has none.
+    ///
+    /// `None` is not an error: every file captured before this feature has no
+    /// key, and its chunks are plaintext. The reader distinguishes the two by
+    /// the storage key's shape (`.zst.enc` versus `.zst`), not by this.
+    pub async fn capture_key(&self, file_id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id::text, wrapped_key FROM capture_keys
+              WHERE file_id = $1
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(file_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
     // ── the distiller ──────────────────────────────────────
 
     /// Sessions that are **idle** and have events the distiller has not seen.

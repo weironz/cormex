@@ -128,6 +128,15 @@ pub struct Health {
     /// has no database to query) still return `/health` as normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingHealth>,
+    /// Whether captured chunks are encrypted at rest (P6-1).
+    ///
+    /// `"encrypted"` / `"plaintext"` / absent (an old server). Reported for the
+    /// same reason as `auth`: "is my archive encrypted" has to be answerable
+    /// without reading environment variables on the server, and a deployment
+    /// that *believes* it is encrypted when it is not is more dangerous than
+    /// one that knows it is plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_encryption: Option<String>,
     /// One line about the tool sandbox. **Only the local agent has it** — on
     /// the server side the startup log carries this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
