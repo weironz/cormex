@@ -23,10 +23,12 @@
 //! machines, and every one of those would multiply its size for something it
 //! never uses. `cargo tree -p cormex` is the check.
 
+pub mod catalog;
 pub mod client;
 pub mod cmd;
 pub mod config;
 pub mod credentials;
+pub mod git_meta;
 pub mod state;
 
 pub use client::{ApiClient, ExitCode};

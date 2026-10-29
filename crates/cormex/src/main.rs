@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{login, logout, status};
+use cormex::cmd::{detect, login, logout, status};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -57,6 +57,14 @@ enum Command {
     },
     /// Show whether this machine is set up and keeping up.
     Status {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the agents and session files found on this machine.
+    ///
+    /// Reads paths and metadata only -- never a session's contents.
+    Detect {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -146,6 +154,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 logout::forget(&cfg, &dirs.config)?;
             } else {
                 logout::run(&cfg, &dirs.config).await?;
+            }
+            Ok(ExitCode::Ok)
+        }
+        Command::Detect { json } => {
+            let catalog = cormex_proto::catalog::Catalog::builtin().clone();
+            // The device id is not known until the server issues one, and
+            // `detect` runs before login. A local placeholder is enough: it only
+            // has to be stable on **this** machine, which is what keeps two
+            // machines' memory pseudo-sessions apart
+            let device_id = cfg.device_label.clone();
+            let report = detect::run(&catalog, &cfg, &device_id)?;
+            if json {
+                println!("{}", detect::render_json(&report)?);
+            } else {
+                print!("{}", detect::render(&report));
             }
             Ok(ExitCode::Ok)
         }
