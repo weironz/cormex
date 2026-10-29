@@ -133,6 +133,9 @@ pub fn spawn(st: AppState) {
                         "the masker round failed; the next one retries"
                     ),
                 }
+                // **Projector first, then indexer.** The indexer consumes
+                // events the projector wrote; the other order means the first
+                // round indexes nothing and every round is one behind
                 match project_tick(&st, &tenant).await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(projected = n, schema = schema.as_str(), "projected"),
@@ -140,6 +143,15 @@ pub fn spawn(st: AppState) {
                         error = %e,
                         schema = schema.as_str(),
                         "the projector round failed; the next one retries"
+                    ),
+                }
+                match index_tick(&tenant).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(chunks = n, schema = schema.as_str(), "indexed"),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        schema = schema.as_str(),
+                        "the indexer round failed; the next one retries"
                     ),
                 }
             }
@@ -196,6 +208,90 @@ pub(crate) async fn mask_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
         done += 1;
     }
     Ok(done)
+}
+
+/// One indexer round. Returns how many chunks were written.
+///
+/// # What it indexes, and what it deliberately does not
+///
+/// Only `tool_call` / `tool_result` events — the ones the conversation index
+/// skips. Indexing the messages here as well would put every sentence in two
+/// indexes, and `scope=archive` would then return the conversation with tool
+/// output mixed in, which is exactly the noise D4 keeps out of the default
+/// search.
+///
+/// # Errors
+/// The todo query failed, or the store could not be reached.
+pub(crate) async fn index_tick(tenant: &Tenant) -> Result<usize> {
+    let store = tenant.store()?;
+    let todo = store.events_needing_index(BATCH * 20).await?;
+    let mut written = 0;
+
+    for event in todo {
+        // A project excluded from the archive index is skipped at **write**
+        // time as well as at query time: writing it would put a project the
+        // user asked to leave alone into an index, and the query-side filter
+        // would only hide it
+        if let Some(project) = store.session_project_key(&event.session_id).await?
+            && store.archive_index_excluded(&project).await?
+        {
+            continue;
+        }
+
+        let text = event.text.unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let chunks: Vec<cormex_store::NewArchiveChunk> = split_chunks(&text)
+            .into_iter()
+            .enumerate()
+            .map(|(part, piece)| cormex_store::NewArchiveChunk {
+                id: Id::new(),
+                session_id: event.session_id.parse().expect("a ULID from the database"),
+                event_id: event.id.parse().expect("a ULID from the database"),
+                part: i32::try_from(part).unwrap_or(0),
+                tsv_source: cormex_memory::tokenize::to_tsvector_input(&piece),
+                text: piece,
+            })
+            .collect();
+
+        store
+            .archive_txn(async |t| t.insert_archive_chunks(&chunks).await)
+            .await?;
+        written += chunks.len();
+    }
+    Ok(written)
+}
+
+/// Split a long text into 2 KiB pieces, on a **character** boundary.
+///
+/// A byte boundary can land in the middle of a multi-byte character, and the
+/// result is not valid UTF-8 — which `to_tsvector` then rejects, turning one
+/// long tool output into a failed round.
+fn split_chunks(text: &str) -> Vec<String> {
+    const PIECE: usize = 2 * 1024;
+    if text.len() <= PIECE {
+        return vec![text.to_owned()];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + PIECE).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // A single character larger than the piece size: take it whole
+            end = text[start..]
+                .chars()
+                .next()
+                .map_or(text.len(), |c| start + c.len_utf8());
+        }
+        out.push(text[start..end].to_owned());
+        start = end;
+    }
+    out
 }
 
 /// One projector round. Returns how many events were written.
@@ -866,5 +962,108 @@ mod tests {
             "spawn no longer checks for the mock backend; on a mock instance the workers would \
              spin against a database that does not exist"
         );
+    }
+
+    /// The indexer writes chunks for tool events only.
+    ///
+    /// Indexing the messages here as well would put every sentence in two
+    /// indexes, and `scope=archive` would return the conversation with tool
+    /// output mixed in — the noise D4 keeps out of the default search.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_indexer_indexes_tool_events_only() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"run the tests"},"timestamp":"2026-10-29T08:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]},"timestamp":"2026-10-29T08:00:01Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 42 passed"}]},"timestamp":"2026-10-29T08:00:02Z"}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (session, _generation) = seed(&store, "claude_code", body).await;
+        store_object(&st, body).await;
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        project_tick(&st, &tenant).await.expect("project");
+        let chunks = index_tick(&tenant).await.expect("index");
+        assert!(chunks > 0, "the tool events should have been indexed");
+
+        // The tool result is findable in the archive
+        let archive = store
+            .search_archive(
+                &cormex_memory::tokenize::to_tsquery_input("passed"),
+                None,
+                None,
+                None,
+                None,
+                20,
+            )
+            .await
+            .expect("archive search");
+        assert_eq!(
+            archive.len(),
+            1,
+            "the tool result should be in the archive index"
+        );
+
+        // The message is not
+        let conversation = store
+            .search_conversation(
+                &cormex_memory::tokenize::to_tsquery_input("tests"),
+                None,
+                None,
+                None,
+                None,
+                20,
+            )
+            .await
+            .expect("conversation search");
+        assert_eq!(
+            conversation.len(),
+            1,
+            "the user message should be in the conversation index"
+        );
+
+        // A second tick has nothing to do
+        let again = index_tick(&tenant).await.expect("second index");
+        assert_eq!(
+            again, 0,
+            "the second tick re-indexed what was already there"
+        );
+
+        // The session id is the one we seeded
+        assert_eq!(archive[0].session_id, session);
+
+        db.drop().await;
+    }
+
+    /// A long tool output is split on a **character** boundary.
+    ///
+    /// A byte boundary can land inside a multi-byte character, and the result
+    /// is not valid UTF-8 — which `to_tsvector` then rejects, turning one long
+    /// tool output into a failed round.
+    #[test]
+    fn a_long_output_is_split_on_a_char_boundary() {
+        let text = "对".repeat(3000); // 3 bytes each, 9000 bytes
+        let pieces = split_chunks(&text);
+        assert!(pieces.len() > 1, "a 9 KB text should have been split");
+        for p in &pieces {
+            assert!(
+                std::str::from_utf8(p.as_bytes()).is_ok(),
+                "a piece is not valid UTF-8: a byte boundary landed inside a character"
+            );
+        }
+        assert_eq!(pieces.concat(), text, "the pieces must reassemble");
+    }
+
+    #[test]
+    fn a_short_output_is_one_piece() {
+        assert_eq!(split_chunks("short"), vec!["short".to_owned()]);
     }
 }

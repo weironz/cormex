@@ -395,6 +395,35 @@ pub struct ArchiveSessionRow {
     pub devices: Option<Vec<String>>,
 }
 
+/// One hit from the conversation search.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ConversationHit {
+    pub session_id: String,
+    pub event_id: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub text: Option<String>,
+    pub score: f32,
+}
+
+/// One hit from the archive search.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ArchiveHit {
+    pub session_id: String,
+    pub event_id: String,
+    pub part: i32,
+    pub text: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub score: f32,
+}
+
+/// One exclusion / inclusion of a project's archive index.
+#[derive(Debug, Clone)]
+pub struct NewArchiveIndexEvent {
+    pub id: Id,
+    pub project_key: String,
+    pub excluded: bool,
+}
+
 /// One mask interval.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct CaptureMask {

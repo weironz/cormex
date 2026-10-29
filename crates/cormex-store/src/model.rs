@@ -124,6 +124,7 @@ pub mod table {
         "transcript_projections",
         "archive_chunks",
         "archive_access_log",
+        "archive_index_events",
     ];
 }
 

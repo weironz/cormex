@@ -1237,6 +1237,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cormex-core",
+ "cormex-memory",
  "dotenvy",
  "futures",
  "pgvector",

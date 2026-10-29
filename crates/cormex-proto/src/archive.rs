@@ -98,6 +98,30 @@ pub struct ArchiveEventsResponse {
     pub next_cursor: Option<String>,
 }
 
+/// `GET /archive/search`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSearchResponse {
+    pub hits: Vec<ArchiveSearchHit>,
+}
+
+/// One search hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSearchHit {
+    pub session_id: String,
+    pub event_id: String,
+    /// The matched text, truncated for display.
+    pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    pub score: f32,
+}
+
+/// How much of a matched event the search returns.
+///
+/// 300 characters is enough to see why it matched and short enough that twenty
+/// hits stay readable. The full record is one `session_get` away.
+pub const SEARCH_SNIPPET_CHARS: usize = 300;
+
 /// How much of a tool result the `digest` view shows.
 ///
 /// 2 KiB is roughly a screenful of monospace text. The point of the digest view

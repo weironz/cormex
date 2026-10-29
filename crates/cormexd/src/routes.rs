@@ -142,6 +142,9 @@ protected_routes! {
     "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/raw/{generation_id}" [GET] => get(crate::archive_api::get_raw),
+    // Full-text search. `scope=archive` needs `raw:read` -- the check is in the
+    // handler, because it depends on the query string rather than the path
+    "/archive/search" [GET] => get(crate::archive_api::search),
     // Bring-your-own API key. Three actions on one path: read status / store /
     // withdraw
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)

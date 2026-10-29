@@ -68,11 +68,12 @@ mod tenant;
 mod txn;
 
 pub use archive::{
-    AppendOutcome, ArchiveSessionRow, ArchiveTxn, CaptureChunk, CaptureFile, CaptureMask,
-    CaptureSession, ChunkEncoding, FileEventOp, FileRole, Framing, Generation, GenerationReason,
-    NewAccessLog, NewArchiveChunk, NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent,
-    NewCaptureMask, NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEvent,
-    Projection, ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    AppendOutcome, ArchiveHit, ArchiveSessionRow, ArchiveTxn, CaptureChunk, CaptureFile,
+    CaptureMask, CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing,
+    Generation, GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent,
+    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession,
+    NewMaskProgress, NewProjection, NewTranscriptEvent, Projection, ProjectionStatus,
+    RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
 pub use bootstrap::{TenantMigration, migrate_all, provision};
 pub use error::{Result, StoreError};

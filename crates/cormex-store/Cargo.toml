@@ -26,3 +26,9 @@ futures.workspace = true
 # migration by hash. sqlx hashes the whole file, so a comment edit is a schema
 # incident -- see that test's header for the deployment it stopped halfway.
 sha2 = "0.10"
+# Only for `tests/search.rs`: the Chinese cases need jieba's segmentation,
+# because `to_tsvector('simple', …)` does not segment Chinese at all — the whole
+# sentence becomes one lexeme. A dev-dependency, not a dependency: the direction
+# `cormex-core ← cormex-memory` and `cormex-store` beside it must not be
+# reversed in the library itself.
+cormex-memory.workspace = true

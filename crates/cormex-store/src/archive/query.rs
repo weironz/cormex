@@ -9,8 +9,8 @@
 use chrono::{DateTime, Utc};
 
 use crate::archive::model::{
-    ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, Generation, Projection,
-    TranscriptEvent,
+    ArchiveHit, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, ConversationHit,
+    Generation, Projection, TranscriptEvent,
 };
 use crate::error::Result;
 use crate::store::Store;
@@ -254,6 +254,203 @@ impl Store {
         .await?;
         // An empty session is not "the only copy of anything"
         Ok(total > 0 && total == missing)
+    }
+
+    /// Tool events that have no archive-index chunks yet.
+    ///
+    /// The todo is derived, like the masker's and the projector's: an event is
+    /// done when it has at least one chunk. A restarted process loses nothing.
+    pub async fn events_needing_index(&self, limit: i64) -> Result<Vec<TranscriptEvent>> {
+        let rows = sqlx::query_as::<_, TranscriptEvent>(
+            "SELECT e.id, e.session_id, e.parser_version, e.seq, e.kind, e.occurred_at,
+                    e.content, e.text, e.tool_name, e.tool_call_id,
+                    e.src_generation_id, e.src_offset, e.src_length, e.created_at
+               FROM transcript_events e
+              WHERE e.kind IN ('tool_call', 'tool_result')
+                AND e.text IS NOT NULL AND e.text <> ''
+                AND NOT EXISTS (SELECT 1 FROM archive_chunks c WHERE c.event_id = e.id)
+              ORDER BY e.session_id, e.seq
+              LIMIT $1",
+        )
+        .bind(limit.clamp(1, 2000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// The project key of a session, from any of its files.
+    ///
+    /// Used by the indexer to honour a project's exclusion. `None` = the
+    /// session has no project, which is **not** excluded: excluding by default
+    /// would mean the index silently stops covering new projects.
+    pub async fn session_project_key(&self, session_id: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT project_key FROM capture_files
+              WHERE session_id = $1 AND project_key IS NOT NULL LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(k,)| k))
+    }
+
+    /// Search the **conversation** layer: what people and agents said.
+    ///
+    /// Only `user_message` / `agent_message` / `plan` — **not** tool output.
+    /// That is D4: a tool's output is archived and searchable through
+    /// [`Self::search_archive`], but it does not enter the conversation index,
+    /// because a build log would otherwise outrank the sentence somebody
+    /// actually typed.
+    ///
+    /// Results are aggregated **per session**, taking the best-scoring event:
+    /// a search that returns twelve hits from one long session buries the other
+    /// sessions that matched.
+    pub async fn search_conversation(
+        &self,
+        tsquery_input: &str,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<ConversationHit>> {
+        if tsquery_input.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, ConversationHit>(
+            "WITH scored AS (
+                 SELECT e.session_id, e.id AS event_id, e.occurred_at, e.text,
+                        ts_rank(e.tsv, to_tsquery('simple', $1)) AS score,
+                        row_number() OVER (
+                            PARTITION BY e.session_id
+                            ORDER BY ts_rank(e.tsv, to_tsquery('simple', $1)) DESC,
+                                     e.seq ASC
+                        ) AS rn
+                   FROM transcript_events e
+                   JOIN capture_sessions s ON s.id = e.session_id
+                  WHERE e.tsv @@ to_tsquery('simple', $1)
+                    AND e.kind IN ('user_message', 'agent_message', 'plan')
+                    AND ($2::text IS NULL OR s.agent = $2)
+                    AND ($3::text IS NULL OR EXISTS (
+                            SELECT 1 FROM capture_files f
+                             WHERE f.session_id = e.session_id AND f.project_key = $3))
+                    AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
+                    AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
+             )
+             SELECT session_id, event_id, occurred_at, text, score
+               FROM scored WHERE rn = 1
+              ORDER BY score DESC, occurred_at DESC NULLS LAST
+              LIMIT $6",
+        )
+        .bind(tsquery_input)
+        .bind(agent)
+        .bind(project_key)
+        .bind(since)
+        .bind(until)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Search the **archive** layer: everything, tool output included.
+    ///
+    /// This is the `scope=archive` path, and it requires `raw:read` — a tool's
+    /// output is where a secret or a private document actually appears, and
+    /// this is the index that reaches it.
+    ///
+    /// A project can be excluded from this index by
+    /// [`Self::archive_index_excluded`]; the exclusion is applied here rather
+    /// than at write time, so turning it back on does not require re-indexing.
+    pub async fn search_archive(
+        &self,
+        tsquery_input: &str,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<ArchiveHit>> {
+        if tsquery_input.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, ArchiveHit>(
+            "WITH scored AS (
+                 SELECT c.session_id, c.event_id, c.part, c.text,
+                        e.occurred_at,
+                        ts_rank(c.tsv, to_tsquery('simple', $1)) AS score,
+                        row_number() OVER (
+                            PARTITION BY c.session_id
+                            ORDER BY ts_rank(c.tsv, to_tsquery('simple', $1)) DESC,
+                                     c.part ASC
+                        ) AS rn
+                   FROM archive_chunks c
+                   JOIN transcript_events e ON e.id = c.event_id
+                   JOIN capture_sessions s ON s.id = c.session_id
+                  WHERE c.tsv @@ to_tsquery('simple', $1)
+                    AND ($2::text IS NULL OR s.agent = $2)
+                    AND ($3::text IS NULL OR EXISTS (
+                            SELECT 1 FROM capture_files f
+                             WHERE f.session_id = c.session_id AND f.project_key = $3))
+                    AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
+                    AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
+                    -- A project excluded from the archive index is skipped
+                    -- here, not at write time: turning it back on must not
+                    -- require re-indexing
+                    AND NOT EXISTS (
+                            SELECT 1 FROM capture_files f
+                             WHERE f.session_id = c.session_id
+                               AND f.project_key IS NOT NULL
+                               AND (SELECT ev.op FROM archive_index_events ev
+                                     WHERE ev.project_key = f.project_key
+                                     ORDER BY ev.created_at DESC, ev.id DESC LIMIT 1) = 'exclude')
+             )
+             SELECT session_id, event_id, part, text, occurred_at, score
+               FROM scored WHERE rn = 1
+              ORDER BY score DESC, occurred_at DESC NULLS LAST
+              LIMIT $6",
+        )
+        .bind(tsquery_input)
+        .bind(agent)
+        .bind(project_key)
+        .bind(since)
+        .bind(until)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Whether a project is excluded from the archive index.
+    ///
+    /// The newest event wins; a project with no event is **included** (the
+    /// default), because excluding by default would mean the index silently
+    /// stops covering new projects.
+    pub async fn archive_index_excluded(&self, project_key: &str) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT op FROM archive_index_events WHERE project_key = $1
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(project_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.is_some_and(|(op,)| op == "exclude"))
+    }
+
+    /// Record an exclusion or an inclusion.
+    ///
+    /// # Errors
+    /// The write failed.
+    pub async fn set_archive_index(&self, project_key: &str, excluded: bool) -> Result<()> {
+        self.archive_txn(async |t| {
+            t.insert_archive_index_event(&crate::archive::NewArchiveIndexEvent {
+                id: cormex_core::Id::new(),
+                project_key: project_key.to_owned(),
+                excluded,
+            })
+            .await
+        })
+        .await
     }
 
     /// Every file of a session.

@@ -70,6 +70,19 @@ pub struct EventsQuery {
     pub limit: Option<i64>,
 }
 
+/// `GET /archive/search`.
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    /// `conversation` (the default) or `archive`.
+    pub scope: Option<String>,
+    pub agent: Option<String>,
+    pub project: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: Option<i64>,
+}
+
 /// `GET /archive/raw/{generation_id}`.
 #[derive(Debug, Deserialize)]
 pub struct RawQuery {
@@ -77,6 +90,94 @@ pub struct RawQuery {
     pub length: Option<i64>,
     /// Return the bytes untouched. Requires `raw:read`, and is logged.
     pub unmask: Option<bool>,
+}
+
+/// `GET /archive/search` — full-text search over conversations or the archive.
+///
+/// # The two scopes are two different indexes
+///
+/// `conversation` searches what people and agents **said**; `archive` searches
+/// everything, tool output included. They are separate because a build log would
+/// otherwise outrank the sentence somebody actually typed (D4).
+///
+/// `archive` requires `raw:read`: a tool's output is where a secret or a private
+/// document actually appears, and this is the index that reaches it.
+///
+/// # Errors
+/// The caller may not search (403), the query is malformed (400), or the search
+/// failed.
+pub async fn search(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<cormex_proto::archive::ArchiveSearchResponse>, ApiError> {
+    let scope = q.scope.as_deref().unwrap_or("conversation");
+    if scope == "archive" && !principal.has_scope(crate::device_keys::Scope::RawRead) {
+        return Err(ApiError::forbidden(
+            "searching the archive requires raw:read: it reaches tool output, which is where a \
+             secret or a private document actually appears",
+        ));
+    }
+    if scope != "conversation" && scope != "archive" {
+        return Err(ApiError::bad_request(
+            "scope accepts `conversation` or `archive`",
+        ));
+    }
+
+    let store = archive_store(&st, &principal).await?;
+    let tsquery = cormex_memory::tokenize::to_tsquery_input(&q.q);
+    let since = parse_time(q.since.as_deref())?;
+    let until = parse_time(q.until.as_deref())?;
+    let limit = q.limit.unwrap_or(20);
+
+    let hits = if scope == "archive" {
+        store
+            .search_archive(
+                &tsquery,
+                q.agent.as_deref(),
+                q.project.as_deref(),
+                since,
+                until,
+                limit,
+            )
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|h| cormex_proto::archive::ArchiveSearchHit {
+                session_id: h.session_id,
+                event_id: h.event_id,
+                snippet: truncate_bytes(&h.text, cormex_proto::archive::SEARCH_SNIPPET_CHARS),
+                occurred_at: h.occurred_at.map(|t| t.to_rfc3339()),
+                score: h.score,
+            })
+            .collect()
+    } else {
+        store
+            .search_conversation(
+                &tsquery,
+                q.agent.as_deref(),
+                q.project.as_deref(),
+                since,
+                until,
+                limit,
+            )
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|h| cormex_proto::archive::ArchiveSearchHit {
+                session_id: h.session_id,
+                event_id: h.event_id,
+                snippet: truncate_bytes(
+                    h.text.as_deref().unwrap_or(""),
+                    cormex_proto::archive::SEARCH_SNIPPET_CHARS,
+                ),
+                occurred_at: h.occurred_at.map(|t| t.to_rfc3339()),
+                score: h.score,
+            })
+            .collect()
+    };
+
+    Ok(Json(cormex_proto::archive::ArchiveSearchResponse { hits }))
 }
 
 /// # Errors

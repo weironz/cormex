@@ -285,8 +285,20 @@ fn flatten_text(content: Option<&Value>) -> String {
             .filter_map(|i| match i.get("type").and_then(Value::as_str) {
                 Some("text") => i.get("text").and_then(Value::as_str).map(str::to_owned),
                 Some("thinking") => i.get("thinking").and_then(Value::as_str).map(str::to_owned),
+                // **A tool's output is text too.** Leaving it out made
+                // `tool_result` events carry an empty `text`, and the archive
+                // index — whose entire purpose is to make tool output
+                // searchable — then had nothing to index. The symptom is
+                // `scope=archive` returning nothing for a word that is plainly
+                // in the output.
+                Some("tool_result") => Some(flatten_value(i.get("content"))),
+                // A tool call has no output, but its **arguments** are what
+                // make it findable: "which session ran `cargo test`" is a
+                // question people ask
+                Some("tool_use") => i.get("input").map(|v| v.to_string()),
                 _ => None,
             })
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
@@ -430,6 +442,39 @@ mod tests {
             Some("Read"),
             "the tool result lost the tool's name; the record itself has only the id, so the \
              name has to come from the call"
+        );
+    }
+
+    /// **A tool result's output is in `text`.**
+    ///
+    /// It was not, and the archive index — whose entire purpose is to make tool
+    /// output searchable — then had nothing to index. The symptom is
+    /// `scope=archive` returning nothing for a word that is plainly in the
+    /// output.
+    #[test]
+    fn a_tool_results_output_is_in_the_text() {
+        let body = br#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 42 passed"}]}}
+"#;
+        let events = feed_all(body);
+        assert_eq!(events[0].kind, TranscriptKind::ToolResult);
+        assert!(
+            events[0].text.contains("42 passed"),
+            "the tool output is missing from `text`: {:?}",
+            events[0].text
+        );
+    }
+
+    /// A tool call's arguments are in `text`, so "which session ran this" is
+    /// answerable.
+    #[test]
+    fn a_tool_calls_arguments_are_in_the_text() {
+        let body = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}
+"#;
+        let events = feed_all(body);
+        assert!(
+            events[0].text.contains("cargo test"),
+            "the tool call's arguments are missing from `text`: {:?}",
+            events[0].text
         );
     }
 

@@ -50,11 +50,12 @@ use crate::model::table;
 use crate::store::Store;
 
 pub use model::{
-    AppendOutcome, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, CaptureSession,
-    ChunkEncoding, FileEventOp, FileRole, Framing, Generation, GenerationReason, NewAccessLog,
-    NewArchiveChunk, NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask,
-    NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEvent, Projection,
-    ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    AppendOutcome, ArchiveHit, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask,
+    CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing, Generation,
+    GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent, NewCaptureChunk,
+    NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession, NewMaskProgress,
+    NewProjection, NewTranscriptEvent, Projection, ProjectionStatus, RegisteredFile,
+    TranscriptEvent, TranscriptEventKind,
 };
 
 /// The advisory lock class for archive-generation appends.
@@ -495,6 +496,17 @@ impl ArchiveTxn {
             .execute(&mut *self.inner.tx)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Record an exclusion or an inclusion of a project's archive index.
+    pub async fn insert_archive_index_event(&mut self, new: &NewArchiveIndexEvent) -> Result<()> {
+        sqlx::query("INSERT INTO archive_index_events (id, project_key, op) VALUES ($1, $2, $3)")
+            .bind(new.id.to_string())
+            .bind(&new.project_key)
+            .bind(if new.excluded { "exclude" } else { "include" })
+            .execute(&mut *self.inner.tx)
+            .await?;
         Ok(())
     }
 
