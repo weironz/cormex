@@ -199,8 +199,12 @@ mod tests {
     /// can have.
     #[tokio::test]
     async fn init_plans_estimates_and_respects_declines() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
+        // across `await` points, and holding a std guard there blocks the
+        // whole worker thread — clippy's `await_holding_lock` is right to
+        // refuse it
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
         // Point the installers at the temp home so the real one is untouched

@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart' as http;
 
 import '../models/account.dart';
+import '../models/archive_session.dart';
 import '../models/auth_tokens.dart';
 import '../models/episode.dart';
 import '../models/health_status.dart';
 import '../models/json.dart';
 import '../models/memory_search_result.dart';
+import '../models/transcript_event.dart';
 import 'api_exception.dart';
 import 'http_client_factory.dart';
 
@@ -227,6 +230,93 @@ class CormexApi {
   /// `GET /episodes/{id}` —— 一条事实的出处。
   Future<Episode> episode(String id) async =>
       Episode.fromJson(await _getJson('/episodes/${Uri.encodeComponent(id)}'));
+
+  // ─────────────────────────────── 会话档案 ───────────────────────────────
+
+  /// `GET /archive/sessions` —— 采集进来的会话列表。
+  ///
+  /// 过滤与分页都在**服务端**：先取 `limit` 条再在内存里过滤，会让被过滤掉
+  /// 的那些**占掉配额** —— 按 agent 一筛，列表就少了几条，而且没有任何提示。
+  Future<ArchiveSessionsPage> listArchiveSessions({
+    String? agent,
+    String? project,
+    DateTime? since,
+    DateTime? until,
+    String? cursor,
+    int limit = 50,
+  }) async {
+    final json = await _getJson('/archive/sessions', {
+      if (agent != null && agent.isNotEmpty) 'agent': agent,
+      if (project != null && project.isNotEmpty) 'project': project,
+      if (since != null) 'since': since.toUtc().toIso8601String(),
+      if (until != null) 'until': until.toUtc().toIso8601String(),
+      if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+      'limit': '$limit',
+    });
+    return ArchiveSessionsPage.fromJson(json);
+  }
+
+  /// `GET /archive/sessions/{id}` —— 会话详情：元数据、文件与代。
+  Future<ArchiveSessionDetail> archiveSession(String id) async =>
+      ArchiveSessionDetail.fromJson(
+        await _getJson('/archive/sessions/${Uri.encodeComponent(id)}'),
+      );
+
+  /// `GET /archive/sessions/{id}/events` —— 一页事件。
+  ///
+  /// [view] 是 `transcript`（默认）或 `digest`。digest 把工具结果截到 2 KiB
+  /// 并折叠工具调用 —— 用来快速扫一段对话，而不是读一份构建日志。
+  Future<TranscriptEventsPage> sessionEvents(
+    String id, {
+    String view = 'transcript',
+    String? cursor,
+    int limit = 100,
+  }) async {
+    final json = await _getJson(
+      '/archive/sessions/${Uri.encodeComponent(id)}/events',
+      {
+        'view': view,
+        if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+        'limit': '$limit',
+      },
+    );
+    return TranscriptEventsPage.fromJson(json);
+  }
+
+  /// `GET /archive/raw/{generationId}` —— 原始字节。
+  ///
+  /// 默认返回**遮罩后**的字节（疑似密钥换成 `[masked:<rule>]`）；
+  /// [unmask] 为 true 时原样返回。两种都要求 `raw:read`，且都会在服务端
+  /// 写一条访问日志 —— 一次遮罩读和一次未遮罩读在请求日志里长得一样，
+  /// 那条日志是事后唯一能区分它们的东西。
+  ///
+  /// 返回的是原始 `Uint8List` 而不是 `String`：这是文件字节，不保证是
+  /// UTF-8，按文本解码会把非 UTF-8 的部分弄坏。
+  Future<Uint8List> rawSlice(
+    String generationId, {
+    int? offset,
+    int? length,
+    bool unmask = false,
+  }) async {
+    final query = {
+      if (offset != null) 'offset': '$offset',
+      if (length != null) 'length': '$length',
+      if (unmask) 'unmask': 'true',
+    };
+    final http.Response response;
+    try {
+      response = await _client.get(
+        _uri('/archive/raw/${Uri.encodeComponent(generationId)}', query),
+        headers: _headers(const {'accept': 'application/octet-stream'}),
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+    return response.bodyBytes;
+  }
 
   // ─────────────────────────────── 账号 ───────────────────────────────
 
