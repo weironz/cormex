@@ -95,6 +95,31 @@ pub mod table {
     // method's comments spell out the boundary of where it applies.
     pub const FACT_EMBEDDINGS: &str = "fact_embeddings";
     pub const ENTITY_EMBEDDINGS: &str = "entity_embeddings";
+
+    // ── The archive tables: also **not** in `ALL` ─────────────────
+    //
+    // Same rule as the two above, for a different reason. `ALL` means "every
+    // table name that can appear in `sync_log.table_name`", and the capture
+    // tables never appear there: the raw archive is server-only and is not
+    // pushed to any device (D3).
+    //
+    // They are listed here rather than left unmentioned so that the
+    // disjointness is something a test can assert. The failure this guards
+    // against is somebody adding a capture table to `ALL` "for completeness",
+    // at which point `sync_payload` would need a branch for it and the R layer
+    // would start flowing to devices — with no error anywhere.
+    //
+    // Phase 2 appends `transcript_events`, `transcript_projections` and
+    // `archive_chunks` here.
+    pub const ARCHIVE: &[&str] = &[
+        "capture_sessions",
+        "capture_files",
+        "capture_generations",
+        "capture_chunks",
+        "capture_file_events",
+        "capture_masks",
+        "capture_mask_progress",
+    ];
 }
 
 /// Every column of the `facts` table. The four retrieval channels, the three
@@ -164,6 +189,13 @@ pub(crate) use fact_columns;
 ///
 /// `#[derive(sqlx::Type)]` is not used: those macros target Postgres's native
 /// ENUM type, whereas these columns in the schema are TEXT with a CHECK.
+/// The `as_str` / `FromStr` / sqlx `Type`+`Encode`+`Decode` boilerplate for a
+/// TEXT column with a CHECK constraint.
+///
+/// Exported inside the crate so that `archive::model` can declare its own
+/// enums the same way rather than hand-writing a second copy of the impls —
+/// and so that an unknown value from the database keeps producing
+/// [`crate::StoreError::UnknownVariant`] instead of a panic.
 macro_rules! text_enum {
     (
         $(#[$meta:meta])*
@@ -236,6 +268,12 @@ macro_rules! text_enum {
         }
     };
 }
+
+// Exported inside the crate so `archive::model` can declare its own enums with
+// the same impls rather than hand-writing a second copy -- and so that an
+// unknown value from the database keeps producing `StoreError::UnknownVariant`
+// instead of a panic.
+pub(crate) use text_enum;
 
 text_enum! {
     /// `episodes.role`
