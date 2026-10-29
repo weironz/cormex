@@ -141,6 +141,7 @@ protected_routes! {
     "/archive/sessions" [GET] => get(crate::archive_api::list_sessions),
     "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
+    "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),
     "/archive/raw/{generation_id}" [GET] => get(crate::archive_api::get_raw),
     // Full-text search. `scope=archive` needs `raw:read` -- the check is in the
     // handler, because it depends on the query string rather than the path

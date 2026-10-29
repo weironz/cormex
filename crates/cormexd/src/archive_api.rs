@@ -83,6 +83,38 @@ pub struct SearchQuery {
     pub limit: Option<i64>,
 }
 
+/// `GET /archive/sessions/{id}/brief` — the handover brief.
+///
+/// Phase 5 generates briefs. Until then this returns a placeholder that says so
+/// plus the session's header — an empty body would read as "this session has
+/// nothing in it", and the actual situation is "the generator does not exist
+/// yet".
+///
+/// # Errors
+/// The session does not exist, or the caller may not read it.
+pub async fn get_brief(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = archive_store(&st, &principal).await?;
+    let row = store
+        .archive_session(&id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::not_found("no such session, or it has no events yet"))?;
+
+    Ok(Json(serde_json::json!({
+        "session_id": row.id,
+        "generated": false,
+        "brief": serde_json::Value::Null,
+        "note": "briefs are generated in phase 5; until then use view=digest",
+        "title": row.title_source.map(|t| t.chars().take(TITLE_CHARS).collect::<String>()),
+        "agent": row.agent,
+        "event_count": row.event_count,
+    })))
+}
+
 /// `GET /archive/raw/{generation_id}`.
 #[derive(Debug, Deserialize)]
 pub struct RawQuery {
