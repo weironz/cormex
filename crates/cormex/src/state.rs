@@ -458,6 +458,25 @@ impl StateDb {
         Ok(())
     }
 
+    /// Every target `init` changed, newest first.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub fn installs(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT target FROM installs ORDER BY id DESC")
+            .context("could not prepare the installs query")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .context("could not read the installs")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("could not read an install row")?);
+        }
+        Ok(out)
+    }
+
     /// How many queue entries are waiting.
     ///
     /// # Errors

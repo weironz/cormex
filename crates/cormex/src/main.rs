@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{detect, login, logout, status};
+use cormex::cmd::{detect, doctor, init, login, logout, status, uninstall};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -77,6 +77,33 @@ enum Command {
     Hook {
         /// Which agent's hook this is.
         agent: String,
+    },
+    /// Set this machine up: hooks, scheduler, retention, then backfill.
+    Init {
+        /// Accept every change without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Show the changes, apply nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Comma-separated agent ids. Default is every agent found.
+        #[arg(long, value_delimiter = ',')]
+        agents: Vec<String>,
+        /// Run the backfill after applying the changes.
+        #[arg(long)]
+        backfill: bool,
+    },
+    /// Undo every change `init` made.
+    Uninstall {
+        /// Keep the local upload state.
+        #[arg(long)]
+        keep_data: bool,
+    },
+    /// Check why this machine is not capturing.
+    Doctor {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
     },
     /// List the agents and session files found on this machine.
     ///
@@ -225,6 +252,55 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 ExitCode::PartialFailure
             } else {
                 ExitCode::Ok
+            })
+        }
+        Command::Init {
+            yes,
+            dry_run,
+            agents,
+            backfill,
+        } => {
+            let opts = init::InitOptions {
+                yes,
+                dry_run,
+                agents,
+                backfill,
+            };
+            let report = init::run(&cfg, &dirs.config, &dirs.data, &opts, |change| {
+                // Without `--yes`, ask. The prompt goes to stderr so that a
+                // script capturing stdout is not confused by it
+                eprint!("\n{} [y/N] ", change.description);
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap_or(0) > 0
+                    && line.trim().eq_ignore_ascii_case("y")
+            })
+            .await?;
+            print!("{}", init::render_plan(&report));
+            if dry_run {
+                println!("\n(dry run: nothing was changed)");
+            } else if !report.applied.is_empty() {
+                println!("\napplied {} change(s)", report.applied.len());
+            }
+            Ok(ExitCode::Ok)
+        }
+        Command::Uninstall { keep_data } => {
+            let report = uninstall::run(&cfg, &dirs.data, keep_data)?;
+            print!("{}", uninstall::render(&report));
+            Ok(ExitCode::Ok)
+        }
+        Command::Doctor { json } => {
+            let report = doctor::run(&cfg, &dirs.config, &dirs.data).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", doctor::render(&report));
+            }
+            Ok(if report.all_ok() {
+                ExitCode::Ok
+            } else {
+                ExitCode::PartialFailure
             })
         }
         Command::Detect { json } => {
