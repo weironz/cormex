@@ -516,6 +516,14 @@ text_enum! {
         Episode => "episode",
         Fact => "fact",
         Summary => "summary",
+        /// A normalized transcript event (phase 5).
+        ///
+        /// **The Rust variant has to be deployed before the migration that
+        /// lets the database store it.** The other order makes the whole
+        /// `derivations` table unreadable: `query_as` stops at the first value
+        /// its `FromStr` does not know, so one row written by a newer schema
+        /// breaks every read of the table, not just that row.
+        TranscriptEvent => "transcript_event",
     }
 }
 

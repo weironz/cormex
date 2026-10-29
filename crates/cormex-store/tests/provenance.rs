@@ -18,8 +18,8 @@ mod common;
 
 use cormex_core::Id;
 use cormex_store::{
-    FactSource, NewSummary, ProvenanceRef, SourceChannel, StoreError, SummaryScope, SyncPayload,
-    table,
+    FactSource, NewSummary, ProvenanceRef, SourceChannel, SourceKind, StoreError, SummaryScope,
+    SyncPayload, table,
 };
 
 /// The last migration version before the columns were added.
@@ -461,4 +461,142 @@ async fn raw_insert_fact(
                  '{episode}', 'raw', 'dev'{vals})"
     );
     db.try_exec_raw(sql).await
+}
+
+// ══════════════════════════════════════════════════════════
+//  The transcript_event source kind (P5-1)
+// ══════════════════════════════════════════════════════════
+
+/// A derivation can name a transcript event as its source, and it reads back.
+///
+/// Phase 5's distiller derives summaries from P-layer events. Without this edge
+/// "which conversation produced this summary" has no answer — and GDPR Art.17's
+/// erasure obligation extends to derived data: a purged session's summaries have
+/// to be findable and dealt with alongside it.
+///
+/// **The read half is the one that matters.** `SourceKind` is a `FromStr` over
+/// `source_kind`, and `query_as` gives up on the first value it cannot parse —
+/// so a value the Rust side does not know makes the *whole table* unreadable,
+/// not just that row. The sync pull below is exactly that read path.
+#[tokio::test]
+async fn a_derivation_can_name_a_transcript_event() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let episode = common::new_episode("prov-transcript", "hello");
+    // The event id is only a ULID here: this test is about the CHECK and the
+    // `SourceKind` round trip, not about the projector that will mint them
+    let event_id = Id::new();
+    let summary = new_summary(vec![ProvenanceRef {
+        kind: SourceKind::TranscriptEvent,
+        id: event_id,
+    }]);
+    let summary_id = summary.id;
+
+    let written = s
+        .write_txn(async |t| {
+            t.insert_episode(&episode).await?;
+            t.insert_summary(&summary).await
+        })
+        .await;
+    assert!(
+        written.is_ok(),
+        "the database refused a transcript_event source: {written:?}"
+    );
+
+    let records = s
+        .fetch_since(0, 200)
+        .await
+        .expect("the sync pull should not fail");
+    let edges: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r.payload.as_ref() {
+            Some(SyncPayload::Derivation(d)) if d.derived_id == summary_id.to_string() => {
+                Some(d.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    db.cleanup().await;
+
+    assert_eq!(
+        edges.len(),
+        1,
+        "the summary should have exactly one provenance edge; it had {}",
+        edges.len()
+    );
+    assert_eq!(
+        edges[0].source_kind,
+        SourceKind::TranscriptEvent,
+        "the edge was written but does not read back as transcript_event -- a value the \
+         `FromStr` cannot parse breaks every read of the table, not just this row"
+    );
+    assert_eq!(edges[0].source_id, event_id.to_string());
+}
+
+/// The three older source kinds still round-trip.
+///
+/// The migration only **widened** the CHECK. A narrowing would make existing
+/// rows unreadable, and the symptom would be "the derivations table is empty"
+/// rather than an error — which is why this is asserted rather than assumed.
+#[tokio::test]
+async fn the_old_source_kinds_still_round_trip() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let episode = common::new_episode("prov-old", "hello");
+    let entity = common::new_entity("project", "Cortex");
+    let fact = common::new_fact(entity.id, "uses", "RustFS", episode.id);
+    let source_summary = new_summary(vec![ProvenanceRef::episode(episode.id)]);
+    let source_summary_id = source_summary.id;
+    let derived = new_summary(vec![
+        ProvenanceRef::episode(episode.id),
+        ProvenanceRef::fact(fact.id),
+        ProvenanceRef::summary(source_summary_id),
+    ]);
+    let derived_id = derived.id;
+
+    let written = s
+        .write_txn(async |t| {
+            t.insert_episode(&episode).await?;
+            t.insert_entity(&entity).await?;
+            t.insert_fact(&fact).await?;
+            t.insert_summary(&source_summary).await?;
+            t.insert_summary(&derived).await
+        })
+        .await;
+    assert!(
+        written.is_ok(),
+        "an episode / fact / summary source was rejected after the CHECK was widened: {written:?}"
+    );
+
+    let records = s
+        .fetch_since(0, 200)
+        .await
+        .expect("the sync pull should not fail");
+    let mut kinds: Vec<String> = records
+        .iter()
+        .filter_map(|r| match r.payload.as_ref() {
+            Some(SyncPayload::Derivation(d)) if d.derived_id == derived_id.to_string() => {
+                Some(d.source_kind.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    kinds.sort();
+    db.cleanup().await;
+
+    assert_eq!(
+        kinds,
+        vec![
+            "episode".to_owned(),
+            "fact".to_owned(),
+            "summary".to_owned()
+        ],
+        "the pre-existing source kinds should still read back unchanged"
+    );
 }
