@@ -30,6 +30,7 @@ pub mod config;
 pub mod credentials;
 pub mod git_meta;
 pub mod state;
+pub mod sync;
 
 pub use client::{ApiClient, ExitCode};
 pub use config::{Config, Dirs};

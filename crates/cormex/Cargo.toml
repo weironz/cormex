@@ -41,6 +41,7 @@ sha2 = "0.10"
 keyring = "3"
 directories = "6"
 fs4 = "0.13"
+async-trait.workspace = true
 rpassword = "7"
 chrono.workspace = true
 anyhow.workspace = true

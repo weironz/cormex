@@ -1072,6 +1072,7 @@ name = "cormex"
 version = "0.1.11"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",

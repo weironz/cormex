@@ -61,6 +61,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Upload the session files that changed since the last run.
+    Sync {
+        /// Only this logical path.
+        #[arg(long)]
+        source: Option<String>,
+        /// Decide and report, upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds this run may spend.
+        #[arg(long, default_value_t = 60)]
+        budget_secs: u64,
+    },
     /// List the agents and session files found on this machine.
     ///
     /// Reads paths and metadata only -- never a session's contents.
@@ -156,6 +168,50 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 logout::run(&cfg, &dirs.config).await?;
             }
             Ok(ExitCode::Ok)
+        }
+        Command::Sync {
+            source,
+            dry_run,
+            budget_secs,
+        } => {
+            let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
+            let client = cormex::ApiClient::new(&cfg.server_url, &key)?;
+            let api = cormex::sync::api::HttpCaptureApi::new(client);
+            let db = cormex::StateDb::open(&dirs.data)?;
+            let catalog = cormex_proto::catalog::Catalog::builtin().clone();
+            let opts = cormex::sync::SyncOptions {
+                trigger: cormex::sync::Trigger::Manual,
+                only: source,
+                budget: cormex::sync::upload::Budget::new(budget_secs, 512 << 20),
+                dry_run,
+            };
+            let report = cormex::sync::run(
+                &api,
+                &db,
+                &dirs.data,
+                &catalog,
+                &cfg,
+                &cfg.device_label,
+                &opts,
+            )
+            .await?;
+            println!(
+                "{} seen, {} uploaded, {} bytes, {} errors, {} deferred, {} locked",
+                report.files_seen,
+                report.files_uploaded,
+                report.bytes,
+                report.errors,
+                report.deferred,
+                report.locked
+            );
+            if let Some(e) = &report.last_error {
+                eprintln!("first error: {e}");
+            }
+            Ok(if report.errors > 0 {
+                ExitCode::PartialFailure
+            } else {
+                ExitCode::Ok
+            })
         }
         Command::Detect { json } => {
             let catalog = cormex_proto::catalog::Catalog::builtin().clone();
