@@ -294,11 +294,28 @@ impl MemoryMcp {
                     None,
                 )
             })?;
-        // Character for character the same resolution as in any ordinary
-        // handler. The tenant never comes from the request body — letting the
-        // caller declare its own identity is the same as having no tenant
-        // isolation at all
-        futures::executor::block_on(self.state.tenant(&parts.headers))
+        // The tenant never comes from the request body — letting the caller
+        // declare its own identity is the same as having no tenant isolation at
+        // all.
+        //
+        // It comes from the **principal the authentication middleware resolved**,
+        // carried in the parts' extensions exactly as it is for an ordinary
+        // handler. Re-deriving it from `parts.headers` (which is what this used
+        // to do) loses the distinction between credential kinds: a delegated
+        // token is not recognised by a header lookup and falls back to user #1.
+        let principal = parts
+            .extensions
+            .get::<crate::principal::Principal>()
+            .cloned()
+            .ok_or_else(|| {
+                ErrorData::internal_error(
+                    "this MCP request reached the service without a resolved principal; it \
+                     must be mounted behind the authentication middleware"
+                        .to_string(),
+                    None,
+                )
+            })?;
+        futures::executor::block_on(self.state.tenant_of(&principal))
             .map_err(|e| ErrorData::invalid_request(format!("{e:?}"), None))
     }
 }

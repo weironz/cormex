@@ -489,27 +489,20 @@ pub async fn register(
 /// No accounts system is attached, or the usage could not be computed.
 pub async fn usage(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<Json<crate::quota::QuotaView>, ApiError> {
-    let user_id = current_user(&st, &headers).await;
+    let user_id = current_user(&st, &principal).await;
     Ok(Json(st.quota_status(&user_id).await?.into()))
 }
 
-/// Who sent this request.
+/// Who sent this request, **from the principal the middleware resolved**.
 ///
-/// When the access token is not recognised, this falls back to user #1 — that
-/// is the old pre-shared token path, which has already passed the inbound gate,
-/// or this handler would never have been reached at all.
-pub async fn current_user(st: &AppState, headers: &axum::http::HeaderMap) -> String {
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    match st.access_book().resolve(bearer) {
-        Some(id) => id,
-        None => owner_user_id(st).await.unwrap_or_else(|| "owner".into()),
-    }
+/// This used to take the headers and re-derive the identity, falling back to
+/// user #1 for anything it did not recognise — including delegated tokens. That
+/// is how a sandbox token issued to user B ended up writing into user A's
+/// tenant. The headers are no longer consulted here at all.
+pub async fn current_user(st: &AppState, principal: &crate::principal::Principal) -> String {
+    principal.user_id_or_owner(st).await
 }
 
 /// `GET /auth/me`
@@ -520,19 +513,11 @@ pub async fn current_user(st: &AppState, headers: &axum::http::HeaderMap) -> Str
 /// contact with all of them the same day.
 pub async fn whoami(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<Json<WhoAmI>, ApiError> {
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    let user_id = match st.access_book().resolve(bearer) {
-        Some(id) => id,
-        // Unrecognised means the legacy token path (it has already passed the
-        // inbound gate, or this handler would never have been reached)
-        None => owner_user_id(&st).await.unwrap_or_else(|| "owner".into()),
-    };
+    // **The principal, not the bearer.** This used to re-read the header, and a
+    // delegated token therefore answered "you are user #1".
+    let user_id = principal.user_id_or_owner(&st).await;
     let row = sqlx::query("SELECT username, schema_name FROM cormex_auth.users WHERE id = $1")
         .bind(&user_id)
         .fetch_optional(&st.accounts()?.pool)
@@ -559,7 +544,7 @@ pub async fn whoami(
 ///
 /// Takes the first row in ascending id order — ULIDs are ordered, so "the
 /// first" is "the earliest created".
-async fn owner_user_id(st: &AppState) -> Option<String> {
+pub(crate) async fn owner_user_id(st: &AppState) -> Option<String> {
     let acc = st.accounts().ok()?;
     sqlx::query("SELECT id FROM cormex_auth.users ORDER BY id LIMIT 1")
         .fetch_optional(&acc.pool)

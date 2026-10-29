@@ -26,8 +26,8 @@
 //! caller hand over a `blob_hash` directly would have no such layer: object
 //! storage is content-addressed, and a hash carries no ownership of its own.
 
+use axum::Json;
 use axum::extract::{Query, State};
-use axum::{Json, http::HeaderMap};
 use cormex_core::{CormexError, Id, Result};
 
 use crate::routes::ApiError;
@@ -71,10 +71,10 @@ pub struct RecordRequest {
 /// Tenant resolution or the query failed.
 pub async fn list(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Query(q): Query<ScopeQuery>,
 ) -> std::result::Result<Json<Vec<SnapshotRow>>, ApiError> {
-    let owner = crate::accounts::current_user(&st, &headers).await;
+    let owner = crate::accounts::current_user(&st, &principal).await;
     Ok(Json(rows_for(&st, &owner, &q.scope).await?))
 }
 
@@ -90,10 +90,10 @@ pub async fn list(
 /// Tenant resolution or the write failed.
 pub async fn record(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<RecordRequest>,
 ) -> std::result::Result<Json<SnapshotRow>, ApiError> {
-    let owner = crate::accounts::current_user(&st, &headers).await;
+    let owner = crate::accounts::current_user(&st, &principal).await;
     let row = SnapshotRow {
         id: Id::new().to_string(),
         blob_hash: req.blob_hash,

@@ -397,31 +397,55 @@ impl AppState {
     /// real handlers.
     #[cfg(test)]
     pub fn for_tests(rt: Runtime) -> Self {
+        Self::for_tests_with(Backend::Mock, rt, Self::test_config())
+    }
+
+    /// The same, but backed by a **real** database.
+    ///
+    /// Takes an already-built [`crate::live::Live`] rather than calling
+    /// [`Self::new_live`]: that one also spawns the transcription backfill and
+    /// the vector re-embedder, and both of them would then be running against
+    /// the test database for the rest of the binary's lifetime. The tests that
+    /// need this (tenant isolation by principal) want the request path, not the
+    /// background jobs.
+    #[cfg(test)]
+    pub fn for_tests_live(live: crate::live::Live, rt: Runtime, config: Config) -> Self {
+        Self::for_tests_with(Backend::Live(Arc::new(live)), rt, config)
+    }
+
+    #[cfg(test)]
+    fn for_tests_with(backend: Backend, rt: Runtime, config: Config) -> Self {
         Self {
             inner: Arc::new(Inner {
-                config: Config {
-                    database_url: "postgres://tests-never-connect".into(),
-                    bind: "127.0.0.1:0".into(),
-                    s3: cormex_core::config::S3Config {
-                        endpoint: String::new(),
-                        bucket: String::new(),
-                        region: String::new(),
-                        access_key: String::new(),
-                        secret_key: String::new(),
-                    },
-                    llm: cormex_core::config::LlmConfig {
-                        provider: "none".into(),
-                        model: String::new(),
-                        cheap_model: String::new(),
-                        base_url: None,
-                    },
-                    device_id: "test".into(),
-                },
-                backend: Backend::Mock,
+                config,
+                backend,
                 bus: SyncBus::inert(),
                 blobs: crate::blobs::MediaStore::unavailable_for_tests(),
                 rt,
             }),
+        }
+    }
+
+    /// A `Config` that reaches nothing.
+    #[cfg(test)]
+    pub fn test_config() -> Config {
+        Config {
+            database_url: "postgres://tests-never-connect".into(),
+            bind: "127.0.0.1:0".into(),
+            s3: cormex_core::config::S3Config {
+                endpoint: String::new(),
+                bucket: String::new(),
+                region: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+            },
+            llm: cormex_core::config::LlmConfig {
+                provider: "none".into(),
+                model: String::new(),
+                cheap_model: String::new(),
+                base_url: None,
+            },
+            device_id: "test".into(),
         }
     }
 

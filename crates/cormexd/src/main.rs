@@ -17,6 +17,7 @@ mod import;
 mod live;
 /// Memory's outward-facing MCP frontage. See that module's header comment.
 mod mcp;
+mod principal;
 mod quota;
 mod reembed;
 mod request_tenant;

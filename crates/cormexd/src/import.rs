@@ -230,7 +230,7 @@ pub async fn preview(
 /// `POST /import/run` — SSE.
 pub async fn run(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<ImportRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, rx) = mpsc::channel::<ImportEvent>(64);
@@ -239,7 +239,7 @@ pub async fn run(
         // The tenant is resolved **before any work starts**. If it cannot be
         // resolved, not a single row is written — discovering halfway through
         // that we do not know whose data this is cannot be rolled back
-        let tenant = match st.tenant(&headers).await {
+        let tenant = match principal.tenant(&st).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = tx

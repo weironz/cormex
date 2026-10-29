@@ -211,10 +211,10 @@ impl AppState {
 /// The database could not be queried.
 pub async fn get(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<Json<KeyStatus>, ApiError> {
     let supported = kek().is_ok();
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     let Ok(store) = tenant.store() else {
         return Ok(Json(KeyStatus {
             configured: false,
@@ -272,7 +272,7 @@ pub async fn get(
 /// unrecognised, or the write failed.
 pub async fn put(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<SetKeyRequest>,
 ) -> Result<Json<KeyStatus>, ApiError> {
     let api_key = req.api_key.trim();
@@ -303,7 +303,7 @@ pub async fn put(
         .rev()
         .collect();
 
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     let store = tenant.store().map_err(|e| {
         ApiError::unsupported(format!(
             "this deployment cannot store a bring-your-own key: {e}"
@@ -329,7 +329,7 @@ pub async fn put(
     .map_err(|e| ApiError::internal(format!("could not store it: {e}")))?;
 
     tracing::info!(provider = %req.provider, "the user stored a bring-your-own API key");
-    get(State(st), headers).await
+    get(State(st), axum::Extension(principal)).await
 }
 
 /// `DELETE /settings/llm-key` — stop using the bring-your-own key.
@@ -342,9 +342,9 @@ pub async fn put(
 /// The write failed.
 pub async fn delete(
     State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<Json<KeyStatus>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     let store = tenant
         .store()
         .map_err(|e| ApiError::unsupported(e.to_string()))?;
@@ -359,7 +359,7 @@ pub async fn delete(
     .map_err(|e| ApiError::internal(format!("could not revoke it: {e}")))?;
 
     tracing::info!("the user removed their bring-your-own API key");
-    get(State(st), headers).await
+    get(State(st), axum::Extension(principal)).await
 }
 
 #[cfg(test)]

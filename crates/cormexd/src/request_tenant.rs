@@ -84,25 +84,23 @@ impl Tenant {
 }
 
 impl AppState {
-    /// Resolve which tenant this request belongs to.
+    /// Resolve the tenant of an **already-parsed** principal.
     ///
-    /// The resolution order is deliberately "check the backend, then check
-    /// whether there is an accounts system, and only then query the database":
-    /// the first two steps cover the overwhelming majority of deployments
-    /// (a mock development machine, single-user self-hosting) without a single
-    /// database round trip.
+    /// This is the real entry point: the identity was decided once, in the
+    /// middleware, and this only turns it into a schema. Handlers take
+    /// `Extension<Principal>` and call this — they must not re-read headers, or
+    /// a delegated caller becomes its owner's full credential again.
     ///
     /// # Errors
-    /// The user exists but their schema name is invalid, or the pool for that
-    /// schema cannot be created.
-    pub async fn tenant(&self, headers: &axum::http::HeaderMap) -> Result<Tenant, ApiError> {
-        // Mock backend: no database, so there is no tenant to assign
+    /// The account's schema name is invalid, or the pool for it cannot be
+    /// created.
+    pub async fn tenant_of(
+        &self,
+        principal: &crate::principal::Principal,
+    ) -> Result<Tenant, ApiError> {
         let Some(public_store) = self.public_store() else {
             return Ok(Tenant::Mock);
         };
-
-        // No accounts system attached = single-user self-hosting. Always public,
-        // byte-for-byte identical to today
         let Ok(acc) = self.accounts() else {
             return Ok(Tenant::Live {
                 schema: SchemaName::public(),
@@ -110,7 +108,15 @@ impl AppState {
             });
         };
 
-        let user_id = crate::accounts::current_user(self, headers).await;
+        // The legacy token has no account row of its own; it is the operator's
+        // key and maps to user #1. `None` (no accounts at all) also lands on
+        // public, which is the same thing
+        let Some(user_id) = principal.user_id(self).await else {
+            return Ok(Tenant::Live {
+                schema: SchemaName::public(),
+                store: public_store,
+            });
+        };
         let schema = resolve_schema(&acc.pool, &user_id).await?;
         self.tenant_on(schema).await
     }

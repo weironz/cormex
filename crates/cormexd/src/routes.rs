@@ -319,9 +319,12 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
 /// For connections that **cannot set request headers**: the browser's
 /// `EventSource`, `WebSocket`, `<img src>`. The ticket travels as `?ticket=` and
 /// expires after 60 seconds. See [`crate::auth`].
-async fn issue_ticket(State(st): State<AppState>) -> Json<TicketResponse> {
+async fn issue_ticket(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
+) -> Json<TicketResponse> {
     Json(TicketResponse {
-        ticket: st.ticket_book().issue(),
+        ticket: st.ticket_book().issue(principal),
         expires_in_secs: crate::auth::TICKET_TTL.as_secs(),
     })
 }
@@ -419,10 +422,10 @@ fn delegate_token(st: &AppState, scope: crate::delegated_token::DelegatedScope) 
 /// row, and all three are returned at once.
 async fn delegate(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<cormex_proto::delegate::DelegateRequest>,
 ) -> Result<Json<cormex_proto::delegate::Delegation>, ApiError> {
-    let owner = crate::accounts::current_user(&st, &headers).await;
+    let owner = crate::accounts::current_user(&st, &principal).await;
     let (scope, runtime) = delegation_scope(&st, &owner, &req.session_id).await;
     let scope_key = scope.key();
     // The quota is **reported**, never enforced here: this key is not used only
@@ -480,21 +483,21 @@ async fn revoke_delegation(
 /// unable to distinguish "it finished" from "it broke".
 async fn llm_stream(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<LlmStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Every model call from the desktop client goes through here, which makes it
     // the place the quota most needs to hold. Check **before issuing**: deducting
     // afterwards means the final call always overshoots, and that call might be
     // an import of six thousand calls
-    let user = crate::accounts::current_user(&st, &headers).await;
+    let user = crate::accounts::current_user(&st, &principal).await;
 
     // Someone with their own key uses it and does not count against the quota,
     // so **look for a key first and only then decide whether to check the
     // quota**. The other order would lock someone who supplied their own key out
     // of their own allowance — while the quota message says, in so many words,
     // that supplying your own key exempts you from it
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     let own = st.own_key(&tenant).await;
     if own.is_none() {
         st.enforce_quota(&user).await?;
@@ -619,10 +622,10 @@ async fn llm_stream(
 
 async fn memory_search(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Query(q): Query<MemorySearchQuery>,
 ) -> Result<Json<MemorySearchResponse>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.memory_search(&tenant, q).await?))
 }
 
@@ -642,14 +645,12 @@ async fn memory_search(
 /// and executes for the first time exactly when something has gone wrong.
 async fn write_episode(
     State(st): State<AppState>,
-    headers: HeaderMap,
-    // The scope carried by a delegated credential, inserted by the
-    // authentication middleware. **The origin is decided by the credential, not
-    // by the request body** — this is the crux of the entire memory write path:
-    // letting the client declare "I am low trust" is letting a prompt-injected
-    // agent pick its own trust tier. `None` means this is a full user
-    // credential, with no downgrade.
-    delegation: Option<axum::Extension<crate::delegated_token::DelegatedScope>>,
+    // The principal resolved by the authentication middleware. **The origin is
+    // decided by the credential, not by the request body** — this is the crux of
+    // the entire memory write path: letting the client declare "I am low trust"
+    // is letting a prompt-injected agent pick its own trust tier. A non-delegated
+    // principal is a full user credential, with no downgrade.
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<NewEpisodeRequest>,
 ) -> Result<Json<EpisodeAck>, ApiError> {
     // **Only the one carrying an anchor costs money** (it triggers extraction).
@@ -658,15 +659,15 @@ async fn write_episode(
     // "out of allowance" into "the raw text cannot be stored either", losing
     // data for nothing
     if req.anchor_episode_id.is_some() {
-        let user = crate::accounts::current_user(&st, &headers).await;
+        let user = crate::accounts::current_user(&st, &principal).await;
         st.enforce_quota(&user).await?;
     }
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     // A delegated caller may only write to **its own session**. Without this, a
     // prompt-injected agent could write fabricated "things the user said" into
     // **any** of that person's sessions — and binding the scope to a session is
     // entirely about this
-    if let Some(axum::Extension(scope)) = &delegation
+    if let Some(scope) = principal.delegated()
         && scope.session_id != req.session_id
     {
         tracing::warn!(
@@ -686,7 +687,7 @@ async fn write_episode(
             // tier 2. The tier for third parties writing in over MCP (tier 4)
             // does not use this route; it goes through `crate::mcp`'s remember
             // tool
-            if delegation.is_some() {
+            if principal.delegated().is_some() {
                 cormex_memory::extract::TurnOrigin::Delegated
             } else {
                 cormex_memory::extract::TurnOrigin::Trusted
@@ -698,10 +699,10 @@ async fn write_episode(
 
 async fn get_episode(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<EpisodeDto>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.get_episode(&tenant, &id).await?))
 }
 
@@ -711,9 +712,9 @@ async fn get_episode(
 /// means "disappear from the list".
 async fn list_projects(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<Json<ProjectsResponse>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(ProjectsResponse {
         projects: st.list_projects(&tenant).await?,
     }))
@@ -723,21 +724,21 @@ async fn list_projects(
 /// response.
 async fn create_project(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<NewProjectRequest>,
 ) -> Result<Json<ProjectDto>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.create_project(&tenant, &req.name).await?))
 }
 
 /// Rename. Returns the project as it stands after the change.
 async fn patch_project(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(id): Path<String>,
     Json(patch): Json<ProjectPatch>,
 ) -> Result<Json<ProjectDto>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.patch_project(&tenant, &id, patch).await?))
 }
 
@@ -752,10 +753,10 @@ async fn patch_project(
 /// case.
 async fn delete_project(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     st.delete_project(&tenant, &id).await?;
     Ok(Json(serde_json::json!({})))
 }
@@ -766,11 +767,11 @@ async fn delete_project(
 /// project.
 async fn list_sessions(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<SessionsResponse>, ApiError> {
     Ok(Json(SessionsResponse {
-        sessions: st.list_sessions(&st.tenant(&headers).await?, &q).await?,
+        sessions: st.list_sessions(&principal.tenant(&st).await?, &q).await?,
     }))
 }
 
@@ -783,11 +784,11 @@ async fn list_sessions(
 /// truncated.
 async fn get_session(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(id): Path<String>,
     Query(q): Query<SessionDetailQuery>,
 ) -> Result<Json<SessionDetail>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.session_detail(&tenant, &id, &q).await?))
 }
 
@@ -801,11 +802,11 @@ async fn get_session(
 /// different path requiring a second confirmation.
 async fn patch_session(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(id): Path<String>,
     Json(patch): Json<SessionPatch>,
 ) -> Result<Json<SessionDto>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.patch_session(&tenant, &id, patch).await?))
 }
 
@@ -817,6 +818,7 @@ async fn patch_session(
 async fn upload_blob(
     State(st): State<AppState>,
     headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     body: Bytes,
 ) -> Result<Json<BlobDto>, ApiError> {
     let declared = headers
@@ -826,7 +828,7 @@ async fn upload_blob(
         // type
         .map(|v| v.split(';').next().unwrap_or(v).trim())
         .filter(|v| !v.is_empty());
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.upload_blob(&tenant, body, declared).await?))
 }
 
@@ -857,20 +859,20 @@ fn ensure_presign_supported(st: &AppState) -> Result<(), ApiError> {
 
 async fn commit_blob(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Json(req): Json<BlobCommitRequest>,
 ) -> Result<Json<BlobDto>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.commit_blob(&tenant, req).await?))
 }
 
 async fn get_blob_url(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Path(hash): Path<String>,
 ) -> Result<Json<BlobUrlResponse>, ApiError> {
     ensure_presign_supported(&st)?;
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.blob_download_url(&tenant, &hash).await?))
 }
 
@@ -892,8 +894,9 @@ async fn get_blob(
     State(st): State<AppState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
 ) -> Result<axum::response::Response, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     let (mime, size) = st.blob_meta(&tenant, &hash).await?;
     let total = u64::try_from(size).unwrap_or(0);
 
@@ -952,10 +955,10 @@ async fn get_blob(
 
 async fn sync(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<crate::principal::Principal>,
     Query(q): Query<SyncQuery>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    let tenant = st.tenant(&headers).await?;
+    let tenant = principal.tenant(&st).await?;
     Ok(Json(st.sync_since(&tenant, q).await?))
 }
 

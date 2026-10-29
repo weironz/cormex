@@ -257,21 +257,32 @@ pub fn generate() -> (String, String) {
 
 // ─────────────────────── Short-lived tickets ──────────────────
 
-/// Tickets that have been issued and have not yet expired.
+/// Tickets that have been issued and have not yet expired, **each bound to the
+/// principal that asked for it**.
 ///
 /// Kept in memory, never in the database: a ticket does not survive a minute,
 /// while anything written to `sync_log` syncs to every device and can never be
 /// removed. All tickets are void after a process restart, and the client simply
 /// exchanges for another one — it holds the long-lived token anyway.
+///
+/// # Why the principal is stored with the ticket
+///
+/// It used to be a bare `HashMap<String, Instant>`, so a ticket carried no
+/// identity: whatever consumed it fell back to user #1. A browser signed in as
+/// user B therefore opened its WebSocket and `<img src>` requests against user
+/// A's memory — and nothing reported an error. The ticket is issued by an
+/// already-authenticated request, so the identity is right there; recording it
+/// costs one clone.
 #[derive(Default)]
 pub struct TicketBook {
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<String, (crate::principal::Principal, Instant)>>,
 }
 
 impl TicketBook {
-    /// Issue a ticket. The caller must **already** have passed bearer
-    /// verification.
-    pub fn issue(&self) -> String {
+    /// Issue a ticket for this principal. The caller must **already** have
+    /// passed bearer verification — the principal it hands over is the one the
+    /// middleware resolved.
+    pub fn issue(&self, principal: crate::principal::Principal) -> String {
         let mut buf = [0u8; 32];
         getrandom::fill(&mut buf).expect(
             "the kernel entropy source is unavailable; refusing to issue a predictable ticket",
@@ -285,17 +296,24 @@ impl TicketBook {
         // task: issuing is the only action that grows this map, so pruning here
         // makes "grows and never shrinks" impossible
         let now = Instant::now();
-        guard.retain(|_, exp| *exp > now);
-        guard.insert(ticket.clone(), now + TICKET_TTL);
+        guard.retain(|_, (_, exp)| *exp > now);
+        guard.insert(ticket.clone(), (principal, now + TICKET_TTL));
         ticket
     }
 
-    fn valid(&self, ticket: &str) -> bool {
+    /// The principal this ticket was issued for, if it is still valid.
+    ///
+    /// Returning the principal rather than a bare `bool` is what keeps the
+    /// ticket path from having to guess an identity — see the type's docs.
+    fn resolve(&self, ticket: &str) -> Option<crate::principal::Principal> {
         let guard = self
             .inner
             .lock()
             .expect("the ticket book's lock should never be poisoned");
-        guard.get(ticket).is_some_and(|exp| *exp > Instant::now())
+        guard
+            .get(ticket)
+            .filter(|(_, exp)| *exp > Instant::now())
+            .map(|(p, _)| p.clone())
     }
 
     #[cfg(test)]
@@ -322,7 +340,8 @@ impl TicketBook {
 pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let mode = st.auth_mode();
     if matches!(mode, AuthMode::Disabled) {
-        return next.run(req).await;
+        let principal = crate::principal::Principal::LegacyOwner;
+        return next.run(with_principal(req, principal)).await;
     }
 
     // 1) The normal path: Authorization: Bearer
@@ -335,7 +354,8 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
     if let Some(tok) = bearer {
         // The pre-shared token (the old path, and the norm for self-hosting)
         if mode.verify(tok) {
-            return next.run(req).await;
+            let principal = crate::principal::Principal::LegacyOwner;
+            return next.run(with_principal(req, principal)).await;
         }
         // The access token obtained by logging in.
         //
@@ -347,8 +367,9 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         // isolation, the middleware tests only inspected the public route table,
         // and the client tests hit a mock. **Not one of them went from logging
         // in to using the result.**
-        if st.access_book().resolve(tok).is_some() {
-            return next.run(req).await;
+        if let Some(user_id) = st.access_book().resolve(tok) {
+            let principal = crate::principal::Principal::User { user_id };
+            return next.run(with_principal(req, principal)).await;
         }
         // A sandbox token. **What sets it apart from the two branches above is
         // that it carries a scope** — recognising it is not enough, we still
@@ -368,9 +389,8 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
                 // "can it reach this route"; it cannot answer "can it reach this
                 // session's data" — that requires the handler to have the body
                 // and parameters in hand)
-                let mut req = req;
-                req.extensions_mut().insert(scope);
-                return next.run(req).await;
+                let principal = crate::principal::Principal::Delegated(scope);
+                return next.run(with_principal(req, principal)).await;
             }
             tracing::warn!(
                 owner = %scope.owner, session = %scope.session_id, %method, %path,
@@ -387,10 +407,14 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
     }
 
     // 2) Clients that cannot set request headers: short-lived tickets
+    //
+    // The ticket carries the principal it was issued for, so this path has an
+    // identity too. It used to have none, and everything that consumed a ticket
+    // fell back to user #1.
     if let Some(ticket) = ticket_from_query(req.uri().query())
-        && st.ticket_book().valid(&ticket)
+        && let Some(principal) = st.ticket_book().resolve(&ticket)
     {
-        return next.run(req).await;
+        return next.run(with_principal(req, principal)).await;
     }
 
     // No distinction between "no credential supplied" and "wrong credential":
@@ -409,6 +433,17 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         }),
     )
         .into_response()
+}
+
+/// Attach the resolved principal to the request.
+///
+/// One helper rather than four `extensions_mut().insert(...)` calls: the
+/// delegated branch also used to insert the raw `DelegatedScope`, and having two
+/// extension types for one concept is how "the handler read the one the
+/// middleware did not set" becomes possible.
+fn with_principal(mut req: Request, principal: crate::principal::Principal) -> Request {
+    req.extensions_mut().insert(principal);
+    req
 }
 
 /// Pull `ticket=` out of the query string.
@@ -585,17 +620,49 @@ mod tests {
         );
     }
 
+    fn user(id: &str) -> crate::principal::Principal {
+        crate::principal::Principal::User {
+            user_id: id.to_owned(),
+        }
+    }
+
     #[test]
     fn a_ticket_is_valid_until_it_is_not_in_the_book() {
         let book = TicketBook::default();
-        let t = book.issue();
-        assert!(book.valid(&t));
+        let t = book.issue(user("u1"));
+        assert!(book.resolve(&t).is_some());
         assert!(
-            !book.valid("deadbeef"),
+            book.resolve("deadbeef").is_none(),
             "a ticket that was never issued must not pass"
         );
         // Reusable: the second image on a page must not 401
-        assert!(book.valid(&t));
+        assert!(book.resolve(&t).is_some());
+    }
+
+    /// **A ticket resolves to the principal that asked for it**, not to user #1.
+    ///
+    /// The ticket used to be a bare string with no identity, so everything that
+    /// consumed one fell back to the first account — a browser signed in as user
+    /// B opened its WebSocket against user A's memory, silently.
+    #[test]
+    fn a_ticket_remembers_who_it_was_issued_for() {
+        let book = TicketBook::default();
+        let a = book.issue(user("user-a"));
+        let b = book.issue(user("user-b"));
+
+        let who = |t: &str| {
+            book.resolve(t).and_then(|p| match p {
+                crate::principal::Principal::User { user_id } => Some(user_id),
+                _ => None,
+            })
+        };
+        assert_eq!(who(&a).as_deref(), Some("user-a"));
+        assert_eq!(
+            who(&b).as_deref(),
+            Some("user-b"),
+            "two tickets issued by two users resolved to the same identity — every consumer of \
+             the ticket path (WebSocket, <img src>) would then read one person's memory"
+        );
     }
 
     #[test]
@@ -603,17 +670,20 @@ mod tests {
         let book = TicketBook::default();
         {
             let mut g = book.inner.lock().unwrap();
-            g.insert("old".into(), Instant::now() - Duration::from_secs(1));
+            g.insert(
+                "old".into(),
+                (user("u1"), Instant::now() - Duration::from_secs(1)),
+            );
         }
         assert_eq!(book.len(), 1);
-        let fresh = book.issue();
+        let fresh = book.issue(user("u1"));
         assert_eq!(
             book.len(),
             1,
             "expired tickets should be pruned when a new one is issued"
         );
-        assert!(book.valid(&fresh));
-        assert!(!book.valid("old"));
+        assert!(book.resolve(&fresh).is_some());
+        assert!(book.resolve("old").is_none());
     }
 
     #[test]
