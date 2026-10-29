@@ -985,6 +985,14 @@ impl Live {
         }))
     }
 
+    /// The provider client. The distiller needs it to make its cheap-model
+    /// call; it is the same client every other background job uses, so there is
+    /// no second key to configure.
+    #[must_use]
+    pub fn llm(&self) -> &LlmClient {
+        &self.llm
+    }
+
     /// The current vectorization backend. The backfiller uses it to compute
     /// vectors.
     #[must_use]

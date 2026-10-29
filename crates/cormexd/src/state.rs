@@ -479,6 +479,10 @@ impl AppState {
                 catalog_path: None,
                 max_chunk_bytes: cormex_core::config::DEFAULT_CAPTURE_MAX_CHUNK,
             },
+            distill: cormex_core::config::DistillConfig {
+                model: None,
+                daily_tokens: cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS,
+            },
         }
     }
 
@@ -658,6 +662,34 @@ impl AppState {
     #[must_use]
     pub fn capture_config(&self) -> &cormex_core::config::CaptureConfig {
         &self.inner.config.capture
+    }
+
+    /// The distiller's settings.
+    #[must_use]
+    pub fn distill_config(&self) -> &cormex_core::config::DistillConfig {
+        &self.inner.config.distill
+    }
+
+    /// Which account owns a schema, for per-tenant accounting.
+    ///
+    /// `None` means "no accounts system attached" (single-user self-hosting),
+    /// where a per-tenant budget is meaningless because there is one tenant and
+    /// the money is the operator's own.
+    ///
+    /// # Errors
+    /// `cormex_auth.users` could not be queried.
+    pub async fn user_for_schema(
+        &self,
+        schema: &cormex_store::SchemaName,
+    ) -> Result<Option<String>, cormex_core::CormexError> {
+        let Ok(acc) = self.accounts() else {
+            return Ok(None);
+        };
+        sqlx::query_scalar("SELECT id::text FROM cormex_auth.users WHERE schema_name = $1")
+            .bind(schema.as_str())
+            .fetch_optional(&acc.pool)
+            .await
+            .map_err(|e| CormexError::Store(format!("could not resolve the schema's owner: {e}")))
     }
 
     pub fn blob_backend(&self) -> &'static str {

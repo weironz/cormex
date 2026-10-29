@@ -499,6 +499,27 @@ impl ArchiveTxn {
         Ok(())
     }
 
+    /// Advance the distiller's progress for one session.
+    ///
+    /// Append-only like every other progress table: the newest row is the
+    /// current state, and "when did the distiller get this far" stays
+    /// answerable.
+    pub async fn insert_distill_progress(
+        &mut self,
+        session_id: &str,
+        through_seq: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO distill_progress (id, session_id, through_seq) VALUES ($1, $2, $3)",
+        )
+        .bind(cormex_core::Id::new().to_string())
+        .bind(session_id)
+        .bind(through_seq)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(())
+    }
+
     /// Record an exclusion or an inclusion of a project's archive index.
     pub async fn insert_archive_index_event(&mut self, new: &NewArchiveIndexEvent) -> Result<()> {
         sqlx::query("INSERT INTO archive_index_events (id, project_key, op) VALUES ($1, $2, $3)")

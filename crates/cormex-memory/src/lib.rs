@@ -27,6 +27,7 @@
 pub use cormex_core::injection;
 
 pub mod crosslink;
+pub mod distill;
 pub mod embed;
 pub mod embed_api;
 /// In-process ONNX inference backend. **Not built by default** — see the
@@ -45,6 +46,7 @@ pub use crosslink::{
     AcceptAll, Accepted, Candidate, CheapModelJudge, LinkCorpus, LinkJudge, LinkReport, Linker,
     RELATES_TO, StoreCorpus,
 };
+pub use distill::{CheapModelObserver, DistillEvent, Observation, ObservationOutcome, Observer};
 pub use embed::{EMBEDDING_DIM, Embedder};
 pub use extract::{
     CandidateFact, EntityIndex, EntityRef, ExtractContext, Extractor, InProcessEntityIndex,

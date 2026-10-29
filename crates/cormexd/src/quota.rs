@@ -185,6 +185,30 @@ impl AppState {
         })
     }
 
+    /// How many tokens this tenant has spent on **distillation** today.
+    ///
+    /// A calendar day rather than the quota's rolling window: the distiller's
+    /// budget is a "don't let one import eat the machine" guard, not an
+    /// allowance somebody is entitled to. A rolling window would let it start
+    /// spending again the moment yesterday's usage slid out, in the middle of
+    /// the import that is the reason the guard exists.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub async fn distill_tokens_today(&self, user_id: &str) -> Result<i64, ApiError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(sum(input_tokens + output_tokens), 0)::bigint
+               FROM cormex_auth.usage
+              WHERE user_id = $1 AND kind = 'distill'
+                AND occurred_at >= date_trunc('day', now())",
+        )
+        .bind(user_id)
+        .fetch_one(&self.accounts()?.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("could not compute the distill usage: {e}")))?;
+        Ok(row.0)
+    }
+
     /// Block the caller if they are over the limit.
     ///
     /// # Why the check happens **before** the call, rather than deducting after

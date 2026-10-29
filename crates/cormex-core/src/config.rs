@@ -20,6 +20,24 @@ pub struct Config {
     pub device_id: String,
     /// Capture settings. See [`CaptureConfig`].
     pub capture: CaptureConfig,
+    /// The distiller's settings. See [`DistillConfig`].
+    pub distill: DistillConfig,
+}
+
+/// The distiller's settings (design §9.3).
+#[derive(Debug, Clone)]
+pub struct DistillConfig {
+    /// `CORMEX_DISTILL_MODEL`. `None` = the same cheap model extraction uses.
+    ///
+    /// Not defaulted to the main model: this runs on every idle session, and
+    /// main-model prices would make the archive cost more than the
+    /// conversations it archives.
+    pub model: Option<String>,
+    /// `CORMEX_DISTILL_DAILY_TOKENS`, per tenant per day. **0 = unlimited.**
+    ///
+    /// Per tenant rather than per deployment: one person importing three years
+    /// of history must not spend everyone else's allowance.
+    pub daily_tokens: i64,
 }
 
 /// The capture endpoints' settings.
@@ -137,6 +155,10 @@ impl Config {
                 catalog_path: non_empty("CORMEX_CAPTURE_CATALOG"),
                 max_chunk_bytes: parse_max_chunk()?,
             },
+            distill: DistillConfig {
+                model: non_empty("CORMEX_DISTILL_MODEL"),
+                daily_tokens: parse_distill_daily()?,
+            },
         })
     }
 }
@@ -167,6 +189,33 @@ fn parse_max_chunk() -> Result<usize> {
     if n == 0 {
         return Err(CormexError::Config(
             "CORMEX_CAPTURE_MAX_CHUNK must not be 0: that refuses every chunk".into(),
+        ));
+    }
+    Ok(n)
+}
+
+/// The default per-tenant daily observation budget: 200k tokens.
+///
+/// Derived from cost, like the quota: at roughly one yuan per million tokens
+/// for a cheap model, 200k is about two jiao per tenant per day. An ordinary
+/// day of work is a small fraction of it; a three-year history import runs into
+/// it, which is the point — a backfill should not silently spend a month's
+/// budget in an hour.
+pub const DEFAULT_DISTILL_DAILY_TOKENS: i64 = 200_000;
+
+/// Parse `CORMEX_DISTILL_DAILY_TOKENS`. **0 means unlimited.**
+fn parse_distill_daily() -> Result<i64> {
+    let Some(raw) = non_empty("CORMEX_DISTILL_DAILY_TOKENS") else {
+        return Ok(DEFAULT_DISTILL_DAILY_TOKENS);
+    };
+    let n: i64 = raw.trim().parse().map_err(|_| {
+        CormexError::Config(format!(
+            "CORMEX_DISTILL_DAILY_TOKENS is not an integer: {raw:?}"
+        ))
+    })?;
+    if n < 0 {
+        return Err(CormexError::Config(
+            "CORMEX_DISTILL_DAILY_TOKENS must not be negative (0 means unlimited)".into(),
         ));
     }
     Ok(n)

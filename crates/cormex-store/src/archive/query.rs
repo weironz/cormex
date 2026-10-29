@@ -633,6 +633,84 @@ impl Store {
         Ok(rows)
     }
 
+    // ── the distiller ──────────────────────────────────────
+
+    /// Sessions that are **idle** and have events the distiller has not seen.
+    ///
+    /// # Why "idle" rather than "has new events"
+    ///
+    /// A session being written to right now would be distilled in the middle of
+    /// a thought: the observation would say "the user asked X" and the answer
+    /// would land thirty seconds later, producing a second entry that repeats
+    /// the first's context. Waiting for `idle_minutes` of quiet means one entry
+    /// per finished stretch of work.
+    ///
+    /// Idleness is measured on `transcript_events.created_at` — the time the
+    /// event was **projected**, not the time it happened. A backfilled session
+    /// from six months ago has old `occurred_at` values but a fresh
+    /// `created_at`, and using the event time there would make every historical
+    /// session look idle the instant it was projected, so a whole history import
+    /// would be distilled in one burst.
+    ///
+    /// Returns `(session_id, through_seq)` — `through_seq` is `-1` when the
+    /// session has never been distilled.
+    pub async fn sessions_needing_distill(
+        &self,
+        idle_minutes: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT e.session_id, coalesce(prog.through_seq, -1) AS through_seq
+               FROM transcript_events e
+               LEFT JOIN LATERAL (
+                    SELECT p.through_seq
+                      FROM distill_progress p
+                     WHERE p.session_id = e.session_id
+                     ORDER BY p.created_at DESC, p.id DESC
+                     LIMIT 1
+               ) prog ON true
+              GROUP BY e.session_id, prog.through_seq
+             HAVING max(e.seq) > coalesce(prog.through_seq, -1)
+                AND max(e.created_at) <= clock_timestamp() - make_interval(mins => $1::int)
+              ORDER BY max(e.created_at) ASC
+              LIMIT $2",
+        )
+        .bind(i32::try_from(idle_minutes).unwrap_or(i32::MAX))
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// A session's events after `after_seq`, ascending, with a hard cap.
+    ///
+    /// The cap is not a page size: it is a **cost** ceiling. A session with ten
+    /// thousand events since the last run would otherwise go to the model in
+    /// one request, and the request would be rejected for length after the
+    /// tokens had already been counted.
+    pub async fn events_after_seq(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<TranscriptEvent>> {
+        let rows = sqlx::query_as::<_, TranscriptEvent>(
+            "SELECT id, session_id, parser_version, seq, kind, occurred_at, content,
+                    text, tool_name, tool_call_id,
+                    src_generation_id, src_offset, src_length, created_at
+               FROM transcript_events
+              WHERE session_id = $1 AND seq > $2
+              ORDER BY seq ASC
+              LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(after_seq)
+        .bind(limit.clamp(1, 2000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
     /// The chunks covering `[offset, offset + len)`, ascending by offset.
     ///
     /// Used to serve a byte range of the original file (the raw view, and

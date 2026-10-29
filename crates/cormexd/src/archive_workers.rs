@@ -29,12 +29,16 @@
 //! that fails on a given input fails on it every time, and retrying every round
 //! turns one bad session into a log flood.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use cormex_core::Id;
+use cormex_memory::distill::{DistillEvent, Observation, Observer};
 use cormex_proto::transcript::ContentBlock;
 use cormex_store::{
-    CaptureChunk, ChunkEncoding, NewCaptureMask, NewMaskProgress, NewProjection,
-    NewTranscriptEvent, Projection, ProjectionStatus, Store, TranscriptEventKind,
+    CaptureChunk, ChunkEncoding, NewCaptureMask, NewMaskProgress, NewProjection, NewSummary,
+    NewTranscriptEvent, Projection, ProjectionStatus, ProvenanceRef, SourceKind, Store,
+    SummaryScope, TranscriptEvent, TranscriptEventKind,
 };
 
 use crate::request_tenant::Tenant;
@@ -83,6 +87,31 @@ pub const SCANNER: &str = "redaction@1";
 
 /// How long a failed session is left alone.
 const FAILED_BACKOFF: chrono::Duration = chrono::Duration::hours(1);
+
+/// How long a session has to be quiet before it is distilled.
+///
+/// Thirty minutes is the design's number (§8.4). Shorter and one stretch of
+/// work produces several entries that repeat each other's context; longer and
+/// "I just finished this, what did we learn" goes unanswered.
+const DISTILL_IDLE_MINUTES: i64 = 30;
+
+/// How many events one distillation run takes.
+///
+/// A cost ceiling, not a page size: a session with ten thousand new events
+/// would otherwise go to the model in one request and be rejected for length
+/// after the tokens had already been counted. The next round picks up where
+/// this one stopped.
+const DISTILL_BATCH: i64 = 200;
+
+/// What `summaries.embedding_model` holds when there is no vector.
+///
+/// The column is `NOT NULL` and the four vector channels filter on it, so this
+/// value is never matched by a query — which is exactly right for a row with no
+/// vector.
+const NO_EMBEDDING: &str = "none";
+
+/// The `device_id` on rows the server itself produced.
+const SERVER_DEVICE: &str = "server";
 
 /// Spawn both workers.
 ///
@@ -152,6 +181,20 @@ pub fn spawn(st: AppState) {
                         error = %e,
                         schema = schema.as_str(),
                         "the indexer round failed; the next one retries"
+                    ),
+                }
+                // **Last, and only over what the projector has already
+                // written.** The distiller's input is P-layer events; running
+                // it before the projector would distill a session that is one
+                // round behind, and the observation would be about work that
+                // the next round then re-distills
+                match distill_tick(&st, &tenant).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(entries = n, schema = schema.as_str(), "distilled"),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        schema = schema.as_str(),
+                        "the distiller round failed; the next one retries"
                     ),
                 }
             }
@@ -262,6 +305,264 @@ pub(crate) async fn index_tick(tenant: &Tenant) -> Result<usize> {
         written += chunks.len();
     }
     Ok(written)
+}
+
+/// One distiller round. Returns how many observation entries were written.
+///
+/// # The order of the four gates
+///
+/// 1. **Idle.** A session being written to right now would be distilled in the
+///    middle of a thought; see `sessions_needing_distill`.
+/// 2. **Budget.** Checked *before* the model call, for the same reason
+///    `enforce_quota` is: deducting afterwards means the last call always
+///    overshoots, and "the last call" can be a three-year history import.
+/// 3. **Redaction scan.** Before the text leaves the process. The P layer is
+///    already masked, so this is a second fence rather than the first — but a
+///    scanner rule added after a session was projected would otherwise let the
+///    unmasked text through here.
+/// 4. **The model call, outside any transaction** (constraint 1).
+///
+/// # Errors
+/// The todo query failed, or the store could not be reached. A model failure
+/// for one session is logged and the round continues: a provider outage must
+/// not stop masking and projecting, which do not need a model at all.
+pub(crate) async fn distill_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
+    // The observer is built once per round rather than per session: it holds
+    // the provider client, and constructing one per session would re-read the
+    // provider definition every time
+    let observer = match observer_for(st) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!(error = %e, "no model is configured; the distiller will not run");
+            return Ok(0);
+        }
+    };
+    distill_round(st, tenant, observer.as_ref()).await
+}
+
+/// The round itself, with the observer supplied.
+///
+/// Split from [`distill_tick`] so the tests can drive it with a fake: a
+/// distiller whose only implementation is "call the provider" can be tested
+/// only by calling a provider, and then the assertions measure the model's mood
+/// rather than the tick's behaviour.
+pub(crate) async fn distill_round(
+    st: &AppState,
+    tenant: &Tenant,
+    observer: &dyn Observer,
+) -> Result<usize> {
+    let store = tenant.store()?;
+    let todo = store
+        .sessions_needing_distill(DISTILL_IDLE_MINUTES, BATCH)
+        .await?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+
+    // The owner of this schema, for the per-tenant budget. `None` = no accounts
+    // system (single-user self-hosting), where there is no one to bill and the
+    // budget is the operator's own business
+    let owner = st.user_for_schema(&tenant_schema(tenant)).await?;
+    let daily_limit = st.distill_config().daily_tokens;
+
+    let mut written = 0;
+    for (session_id, through_seq) in todo {
+        if let (Some(user), true) = (&owner, daily_limit > 0) {
+            match st.distill_tokens_today(user).await {
+                Ok(used) if used >= daily_limit => {
+                    tracing::info!(
+                        used,
+                        limit = daily_limit,
+                        "this tenant's distillation budget is spent for today; stopping"
+                    );
+                    break;
+                }
+                Ok(_) => {}
+                // **Fail open on an accounting error.** The alternative is that
+                // a broken usage query silently stops the observation log for
+                // every tenant, and nothing says why
+                Err(e) => {
+                    tracing::warn!(error = %e.message(), "could not read the distill budget; continuing")
+                }
+            }
+        }
+
+        let events = store
+            .events_after_seq(&session_id, through_seq, DISTILL_BATCH)
+            .await?;
+        if events.is_empty() {
+            continue;
+        }
+        let last_seq = events.last().map_or(through_seq, |e| e.seq);
+
+        let batch: Vec<DistillEvent> = events.iter().map(distill_event_of).collect();
+        // The scan runs on the **joined** text: a secret split across two
+        // events (a command and its output) would pass a per-event scan
+        let joined: String = batch
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(rule) = cormex_memory::redaction::scan(&joined) {
+            tracing::warn!(
+                session = %session_id,
+                rule = rule.name(),
+                "this batch still contains credentials after masking; skipping distillation \
+                 (the raw archive keeps the original as usual)"
+            );
+            // Progress still advances: re-reading the same batch every round
+            // would log this warning forever and never get past it
+            store
+                .archive_txn(async |t| t.insert_distill_progress(&session_id, last_seq).await)
+                .await?;
+            continue;
+        }
+
+        let outcome = match observer.observe(&session_id, &batch).await {
+            Ok(o) => o,
+            Err(e) => {
+                // No progress advance: the next round retries. Unlike the
+                // projector's parse failures, a provider error is usually
+                // transient, and giving up on the session forever would lose
+                // the observations for good
+                tracing::warn!(session = %session_id, error = %e, "the observation run failed; the next round retries");
+                continue;
+            }
+        };
+
+        if let Some(user) = &owner {
+            st.record_usage(
+                user,
+                "distill",
+                crate::quota::Usage {
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                    own_key: false,
+                },
+                &outcome.model,
+            )
+            .await;
+        }
+
+        written += write_observations(st, store, &session_id, &outcome.entries).await?;
+
+        store
+            .archive_txn(async |t| t.insert_distill_progress(&session_id, last_seq).await)
+            .await?;
+    }
+    Ok(written)
+}
+
+/// Write one run's observations as `summaries` + `derivations`.
+///
+/// # Why these are synchronous tables
+///
+/// `summaries` and `derivations` are in `table::ALL`, so they go through
+/// `write_txn` and into `sync_log` — a device that receives a purged session's
+/// tombstone has to be able to find the summaries derived from it, and that
+/// lookup is the `derivations` edge.
+///
+/// # Idempotency
+///
+/// The summary's id is `Id::derived(at, "distill|<session>|<sources>")`, so a
+/// re-run over the same events produces the same rows and the PK rejects the
+/// duplicate. That is what makes "the process died after the model call but
+/// before the progress row" safe: the next round redoes the call, and the write
+/// is a no-op.
+async fn write_observations(
+    _st: &AppState,
+    store: &Store,
+    session_id: &str,
+    entries: &[Observation],
+) -> Result<usize> {
+    let mut written = 0;
+    for entry in entries {
+        let seed = format!(
+            "distill|{session_id}|{}",
+            entry
+                .sources
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let summary = NewSummary {
+            id: Id::derived(entry.at, &seed),
+            scope: SummaryScope::Session,
+            scope_key: session_id.to_owned(),
+            text: entry.text.clone(),
+            tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(&entry.text)),
+            // **No vector.** Summaries are not in the vector recall channels
+            // today; computing one here would spend an embedding call per
+            // observation for a column nothing reads. `embedding_model` is NOT
+            // NULL, so it carries an explicit "there is no vector" marker
+            // rather than an empty string — an empty string reads like a model
+            // whose name failed to be filled in
+            embedding: None,
+            embedding_model: NO_EMBEDDING.to_owned(),
+            covers_from: Some(entry.at),
+            covers_to: Some(entry.at),
+            sources: entry
+                .sources
+                .iter()
+                .map(|id| ProvenanceRef {
+                    kind: SourceKind::TranscriptEvent,
+                    id: *id,
+                })
+                .collect(),
+            // Not a device: the server produced this. Recording a device id
+            // here would attribute the observation to whichever machine
+            // happened to run the worker
+            device_id: SERVER_DEVICE.to_owned(),
+        };
+        match store
+            .write_txn(async |t| t.insert_summary(&summary).await)
+            .await
+        {
+            Ok(_) => written += 1,
+            // A duplicate means this exact observation was already written —
+            // the run is idempotent, not failed
+            Err(cormex_store::StoreError::Sql(sqlx::Error::Database(e)))
+                if e.code().as_deref() == Some("23505") =>
+            {
+                tracing::debug!(session = %session_id, "this observation was already written");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(written)
+}
+
+/// The observer the deployment is configured for.
+///
+/// `Err` when no provider is configured at all — which is the mock backend's
+/// shape, and the reason this is not an `Option<Observer>`: the caller has to
+/// decide what "no model" means, and silently skipping is the wrong default for
+/// a misconfigured deployment.
+fn observer_for(st: &AppState) -> Result<Arc<dyn Observer>> {
+    let live = st
+        .live()
+        .ok_or_else(|| anyhow::anyhow!("the mock backend has no model"))?;
+    let observer = cormex_memory::distill::CheapModelObserver::new(live.llm().clone())
+        .with_model(st.distill_config().model.clone())?;
+    Ok(Arc::new(observer))
+}
+
+fn tenant_schema(tenant: &Tenant) -> cormex_store::SchemaName {
+    match tenant {
+        Tenant::Live { schema, .. } => schema.clone(),
+        Tenant::Mock => cormex_store::SchemaName::public(),
+    }
+}
+
+fn distill_event_of(e: &TranscriptEvent) -> DistillEvent {
+    DistillEvent {
+        id: e.id.parse().unwrap_or_else(|_| Id::new()),
+        seq: e.seq,
+        kind: e.kind,
+        occurred_at: e.occurred_at,
+        text: e.text.clone().unwrap_or_default(),
+    }
 }
 
 /// Split a long text into 2 KiB pieces, on a **character** boundary.
@@ -1065,5 +1366,282 @@ mod tests {
     #[test]
     fn a_short_output_is_one_piece() {
         assert_eq!(split_chunks("short"), vec!["short".to_owned()]);
+    }
+
+    // ── the distiller ──────────────────────────────────────
+
+    /// An observer that answers with a fixed observation citing event #1.
+    ///
+    /// The tick's real logic — when it fires, what it passes in, where the
+    /// output lands, when the budget stops it — is what these tests measure. A
+    /// real provider would make them measure the model's mood instead, and they
+    /// could not run in CI at all.
+    struct FakeObserver {
+        entries: Vec<cormex_memory::distill::Observation>,
+        seen: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl FakeObserver {
+        fn new(entries: Vec<cormex_memory::distill::Observation>) -> Self {
+            Self {
+                entries,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Observer for FakeObserver {
+        async fn observe(
+            &self,
+            _session_id: &str,
+            events: &[DistillEvent],
+        ) -> cormex_core::Result<cormex_memory::distill::ObservationOutcome> {
+            self.seen.lock().expect("not poisoned").push(events.len());
+            Ok(cormex_memory::distill::ObservationOutcome {
+                entries: self.entries.clone(),
+                input_tokens: 100,
+                output_tokens: 20,
+                model: "fake".into(),
+            })
+        }
+    }
+
+    /// Make every event look an hour old, so the idle gate opens.
+    ///
+    /// `transcript_events.created_at` is `clock_timestamp()`, and a test cannot
+    /// wait thirty minutes. This is the one place a test writes an `UPDATE` —
+    /// it is simulating the passage of time, not changing a fact.
+    async fn age_events(db: &crate::test_support::FreshDb) {
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::query(
+            "UPDATE transcript_events SET created_at = clock_timestamp() - interval '1 hour'",
+        )
+        .execute(&pool)
+        .await
+        .expect("backdate");
+        pool.close().await;
+    }
+
+    async fn seed_projected_session(st: &AppState, store: &Store, body: &[u8]) -> (String, Tenant) {
+        let (session, _generation) = seed(store, "claude_code", body).await;
+        store_object(st, body).await;
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: std::sync::Arc::new(store.clone()),
+        };
+        project_tick(st, &tenant).await.expect("project tick");
+        (session, tenant)
+    }
+
+    /// An idle session produces a summary with a `transcript_event` edge.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_distiller_writes_observations_with_provenance() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body =
+            br#"{"type":"user","message":{"role":"user","content":"we decided to use RustFS"}}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (session, tenant) = seed_projected_session(&st, &store, body).await;
+        age_events(&db).await;
+
+        let events = store
+            .events_after_seq(&session, -1, 10)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 1, "the fixture should have one event");
+
+        let observer = FakeObserver::new(vec![cormex_memory::distill::Observation {
+            at: chrono::Utc::now(),
+            text: "决定用 RustFS".into(),
+            sources: vec![events[0].id.parse().expect("a ULID")],
+        }]);
+        let written = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("distill round");
+        assert_eq!(written, 1, "one observation should have been written");
+
+        let summaries = store
+            .summaries_for_scope(cormex_store::SummaryScope::Session, &session, 10)
+            .await
+            .expect("summaries");
+        assert_eq!(summaries.len(), 1, "the observation should be a summary");
+        assert_eq!(summaries[0].text, "决定用 RustFS");
+
+        // **The edge is what makes the summary findable after a purge.**
+        let edges: Vec<String> = {
+            let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT source_kind FROM derivations WHERE derived_id = $1")
+                    .bind(&summaries[0].id)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("derivations");
+            pool.close().await;
+            rows.into_iter().map(|(k,)| k).collect()
+        };
+        assert_eq!(
+            edges,
+            vec!["transcript_event".to_owned()],
+            "the summary must cite the event it was drawn from"
+        );
+
+        // A second round has nothing to do: progress advanced past the event
+        let again = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("second round");
+        assert_eq!(
+            again, 0,
+            "the second round re-distilled events that were already processed"
+        );
+
+        db.drop().await;
+    }
+
+    /// A session that is still being written to is left alone.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_session_that_is_not_idle_is_not_distilled() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let observer = FakeObserver::new(Vec::new());
+        let written = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("distill round");
+        assert_eq!(
+            written, 0,
+            "a session projected seconds ago was distilled; the observation would be about a \
+             thought that is still being finished"
+        );
+        assert!(
+            observer.seen.lock().expect("not poisoned").is_empty(),
+            "the model was called for a session that is not idle"
+        );
+
+        db.drop().await;
+    }
+
+    /// A spent budget stops the round **before** the model call.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_daily_budget_stops_the_round_before_the_model_call() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+        age_events(&db).await;
+
+        // An account owns `public`, and it has already spent more than the
+        // default daily budget on distillation
+        let user = Id::new().to_string();
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::query(
+            "INSERT INTO cormex_auth.users (id, username, password_hash, schema_name)
+             VALUES ($1, 'budget-test', 'x', 'public')",
+        )
+        .bind(&user)
+        .execute(&pool)
+        .await
+        .expect("insert the account");
+        sqlx::query(
+            "INSERT INTO cormex_auth.usage (id, user_id, kind, input_tokens, output_tokens)
+             VALUES ($1, $2, 'distill', $3, 0)",
+        )
+        .bind(Id::new().to_string())
+        .bind(&user)
+        .bind(cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS)
+        .execute(&pool)
+        .await
+        .expect("insert the usage");
+        pool.close().await;
+
+        let observer = FakeObserver::new(Vec::new());
+        let written = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("distill round");
+        assert_eq!(written, 0, "a spent budget must write nothing");
+        assert!(
+            observer.seen.lock().expect("not poisoned").is_empty(),
+            "the model was called after the budget was spent -- the check has to come before \
+             the call, or the last call always overshoots"
+        );
+
+        db.drop().await;
+    }
+
+    /// A batch that still contains a credential after masking is skipped, and
+    /// progress still advances.
+    ///
+    /// Advancing is the point: re-reading the same batch every round would log
+    /// the warning forever and never get past it.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_credential_in_the_batch_is_skipped_and_progress_advances() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+        age_events(&db).await;
+
+        // Simulate a scanner rule that arrived after this session was
+        // projected: the P layer's text is what the distiller reads, and it is
+        // not masked for a rule that did not exist when it was written
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::query(
+            "UPDATE transcript_events SET text = 'token sk-abcdef0123456789abcdef0123456789'",
+        )
+        .execute(&pool)
+        .await
+        .expect("plant a credential");
+        pool.close().await;
+
+        let observer = FakeObserver::new(Vec::new());
+        let written = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("distill round");
+        assert_eq!(written, 0, "nothing should have been written");
+        assert!(
+            observer.seen.lock().expect("not poisoned").is_empty(),
+            "the text crossed the network despite the scan"
+        );
+
+        // Progress advanced, so the next round does not re-read the same batch
+        let again = distill_round(&st, &tenant, &observer)
+            .await
+            .expect("second round");
+        assert_eq!(again, 0);
+        assert!(
+            observer.seen.lock().expect("not poisoned").is_empty(),
+            "the second round re-read the batch it had already skipped"
+        );
+
+        db.drop().await;
     }
 }

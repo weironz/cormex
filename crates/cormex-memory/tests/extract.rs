@@ -686,3 +686,71 @@ async fn facts_written_from_a_sandbox_are_not_trusted_like_the_user_speaking() {
         normal_fact.trust_tier
     );
 }
+
+/// The distiller against a real model. CI has no key, so this skips by default;
+/// run it by hand with
+/// `cargo test -p cormex-memory --test extract -- --ignored --nocapture`.
+///
+/// What it checks is the **contract with the model**, not the pipeline: that the
+/// prompt produces parseable observations that cite the events they came from.
+/// The pipeline's own behaviour (idle gate, truncation, budget, where the rows
+/// land) is covered by `cormexd`'s archive-worker tests with a fake observer —
+/// they have to be, because those assertions must not depend on a model's mood.
+#[tokio::test]
+#[ignore = "needs DEEPSEEK_API_KEY; makes real API calls"]
+async fn real_llm_observation_quality() {
+    let _ = dotenvy::dotenv();
+    // Skip rather than fail when no provider is configured: CI passes
+    // `--include-ignored` to reach the database tests, and that flag cannot
+    // tell "needs a database CI has" from "needs an API key CI must not have"
+    let Ok(llm) = cormex_llm::LlmClient::from_env() else {
+        eprintln!("skipped: no LLM provider configured (DEEPSEEK_API_KEY and friends)");
+        return;
+    };
+    use cormex_memory::distill::Observer as _;
+    let observer = cormex_memory::distill::CheapModelObserver::new(llm);
+
+    let events = vec![
+        cormex_memory::distill::DistillEvent {
+            id: Id::new(),
+            seq: 0,
+            kind: cormex_store::TranscriptEventKind::UserMessage,
+            occurred_at: Some(ts(2026, 10, 29)),
+            text: "对象存储最后定了用 RustFS，不用 MinIO 了 —— license 变更那事儿。".into(),
+        },
+        cormex_memory::distill::DistillEvent {
+            id: Id::new(),
+            seq: 1,
+            kind: cormex_store::TranscriptEventKind::AgentMessage,
+            occurred_at: Some(ts(2026, 10, 29)),
+            text: "记下了：用 RustFS。另外那个接口必须带 Host 头，否则 rmcp 的 allowed-hosts 检查会拒。".into(),
+        },
+    ];
+
+    let outcome = observer
+        .observe("smoke-session", &events)
+        .await
+        .expect("a real observation run should not fail");
+
+    println!("\n=== {} observations ===", outcome.entries.len());
+    for o in &outcome.entries {
+        println!("- [{}] {}\n    sources: {:?}", o.at, o.text, o.sources);
+    }
+
+    assert!(
+        !outcome.entries.is_empty(),
+        "this exchange plainly contains things worth remembering"
+    );
+    for o in &outcome.entries {
+        assert!(
+            !o.sources.is_empty(),
+            "an observation with no source cannot be found after its source is purged: {o:?}"
+        );
+        assert!(
+            o.sources
+                .iter()
+                .all(|id| events.iter().any(|e| e.id == *id)),
+            "an observation cited an event that was not in the batch: {o:?}"
+        );
+    }
+}

@@ -141,6 +141,10 @@ async fn build_live(
             catalog_path: None,
             max_chunk_bytes: cormex_core::config::DEFAULT_CAPTURE_MAX_CHUNK,
         },
+        distill: cormex_core::config::DistillConfig {
+            model: None,
+            daily_tokens: cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS,
+        },
     };
 
     // The hash embedder: no model download, no network. Retrieval quality is
