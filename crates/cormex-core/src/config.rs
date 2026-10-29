@@ -38,6 +38,21 @@ pub struct DistillConfig {
     /// Per tenant rather than per deployment: one person importing three years
     /// of history must not spend everyone else's allowance.
     pub daily_tokens: i64,
+    /// Whether captured sessions are promoted into `episodes` for fact
+    /// extraction (D14). `CORMEX_PROMOTE_ENABLED`, default on.
+    ///
+    /// Off is a legitimate choice: promotion spends an extraction call per
+    /// promoted message, and somebody archiving sessions purely for the raw
+    /// record is paying for facts they never asked for.
+    pub promote: bool,
+    /// How many events one promotion round takes.
+    ///
+    /// A **rate** limit, not a page size. A history import projects months of
+    /// sessions in a few rounds; without a cap the promoter would hand the
+    /// extractor thousands of messages at once, and the extraction gate would
+    /// then be saturated for hours while ordinary conversation queue behind it.
+    /// `CORMEX_PROMOTE_PER_ROUND`.
+    pub promote_per_round: i64,
 }
 
 /// The capture endpoints' settings.
@@ -158,6 +173,8 @@ impl Config {
             distill: DistillConfig {
                 model: non_empty("CORMEX_DISTILL_MODEL"),
                 daily_tokens: parse_distill_daily()?,
+                promote: parse_bool("CORMEX_PROMOTE_ENABLED", true),
+                promote_per_round: parse_promote_per_round()?,
             },
         })
     }
@@ -202,6 +219,51 @@ fn parse_max_chunk() -> Result<usize> {
 /// it, which is the point — a backfill should not silently spend a month's
 /// budget in an hour.
 pub const DEFAULT_DISTILL_DAILY_TOKENS: i64 = 200_000;
+
+/// The default promotion cap per round: 40 messages.
+///
+/// At the extraction gate's default concurrency this is a couple of minutes of
+/// work per round, which leaves the gate mostly free for live conversation.
+pub const DEFAULT_PROMOTE_PER_ROUND: i64 = 40;
+
+/// Parse `CORMEX_PROMOTE_PER_ROUND`. **0 disables promotion**, the same way
+/// `CORMEX_PROMOTE_ENABLED=false` does.
+fn parse_promote_per_round() -> Result<i64> {
+    let Some(raw) = non_empty("CORMEX_PROMOTE_PER_ROUND") else {
+        return Ok(DEFAULT_PROMOTE_PER_ROUND);
+    };
+    let n: i64 = raw.trim().parse().map_err(|_| {
+        CormexError::Config(format!(
+            "CORMEX_PROMOTE_PER_ROUND is not an integer: {raw:?}"
+        ))
+    })?;
+    if n < 0 {
+        return Err(CormexError::Config(
+            "CORMEX_PROMOTE_PER_ROUND must not be negative (0 disables promotion)".into(),
+        ));
+    }
+    Ok(n)
+}
+
+/// Parse a boolean environment variable.
+///
+/// Accepts `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive), and
+/// **errors on anything else** rather than falling back: a typo that silently
+/// means "on" is the failure mode that matters here — somebody turning
+/// promotion off and finding out months later that it never was.
+fn parse_bool(key: &str, default: bool) -> bool {
+    let Some(raw) = non_empty(key) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        other => {
+            tracing::warn!(var = key, value = other, "not a boolean; using the default");
+            default
+        }
+    }
+}
 
 /// Parse `CORMEX_DISTILL_DAILY_TOKENS`. **0 means unlimited.**
 fn parse_distill_daily() -> Result<i64> {

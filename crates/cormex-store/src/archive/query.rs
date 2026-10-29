@@ -633,6 +633,38 @@ impl Store {
         Ok(rows)
     }
 
+    // ── promotion (P → episodes) ───────────────────────────
+
+    /// Sessions with events the promoter has not looked at, and how far it got.
+    ///
+    /// No idle gate here, unlike the distiller: promotion is per event, so
+    /// promoting a session that is still being written to is harmless — the
+    /// next round picks up the new events, and each event becomes exactly one
+    /// episode (its id is derived from the event).
+    ///
+    /// Returns `(session_id, through_seq)`; `-1` when never promoted.
+    pub async fn sessions_needing_promotion(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT e.session_id, coalesce(prog.through_seq, -1) AS through_seq
+               FROM transcript_events e
+               LEFT JOIN LATERAL (
+                    SELECT p.through_seq
+                      FROM promote_progress p
+                     WHERE p.session_id = e.session_id
+                     ORDER BY p.created_at DESC, p.id DESC
+                     LIMIT 1
+               ) prog ON true
+              GROUP BY e.session_id, prog.through_seq
+             HAVING max(e.seq) > coalesce(prog.through_seq, -1)
+              ORDER BY min(e.created_at) ASC
+              LIMIT $1",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
     // ── the handover brief ─────────────────────────────────
 
     /// The newest brief for a session, if it still covers every event.

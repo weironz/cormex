@@ -199,6 +199,7 @@ impl AppState {
     }
 }
 
+#[derive(Clone)]
 enum Backend {
     /// A source of fake data. Its contract is identical to Live's.
     Mock,
@@ -442,6 +443,28 @@ impl AppState {
         }
     }
 
+    /// The same state with promotion turned on or off.
+    ///
+    /// Test-only: the setting normally comes from the environment at startup,
+    /// and the tests need to exercise both branches in one process. Rebuilding
+    /// the whole `Inner` is what keeps every other handle (the same `Live`, the
+    /// same pools) pointing at the same database.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_promotion(&self, on: bool) -> Self {
+        let mut config = self.inner.config.clone();
+        config.distill.promote = on;
+        Self {
+            inner: Arc::new(Inner {
+                config,
+                backend: self.inner.backend.clone(),
+                bus: self.inner.bus.clone(),
+                blobs: self.inner.blobs.clone(),
+                rt: self.inner.rt.clone(),
+            }),
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn for_tests_with(backend: Backend, rt: Runtime, config: Config) -> Self {
         Self {
@@ -482,6 +505,8 @@ impl AppState {
             distill: cormex_core::config::DistillConfig {
                 model: None,
                 daily_tokens: cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS,
+                promote: true,
+                promote_per_round: cormex_core::config::DEFAULT_PROMOTE_PER_ROUND,
             },
         }
     }

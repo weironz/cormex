@@ -128,6 +128,7 @@ pub mod table {
         // Phase 5: the distiller's progress, and the brief pointers
         "distill_progress",
         "session_briefs",
+        "promote_progress",
     ];
 }
 

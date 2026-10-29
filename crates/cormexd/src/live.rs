@@ -993,6 +993,22 @@ impl Live {
         &self.llm
     }
 
+    /// The fact extractor, and the gate that bounds how many may run at once.
+    ///
+    /// The promoter reuses **the same** extractor and gate as `POST /episodes`
+    /// rather than building its own: a second instance would mean a second
+    /// concurrency ceiling, and a history import would then run at twice the
+    /// rate the gate was sized for.
+    #[must_use]
+    pub fn extractor(
+        &self,
+    ) -> (
+        &cormex_memory::extract::Extractor,
+        &Arc<tokio::sync::Semaphore>,
+    ) {
+        (&self.extractor, &self.extract_gate)
+    }
+
     /// The current vectorization backend. The backfiller uses it to compute
     /// vectors.
     #[must_use]

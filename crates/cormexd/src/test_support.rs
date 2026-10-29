@@ -144,6 +144,8 @@ async fn build_live(
         distill: cormex_core::config::DistillConfig {
             model: None,
             daily_tokens: cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS,
+            promote: true,
+            promote_per_round: cormex_core::config::DEFAULT_PROMOTE_PER_ROUND,
         },
     };
 

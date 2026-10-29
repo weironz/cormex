@@ -36,8 +36,8 @@ use cormex_core::Id;
 use cormex_memory::distill::{DistillEvent, Observation, Observer};
 use cormex_proto::transcript::ContentBlock;
 use cormex_store::{
-    CaptureChunk, ChunkEncoding, NewCaptureMask, NewMaskProgress, NewProjection, NewSummary,
-    NewTranscriptEvent, Projection, ProjectionStatus, ProvenanceRef, SourceKind, Store,
+    CaptureChunk, ChunkEncoding, NewCaptureMask, NewEpisode, NewMaskProgress, NewProjection,
+    NewSummary, NewTranscriptEvent, Projection, ProjectionStatus, ProvenanceRef, SourceKind, Store,
     SummaryScope, TranscriptEvent, TranscriptEventKind,
 };
 
@@ -191,6 +191,20 @@ pub fn spawn(st: AppState) {
                         error = %e,
                         schema = schema.as_str(),
                         "the distiller round failed; the next one retries"
+                    ),
+                }
+                // Promotion is last and independent: it writes `episodes`,
+                // which is a synchronous table, so it takes the sync lock —
+                // running it before the archive work would let a history
+                // import's promotion delay masking and projection, and those
+                // two are what make the archive readable at all
+                match promote_tick(&st, &tenant).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(promoted = n, schema = schema.as_str(), "promoted"),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        schema = schema.as_str(),
+                        "the promoter round failed; the next one retries"
                     ),
                 }
             }
@@ -559,6 +573,253 @@ pub(crate) fn distill_event_of(e: &TranscriptEvent) -> DistillEvent {
         occurred_at: e.occurred_at,
         text: e.text.clone().unwrap_or_default(),
     }
+}
+
+// ══════════════════════════════════════════════════════════
+//  Promotion: P-layer events → episodes → facts (D14)
+// ══════════════════════════════════════════════════════════
+
+/// Which events become `episodes`, and therefore facts.
+///
+/// # The policy, and why it is this one
+///
+/// Every user message, plus **the last agent message of each turn**. Not every
+/// agent message: an agent writes several paragraphs per turn, and promoting
+/// each one is several extraction calls to say one thing. The last one carries
+/// the conclusion, which is what a fact is made of.
+///
+/// Tool output is **never** promoted. It is the largest, least factual part of
+/// a transcript, and the trace pipeline (`cormex_memory::trace`) already mines
+/// it for the hard signals worth keeping — running it through the extractor as
+/// well would pay a model to read build logs.
+///
+/// # Why the rule is computed over the batch rather than stored
+///
+/// "Is this the last agent message of its turn" is a property of the events
+/// around it. Storing it would need a column that the projector would have to
+/// keep in step with every append; computing it over the batch costs one pass
+/// and cannot go stale.
+#[must_use]
+pub fn should_promote(events: &[TranscriptEvent], index: usize) -> bool {
+    match events[index].kind {
+        TranscriptEventKind::UserMessage => true,
+        TranscriptEventKind::AgentMessage => {
+            // The last agent message before the next user message (or the end)
+            !events[index + 1..]
+                .iter()
+                .take_while(|e| e.kind != TranscriptEventKind::UserMessage)
+                .any(|e| e.kind == TranscriptEventKind::AgentMessage)
+        }
+        _ => false,
+    }
+}
+
+/// The step that turns one promoted episode into facts.
+///
+/// A trait so the tests can drive promotion without a provider: the assertions
+/// that matter here are "the same event is never promoted twice" and "the facts
+/// land where `memory_search` can find them", and neither should depend on a
+/// model's mood.
+#[async_trait::async_trait]
+pub trait FactSink: Send + Sync {
+    /// # Errors
+    /// The extraction failed. The episode is already written and stays; only
+    /// the facts are missing.
+    async fn extract(
+        &self,
+        store: &Store,
+        text: &str,
+        ctx: &cormex_memory::extract::ExtractContext,
+    ) -> anyhow::Result<()>;
+}
+
+/// The production sink: the same extractor and gate `POST /episodes` uses.
+pub struct LiveFactSink<'a> {
+    extractor: &'a cormex_memory::extract::Extractor,
+    gate: &'a Arc<tokio::sync::Semaphore>,
+}
+
+impl<'a> LiveFactSink<'a> {
+    #[must_use]
+    pub fn new(
+        extractor: &'a cormex_memory::extract::Extractor,
+        gate: &'a Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self { extractor, gate }
+    }
+}
+
+#[async_trait::async_trait]
+impl FactSink for LiveFactSink<'_> {
+    async fn extract(
+        &self,
+        store: &Store,
+        text: &str,
+        ctx: &cormex_memory::extract::ExtractContext,
+    ) -> anyhow::Result<()> {
+        // The **same** gate as the request path: a history import promoting
+        // thousands of messages must not run at twice the rate the gate was
+        // sized for
+        let _permit = self.gate.acquire().await.ok();
+        let report = self.extractor.ingest(store, text, ctx).await?;
+        tracing::debug!(
+            written = report.written.len(),
+            superseded = report.superseded.len(),
+            "promoted episode extracted"
+        );
+        Ok(())
+    }
+}
+
+/// One promotion round. Returns how many episodes were promoted.
+///
+/// # Errors
+/// The todo query failed, or the store could not be reached. An extraction
+/// failure for one episode is logged and the round continues — a provider
+/// outage must not stop the archive from being promoted once it recovers, and
+/// the progress row only advances past what actually succeeded.
+pub(crate) async fn promote_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
+    let cfg = st.distill_config();
+    if !cfg.promote || cfg.promote_per_round <= 0 {
+        return Ok(0);
+    }
+    let Some(live) = st.live() else {
+        return Ok(0);
+    };
+    let (extractor, gate) = live.extractor();
+    promote_round(st, tenant, &LiveFactSink::new(extractor, gate)).await
+}
+
+/// The round itself, with the fact sink supplied.
+pub(crate) async fn promote_round(
+    st: &AppState,
+    tenant: &Tenant,
+    sink: &dyn FactSink,
+) -> Result<usize> {
+    let cfg = st.distill_config();
+    if !cfg.promote || cfg.promote_per_round <= 0 {
+        return Ok(0);
+    }
+    let store = tenant.store()?;
+    let todo = store.sessions_needing_promotion(BATCH).await?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+
+    let mut promoted = 0usize;
+    for (session_id, through_seq) in todo {
+        let events = store
+            .events_after_seq(&session_id, through_seq, cfg.promote_per_round)
+            .await?;
+        if events.is_empty() {
+            continue;
+        }
+
+        let mut last_ok = through_seq;
+        for (i, event) in events.iter().enumerate() {
+            if !should_promote(&events, i) {
+                last_ok = event.seq;
+                continue;
+            }
+            let Some(text) = event
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            else {
+                last_ok = event.seq;
+                continue;
+            };
+
+            // Write-side negative filter, before the text reaches the model.
+            // The P layer is already masked; this catches a scanner rule that
+            // arrived after the session was projected
+            if let Some(rule) = cormex_memory::redaction::scan(text) {
+                tracing::warn!(
+                    session = %session_id,
+                    rule = rule.name(),
+                    "this event still contains credentials; not promoting it"
+                );
+                last_ok = event.seq;
+                continue;
+            }
+
+            let episode = NewEpisode {
+                // **Derived from the event id.** A re-run over the same events
+                // produces the same id, so the PK rejects the duplicate and
+                // "promote this event twice" is impossible by construction —
+                // which is what makes the progress row safe to lose
+                id: Id::derived(
+                    event.occurred_at.unwrap_or(event.created_at),
+                    &format!("promote|{}", event.id),
+                ),
+                session_id: session_id.clone(),
+                role: match event.kind {
+                    TranscriptEventKind::UserMessage => cormex_store::Role::User,
+                    _ => cormex_store::Role::Assistant,
+                },
+                // The event id travels inside `content`, which is how a fact
+                // extracted from this episode can be traced back to the
+                // transcript line it came from
+                content: serde_json::json!({
+                    "transcript_event_id": event.id,
+                    "text": text,
+                }),
+                text: Some(text.to_owned()),
+                tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(text)),
+                domain: None,
+                device_id: SERVER_DEVICE.to_owned(),
+                occurred_at: event.occurred_at.unwrap_or(event.created_at),
+            };
+            let episode_id = episode.id;
+
+            let written = store
+                .write_txn(async |t| t.insert_episode(&episode).await)
+                .await;
+            match written {
+                Ok(_) => promoted += 1,
+                Err(cormex_store::StoreError::Sql(sqlx::Error::Database(e)))
+                    if e.code().as_deref() == Some("23505") =>
+                {
+                    // Already promoted. Not an error: the progress row was
+                    // lost or the round overlapped
+                    tracing::debug!(session = %session_id, event = %event.id, "already promoted");
+                }
+                Err(e) => {
+                    // **Stop this session here** rather than skipping ahead:
+                    // advancing past an episode that failed to write would
+                    // leave it unextracted forever
+                    tracing::warn!(session = %session_id, error = %e, "could not promote this event");
+                    break;
+                }
+            }
+
+            // ── The extraction, through the same gate as `POST /episodes` ──
+            let ctx = cormex_memory::extract::ExtractContext::new(
+                episode_id,
+                event.occurred_at.unwrap_or(event.created_at),
+            );
+            // The episode is written; only the facts are missing if this
+            // fails. Advancing is right: re-running extraction would need the
+            // episode to be re-promoted, and its id makes that a no-op
+            if let Err(e) = sink.extract(store, text, &ctx).await {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %e,
+                    "the promoted episode could not be extracted; the episode itself is kept"
+                );
+            }
+
+            last_ok = event.seq;
+        }
+
+        if last_ok > through_seq {
+            store
+                .archive_txn(async |t| t.insert_promote_progress(&session_id, last_ok).await)
+                .await?;
+        }
+    }
+    Ok(promoted)
 }
 
 /// Split a long text into 2 KiB pieces, on a **character** boundary.
@@ -1362,6 +1623,313 @@ mod tests {
     #[test]
     fn a_short_output_is_one_piece() {
         assert_eq!(split_chunks("short"), vec!["short".to_owned()]);
+    }
+
+    // ── promotion ──────────────────────────────────────────
+
+    /// The policy: every user message, and only the **last** agent message of
+    /// each turn.
+    ///
+    /// Promoting every agent message would be several extraction calls to say
+    /// one thing; promoting none of them would lose the conclusions.
+    #[test]
+    fn the_promotion_policy_takes_users_and_the_last_agent_message() {
+        use TranscriptEventKind as K;
+        let kinds = [
+            K::UserMessage,
+            K::AgentMessage,
+            K::ToolCall,
+            K::AgentMessage,
+            K::ToolResult,
+            K::UserMessage,
+            K::AgentMessage,
+        ];
+        let events: Vec<TranscriptEvent> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| fake_event(i as i64, *k))
+            .collect();
+        let picked: Vec<bool> = (0..events.len())
+            .map(|i| should_promote(&events, i))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![true, false, false, true, false, true, true],
+            "user messages always promote; of two agent messages in a turn only the last one \
+             does; tool calls and results never do"
+        );
+    }
+
+    /// A trailing agent message with no user after it is still the turn's last.
+    #[test]
+    fn a_lone_agent_message_is_promoted() {
+        use TranscriptEventKind as K;
+        let events = vec![fake_event(0, K::AgentMessage)];
+        assert!(should_promote(&events, 0));
+    }
+
+    fn fake_event(seq: i64, kind: TranscriptEventKind) -> TranscriptEvent {
+        TranscriptEvent {
+            id: Id::new().to_string(),
+            session_id: Id::new().to_string(),
+            parser_version: "claude_code@1".into(),
+            seq,
+            kind,
+            occurred_at: Some(chrono::Utc::now()),
+            content: serde_json::json!([]),
+            text: Some(format!("event {seq}")),
+            tool_name: None,
+            tool_call_id: None,
+            src_generation_id: Id::new().to_string(),
+            src_offset: 0,
+            src_length: 0,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A sink that writes one fact per episode, so `memory_search` can find it.
+    ///
+    /// Writing a real fact (rather than counting calls) is the point: the
+    /// acceptance is "the extracted facts can be found by `memory_search`", and
+    /// a counter would pass even if the write went to the wrong schema.
+    struct FakeFactSink {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeFactSink {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.seen.lock().expect("not poisoned").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FactSink for FakeFactSink {
+        async fn extract(
+            &self,
+            store: &Store,
+            text: &str,
+            ctx: &cormex_memory::extract::ExtractContext,
+        ) -> anyhow::Result<()> {
+            self.seen
+                .lock()
+                .expect("not poisoned")
+                .push(text.to_owned());
+            // The same shape the real extractor writes: an entity, a fact with
+            // its embedding, and a fact_event
+            let entity = cormex_store::NewEntity {
+                id: Id::new(),
+                kind: "concept".into(),
+                name: "RustFS".into(),
+                summary: None,
+                embedding: Some(cormex_store::Vector::from(vec![0.1f32; 1024])),
+                embedding_model: "test-model".into(),
+                device_id: SERVER_DEVICE.into(),
+            };
+            let entity_id = entity.id;
+            let statement = format!("cormex 使用 RustFS（{text}）");
+            let fact = cormex_store::NewFact {
+                id: Id::new(),
+                subject_id: entity_id,
+                predicate: "uses".into(),
+                object_text: Some("RustFS".into()),
+                object_entity_id: None,
+                statement: statement.clone(),
+                embedding: Some(cormex_store::Vector::from(vec![0.1f32; 1024])),
+                embedding_model: "test-model".into(),
+                domain: None,
+                confidence: 1.0,
+                valid_at: None,
+                source_episode_id: ctx.episode_id,
+                tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(&statement)),
+                source: cormex_store::FactSource::Conversation,
+                derived_from: Vec::new(),
+                extracted_by: "fake/test".into(),
+                device_id: SERVER_DEVICE.into(),
+            };
+            store
+                .write_txn(async |t| {
+                    t.insert_entity(&entity).await?;
+                    t.insert_fact(&fact).await
+                })
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// The same event is never promoted twice.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn promotion_is_idempotent() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"we use RustFS"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let sink = FakeFactSink::new();
+        let first = promote_round(&st, &tenant, &sink)
+            .await
+            .expect("first round");
+        assert_eq!(first, 1, "one user message should have been promoted");
+        assert_eq!(sink.calls(), 1);
+
+        // Lose the progress row, as a crash between the write and the progress
+        // insert would
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::query("DELETE FROM promote_progress")
+            .execute(&pool)
+            .await
+            .expect("drop the progress");
+        pool.close().await;
+
+        let second = promote_round(&st, &tenant, &sink)
+            .await
+            .expect("second round");
+        assert_eq!(
+            second, 0,
+            "the event was promoted again after the progress row was lost -- its derived id is \
+             what makes a re-run safe"
+        );
+
+        // And there is exactly one episode for it
+        let episodes: Vec<(String,)> = {
+            let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+            let rows = sqlx::query_as("SELECT id::text FROM episodes")
+                .fetch_all(&pool)
+                .await
+                .expect("episodes");
+            pool.close().await;
+            rows
+        };
+        assert_eq!(episodes.len(), 1, "duplicate episodes: {episodes:?}");
+
+        db.drop().await;
+    }
+
+    /// A second round with the progress row intact does nothing.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_second_promotion_round_does_nothing() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"we use RustFS"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let sink = FakeFactSink::new();
+        promote_round(&st, &tenant, &sink).await.expect("first");
+        let again = promote_round(&st, &tenant, &sink).await.expect("second");
+        assert_eq!(again, 0);
+        assert_eq!(sink.calls(), 1, "the extractor ran twice for one event");
+
+        db.drop().await;
+    }
+
+    /// The facts the promotion produced are findable by `memory_search`.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn promoted_facts_are_findable_by_memory_search() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body =
+            br#"{"type":"user","message":{"role":"user","content":"we use RustFS for objects"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let sink = FakeFactSink::new();
+        promote_round(&st, &tenant, &sink).await.expect("promote");
+
+        let text = st
+            .memory_search_text(&tenant, "RustFS", None, 10)
+            .await
+            .expect("memory search");
+        assert!(
+            text.contains("RustFS"),
+            "the promoted fact is not reachable through memory_search: {text}"
+        );
+
+        db.drop().await;
+    }
+
+    /// An event whose text still carries a credential is not promoted.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_credential_is_not_promoted() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        // A scanner rule that arrived after this session was projected
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::query(
+            "UPDATE transcript_events SET text = 'my key is sk-abcdef0123456789abcdef0123456789'",
+        )
+        .execute(&pool)
+        .await
+        .expect("plant");
+        pool.close().await;
+
+        let sink = FakeFactSink::new();
+        let promoted = promote_round(&st, &tenant, &sink).await.expect("promote");
+        assert_eq!(
+            promoted, 0,
+            "an event carrying a credential was promoted; the raw text would then cross the \
+             network on its way to the extractor"
+        );
+        assert_eq!(sink.calls(), 0);
+
+        db.drop().await;
+    }
+
+    /// Promotion can be turned off.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn promotion_can_be_disabled() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let off = st.with_promotion(false);
+        let sink = FakeFactSink::new();
+        let promoted = promote_round(&off, &tenant, &sink).await.expect("promote");
+        assert_eq!(promoted, 0, "promotion ran while it was turned off");
+        assert_eq!(sink.calls(), 0);
+
+        db.drop().await;
     }
 
     // ── the distiller ──────────────────────────────────────
