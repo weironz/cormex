@@ -38,6 +38,26 @@ pub(crate) const MAX_LIMIT: i64 = 200;
 /// the **current** valid set, and using it for replay would prematurely erase
 /// "conclusions that were only overturned later" — which is exactly what replay
 /// exists to look at.
+///
+/// # The state machine, not "has it ever been invalidated"
+///
+/// `fact_events` is a state machine: `invalidate` makes a fact stop holding,
+/// `revoke` withdraws that invalidation, and **the last state event wins** —
+/// that is what `fact_status` (the `DISTINCT ON … ORDER BY created_at DESC,
+/// id DESC` view) encodes, and what `active_facts` filters on.
+///
+/// The predicate used to be `NOT EXISTS (… op = 'invalidate' AND created_at <=
+/// $1)`, i.e. "has it ever been invalidated by now". That is not the same
+/// question, and the difference is invisible until somebody actually revokes:
+/// a fact that was invalidated and later restored **never comes back** in
+/// replay, at any instant, including instants after the restore. The symptom is
+/// "replay says I never believed this, but I did — I even re-confirmed it",
+/// with no error anywhere.
+///
+/// So take the last state event at or before `$1` and require it not to be an
+/// `invalidate`. The ordering is the same one `fact_status` uses, `id DESC`
+/// included: `created_at` is `clock_timestamp()`, and two events in the same
+/// microsecond are tie-broken by the ULID so that two replicas agree.
 macro_rules! as_of_snapshot {
     () => {
         concat!(
@@ -45,12 +65,14 @@ macro_rules! as_of_snapshot {
             fact_columns!(),
             " FROM facts f
               WHERE f.created_at <= $1
-                AND NOT EXISTS (
-                    SELECT 1 FROM fact_events e
+                AND coalesce((
+                    SELECT e.op FROM fact_events e
                      WHERE e.fact_id = f.id
-                       AND e.op = 'invalidate'
+                       AND e.op IN ('invalidate', 'revoke')
                        AND e.created_at <= $1
-                )"
+                     ORDER BY e.created_at DESC, e.id DESC
+                     LIMIT 1
+                ), 'revoke') <> 'invalidate'"
         )
     };
 }

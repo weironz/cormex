@@ -624,3 +624,93 @@ async fn queue_len(s: &Store, hash: &str) -> usize {
         .filter(|b| b.hash == hash)
         .count()
 }
+
+// ══════════════════════════════════════════════════════════
+//  R4 -- replay follows the state machine, not "ever invalidated"
+// ══════════════════════════════════════════════════════════
+
+/// A fact that was invalidated and then **restored** must be visible in replay
+/// again from the moment of the restore on.
+///
+/// `fact_events` is a state machine and the last status event wins — that is
+/// what `fact_status` and `active_facts` encode. The replay predicate used to
+/// ask a different question, "has this ever been invalidated at or before
+/// `as_of`", so a restored fact **never came back in replay at any instant**.
+/// The symptom is "replay says I never believed this, but I did — I even
+/// re-confirmed it", with no error anywhere.
+///
+/// Three instants are checked: before the invalidation, between the
+/// invalidation and the restore, and after the restore.
+#[tokio::test]
+async fn a_restored_fact_comes_back_in_replay() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let source = common::new_episode("replay-revoke", "对象存储就用 RustFS");
+    let subject = common::new_entity("project", "Cortex");
+    let fact = common::new_fact(subject.id, "uses", "RustFS", source.id);
+    let fact_id = fact.id;
+
+    s.write_txn(async |t| {
+        t.insert_episode(&source).await?;
+        t.insert_entity(&subject).await?;
+        t.insert_fact(&fact).await
+    })
+    .await
+    .expect("manufacturing the fact should not fail");
+
+    // The three instants are taken from the rows' own `created_at` rather than
+    // from sleeps measured on this side: both are the same system clock, but
+    // only the database's value is the one the predicate compares against
+    let after_insert = Utc::now();
+
+    // A real gap between the two events. Without it both can land in the same
+    // microsecond, and then there is no instant "between them" to test
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let invalidate = NewFactEvent::retracted(fact_id, Utc::now(), "test", common::DEVICE);
+    s.write_txn(async |t| t.insert_fact_event(&invalidate).await)
+        .await
+        .expect("writing the invalidation should not fail");
+    let after_invalidate = Utc::now();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let revoke = NewFactEvent::revoke(fact_id, Actor::User, common::DEVICE);
+    s.write_txn(async |t| t.insert_fact_event(&revoke).await)
+        .await
+        .expect("writing the revoke should not fail");
+    let after_revoke = Utc::now();
+
+    let before = s
+        .facts_as_of(after_insert, 50)
+        .await
+        .expect("replay before the invalidation");
+    let during = s
+        .facts_as_of(after_invalidate, 50)
+        .await
+        .expect("replay between the invalidation and the restore");
+    let after = s
+        .facts_as_of(after_revoke, 50)
+        .await
+        .expect("replay after the restore");
+
+    db.cleanup().await;
+
+    let has = |rows: &[cormex_store::Fact]| rows.iter().any(|f| f.id == fact_id.to_string());
+    assert!(
+        has(&before),
+        "the fact must be visible before it was ever invalidated"
+    );
+    assert!(
+        !has(&during),
+        "the fact must be invisible between the invalidation and the restore"
+    );
+    assert!(
+        has(&after),
+        "the fact was restored by a `revoke` event, so replay must show it again from that \
+         instant on. It is missing, which means the predicate is asking \"has this ever been \
+         invalidated\" instead of \"what was the last status event\" -- a restored fact then \
+         never comes back in replay, at any instant, with no error anywhere"
+    );
+}
