@@ -119,6 +119,11 @@ pub mod table {
         "capture_file_events",
         "capture_masks",
         "capture_mask_progress",
+        // Phase 2's P layer and the archive index
+        "transcript_events",
+        "transcript_projections",
+        "archive_chunks",
+        "archive_access_log",
     ];
 }
 

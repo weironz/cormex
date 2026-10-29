@@ -250,6 +250,149 @@ pub struct NewMaskProgress {
     pub through_offset: i64,
 }
 
+// ══════════════════════════════════════════════════════════
+//  The P layer (phase 2)
+// ══════════════════════════════════════════════════════════
+
+text_enum! {
+    /// `transcript_events.kind`.
+    ///
+    /// The spellings match `cormex_proto::transcript::TranscriptKind`; the
+    /// conversion is one `match` in the projector, where a new variant is a
+    /// compile error rather than a silently missing branch.
+    pub enum TranscriptEventKind {
+        UserMessage => "user_message",
+        AgentMessage => "agent_message",
+        AgentThought => "agent_thought",
+        ToolCall => "tool_call",
+        ToolResult => "tool_result",
+        Plan => "plan",
+        System => "system",
+        Meta => "meta",
+        Unknown => "unknown",
+    }
+}
+
+text_enum! {
+    /// `transcript_projections.status`.
+    pub enum ProjectionStatus {
+        Ok => "ok",
+        /// Some files are projected and others are not yet.
+        Partial => "partial",
+        /// The parser failed on this session. Not retried for an hour.
+        Failed => "failed",
+    }
+}
+
+/// One normalized event to insert.
+#[derive(Debug, Clone)]
+pub struct NewTranscriptEvent {
+    pub id: Id,
+    pub session_id: Id,
+    pub parser_version: String,
+    pub seq: i64,
+    pub kind: TranscriptEventKind,
+    pub occurred_at: Option<DateTime<Utc>>,
+    /// The ACP-aligned content blocks, already serialized.
+    pub content: serde_json::Value,
+    /// The plain text, **already masked**.
+    pub text: Option<String>,
+    /// The jieba-segmented form, for `to_tsvector('simple', $n)`.
+    ///
+    /// Passed in rather than computed here: the tokenizer lives in
+    /// `cormex-memory`, and `cortex-store` must not depend on it. The caller
+    /// computes it outside the transaction, which is also where the rule "the
+    /// tsv is written with the main row" is satisfied — same INSERT.
+    pub tsv_source: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub src_generation_id: Id,
+    pub src_offset: i64,
+    pub src_length: i64,
+}
+
+/// One row of `transcript_events`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct TranscriptEvent {
+    pub id: String,
+    pub session_id: String,
+    pub parser_version: String,
+    pub seq: i64,
+    pub kind: TranscriptEventKind,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub content: serde_json::Value,
+    pub text: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub src_generation_id: String,
+    pub src_offset: i64,
+    pub src_length: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One projection progress row to insert.
+#[derive(Debug, Clone)]
+pub struct NewProjection {
+    pub id: Id,
+    pub session_id: Id,
+    pub parser_version: String,
+    /// `{generation_id: offset projected to}`.
+    pub through: serde_json::Value,
+    pub next_seq: i64,
+    pub status: ProjectionStatus,
+    pub error: Option<String>,
+}
+
+/// The newest projection for a session.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Projection {
+    pub id: String,
+    pub session_id: String,
+    pub parser_version: String,
+    pub through: serde_json::Value,
+    pub next_seq: i64,
+    pub status: ProjectionStatus,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One archive-index chunk to insert.
+#[derive(Debug, Clone)]
+pub struct NewArchiveChunk {
+    pub id: Id,
+    pub session_id: Id,
+    pub event_id: Id,
+    pub part: i32,
+    pub text: String,
+    /// The jieba-segmented form, like [`NewTranscriptEvent::tsv_source`].
+    pub tsv_source: String,
+}
+
+/// One access-log row to insert.
+#[derive(Debug, Clone)]
+pub struct NewAccessLog {
+    pub id: Id,
+    /// Who read it: `user:<id>`, `device:<id>`, `delegated:<session>`.
+    pub principal: String,
+    pub generation_id: Id,
+    pub byte_offset: i64,
+    pub byte_length: i64,
+    /// Whether the read bypassed the mask overlay.
+    pub unmasked: bool,
+}
+
+/// One mask interval.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct CaptureMask {
+    pub id: String,
+    pub generation_id: String,
+    pub byte_offset: i64,
+    pub byte_length: i32,
+    pub rule: String,
+    pub scanner: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What [`super::ArchiveTxn::register_capture_file`] found or created.
 #[derive(Debug, Clone)]
 pub struct RegisteredFile {

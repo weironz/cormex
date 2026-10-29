@@ -50,9 +50,11 @@ use crate::model::table;
 use crate::store::Store;
 
 pub use model::{
-    AppendOutcome, CaptureChunk, CaptureFile, CaptureSession, ChunkEncoding, FileEventOp, FileRole,
-    Framing, Generation, GenerationReason, NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent,
-    NewCaptureMask, NewCaptureSession, NewMaskProgress, RegisteredFile,
+    AppendOutcome, CaptureChunk, CaptureFile, CaptureMask, CaptureSession, ChunkEncoding,
+    FileEventOp, FileRole, Framing, Generation, GenerationReason, NewAccessLog, NewArchiveChunk,
+    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession,
+    NewMaskProgress, NewProjection, NewTranscriptEvent, Projection, ProjectionStatus,
+    RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
 
 /// The advisory lock class for archive-generation appends.
@@ -368,6 +370,152 @@ impl ArchiveTxn {
         .bind(new.file_id.to_string())
         .bind(new.op)
         .bind(&new.detail)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(())
+    }
+
+    // ── the P layer (phase 2) ──────────────────────────────
+
+    /// Insert masks and the progress row that says how far the scanner got.
+    ///
+    /// **One transaction**: a mask row without its progress row would be
+    /// re-scanned next round and inserted twice — which the unique constraint
+    /// would then reject, turning a normal round into an error.
+    pub async fn insert_masks(
+        &mut self,
+        masks: &[NewCaptureMask],
+        progress: &NewMaskProgress,
+    ) -> Result<()> {
+        for m in masks {
+            sqlx::query(
+                "INSERT INTO capture_masks
+                     (id, generation_id, byte_offset, byte_length, rule, scanner)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (generation_id, byte_offset, rule, scanner) DO NOTHING",
+            )
+            .bind(m.id.to_string())
+            .bind(m.generation_id.to_string())
+            .bind(m.byte_offset)
+            .bind(m.byte_length)
+            .bind(&m.rule)
+            .bind(&m.scanner)
+            .execute(&mut *self.inner.tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO capture_mask_progress
+                 (id, generation_id, scanner, through_offset)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(progress.id.to_string())
+        .bind(progress.generation_id.to_string())
+        .bind(&progress.scanner)
+        .bind(progress.through_offset)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert transcript events and the projection progress row.
+    ///
+    /// **`tsv` goes in the same INSERT as the main row** (constraint 1). The
+    /// caller passes the jieba-segmented source, because the tokenizer lives in
+    /// `cormex-memory` and this crate must not depend on it — but the
+    /// *statement* is one, which is what the rule is about.
+    ///
+    /// `ON CONFLICT DO NOTHING` on the derived id: the projector is idempotent,
+    /// and a resumed projection re-feeds bytes it has already seen.
+    pub async fn insert_transcript_events(
+        &mut self,
+        events: &[NewTranscriptEvent],
+        progress: &NewProjection,
+    ) -> Result<()> {
+        for e in events {
+            sqlx::query(
+                "INSERT INTO transcript_events
+                     (id, session_id, parser_version, seq, kind, occurred_at, content,
+                      text, tsv, tool_name, tool_call_id,
+                      src_generation_id, src_offset, src_length)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                         to_tsvector('simple', $9), $10, $11, $12, $13, $14)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(e.id.to_string())
+            .bind(e.session_id.to_string())
+            .bind(&e.parser_version)
+            .bind(e.seq)
+            .bind(e.kind)
+            .bind(e.occurred_at)
+            .bind(sqlx::types::Json(&e.content))
+            .bind(&e.text)
+            .bind(&e.tsv_source)
+            .bind(&e.tool_name)
+            .bind(&e.tool_call_id)
+            .bind(e.src_generation_id.to_string())
+            .bind(e.src_offset)
+            .bind(e.src_length)
+            .execute(&mut *self.inner.tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO transcript_projections
+                 (id, session_id, parser_version, through, next_seq, status, error)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(progress.id.to_string())
+        .bind(progress.session_id.to_string())
+        .bind(&progress.parser_version)
+        .bind(sqlx::types::Json(&progress.through))
+        .bind(progress.next_seq)
+        .bind(progress.status)
+        .bind(&progress.error)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert archive-index chunks.
+    ///
+    /// `tsv` is `NOT NULL` here, unlike `transcript_events`: a chunk exists only
+    /// to be searched, so one without a `tsv` is a row nothing can find.
+    pub async fn insert_archive_chunks(&mut self, chunks: &[NewArchiveChunk]) -> Result<()> {
+        for c in chunks {
+            sqlx::query(
+                "INSERT INTO archive_chunks (id, session_id, event_id, part, text, tsv)
+                 VALUES ($1, $2, $3, $4, $5, to_tsvector('simple', $6))
+                 ON CONFLICT (event_id, part) DO NOTHING",
+            )
+            .bind(c.id.to_string())
+            .bind(c.session_id.to_string())
+            .bind(c.event_id.to_string())
+            .bind(c.part)
+            .bind(&c.text)
+            .bind(&c.tsv_source)
+            .execute(&mut *self.inner.tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Record one read of the raw archive.
+    ///
+    /// Every read, masked or not. `raw:read` is the only permission that can
+    /// hand out unmasked original bytes, and "who read which range, when" is
+    /// the only question that can be answered afterwards — a privileged read
+    /// and a normal one look identical in a request log.
+    pub async fn insert_access_log(&mut self, entry: &NewAccessLog) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO archive_access_log
+                 (id, principal, generation_id, byte_offset, byte_length, unmasked)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(entry.id.to_string())
+        .bind(&entry.principal)
+        .bind(entry.generation_id.to_string())
+        .bind(entry.byte_offset)
+        .bind(entry.byte_length)
+        .bind(entry.unmasked)
         .execute(&mut *self.inner.tx)
         .await?;
         Ok(())

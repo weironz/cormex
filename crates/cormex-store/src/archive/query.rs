@@ -6,7 +6,9 @@
 //! for the same reason [`crate::txn`] has no read methods — a transaction that
 //! holds a lock stays short and write-only.
 
-use crate::archive::model::{CaptureChunk, CaptureFile, Generation};
+use crate::archive::model::{
+    CaptureChunk, CaptureFile, CaptureMask, Generation, Projection, TranscriptEvent,
+};
 use crate::error::Result;
 use crate::store::Store;
 
@@ -96,6 +98,102 @@ impl Store {
         .fetch_one(self.pool())
         .await?;
         Ok(end)
+    }
+
+    /// One page of a session's transcript events, ascending by `seq`.
+    ///
+    /// `after_seq` is exclusive: pass the last `seq` of the previous page. The
+    /// cursor is `seq` rather than an offset because `seq` is the projection's
+    /// own order, and it is unique per `(session, parser_version)` — an offset
+    /// cursor would skip or repeat rows when two events share a timestamp.
+    pub async fn transcript_page(
+        &self,
+        session_id: &str,
+        parser_version: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<TranscriptEvent>> {
+        let rows = sqlx::query_as::<_, TranscriptEvent>(
+            "SELECT id, session_id, parser_version, seq, kind, occurred_at, content,
+                    text, tool_name, tool_call_id,
+                    src_generation_id, src_offset, src_length, created_at
+               FROM transcript_events
+              WHERE session_id = $1 AND parser_version = $2 AND seq > $3
+              ORDER BY seq ASC
+              LIMIT $4",
+        )
+        .bind(session_id)
+        .bind(parser_version)
+        .bind(after_seq)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// The newest projection for a session, or `None` if it has never been
+    /// projected.
+    pub async fn latest_projection(
+        &self,
+        session_id: &str,
+        parser_version: &str,
+    ) -> Result<Option<Projection>> {
+        let row = sqlx::query_as::<_, Projection>(
+            "SELECT id, session_id, parser_version, through, next_seq, status, error, created_at
+               FROM transcript_projections
+              WHERE session_id = $1 AND parser_version = $2
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(parser_version)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// How far the masker has scanned a generation.
+    ///
+    /// `0` when it has never run: the scanner starts at the beginning, which is
+    /// the right answer for "nothing has been masked yet".
+    pub async fn mask_progress(&self, generation_id: &str, scanner: &str) -> Result<i64> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT through_offset FROM capture_mask_progress
+              WHERE generation_id = $1 AND scanner = $2
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(generation_id)
+        .bind(scanner)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map_or(0, |(n,)| n))
+    }
+
+    /// The mask intervals overlapping `[offset, offset + len)`.
+    ///
+    /// Used by the raw view: the bytes come from object storage unchanged, and
+    /// the intervals are replaced with `[masked:<rule>]` unless the caller has
+    /// `raw:read` **and** asked for `unmask=true`.
+    pub async fn masks_in_range(
+        &self,
+        generation_id: &str,
+        offset: i64,
+        len: i64,
+    ) -> Result<Vec<CaptureMask>> {
+        let rows = sqlx::query_as::<_, CaptureMask>(
+            "SELECT id, generation_id, byte_offset, byte_length, rule, scanner, created_at
+               FROM capture_masks
+              WHERE generation_id = $1
+                AND byte_offset < $2 + $3
+                AND byte_offset + byte_length > $2
+              ORDER BY byte_offset ASC",
+        )
+        .bind(generation_id)
+        .bind(offset)
+        .bind(len)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
     }
 
     /// The chunks covering `[offset, offset + len)`, ascending by offset.
