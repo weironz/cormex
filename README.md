@@ -129,6 +129,9 @@ curl -fsSL https://raw.githubusercontent.com/weironz/cormex/main/scripts/install
 
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.ps1 | iex
+
+# or, if you already have Node
+npm install -g cormex
 ```
 
 Then:

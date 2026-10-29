@@ -335,6 +335,13 @@ jobs:
     name: Publish the CLI
     needs: [preflight, cli]
     runs-on: ubuntu-latest
+    env:
+      # Job-level, not step-level: a step's own `env` is not visible to its own
+      # `if`, so `if: env.NPM_TOKEN != ''` with `env:` on the same step is
+      # always false. The step then skips every time and the release looks fine
+      # -- a skipped step in a green run is indistinguishable from a successful
+      # one. See the note on the publish step.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -362,10 +369,14 @@ jobs:
       # release still succeeds. A missing secret must not turn "the binaries
       # shipped" into "the release failed" -- the npm package is a convenience,
       # and `install.sh` is the primary path.
+      #
+      # **The token is on the job, not the step.** A step's own `env` is not
+      # visible to its own `if`, so `if: env.NPM_TOKEN != ''` with a step-level
+      # `env:` is always false -- the step is skipped every time and the release
+      # looks fine. That is exactly what this was, and nothing said so: a
+      # skipped step in a green run is indistinguishable from a successful one.
       - name: Publish to npm
         if: ${{ env.NPM_TOKEN != '' }}
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
