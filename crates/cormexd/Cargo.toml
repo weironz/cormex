@@ -129,7 +129,7 @@ dotenvy.workspace = true
 # re-exports it -- it takes no responsibility for making the derive able to find it
 schemars = { version = "1.0", features = ["chrono04"] }
 
-rmcp = { version = "1.8", default-features = false, features = [
+rmcp = { version = "3.8", default-features = false, features = [
     "server",
     "macros",
     "schemars",

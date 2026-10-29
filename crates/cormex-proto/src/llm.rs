@@ -141,6 +141,15 @@ impl LlmStreamError {
                 category: category.clone(),
                 ..base("refusal", details.clone())
             },
+            // Added in goose `alpha.13`. `NotConfigured` is a **deployment**
+            // problem, not a transient one: the provider was built without a
+            // key or a base URL. It gets its own kind so the client can say
+            // "this server is misconfigured" rather than "the model failed".
+            E::NotConfigured => base(
+                "not_configured",
+                "the server's LLM provider is not configured".to_owned(),
+            ),
+            E::InvalidValue(m) => base("invalid_value", m.clone()),
         }
     }
 
@@ -172,6 +181,8 @@ impl LlmStreamError {
                 details: self.message,
                 top_up_url: self.top_up_url,
             },
+            "not_configured" => E::NotConfigured,
+            "invalid_value" => E::InvalidValue(self.message),
             "refusal" => E::Refusal {
                 details: self.message,
                 category: self.category,

@@ -43,7 +43,7 @@ cormex-blob = { path = "crates/cormex-blob" }
 # goose-provider-types, while goose-provider-types itself **has no rustls-tls feature**
 # (write one and dependency resolution fails outright); the TLS backend is forwarded to
 # reqwest by goose-providers alone.
-goose-providers = { version = "0.1.0-alpha", default-features = false, features = ["rustls-tls"] }
+goose-providers = { version = "0.1.0-alpha.13", default-features = false, features = ["rustls-tls"] }
 
 # Async runtime
 tokio = { version = "1.53", features = ["full"] }

@@ -101,13 +101,23 @@ pub fn api_key_env(name: &str) -> Result<String> {
     Ok(config_of(name)?.api_key_env)
 }
 
-/// The default models declared in the definition: `fast_model` serves as the
-/// cheap model, and the first entry of `models` as the main one.
+/// The default models declared in the definition.
+///
+/// # `fast_model` is gone from goose's config
+///
+/// Up to `0.1.0-alpha.1` the declarative config carried a `fast_model` field.
+/// `alpha.13` removed it, so the cheap model now falls back to the main one —
+/// which is what the field was doing for every provider whose definition did
+/// not name one anyway.
+///
+/// The consequence is worth stating: a provider that used to declare a cheaper
+/// model now runs extraction on the main model, which costs more. That is a
+/// property of the upstream config, not something this layer can recover — the
+/// name is simply not there to read.
 pub(crate) fn default_models(name: &str) -> Result<(Option<String>, Option<String>)> {
     let config = config_of(name)?;
     let main = config.models.first().map(|info| info.name.clone());
-    let cheap = config.fast_model.clone().or_else(|| main.clone());
-    Ok((main, cheap))
+    Ok((main.clone(), main))
 }
 
 fn config_of(name: &str) -> Result<DeclarativeProviderConfig> {
@@ -204,9 +214,12 @@ pub fn model_config(provider: &str, model: &str) -> Result<ModelConfig> {
         .find(|info| info.name == model)
         .map(|info| info.context_limit);
 
+    // `context_limit` is `Option<Option<usize>>` now: the outer `None` means
+    // "no opinion", the inner one "the definition says unknown". Flattening is
+    // right — both mean "fall back to the canonical table"
     Ok(ModelConfig::new(model)
         .with_canonical_limits(provider)
-        .with_context_limit(limit))
+        .with_context_limit(limit.flatten()))
 }
 
 // ─────────────────────────── vision capability ───────────────────────────

@@ -48,10 +48,9 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::AnnotateAble as _;
 use rmcp::model::{
-    CallToolResult, Content, ErrorData, Implementation, ProtocolVersion, ReadResourceResult,
-    ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, ErrorData, Implementation, ProtocolVersion, ResourceContents,
+    ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -142,7 +141,7 @@ impl MemoryMcp {
             .memory_search_text(&tenant, &p.query, p.as_of.as_deref(), SEARCH_LIMIT)
             .await
             .map_err(to_mcp_error)?;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -212,7 +211,7 @@ impl MemoryMcp {
         //
         // Being precise costs nothing here: archiving definitely happened,
         // extracting a fact did not.
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Archived. Traceable facts will be extracted from it afterwards -- \
              not every sentence leaves a fact behind, and whatever is extracted \
              takes part in retrieval at the trust tier of an external source.",
@@ -327,12 +326,12 @@ impl MemoryMcp {
 // thing that will say anything about it
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryMcp {
-    fn get_info(&self) -> ServerInfo {
-        // Both `ServerInfo` and `Implementation` are `#[non_exhaustive]`: an
+    fn get_info(&self) -> ServerConfig {
+        // Both `ServerConfig` and `Implementation` are `#[non_exhaustive]`: an
         // external crate cannot build them with a struct literal, only start
         // from `Default` and assign fields. When rmcp adds a field we do not
         // fail to compile — which is exactly the effect that attribute is for
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -355,15 +354,26 @@ impl ServerHandler for MemoryMcp {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListResourcesResult, ErrorData> {
         Ok(rmcp::model::ListResourcesResult {
+            // SEP-2549 / SEP-2322 fields, new in rmcp 3.x. `None` means
+            // "absent on the wire", which the spec says a client must treat as
+            // complete and as cacheable by anyone -- both correct here: the
+            // resource list is not per-user and does not go stale in a way
+            // that matters
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
             resources: vec![
-                rmcp::model::RawResource::new(PROFILE_URI, "core profile")
+                // `RawResource` was renamed `Resource` in rmcp 3.x, and
+                // `AnnotateAble::no_annotation` is gone: `Resource` has an
+                // `annotations: Option<Annotations>` field, and `None` is what
+                // "no annotation" means
+                rmcp::model::Resource::new(PROFILE_URI, "core profile")
                     .with_description(
                         "The things about this person that rarely change. Put it \
                          in the part of the context you resend every turn -- it is \
                          stable, which is what lets it join the prefix cache.",
                     )
-                    .with_mime_type("text/plain")
-                    .no_annotation(),
+                    .with_mime_type("text/plain"),
             ],
             next_cursor: None,
             meta: None,
@@ -374,7 +384,7 @@ impl ServerHandler for MemoryMcp {
         &self,
         request: rmcp::model::ReadResourceRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<rmcp::model::ReadResourceResponse, ErrorData> {
         if request.uri != PROFILE_URI {
             return Err(ErrorData::resource_not_found(
                 format!("no such resource: {}", request.uri),
@@ -387,10 +397,17 @@ impl ServerHandler for MemoryMcp {
             .profile_text(&tenant, PROFILE_LIMIT)
             .await
             .map_err(to_mcp_error)?;
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            text,
-            PROFILE_URI,
-        )]))
+        // **`cache_scope: Private` and a 5-minute TTL.** The profile is one
+        // person's memory: a shared or intermediary cache serving it to
+        // another user is a leak, and the spec's default (`Public`) is exactly
+        // that. Five minutes is long enough to cover a conversation's turns and
+        // short enough that a memory written now shows up soon.
+        Ok(
+            rmcp::model::ReadResourceResult::new(vec![ResourceContents::text(text, PROFILE_URI)])
+                .with_ttl_ms(5 * 60 * 1000)
+                .with_cache_scope(rmcp::model::CacheScope::Private)
+                .into(),
+        )
     }
 }
 
@@ -420,6 +437,181 @@ pub fn service(state: AppState) -> StreamableHttpService<MemoryMcp, LocalSession
     StreamableHttpService::new(
         move || Ok(MemoryMcp::new(state.clone())),
         Arc::new(LocalSessionManager::default()),
+        // **`legacy_session_mode` stays at its default of `true`, and that
+        // matters.** It is what keeps old clients working: with it off the
+        // server only accepts the 2026-07-28 stateless shape, and a client that
+        // has not updated gets a handshake failure it cannot interpret. The
+        // field was called `stateful_mode` in 1.8; the meaning is the same.
+        //
+        // It cannot be written out here: the struct is `#[non_exhaustive]`, so
+        // a struct expression is refused and there is no `with_…` for this
+        // field. A test pins the default instead of a comment asserting it.
         StreamableHttpServerConfig::default(),
     )
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    //! The two handshakes, over the **real** router.
+    //!
+    //! # Why both
+    //!
+    //! The upgrade to rmcp 3.x is exactly the change that can break one of them
+    //! silently: the new protocol version is stateless, and a server that only
+    //! accepts it looks perfectly healthy while every older client fails the
+    //! handshake. Nothing else in the test suite goes through `/mcp` at all.
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode, header};
+    use tower::ServiceExt as _;
+
+    /// A token the router accepts.
+    fn token() -> (axum::Router, String) {
+        let (token, digest_hex) = crate::auth::generate();
+        let raw = hex::decode(&digest_hex).expect("a generated digest should be valid hex");
+        let digest: [u8; 32] = raw.try_into().expect("SHA-256 should be 32 bytes");
+        let rt = crate::state::Runtime {
+            auth: crate::auth::AuthMode::Token { digest },
+            tickets: std::sync::Arc::new(crate::auth::TicketBook::default()),
+            accounts: None,
+            access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
+            delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
+            device_keys: None,
+        };
+        (
+            crate::routes::router(crate::state::AppState::for_tests(rt)),
+            token,
+        )
+    }
+
+    async fn post(
+        app: &axum::Router,
+        token: &str,
+        headers: &[(&str, String)],
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            // The streamable-http transport requires all three: `Accept` for
+            // the SSE return channel, and `Host` for its allowed-hosts check
+            // (rmcp 3.x added that check; without the header it answers 400
+            // with "missing Host header", which reads like a malformed request
+            // rather than a missing one)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::HOST, "127.0.0.1");
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).expect("request"))
+            .await
+            .expect("Infallible");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The **old** handshake still works.
+    ///
+    /// `initialize` → `initialized` → `tools/list`. This is what every client
+    /// that has not moved to 2026-07-28 does, and it is the half the upgrade
+    /// can break without anything else noticing.
+    #[tokio::test]
+    async fn the_legacy_initialize_handshake_still_works() {
+        let (app, token) = token();
+
+        let (status, body) = post(
+            &app,
+            &token,
+            &[],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "initialize: {body}");
+        assert!(
+            body.contains("cormex-memory") || body.contains("serverInfo"),
+            "the initialize response should carry the server's identity: {body}"
+        );
+    }
+
+    /// A **stateless** request (2026-07-28) works without a handshake.
+    ///
+    /// The new protocol has no session: a client sends `tools/list` directly,
+    /// with the protocol version in `_meta`. A server that only supports the
+    /// legacy mode rejects this, and the rejection is a 400 that says nothing
+    /// about which side is old.
+    #[tokio::test]
+    async fn a_stateless_tools_list_works_without_a_handshake() {
+        let (app, token) = token();
+
+        let (status, body) = post(
+            &app,
+            &token,
+            &[
+                ("mcp-protocol-version", "2026-07-28".to_owned()),
+                ("mcp-method", "tools/list".to_owned()),
+            ],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    // The keys are **namespaced**, as the 2026-07-28 spec
+                    // defines them. A bare `protocolVersion` is rejected with
+                    // "request _meta is missing or has malformed required
+                    // fields", which names the field but not its namespace.
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a stateless tools/list should be accepted: {body}"
+        );
+        assert!(
+            body.contains("memory_search"),
+            "the tool list should contain memory_search: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// The session mode is the one old clients need.
+    ///
+    /// The field is `#[non_exhaustive]` and has no builder, so this is the only
+    /// place the value can be checked. Turning it off would break every client
+    /// that has not moved to the 2026-07-28 stateless shape, and the failure
+    /// they see is a handshake error that says nothing about the cause.
+    #[test]
+    fn the_server_keeps_the_legacy_session_mode() {
+        let config = StreamableHttpServerConfig::default();
+        assert!(
+            config.legacy_session_mode,
+            "legacy_session_mode is off: a client that has not updated to the 2026-07-28 \
+             stateless shape will fail the handshake, and the error it sees points at nothing"
+        );
+    }
 }
