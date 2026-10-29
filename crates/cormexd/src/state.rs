@@ -741,7 +741,7 @@ impl AppState {
     /// A user's `Store`, **entered from a user id rather than request headers**.
     ///
     /// Background jobs (snapshots) hold only the owner recorded in a sandbox
-    /// token and no access token, so [`Self::tenant`]'s path is unavailable to
+    /// token and no access token, so `AppState::tenant`'s path is unavailable to
     /// them. Details in [`Self::tenant_for_user`].
     ///
     /// # Errors
