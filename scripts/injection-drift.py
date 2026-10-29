@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """核对 injection.rs 两份实现有没有漂。
 
-`cortex-core/src/injection.rs` 在两个仓库各有一份 —— 这边给 MCP，Cortex 那边给
+`cormex-core/src/injection.rs` 在两个仓库各有一份 —— 这边给 MCP，Cormex 那边给
 agent 注入 —— 而它们**没有任何编译期联系**。漂移的症状是同一条记忆经 MCP 看到的
 和经 agent 看到的长得不一样，且**不报错**。
 
@@ -10,7 +10,7 @@ agent 注入 —— 而它们**没有任何编译期联系**。漂移的症状�
 
 用法：
 
-    python scripts/injection-drift.py ../cortex/crates/cortex-core/src/injection.rs
+    python scripts/injection-drift.py ../cormex/crates/cormex-core/src/injection.rs
 
 拿不到另一份时（开源用户、CI）直接跳过并返回 0 —— 这个检查对只有这一个仓库的人
 没有意义，而让它红会把「你缺一个私有仓库」变成一次构建失败。
@@ -24,7 +24,7 @@ import sys
 MINE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "crates",
-    "cortex-core",
+    "cormex-core",
     "src",
     "injection.rs",
 )
@@ -39,7 +39,7 @@ def tokens(path):
     s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
     # 逐行削 `//`，**行首行尾都要**。只削行首会把一条行尾注释报成「渲染不一致」，
     # 而一个假阳性比没有检查更糟：下一次真漂的时候没人再信它。
-    # 要避开字符串里的 `//`（如 `cortex://profile`），所以跟一下引号状态。
+    # 要避开字符串里的 `//`（如 `cormex://profile`），所以跟一下引号状态。
     out = []
     for line in s.split("\n"):
         in_str = False

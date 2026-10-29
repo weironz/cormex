@@ -1,0 +1,120 @@
+[package]
+name = "cormexd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Cormex daemon: the memory engine and the sync service"
+
+[dependencies]
+cormex-core.workspace = true
+cormex-memory.workspace = true
+# **There is no bollard / tar / reqwest here** -- they left for `cormex-agentd` together
+# with the container orchestration. This process starts no containers, unpacks no tars and
+# initiates no HTTP of its own (requests on the LLM side are sent by goose's provider layer).
+bytes = "1"
+cormex-llm.workspace = true
+cormex-store.workspace = true
+# **There is no `cormex-agent` here, and it must not be added back.**
+#
+# It was here once, for three things: the in-process agent loop (deleted), the container
+# orchestration (moved out to cormex-agentd), and two small utilities (`status_line` and
+# `workspace::validate` -- one no longer meaningful, the other rerouted through
+# `live::workspace_patch`).
+#
+# The price of adding it back is that anyone who only wants the memory layer has to compile
+# the agent loop + the tools + the sandbox along with it. This memory half is to be open
+# sourced on its own (Cormex), and this is the edge that has to be cut.
+cormex-proto.workspace = true
+# The import parsers are shared by all three sites, see the crate docs of cormex-import
+cormex-import.workspace = true
+
+cormex-blob.workspace = true
+
+# There is **no sqlx** here, and there should not be one again.
+# It was once depended on directly for PgListener and LISTEN/NOTIFY, and the reasoning
+# sounded sufficient (a connection-level capability the repository abstraction cannot cover),
+# but a hole like that spreads once opened: the next feature that "only needs one line of
+# SQL" would end up written here as a matter of course.
+# It has since sunk down into cormex_store::Store::listen_sync().
+async-trait.workspace = true
+
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["time"] }
+futures.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+# Authentication and confirmation credentials. All three are already in the dependency tree
+# (cormex-blob's content addressing uses sha2+hex, and getrandom comes along through rustls /
+# rand), so this merely adds the edge to cormexd.
+#
+# argon2 / bcrypt are deliberately **not** introduced: a slow KDF defends a low-entropy
+# password against offline cracking, whereas the credential here is a 256-bit kernel random
+# number -- a million times slower and it would still not be crackable. See src/auth.rs.
+sha2 = "0.10"
+hex = "0.4"
+# AES-256-GCM for a bring-your-own key. Already in the dependency tree (pulled in by rustls);
+# declared explicitly here
+ring = "0.17"
+# Credentials have to come straight from the kernel CSPRNG. Not a ULID pressed into service:
+# its top 48 bits are a timestamp, leaving only 80 random bits, and "the window is very
+# short" has no business being counted as entropy. See src/confirm.rs.
+getrandom = "0.3"
+# Password hashing. **The sha2 above must not be reused** -- the argument in auth.rs that "a
+# slow KDF is not required" rests on a premise: that the token is high-entropy and random. A
+# password chosen by a human does not satisfy it.
+# The account tables live in cormex_auth, and that is not part of the memory database --
+# cormex-store's repository layer deliberately does not know about it (every query in that
+# layer assumes it is inside a tenant schema).
+# So sqlx is used directly here, with a pool of its own
+sqlx.workspace = true
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["alloc"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+
+# The MCP facade memory presents to the outside world (`src/mcp.rs`).
+#
+# **Pinned at 1.8, the same copy as cormex-llm / cormex-agent** -- those two pulled it in for
+# goose's `Tool` type. Letting them diverge has the same consequence as the pgvector episode:
+# two copies of rmcp coexisting, with identically named yet incompatible types. goose
+# upstream is already on 3.0; we are not following.
+# The JSON Schema for tool arguments. **It has to be the very copy rmcp uses** (1.0): the
+# code `#[derive(JsonSchema)]` expands into refers to a bare `schemars::`, and rmcp merely
+# re-exports it -- it takes no responsibility for making the derive able to find it
+schemars = { version = "1.0", features = ["chrono04"] }
+
+rmcp = { version = "1.8", default-features = false, features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+
+[dev-dependencies]
+# The workspace path validation tests really do create directories, files and symlinks --
+# "what kind of directory deserves to be a workspace" is a judgement about a real
+# filesystem, and there is no mocking it
+tempfile = "3"
+
+# `ServiceExt::oneshot`: no listening port is started, the request is fed straight into the
+# **real** `router()`. Authentication coverage across the routes can only be tested this way
+# -- standing up a real service would first require a database and an API key, which is
+# exactly where the conclusion "route tests cannot be done" originally came from.
+# tower is already in the dependency tree (tower-http depends on it), so this merely adds
+# the edge to cormexd.
+tower = { version = "0.5", features = ["util"] }
+
+# `#[tokio::test(start_paused = true)]`: the confirmation timeout defaults to 180 seconds,
+# and nobody is going to run a test that really sits through it. A virtual clock turns that
+# into microseconds, and **it exercises the same code**
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,15 +1,12 @@
 # 记忆系统设计
 
-> **迁入说明（2026-10-29）**：本文档原在 Cortex 仓库（`weironz/cortex@4f29191` 的 `docs/memory.md`）。
-> 2026-08 拆仓时它没有跟过来，而本仓库的代码与 migration 注释一直在引用它（`docs/memory.md` §七 / §九 / §十一）。
-> 正文按原样迁入，只把一处指向 Cortex 侧 `references.md` 的相对链接改成了绝对地址；文中的「Cortex」「本仓库」指当时的记忆引擎，也就是现在的 Cormex。
+> **迁入说明（2026-10-29）**：本文档是记忆系统的地基设计，正文按原样迁入。
 > 哪些陈述已经过时、与 2026-10 新调研的一致与冲突之处，见
 > [research/2026-10-agent-memory-survey.md](research/2026-10-agent-memory-survey.md) §10。
 
-Cortex 的核心。本文档定义记忆的存储模型、写入流程、检索策略与索引方案。
+Cormex 的核心。本文档定义记忆的存储模型、写入流程、检索策略与索引方案。
 
 > **地基文档。** schema 变更代价极高，动手写代码前应先在此达成共识。
-> 参考调研见 [references.md](https://github.com/weironz/cortex/blob/main/docs/references.md)。
 >
 > 本文档回答**记忆系统怎么工作**。「**什么东西有资格进记忆**」是另一个问题，
 > 见 [memory-content.md](memory-content.md) —— 那份文档基于一轮 58 个系统的
@@ -32,7 +29,7 @@ Cortex 的核心。本文档定义记忆的存储模型、写入流程、检索�
 
 事实会过期。业界做法（Graphiti）是把旧边的 `invalid_at` 就地更新——**那是 `UPDATE`，会破坏本项目的无冲突性质。**
 
-Cortex 的做法：**失效本身也是一条追加记录**（`fact_events`）。
+Cormex 的做法：**失效本身也是一条追加记录**（`fact_events`）。
 
 后果是两台设备可能各自独立地记录同一条事实的失效——这不是冲突，取最早的一条即可。查询有效事实时排除掉被失效记录指向的即可。
 
@@ -58,7 +55,7 @@ L0 只写不读，仅在需要精确回溯时（"上次我们说的那个"）按
 | 时间轴 | 含义 | 对应字段 |
 |---|---|---|
 | **事件时间**<br>（valid time） | 事情在**真实世界**中何时为真 | `facts.valid_at` → `fact_events.invalid_at` |
-| **系统时间**<br>（transaction time） | Cortex **何时知道**这件事 | `facts.created_at` → `fact_events.created_at` |
+| **系统时间**<br>（transaction time） | Cormex **何时知道**这件事 | `facts.created_at` → `fact_events.created_at` |
 
 ### 为什么必须两条
 
@@ -74,7 +71,7 @@ L0 只写不读，仅在需要精确回溯时（"上次我们说的那个"）按
 ### 两个典型查询
 
 ```sql
--- ① 在 T 时刻，Cortex 认为哪些事实为真（认知回放）
+-- ① 在 T 时刻，Cormex 认为哪些事实为真（认知回放）
 SELECT f.* FROM facts f
 WHERE f.created_at <= :T
   AND NOT EXISTS (
@@ -95,7 +92,7 @@ WHERE (f.valid_at IS NULL OR f.valid_at <= :T)
 
 ## 四、Schema 设计要点
 
-> **权威版本是 `migrations/20260807000001_init.sql`（在 Cormex 仓库里）。**
+> **权威版本是 `migrations/20260807000001_init.sql`。**
 > 本节只讲设计意图，不复制 SQL —— 两份拷贝必然漂移。
 
 所有主键为 **ULID**（26 字符 Crockford base32 **大写**，`COLLATE "C"` + 正则 CHECK 强制），
@@ -152,7 +149,7 @@ flag 除外）决定，不是「撤销栈」——序列 `[invalidate(A), invali
 
 并发分叉（两台设备把 A 分别并进 B 和 C）由 `UNIQUE(from_entity)` 在物理层拒绝后到者：
 **first-writer-wins**，服务端回执后到客户端转 no-op。
-环（A→B + B→A）由 cortexd 写入前沿 `into_entity` 链走到底做成环检测拒绝；
+环（A→B + B→A）由 cormexd 写入前沿 `into_entity` 链走到底做成环检测拒绝；
 视图中的 depth 上限只是兜底保险。
 
 ### session_events —— 会话的生命周期
@@ -290,7 +287,7 @@ score(d) = Σ  1 / (k + rank_i(d))      k 取 60
 
 此策略下向量索引规模约为 episodes 的 1/50，**十万级对话不会爆**。
 
-完整索引清单见 `migration`（在 Cormex 仓库里）。要点：
+完整索引清单见 `migration`。要点：
 
 - `entities` 也建向量索引，但**仅用于抽取期实体消解**（同名/近义实体匹配），不参与四路召回
 - `idx_facts_sp (subject_id, predicate)` 的前缀即覆盖按主语查询，不另建单列索引
@@ -416,7 +413,7 @@ redact/purge 是 UPDATE，不会产生新的业务行版本。传播靠 `redacti
 
 ## 十一、记忆的可编辑性
 
-**"可审计"是 Cortex 的核心差异化。** 用户必须能看到记忆、追问出处、修正错误、删除不想要的——同时审计链保持完整。
+**"可审计"是 Cormex 的核心差异化。** 用户必须能看到记忆、追问出处、修正错误、删除不想要的——同时审计链保持完整。
 
 ### 四类操作
 
@@ -476,7 +473,7 @@ redact/purge 是 UPDATE，不会产生新的业务行版本。传播靠 `redacti
 **在途任务防护**：抽取 / 转录 pipeline 在写入任何派生行之前必须查 `redactions` 表，
 防止 redact 执行时在途的异步任务事后把秘密回填。级联清除任务本身可重跑（幂等）。
 
-表结构见 `migration`（在 Cormex 仓库里） 的 `redactions`
+表结构见 `migration` 的 `redactions`
 （墓碑行本身走 `sync_log` 下发到所有设备）。
 
 约束：

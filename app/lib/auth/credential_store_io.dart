@@ -4,11 +4,11 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'stored_credential.dart';
 
-/// `cortexd --generate-token` 告诉运维去设的那个环境变量。
+/// `cormexd --generate-token` 告诉运维去设的那个环境变量。
 ///
 /// 名字**照抄**：客户端另起一个名字，会让 daemon 自己印出来的那行说明变成
 /// 错的。
-const String kTokenEnvVar = 'CORTEXD_TOKEN';
+const String kTokenEnvVar = 'CORMEXD_TOKEN';
 
 /// 桌面端能记住凭据。
 const bool kCanRememberCredential = true;
@@ -31,7 +31,7 @@ const String _baseUrlKey = 'cormex.base_url';
 /// 不需要用户输入任何东西就能拿到的凭据。
 ///
 /// **顺序有意义**：记住的那把优先于环境变量。连过一次的人期待自己还连着
-/// 同一个身份，而某人 shell profile 里一条陈旧的 `CORTEXD_TOKEN` 不该把他
+/// 同一个身份，而某人 shell profile 里一条陈旧的 `CORMEXD_TOKEN` 不该把他
 /// 悄悄换回单用户那条老路。
 Future<StoredCredential?> readCredential() async {
   try {

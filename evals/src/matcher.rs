@@ -99,9 +99,9 @@ mod tests {
     #[test]
     fn all_parts_must_appear() {
         let matcher = m(&["对象存储", "RustFS"]);
-        assert!(matcher.matches("Cortex 的对象存储换成了 RustFS。"));
+        assert!(matcher.matches("Cormex 的对象存储换成了 RustFS。"));
         assert!(
-            !matcher.matches("Cortex 的对象存储先用 MinIO。"),
+            !matcher.matches("Cormex 的对象存储先用 MinIO。"),
             "one keyword short must not count as a hit, otherwise the gold is \
              meaningless"
         );

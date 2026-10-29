@@ -1,9 +1,9 @@
-//! The `cortex-evals` command line.
+//! The `cormex-evals` command line.
 //!
 //! ```bash
-//! cargo run -p cortex-evals -- validate   # validate the suite only, no database needed
-//! cargo run -p cortex-evals -- run        # run the default suite, produce baseline numbers
-//! cargo run -p cortex-evals -- run --json out.json --md out.md
+//! cargo run -p cormex-evals -- validate   # validate the suite only, no database needed
+//! cargo run -p cormex-evals -- run        # run the default suite, produce baseline numbers
+//! cargo run -p cormex-evals -- run --json out.json --md out.md
 //! ```
 
 use std::path::PathBuf;
@@ -11,17 +11,17 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use cortex_evals::DEFAULT_SUITE;
-use cortex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalConfig};
-use cortex_evals::report::render_text;
-use cortex_evals::runner::{RunOptions, run};
-use cortex_evals::suite::Suite;
-use cortex_memory::retrieval::RecencyMode;
+use cormex_evals::DEFAULT_SUITE;
+use cormex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalConfig};
+use cormex_evals::report::render_text;
+use cormex_evals::runner::{RunOptions, run};
+use cormex_evals::suite::Suite;
+use cormex_memory::retrieval::RecencyMode;
 
 #[derive(Parser)]
 #[command(
-    name = "cortex-evals",
-    about = "Cortex retrieval-quality evaluation",
+    name = "cormex-evals",
+    about = "Cormex retrieval-quality evaluation",
     version
 )]
 struct Cli {
@@ -220,7 +220,7 @@ async fn real_main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cortex_evals=info,warn".into()),
+                .unwrap_or_else(|_| "cormex_evals=info,warn".into()),
         )
         .with_target(false)
         .init();

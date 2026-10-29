@@ -39,7 +39,7 @@ class ConnectionState {
 
   final ConnectionPhase phase;
 
-  /// cortexd 的地址。空串在浏览器里意味着**同源**（见
+  /// cormexd 的地址。空串在浏览器里意味着**同源**（见
   /// [CormexApi.resolveBase]），在桌面端意味着回落到本机默认端口。
   final String baseUrl;
 

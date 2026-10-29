@@ -29,7 +29,7 @@ class CormexApiException implements Exception {
 
   /// 服务端要凭据而我们没给，或者给的那把被拒了。
   ///
-  /// `cortexd::auth::require` 故意不区分「没带」与「带错」（分开报等于给
+  /// `cormexd::auth::require` 故意不区分「没带」与「带错」（分开报等于给
   /// 暴力破解一个进度条），所以这里也不区分。客户端的反应两种情况一样：
   /// 退回连接页，而不是摆一块空面板或者转一个永远不停的圈。
   bool get isUnauthorized => statusCode == 401;

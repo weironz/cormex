@@ -11,7 +11,7 @@ import 'widgets/fact_card.dart';
 ///
 /// # 为什么它值得是一整页
 ///
-/// 在 Cortex 里同样的东西是一条 320px 的边栏，只在对话页里够得着。而检索、
+/// 在 Cormex 里同样的东西是一条 320px 的边栏，只在对话页里够得着。而检索、
 /// 出处、按系统时间回放这三样，恰好是这个项目唯一不可替代的部分（别家给的
 /// 是一个相似度分数）。挤在边栏里等于把它们藏起来 ——「能看见自己的记忆」
 /// 本身就该是一件事，不是聊天的附属品。
@@ -393,7 +393,7 @@ class _ConnectionMenu extends ConsumerWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
 
-    // 认证关掉了要**明说**。cortexd 只有在有人特地写了 CORTEX_AUTH=disabled
+    // 认证关掉了要**明说**。cormexd 只有在有人特地写了 CORMEX_AUTH=disabled
     // 时才会到这个状态，而它每次启动都打一行警告。客户端什么都不说，就成了
     // 整个系统里唯一装作没看见的那一环。
     final warning = health?.authDisabled == true
@@ -433,7 +433,7 @@ class _ConnectionMenu extends ConsumerWidget {
               ),
               if (health != null)
                 Text(
-                  'cortexd ${health.version}',
+                  'cormexd ${health.version}',
                   style: theme.textTheme.labelSmall,
                 ),
               if (warning != null) ...[

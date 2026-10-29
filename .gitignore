@@ -73,7 +73,7 @@ app/.idea/
 /mem0_*.py
 
 # 本地回落的对象存储（RustFS 连不上时 blobs.rs 写在这里）—— 是数据，不是源码
-.cortex/
+.cormex/
 
 # 本机的运维笔记 —— 生产地址、账号、内网拓扑
 #

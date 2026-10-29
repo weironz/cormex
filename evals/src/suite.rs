@@ -3,7 +3,7 @@
 //! # Why a home-grown suite
 //!
 //! Public benchmarks like LoCoMo / LongMemEval are entirely in English and only
-//! test "ask one question, get one answer". Cortex's differentiating
+//! test "ask one question, get one answer". Cormex's differentiating
 //! capabilities — Chinese BM25 via jieba + tsvector, bitemporal replay,
 //! provenance follow-ups, cross-domain retrieval — are **covered by no public
 //! benchmark at all**. Without building our own, the selling points can never
@@ -132,7 +132,7 @@ impl QuestionKind {
 }
 
 /// The query's language. Chinese-English bilingualism is a hard requirement:
-/// Cortex's corpus is natively mixed (Chinese prose with identifiers like
+/// Cormex's corpus is natively mixed (Chinese prose with identifiers like
 /// `RustFS` / `pg_advisory_xact_lock` embedded in it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,7 +226,7 @@ pub struct Turn {
 }
 
 /// A fixture for one tool call, corresponding one-to-one with
-/// `cortex_store::NewEpisodeToolCall`.
+/// `cormex_store::NewEpisodeToolCall`.
 ///
 /// Only four things — command + path + success/failure + a one-line conclusion
 /// — and **no raw stdout**. The shape is copied from production's
@@ -519,7 +519,7 @@ impl Suite {
 }
 
 /// Structural validation of a tool trace. The length limits align with
-/// `cortex_store`'s CHECKs — the symptom of a mismatch is the whole write
+/// `cormex_store`'s CHECKs — the symptom of a mismatch is the whole write
 /// transaction rolling back halfway through loading the corpus, with the error
 /// message stuck over on the Postgres side.
 fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<()> {
@@ -528,10 +528,10 @@ fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<(
         if c.name.trim().is_empty() {
             bail!("{at} has no tool name");
         }
-        if c.name.chars().count() > cortex_store::TOOL_NAME_MAX_CHARS {
+        if c.name.chars().count() > cormex_store::TOOL_NAME_MAX_CHARS {
             bail!(
                 "{at}: the tool name exceeds {} characters and the CHECK would reject the write",
-                cortex_store::TOOL_NAME_MAX_CHARS
+                cormex_store::TOOL_NAME_MAX_CHARS
             );
         }
         if c.summary.trim().is_empty() {
@@ -540,18 +540,18 @@ fn validate_tool_trace(scenario: &str, turn_idx: usize, turn: &Turn) -> Result<(
                  no knowledge whatsoever"
             );
         }
-        if c.summary.chars().count() > cortex_store::TOOL_SUMMARY_MAX_CHARS {
+        if c.summary.chars().count() > cormex_store::TOOL_SUMMARY_MAX_CHARS {
             bail!(
                 "{at}: the summary exceeds {} characters and the CHECK would reject the write",
-                cortex_store::TOOL_SUMMARY_MAX_CHARS
+                cormex_store::TOOL_SUMMARY_MAX_CHARS
             );
         }
         if let Some(p) = &c.path
-            && p.chars().count() > cortex_store::TOOL_PATH_MAX_CHARS
+            && p.chars().count() > cormex_store::TOOL_PATH_MAX_CHARS
         {
             bail!(
                 "{at}: the path exceeds {} characters and the CHECK would reject the write",
-                cortex_store::TOOL_PATH_MAX_CHARS
+                cormex_store::TOOL_PATH_MAX_CHARS
             );
         }
     }

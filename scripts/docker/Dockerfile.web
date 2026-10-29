@@ -58,8 +58,8 @@ WORKDIR /build/app
 # 接到页面自己的源上。于是同一个镜像在 cormex.cloudcele.com、在别人的
 # memory.example.com、在 localhost 上都对。
 #
-# ★ 这是与 Cortex 那份 Dockerfile.web 唯一实质不同的地方，值得说清楚。
-#   那边烧的是完整地址 `https://cortex.cloudcele.com/api`，因为它的
+# ★ 这是与 Cormex 那份 Dockerfile.web 唯一实质不同的地方，值得说清楚。
+#   那边烧的是完整地址 `https://cormex.cloudcele.com/api`，因为它的
 #   `_normalise` 只接受绝对地址（相对路径会被拼成 `http:///api` 这种没有
 #   host 的废 URI）。Cormex 要开源：**一个烧死了我们域名的 Web 镜像，
 #   别人拉下来第一件事是重建**。所以这边先改了客户端，让路径前缀走得通。

@@ -13,13 +13,13 @@ import '../models/memory_search_result.dart';
 import 'api_exception.dart';
 import 'http_client_factory.dart';
 
-/// 对着一台真实的 cortexd 说话。
+/// 对着一台真实的 cormexd 说话。
 ///
 /// # 为什么这里没有 `abstract interface class`
 ///
-/// Cortex 那边有一层抽象接口，因为它有两个实现（真后端 + 一整套 mock
+/// Cormex 那边有一层抽象接口，因为它有两个实现（真后端 + 一整套 mock
 /// fixture）。Cormex 只有一个。给单实现套接口不是解耦，是把每次改动都变成
-/// 改两个文件 —— 而那个抽象层在 Cortex 那边有 501 行。
+/// 改两个文件 —— 而那个抽象层在 Cormex 那边有 501 行。
 class CormexApi {
   CormexApi({
     required String baseUrl,
@@ -51,7 +51,7 @@ class CormexApi {
 
   /// 空地址 = **同源**（在浏览器里），不是「没配」。
   ///
-  /// 这两件事在别处栽过：把空串换成一个默认地址，会让「Web 界面与 cortexd
+  /// 这两件事在别处栽过：把空串换成一个默认地址，会让「Web 界面与 cormexd
   /// 同源反代」那套拓扑整个走不通 —— 浏览器随即因为 CORS 把响应丢掉，
   /// 报的是「Failed to fetch」，一句看起来像后端没起来的错。
   ///
@@ -309,12 +309,12 @@ class CormexApi {
   }
 
   String _unreachableMessage(Object e) =>
-      '连不上 cortexd（$_base）。确认它已启动、地址与端口正确，'
+      '连不上 cormexd（$_base）。确认它已启动、地址与端口正确，'
       '并且允许了这个页面的跨源请求。\n$e';
 
   /// 从错误响应里挖出服务端写给人看的那句话。
   ///
-  /// cortexd 的错误体是 `{"error": "…"}`，而那句话是专门措辞给用户看的
+  /// cormexd 的错误体是 `{"error": "…"}`，而那句话是专门措辞给用户看的
   /// （比如路径校验的拒绝理由）。挖不出来就退回原始 body —— 编一句更友好的
   /// 通用文案，只会盖掉唯一有信息量的东西。
   String _errorMessage(http.Response response) {
@@ -338,7 +338,7 @@ class CormexApi {
   /// `FormatException: Unexpected character (at character 1) <!DOCTYPE html>`。
   /// 那句话技术上完全正确，而且**是首次连接最可能撞上的失败**：最顺手输入
   /// 的地址是浏览器里访问的那个，而 API 常常在深一层路径上
-  /// （`https://host` → Web 界面，`https://host/api` → cortexd）。
+  /// （`https://host` → Web 界面，`https://host/api` → cormexd）。
   Map<String, dynamic> _decodeObject(String what, String body) {
     final Object? decoded;
     try {
@@ -360,8 +360,8 @@ class CormexApi {
       // 再猜就比没用还糟 —— 说出观察到的事实然后打住。
       final bare = _base.path.replaceAll('/', '').isEmpty;
       final hint = bare
-          ? '自托管部署通常把 cortexd 挂在 /api 下 —— 试试 $_base/api。'
-          : '确认这个地址指向 cortexd 本身，而不是 Web 界面或反代的默认站点。';
+          ? '自托管部署通常把 cormexd 挂在 /api 下 —— 试试 $_base/api。'
+          : '确认这个地址指向 cormexd 本身，而不是 Web 界面或反代的默认站点。';
       return '$what：这个地址返回的是网页，不是 API。$hint';
     }
     return '$what：返回的不是 JSON。\n${_trim(body)}';

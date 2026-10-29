@@ -70,14 +70,14 @@ gave it that token. No service key, no privilege escalation surface.
 ## What's in the box
 
 ```
-cortex-core     types / ids / config / errors
-cortex-llm      provider layer (wraps goose-providers)
-cortex-store    sqlx repositories + the sync log
-cortex-memory   tokenization / embeddings / extraction / 4-way recall + RRF
-cortex-blob     content-addressed blob storage (S3 / local)
-cortex-proto    the wire protocol
-cortex-import   importers for ChatGPT / Claude conversation exports
-cortexd         the server: HTTP + SSE + WebSocket + MCP
+cormex-core     types / ids / config / errors
+cormex-llm      provider layer (wraps goose-providers)
+cormex-store    sqlx repositories + the sync log
+cormex-memory   tokenization / embeddings / extraction / 4-way recall + RRF
+cormex-blob     content-addressed blob storage (S3 / local)
+cormex-proto    the wire protocol
+cormex-import   importers for ChatGPT / Claude conversation exports
+cormexd         the server: HTTP + SSE + WebSocket + MCP
 app/            the memory browser (Flutter — web and desktop from one source)
 ```
 

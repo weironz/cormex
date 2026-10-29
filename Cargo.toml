@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/cortex-core",
-    "crates/cortex-llm",
-    "crates/cortex-store",
-    "crates/cortex-memory",
-    "crates/cortex-blob",
-    "crates/cortex-proto",
-    "crates/cortex-import",
-    "crates/cortexd",
+    "crates/cormex-core",
+    "crates/cormex-llm",
+    "crates/cormex-store",
+    "crates/cormex-memory",
+    "crates/cormex-blob",
+    "crates/cormex-proto",
+    "crates/cormex-import",
+    "crates/cormexd",
     "evals",
 ]
 
@@ -24,13 +24,13 @@ license = "Apache-2.0"
 repository = "https://github.com/weironz/cormex"
 
 [workspace.dependencies]
-cortex-core = { path = "crates/cortex-core" }
-cortex-import = { path = "crates/cortex-import" }
-cortex-llm = { path = "crates/cortex-llm" }
-cortex-store = { path = "crates/cortex-store" }
-cortex-memory = { path = "crates/cortex-memory" }
-cortex-proto = { path = "crates/cortex-proto" }
-cortex-blob = { path = "crates/cortex-blob" }
+cormex-core = { path = "crates/cormex-core" }
+cormex-import = { path = "crates/cormex-import" }
+cormex-llm = { path = "crates/cormex-llm" }
+cormex-store = { path = "crates/cormex-store" }
+cormex-memory = { path = "crates/cormex-memory" }
+cormex-proto = { path = "crates/cormex-proto" }
+cormex-blob = { path = "crates/cormex-blob" }
 
 # Provider layer: lifted from goose (Apache-2.0).
 # Depends on goose-providers only -- it already pub-uses the entire type layer of
@@ -63,7 +63,7 @@ serde_json = "1"
 # Note that reqwest 0.13 renamed the TLS feature to rustls (it is no longer rustls-tls)
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "rustls"] }
 
-# Docker API client. Used by cortexd's DockerRunner to start / stop user sandbox containers
+# Docker API client. Used by cormexd's DockerRunner to start / stop user sandbox containers
 # (see docs/sandbox.md, section 7).
 #
 # **Do not hand-roll a unix socket on top of hyper**: Docker's API version negotiation is
@@ -81,7 +81,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # is missing. Windows for development, Linux for production; it has to compile on both.
 
 # WebSocket client. Used by the local agent to reverse-proxy /ws (see
-# cortex-local/src/ws_proxy.rs).
+# cormex-local/src/ws_proxy.rs).
 #
 # **Deliberately no TLS feature whatsoever**: this crate does not establish the connection.
 # reqwest establishes it and hands it over through `from_raw_socket`. Enabling
@@ -97,7 +97,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # Memory engine
 jieba-rs = "0.10"
 fastembed = "5"
-# Write-side credential filtering (cortex-memory/src/redaction.rs).
+# Write-side credential filtering (cormex-memory/src/redaction.rs).
 # The version follows whichever copy jieba-rs has already pulled in; promoting it to a
 # direct dependency adds nothing at all to the compile
 regex = "1"

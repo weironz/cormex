@@ -2,8 +2,8 @@
 #
 #   just up          bring up Postgres + object storage
 #   just db-migrate  apply the migrations
-#   just run         run cortexd in a host process
-#   just serve       run the whole stack in containers (cortexd included)
+#   just run         run cormexd in a host process
+#   just serve       run the whole stack in containers (cormexd included)
 #   just ci          run every check CI runs, locally
 
 set shell := ["bash", "-uc"]
@@ -14,7 +14,7 @@ default:
 
 # ── Dependencies ────────────────────────────────────────
 
-# Postgres (with pgvector) + RustFS. **cortexd is not included** -- during development it
+# Postgres (with pgvector) + RustFS. **cormexd is not included** -- during development it
 # runs in a host process, where changing one line and restarting takes a second. For the
 # whole thing containerized see `just serve`.
 up:
@@ -35,12 +35,12 @@ db-migrate:
 # ── Running it ──────────────────────────────────────────
 
 run:
-    cargo run -p cortexd
+    cargo run -p cormexd
 
-# The whole stack (including the cortexd container). The first run has to compile it.
+# The whole stack (including the cormexd container). The first run has to compile it.
 serve:
     docker compose up -d --build
-    @echo "cortexd http://127.0.0.1:${CORTEXD_PORT:-8080}"
+    @echo "cormexd http://127.0.0.1:${CORMEXD_PORT:-8080}"
 
 # ── Checks ──────────────────────────────────────────────
 

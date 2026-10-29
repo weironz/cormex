@@ -1058,7 +1058,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortex-blob"
+name = "cormex-blob"
 version = "0.1.11"
 dependencies = [
  "anyhow",
@@ -1067,7 +1067,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-types",
  "bytes",
- "cortex-core",
+ "cormex-core",
  "dotenvy",
  "hex",
  "imagesize",
@@ -1084,7 +1084,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-core"
+name = "cormex-core"
 version = "0.1.11"
 dependencies = [
  "anyhow",
@@ -1098,16 +1098,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-evals"
+name = "cormex-evals"
 version = "0.1.11"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "cortex-core",
- "cortex-llm",
- "cortex-memory",
- "cortex-store",
+ "cormex-core",
+ "cormex-llm",
+ "cormex-memory",
+ "cormex-store",
  "dotenvy",
  "serde",
  "serde_json",
@@ -1118,13 +1118,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-import"
+name = "cormex-import"
 version = "0.1.11"
 dependencies = [
  "anyhow",
  "chrono",
- "cortex-core",
- "cortex-proto",
+ "cormex-core",
+ "cormex-proto",
  "serde",
  "serde_json",
  "tokio",
@@ -1132,13 +1132,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-llm"
+name = "cormex-llm"
 version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "cortex-core",
+ "cormex-core",
  "dotenvy",
  "futures",
  "goose-providers",
@@ -1152,16 +1152,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-memory"
+name = "cormex-memory"
 version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "chrono",
- "cortex-core",
- "cortex-llm",
- "cortex-store",
+ "cormex-core",
+ "cormex-llm",
+ "cormex-store",
  "dotenvy",
  "fastembed",
  "jieba-rs",
@@ -1176,12 +1176,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-proto"
+name = "cormex-proto"
 version = "0.1.11"
 dependencies = [
  "chrono",
- "cortex-core",
- "cortex-llm",
+ "cormex-core",
+ "cormex-llm",
  "serde",
  "serde_json",
  "tokio",
@@ -1189,12 +1189,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-store"
+name = "cormex-store"
 version = "0.1.11"
 dependencies = [
  "anyhow",
  "chrono",
- "cortex-core",
+ "cormex-core",
  "dotenvy",
  "futures",
  "pgvector",
@@ -1208,7 +1208,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortexd"
+name = "cormexd"
 version = "0.1.11"
 dependencies = [
  "anyhow",
@@ -1218,13 +1218,13 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "cortex-blob",
- "cortex-core",
- "cortex-import",
- "cortex-llm",
- "cortex-memory",
- "cortex-proto",
- "cortex-store",
+ "cormex-blob",
+ "cormex-core",
+ "cormex-import",
+ "cormex-llm",
+ "cormex-memory",
+ "cormex-proto",
+ "cormex-store",
  "dotenvy",
  "futures",
  "getrandom 0.3.4",

@@ -1,0 +1,26 @@
+[package]
+name = "cormex-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The core business logic of Cormex: the memory engine, the agent loop, tool execution"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+# The deterministic hash behind Id::derived.
+#
+# **std's DefaultHasher must not be used** -- it explicitly makes no promise of stability
+# across Rust versions, while the id computed here is the entire basis of import
+# idempotency: compile once with a different toolchain and the same message gets a different
+# id, so the whole history is imported all over again.
+# sha2 is already in the dependency trees of cormex-blob and cormexd, so it adds nothing to
+# the compile.
+sha2 = "0.10"
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

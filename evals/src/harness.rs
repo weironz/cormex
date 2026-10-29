@@ -7,7 +7,7 @@
 //! development database** — one eval run and `memory search` during development
 //! returns nothing but eval corpus.
 //!
-//! The approach is the same as `crates/cortex-store/tests/common/mod.rs`: the
+//! The approach is the same as `crates/cormex-store/tests/common/mod.rs`: the
 //! connection string is unchanged, only `search_path` is pointed at a freshly
 //! created schema, migrations are run inside it, and it ends with
 //! `DROP SCHEMA ... CASCADE`.
@@ -37,22 +37,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use cortex_core::Id;
-use cortex_core::config::LlmConfig;
-use cortex_llm::LlmClient;
-use cortex_memory::embed::{Backend, Embedder, SharedEmbedder, build_embedder};
-use cortex_memory::extract::{CandidateFact, EntityRef, ExtractContext, Extractor, ObjectRef};
-use cortex_memory::injection::Budget;
-use cortex_memory::retrieval::{GRAPH_SEED_LIMIT, RecallWidth, RecencyMode, Retriever};
-use cortex_memory::tokenize;
-use cortex_store::{NewEpisode, NewEpisodeToolCall, Role, Store, Vector};
+use cormex_core::Id;
+use cormex_core::config::LlmConfig;
+use cormex_llm::LlmClient;
+use cormex_memory::embed::{Backend, Embedder, SharedEmbedder, build_embedder};
+use cormex_memory::extract::{CandidateFact, EntityRef, ExtractContext, Extractor, ObjectRef};
+use cormex_memory::injection::Budget;
+use cormex_memory::retrieval::{GRAPH_SEED_LIMIT, RecallWidth, RecencyMode, Retriever};
+use cormex_memory::tokenize;
+use cormex_store::{NewEpisode, NewEpisodeToolCall, Role, Store, Vector};
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::metrics::{ChannelRun, ScoredItem};
 use crate::suite::{Scenario, SeedFact, Suite, parse_date};
 
-const SCHEMA_PREFIX: &str = "cortex_eval_";
+const SCHEMA_PREFIX: &str = "cormex_eval_";
 
 /// Schemas left behind by a crash get swept once they are older than this.
 /// No indiscriminate sweep — that would delete a schema a sibling process is
@@ -248,7 +248,7 @@ async fn sweep_stale_schemas(admin: &PgPool) {
         .as_millis();
 
     let names: Vec<(String,)> = sqlx::query_as(
-        "SELECT nspname::text FROM pg_namespace WHERE nspname LIKE 'cortex\\_eval\\_%'",
+        "SELECT nspname::text FROM pg_namespace WHERE nspname LIKE 'cormex\\_eval\\_%'",
     )
     .fetch_all(admin)
     .await
@@ -311,7 +311,7 @@ pub fn build_extractor(
                 // The eval must be able to hit a self-hosted endpoint too:
                 // evaluating a different model often just means pointing at a
                 // different compatible service
-                base_url: std::env::var("CORTEX_LLM_BASE_URL")
+                base_url: std::env::var("CORMEX_LLM_BASE_URL")
                     .ok()
                     .filter(|v| !v.trim().is_empty()),
             };
@@ -543,9 +543,9 @@ impl Default for CrossLinkOptions {
         Self {
             enabled: false,
             judge: JudgeKind::Prefilter,
-            min_distance: cortex_memory::crosslink::DEFAULT_MIN_DISTANCE,
-            max_distance: cortex_memory::crosslink::DEFAULT_MAX_DISTANCE,
-            degree_cap: cortex_memory::crosslink::DEFAULT_DEGREE_CAP,
+            min_distance: cormex_memory::crosslink::DEFAULT_MIN_DISTANCE,
+            max_distance: cormex_memory::crosslink::DEFAULT_MAX_DISTANCE,
+            degree_cap: cormex_memory::crosslink::DEFAULT_DEGREE_CAP,
             indexed: false,
         }
     }
@@ -577,7 +577,7 @@ pub async fn build_cross_links(
     embedder: &SharedEmbedder,
     opts: CrossLinkOptions,
 ) -> Result<CrossLinkStats> {
-    use cortex_memory::crosslink::{AcceptAll, CheapModelJudge, LinkJudge, Linker, StoreCorpus};
+    use cormex_memory::crosslink::{AcceptAll, CheapModelJudge, LinkJudge, Linker, StoreCorpus};
 
     // The lookback window is opened to ten years: the eval corpus was just
     // loaded, but its `occurred_at` values span several months, while
@@ -743,7 +743,7 @@ impl EvalRetriever {
         Ok(zip_items(out))
     }
 
-    /// Replay by system time: which facts Cortex held to be true at the moment
+    /// Replay by system time: which facts Cormex held to be true at the moment
     /// `as_of`.
     ///
     /// `replay_ranked` decides between the query-ranked version and the pure
@@ -841,11 +841,11 @@ impl EvalRetriever {
     }
 }
 
-fn statements(facts: Vec<cortex_store::Fact>) -> Vec<String> {
+fn statements(facts: Vec<cormex_store::Fact>) -> Vec<String> {
     facts.into_iter().map(|f| f.statement).collect()
 }
 
-fn zip_items(out: cortex_memory::retrieval::Retrieved) -> Vec<ScoredItem> {
+fn zip_items(out: cormex_memory::retrieval::Retrieved) -> Vec<ScoredItem> {
     out.items
         .into_iter()
         .zip(out.attribution)
@@ -860,14 +860,14 @@ fn zip_items(out: cortex_memory::retrieval::Retrieved) -> Vec<ScoredItem> {
 /// The default vectorization backend — **the same selection logic as
 /// production**.
 ///
-/// It goes through `Backend::from_env()` (`CORTEX_EMBED_BACKEND`, defaulting to
+/// It goes through `Backend::from_env()` (`CORMEX_EMBED_BACKEND`, defaulting to
 /// `api`) rather than hardcoding `HashEmbedder`. There was a version that
 /// hardcoded it, and the price was that every baseline number had been measured
 /// on the premise that "the vector path is just a second lexical channel" —
 /// switching to a real semantic model overturned the per-path conclusions
 /// wholesale, wasting a round of parameter tuning.
 ///
-/// Set `CORTEX_EMBED_BACKEND=hash` to switch back to the hash stub as a control
+/// Set `CORMEX_EMBED_BACKEND=hash` to switch back to the hash stub as a control
 /// (also the way to run CI without network access).
 ///
 /// ⚠️ **Baselines are calibrated against a specific model.**
@@ -893,13 +893,13 @@ mod tests {
 
     fn seed(object: Option<&str>, entity: Option<&str>) -> SeedFact {
         SeedFact {
-            subject: "cortex".into(),
+            subject: "cormex".into(),
             subject_kind: "project".into(),
             predicate: "stores_in".into(),
             object: object.map(str::to_owned),
             object_entity: entity.map(str::to_owned),
             object_entity_kind: "tool".into(),
-            statement: "Cortex 的对象存储用 RustFS".into(),
+            statement: "Cormex 的对象存储用 RustFS".into(),
             valid_at: Some("2026-05-18".into()),
             confidence: 0.9,
             domain: None,

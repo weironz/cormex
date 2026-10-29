@@ -1,4 +1,4 @@
-//! Cortex retrieval quality evals.
+//! Cormex retrieval quality evals.
 //!
 //! The project docs say themselves that "the bottleneck is retrieval quality,
 //! not data volume", yet before this crate existed, RRF's k value, the four
@@ -39,4 +39,4 @@ pub mod runner;
 pub mod suite;
 
 /// Default path to the in-repository suite (relative to the repo root).
-pub const DEFAULT_SUITE: &str = "evals/suites/cortex-zh-en-v1.json";
+pub const DEFAULT_SUITE: &str = "evals/suites/cormex-zh-en-v1.json";

@@ -1,4 +1,4 @@
-# cortex-evals —— retrieval quality evaluation
+# cormex-evals —— retrieval quality evaluation
 
 Before this crate existed, the k of RRF, the width of each retrieval leg, the domain
 weighting coefficients and the budget truncation **could only be tuned by feel**. It does
@@ -6,7 +6,7 @@ exactly one thing: give every "optimization" a number to be checked against.
 
 The question set is a **home-grown** private Chinese-English bilingual one. The public
 benchmarks (LoCoMo / LongMemEval) are all English, and not one of them covers what makes
-Cortex different: Chinese BM25 built on jieba + tsvector, bitemporal replay, cross-domain
+Cormex different: Chinese BM25 built on jieba + tsvector, bitemporal replay, cross-domain
 retrieval, and "ought to retrieve nothing". Without building our own there is no way to
 show the selling points hold up.
 
@@ -16,22 +16,22 @@ show the selling points hold up.
 
 ```bash
 # Validate the question set only, no database -- CI's first gate, takes seconds
-cargo run -p cortex-evals -- validate
+cargo run -p cormex-evals -- validate
 
 # One run, producing the baseline figures (needs Postgres: run just up first)
-cargo run -p cortex-evals -- run
+cargo run -p cormex-evals -- run
 
 # Write out two reports
-cargo run -p cortex-evals -- run --json baseline.json --md baseline.md
+cargo run -p cormex-evals -- run --json baseline.json --md baseline.md
 
 # Run only a few questions, to work on a bad case
-cargo run -p cortex-evals -- run --only q05 --keep-schema
+cargo run -p cormex-evals -- run --only q05 --keep-schema
 
 # A/B: turn domain weighting off and see how much it matters
-cargo run -p cortex-evals -- run --ignore-domain
+cargo run -p cormex-evals -- run --ignore-domain
 
 # CI regression gate: exit non-zero on falling below the threshold
-cargo run -p cortex-evals -- run --min-recall5 0.75
+cargo run -p cormex-evals -- run --min-recall5 0.75
 ```
 
 `DATABASE_URL` is read from the `.env` at the repository root. `--mode llm` really calls the
@@ -39,7 +39,7 @@ extraction model (needs `DEEPSEEK_API_KEY`), folding extraction quality into the
 measurement as well.
 
 **The vector backend follows the same selection logic as production**
-(`CORTEX_EMBED_BACKEND`, default `fast`). An early version hard-coded `HashEmbedder` here,
+(`CORMEX_EMBED_BACKEND`, default `fast`). An early version hard-coded `HashEmbedder` here,
 and the price was that the whole first baseline rested on the premise that "the vector leg
 is merely a second lexical channel" -- swapping in a real semantic model overturned the
 per-leg conclusions wholesale, and a round of tuning had been wasted. On a machine with no
@@ -74,15 +74,15 @@ python evals/sweep.py episodes         # A/B of the episodes leg
 python evals/sweep.py floor:0.4,0.45,0.5,0.55   # sweep a range ad hoc
 ```
 
-It is deliberately not written in Rust: what `cortex-evals` produces is the report of
+It is deliberately not written in Rust: what `cormex-evals` produces is the report of
 **one** run, and pushing "run it N times and compare" inside would saddle the CI path with
 a pile of knobs it has no use for.
 
 ### It does not pollute the development database
 
-Every run creates a **temporary schema** (`cortex_eval_<timestamp>_<pid>`), runs the
+Every run creates a **temporary schema** (`cormex_eval_<timestamp>_<pid>`), runs the
 migrations inside it, and ends with `DROP SCHEMA ... CASCADE`. The same approach as
-`crates/cortex-store/tests/common/mod.rs`. Schemas left behind by a crash are swept up by
+`crates/cormex-store/tests/common/mod.rs`. Schemas left behind by a crash are swept up by
 the next run according to age (30 minutes) -- not swept indiscriminately, which would
 delete the one a sibling process is using.
 
@@ -145,7 +145,7 @@ of the extraction side.
 
 ## Question set format
 
-The question set is a single JSON file (`suites/cortex-zh-en-v1.json`).
+The question set is a single JSON file (`suites/cormex-zh-en-v1.json`).
 Not YAML, because the workspace has no YAML crate at all and pulling in a dependency for
 one file does not pay (and `serde_yaml` is no longer maintained).
 
@@ -164,7 +164,7 @@ one file does not pay (and `serde_yaml` is no longer maintained).
         "predicate": "stores_in",
         "object_entity": "MinIO",    // either this or "object" (a literal), not both
         "object_entity_kind": "tool",
-        "statement": "The first version of Cortex object storage used MinIO.",
+        "statement": "The first version of Cormex object storage used MinIO.",
         "valid_at": "2026-03-02",    // [Valid time] contradiction resolution decides order by it
         "confidence": 0.9
       }]
@@ -284,18 +284,18 @@ infinity and Recall@k is identically 1.
 
 1. Add to `scenarios` if new corpus is needed, otherwise just append to `questions`.
    If a new fact's `predicate` is meant to **supersede** an old value, it has to be one of
-   the single-valued predicates in `cortex_memory::extract::DEFAULT_FUNCTIONAL`
+   the single-valued predicates in `cormex_memory::extract::DEFAULT_FUNCTIONAL`
    (`decided_on` / `assigned_to` / `deadline` / `stores_in` ...), and the two `valid_at`
    values have to be distinguishable in order -- otherwise it is merely marked `flag` and
    both coexist.
-2. Pass static validation with `cargo run -p cortex-evals -- validate`.
-3. Pass the question-set integrity checks with `cargo test -p cortex-evals`. They stop:
+2. Pass static validation with `cargo run -p cormex-evals -- validate`.
+3. Pass the question-set integrity checks with `cargo test -p cormex-evals`. They stop:
    - gold / forbidden matching no seeded fact at all (a dead question / a trivially true assertion)
    - gold and forbidden hitting the same fact (a question that can never be judged correctly)
    - the count for some question type dropping below 8 (single-question jitter drowning the signal)
    - the seven admission rules for tool-experience questions (see "How to add a tool-experience question")
 4. Look at the single-question result with
-   `cargo run -p cortex-evals -- run --only <the new question id>`.
+   `cargo run -p cormex-evals -- run --only <the new question id>`.
 
 Keep question ids in lexicographic order, so that reports and baseline JSON can be diffed
 directly.
@@ -303,7 +303,7 @@ directly.
 ### How to add a question that "needs a cross-domain bridge" (q112-q116 came about this way)
 
 Questions of this kind test whether the `relates_to` edges written by
-`cortex-memory::crosslink` really do let graph traversal get from one domain to the other.
+`cormex-memory::crosslink` really do let graph traversal get from one domain to the other.
 **Writing your own question and grading it yourself is circular reasoning**, so there is a
 fixed procedure:
 
@@ -472,11 +472,11 @@ type and once per language.
 
 ```yaml
 # The first gate: takes seconds, needs no services at all
-- run: cargo run -p cortex-evals -- validate
-- run: cargo test -p cortex-evals
+- run: cargo run -p cormex-evals -- validate
+- run: cargo test -p cormex-evals
 
 # The second gate: needs a Postgres service
-- run: cargo run -p cortex-evals --
+- run: cargo run -p cormex-evals --
          run --mode seed
              --json evals-report.json
              --min-recall5 0.75
@@ -511,7 +511,7 @@ up when reading the numbers.
 
 ## Baseline figures
 
-Reproducible by running it yourself (`cargo run -p cortex-evals -- run`; with no flags at all
+Reproducible by running it yourself (`cargo run -p cormex-evals -- run`; with no flags at all
 that is the production default configuration). 2026-08-07, `mode=seed`,
 `embedder=fastembed:gpahal/bge-m3-onnx-int8`, 73 seeded facts / 17 tool traces /
 124 questions:
@@ -631,7 +631,7 @@ shake", but "we know how much it shakes".
 
 ## Baseline for cross-domain links (`relates_to`)
 
-`--cross-link` runs one pass of `cortex-memory::crosslink`'s nightly scan after the corpus is
+`--cross-link` runs one pass of `cormex-memory::crosslink`'s nightly scan after the corpus is
 loaded: vector nearest neighbours prefilter the cross-domain candidate pairs, the judge
 decides whether to link them, and two directed `relates_to` edges are written.
 **Off by default** -- it writes extra rows into the database, and should not disturb the

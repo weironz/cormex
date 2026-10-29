@@ -11,11 +11,11 @@ name: Release
 #  offer an installation path that does not work. Anyone who does not want docker goes
 #  through `cargo install --git`.
 #
-#  ── The version line is independent of Cortex ─────────────
-#  This is the whole point of the split: Cormex and Cortex release their own versions,
+#  ── The version line is independent of Cormex ─────────────
+#  This is the whole point of the split: Cormex and Cormex release their own versions,
 #  sharing no tags and not aligning with each other. What is checked below is the
 #  `[workspace.package] version` in **this repository's** Cargo.toml, which has nothing
-#  to do with Cortex's version number.
+#  to do with Cormex's version number.
 # ══════════════════════════════════════════════════════════
 
 on:
@@ -80,7 +80,7 @@ jobs:
           got = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
           if got != want:
               print(f"::error::the tag is v{want}, but Cargo.toml's workspace version is {got}")
-              print("The image tag and `cortexd --version` would each state a different number, and both would compile.")
+              print("The image tag and `cormexd --version` would each state a different number, and both would compile.")
               sys.exit(1)
           print(f"OK, versions agree: {got}")
           PY
@@ -146,7 +146,7 @@ jobs:
           # directories the **compile-time** macro `sqlx::migrate!` reads -- leave them out
           # of the context and it blows up at compile time, while a local build stays green
           context: .
-          file: scripts/docker/Dockerfile.cortexd
+          file: scripts/docker/Dockerfile.cormexd
           platforms: linux/amd64
           push: true
           # ★ **Must be turned off.** buildx by default attaches a provenance attestation to
@@ -162,8 +162,8 @@ jobs:
           # turns "which version is running in production" into a question nobody can
           # settle.
           #
-          # The image is called cormex (not cortexd) -- that is the product name, while the
-          # binary inside is still called cortexd
+          # The image is called cormex (not cormexd) -- that is the product name, while the
+          # binary inside is still called cormexd
           tags: |
             willdockerhub/cormex:v${{ needs.preflight.outputs.version }}
             registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v${{ needs.preflight.outputs.version }}
@@ -198,7 +198,7 @@ jobs:
           # have to be present; the symptom of the global one missing is a new tenant
           # failing halfway through account creation
           docker run --rm --entrypoint /bin/sh "$img" -c \
-            'test -d /opt/cortex/migrations && test -d /opt/cortex/migrations-global' \
+            'test -d /opt/cormex/migrations && test -d /opt/cormex/migrations-global' \
             || { echo "::error::the migration directories are missing from the image"; exit 1; }
 
   # ══════════════════════════════════════════════════════════

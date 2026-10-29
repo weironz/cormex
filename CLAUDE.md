@@ -7,10 +7,6 @@
 Cormex —— **AI agent 的记忆服务**。双时间轴、provenance 到源、MCP 原生。
 Apache-2.0，公开仓库，生产在跑。
 
-它 2026-08 从 [Cortex](https://github.com/weironz/cortex) 拆出来独立发版。
-**在这个仓库里不要为 Cortex 做任何事** —— 那是另一个产品、另一条版本线、
-另一个仓库。两边**零代码依赖**，只有 HTTP。
-
 先读 [docs/roadmap.md](docs/roadmap.md) 知道当前该做什么。
 
 ## 差异点在哪 —— 决定往哪儿花时间
@@ -32,14 +28,14 @@ Cormex 也有，那些**不是卖点**。
 ## 架构
 
 ```
-cortex-core     1.2k   类型 / Id / 配置 / 错误 / 注入渲染   ← 无外部依赖
-cortex-llm      1.8k   供应商层（封装 goose-providers）
-cortex-store    11k    sqlx repository + sync_log
-cortex-memory   12k    分词 / embedding / 抽取 / 四路召回 + RRF
-cortex-blob     3.1k   内容寻址的对象存储（S3 / 本地）
-cortex-proto    2.0k   线协议 DTO
-cortex-import   1.8k   ChatGPT / Claude 导出文件的导入器
-cortexd         13k    服务端：HTTP + SSE + WebSocket + MCP
+cormex-core     1.2k   类型 / Id / 配置 / 错误 / 注入渲染   ← 无外部依赖
+cormex-llm      1.8k   供应商层（封装 goose-providers）
+cormex-store    11k    sqlx repository + sync_log
+cormex-memory   12k    分词 / embedding / 抽取 / 四路召回 + RRF
+cormex-blob     3.1k   内容寻址的对象存储（S3 / 本地）
+cormex-proto    2.0k   线协议 DTO
+cormex-import   1.8k   ChatGPT / Claude 导出文件的导入器
+cormexd         13k    服务端：HTTP + SSE + WebSocket + MCP
 evals                  检索质量评测（自建的中英双语题集）
 app/            3.2k   记忆浏览器（Flutter，Web 与桌面同一份源码）
 ```
@@ -49,21 +45,21 @@ app/            3.2k   记忆浏览器（Flutter，Web 与桌面同一份源码�
 发出去的是**两个镜像**：`cormex`（服务端）与 `cormex-web`（浏览器）。
 分开不是形式：可以只跑服务端、只用 MCP，一辈子不部署浏览器。
 
-## 与 Cortex 的边界
+## agent 怎么接进来
 
-Cortex 那侧的 agent 通过三条 HTTP 路借用这里：`/llm/stream` 借模型、
-`/episodes` 写记忆、`/memory/search` 或 `/mcp` 查记忆。
+**没有专属对接。** 任何 agent（Claude Code / Codex / goose / Cursor / …）
+走的是同一组公开接口：`/llm/stream` 借模型、`/episodes` 写记忆、
+`/memory/search` 或 `/mcp` 查记忆。MCP 是标准协议，不做任何厂商特化。
 
-**那正是第三方 agent（Claude Code / goose）走的同一条路。**
-这不是洁癖 —— 自己人和外人用同一个 API，那个 API 才不会烂。
+自己人和外人用同一个 API，那个 API 才不会烂。
 
 由此推出两条：
 
-**这里不跑 agent 循环。** cortexd 里曾经有过一份（docker 接不上时的回落），
+**这里不跑 agent 循环。** cormexd 里曾经有过一份（docker 接不上时的回落），
 删掉的理由不是它有 bug，而是同一个 `Turn::run` 有两处装配，漏改的那一份
 不会有任何测试红。
 
-`routes::cortexd_serves_no_agent_shaped_route` 钉着这件事：`/chat` 与
+`routes::cormexd_serves_no_agent_shaped_route` 钉着这件事：`/chat` 与
 `/sandbox/*` 在这个进程上**根本不存在**，断言是 404 不是 501 ——
 501 说「这条路是我的但我不支持」，404 说「这条路不是我的」，后者才是实话。
 
@@ -91,7 +87,7 @@ Cortex 那侧的 agent 通过三条 HTTP 路借用这里：`/llm/stream` 借模�
 ### 2. migration 只增不改，且必须是 LF
 
 已应用的 migration 是不可变的。改 schema 一律新开文件。
-`crates/cortex-store/tests/migrations_are_immutable.rs` 里两个测试：
+`crates/cormex-store/tests/migrations_are_immutable.rs` 里两个测试：
 `applied_migrations_are_byte_for_byte_unchanged`（钉了全部 16 个文件的 sha256，
 改一个注释都会红）与 `every_migration_on_disk_is_pinned`（新加的文件必须补进
 清单 —— 否则「加一个不被钉的文件」就成了绕过前一个测试的合法途径）。
@@ -114,12 +110,12 @@ migration 20260807000001 was previously applied but has been modified
 
 ### 3. 两套 migration 共用一个库，schema 不同
 
-`migrations/`（记忆，public）与 `migrations-global/`（认证，cortex_auth）
-各有自己的版本表。跑第二套时 **search_path 必须是 `cortex_auth,public`**，
-不能只给 `cortex_auth`：`ulid` / `sha256` 这两个 DOMAIN 住在 `public`。
+`migrations/`（记忆，public）与 `migrations-global/`（认证，cormex_auth）
+各有自己的版本表。跑第二套时 **search_path 必须是 `cormex_auth,public`**，
+不能只给 `cormex_auth`：`ulid` / `sha256` 这两个 DOMAIN 住在 `public`。
 只给一个的症状是 `type "ulid" does not exist`。`state.rs` 里设的就是这两个。
 
-### 4. 记忆注入必须走 `cortex_core::injection`
+### 4. 记忆注入必须走 `cormex_core::injection`
 
 朴素实现（每轮把检索结果拼进 system prompt）会**逐轮打穿前缀缓存**，
 成本涨 5–10 倍，且只有几周后从账单上才看得出来。
@@ -129,7 +125,7 @@ migration 20260807000001 was previously applied but has been modified
 - 时间一律绝对日期
 
 **MCP 那一侧表达的是同一件事**，靠的是原语选对而不是自己拼：
-核心画像是 **resource**（`cortex://profile`，宿主自己贴进可缓存前缀，不随轮次变），
+核心画像是 **resource**（`cormex://profile`，宿主自己贴进可缓存前缀，不随轮次变），
 回合检索是 **tool**（`memory_search`，模型按需调，结果天然落在最新一轮旁边）。
 两边解决的是同一个问题，对上不是巧合。写记忆是第二个 tool（`remember`）。
 
@@ -137,12 +133,13 @@ migration 20260807000001 was previously applied but has been modified
 **不另写一套「MCP 结果格式」**：那道框定一处都不能少 —— 从工具通道回来的记忆
 和从注入通道进去的一样可能混着被抽取进来的恶意指令。
 
-⚠️ **`cortex-core/src/injection.rs` 在两个仓库各有一份**（这边给 MCP，
-那边给 agent），彼此没有编译期联系。漂移的症状是同一条记忆经 MCP 看到的和经
-agent 看到的长得不一样，**不报错**。改这个文件时两边一起改，然后跑：
+⚠️ **`cormex-core/src/injection.rs` 可能在本仓库之外还有一份实现**（给在别处
+运行的 agent 用），彼此没有编译期联系。漂移的症状是同一条记忆经 MCP 看到的和经
+agent 看到的长得不一样，**不报错**。改这个文件时，若手上有另一份，两边一起改，
+然后跑：
 
 ```bash
-python scripts/injection-drift.py ../cortex/crates/cortex-core/src/injection.rs
+python scripts/injection-drift.py ../cormex/crates/cormex-core/src/injection.rs
 ```
 
 2026-08-15 核对过：去掉注释后逐 token 相同（756 个 token）。注释语言两侧已经
@@ -165,10 +162,10 @@ python scripts/injection-drift.py ../cortex/crates/cortex-core/src/injection.rs
 ## 开发
 
 ```bash
-just up            # 起 postgres + rustfs（**不含 cortexd**：开发时它跑宿主进程，
+just up            # 起 postgres + rustfs（**不含 cormexd**：开发时它跑宿主进程，
                    #   改一行重启只要一秒。整栈容器化见 just serve）
 just db-migrate    # 两套 migration，顺序不能反
-just run           # 跑 cortexd
+just run           # 跑 cormexd
 just ci            # fmt-check + lint + test
 just test-db       # 要数据库的那些集成测试
 ```
@@ -185,24 +182,24 @@ Postgres + 两套 migration）、`app`（flutter analyze + test）。
 一致、`Cargo.lock --locked` 自洽）然后并行构建两个镜像，各自烟测后推两个
 registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
 
-**没有 CI 部署。** 部署是手工 ssh + `docker compose up -d`。Cortex 那边有一套
-节点侧的部署策略脚本，这边没有 —— 要做的话见 roadmap。
+**没有 CI 部署。** 部署是手工 ssh + `docker compose up -d`。节点侧的部署策略
+脚本目前没有 —— 要做的话见 roadmap。
 
 ## 部署的形状
 
-两个 compose 栈：这一份（记忆 + 它的库 + 对象存储 + Web）与 Cortex 那一份
-（agent 编排）。分开是因为它们是两个产品、两条版本线；放一份文件里就等于
-「发 Cortex」与「发记忆服务」共用一次 `up`，而拆仓要消灭的正是这种黏连。
+两个 compose 栈：这一份（记忆 + 它的库 + 对象存储 + Web）与 agent 编排那一份。
+agent 循环不在这个仓库里（见上文「agent 怎么接进来」），所以它有自己的栈；
+放一份文件里就等于「发 agent」与「发记忆服务」共用一次 `up`。
 
 三件在生产上会咬人的事：
 
-- **卷是 `external` 且写死了名字**（`cortex_cortex-prod-postgres` 这种历史名，
+- **卷是 `external` 且写死了名字**（`cormex_cormex-prod-postgres` 这种历史名，
   compose 项目前缀留下的）。去掉 external 或改项目名，compose 会**新建空卷**，
   而症状不是报错，是「数据库突然空了」。
 - **同一个域名下 `/api` 走服务端、其余走 Web**，靠边缘的 PathPrefix + StripPrefix。
   优先级显式写死，不靠 traefik「规则越长越优先」的默认 —— 那个默认变了的症状是
   API 请求拿回一份 200 的 index.html，客户端报「JSON 解析失败」。
-- **`CORMEX_VERSION` 与 Cortex 的 `CORTEX_VERSION` 是两个变量**，独立升级。
+- **`CORMEX_VERSION` 与 Cormex 的 `CORMEX_VERSION` 是两个变量**，独立升级。
 
 具体的节点地址、域名、账号**不写在被跟踪的文件里**（这是公开仓库）。
 维护这个部署的机器上有一份 `deploy/PRODUCTION.local.md`（`.gitignore` 的
@@ -229,7 +226,7 @@ registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
 其余：
 
 - 注释解释**为什么**，不解释**是什么**。尤其要写清「为什么不是那个显然的做法」。
-  参考 `crates/cortex-core/src/id.rs` 与 `injection.rs` 的密度与语气
+  参考 `crates/cormex-core/src/id.rs` 与 `injection.rs` 的密度与语气
 - 测试的断言消息要能独立读懂失败原因，别只写 `assert!(x)`
 - 提交前必须过 `cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`
 - 遇到 dead_code 警告，**优先让代码真的用起来**，而不是加 `#[allow]`
@@ -239,8 +236,6 @@ registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
 ## 边界
 
 - **绝不把 API key 写进任何被 git 跟踪的文件**。只放 `.env`
-- **改动跨到 Cortex 时，两个仓库分别提交。** 版本线独立，一次提交跨两仓是做不到的，
-  而「一边改了另一边忘了」的症状是部署时才炸
 - 这是**公开仓库**：提交信息、注释、文档里不要出现节点地址、域名、账号、
   内网拓扑
 

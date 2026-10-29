@@ -1,7 +1,7 @@
 # The compose project name. It prefixes every volume this file creates, which
-# is why it matters more than a label: for a long time it said `cortex`, left
+# is why it matters more than a label: for a long time it said `cormex`, left
 # over from before the memory service moved out of that repo, and the volumes
-# on disk were called `cortex_pg_data` and friends. Production inherited the
+# on disk were called `cormex_pg_data` and friends. Production inherited the
 # same prefix and is now stuck with it -- see the ★ section in
 # `deploy/docker-compose.prod.yml`, where four volumes have to be declared
 # `external` under names nobody can change.
@@ -12,7 +12,7 @@
 # be an error -- it would be "the database is suddenly empty".
 name: cormex
 
-# ─── About every `${CORTEX_BIND_ADDR:-127.0.0.1}:` below ────────────────────
+# ─── About every `${CORMEX_BIND_ADDR:-127.0.0.1}:` below ────────────────────
 #
 # Ports bind to the **loopback** by default instead of `0.0.0.0`; what that takes away is
 # the **LAN** side: a development machine with Wi-Fi on used to be holding a postgres with
@@ -23,7 +23,7 @@ name: cormex
 # The assumption was that this change shut the sandbox out as well. On a real machine it
 # **does not hold** (Docker Desktop / Windows):
 #
-#   from a sandbox → cortex-postgres:5432 (DNS name)                    refused   ← topological isolation works
+#   from a sandbox → cormex-postgres:5432 (DNS name)                    refused   ← topological isolation works
 #   from a sandbox → host.docker.internal:15432 (bound to 0.0.0.0)      reachable
 #   from a sandbox → host.docker.internal:15432 (after rebinding to 127.0.0.1)  **still reachable**
 #
@@ -38,7 +38,7 @@ name: cormex
 # `internal: true` (a container then has no default route at all, `host.docker.internal`
 # still resolves but nothing routes there, and all three lines above are refused).
 # The price is that **published ports stop working on an internal network** (measured too:
-# curl from the host cannot connect), and cortexd currently reverse-proxies into the
+# curl from the host cannot connect), and cormexd currently reverse-proxies into the
 # containers through exactly those published ports -- so that step has to be taken together
 # with a dual-homed relay container, noted as B3 on the roadmap.
 #
@@ -49,55 +49,55 @@ name: cormex
 # to verify it on. And the production `deploy/docker-compose.yml` has not a single `ports:`
 # entry, so it is not exposed in the first place.
 #
-# To connect from another machine on the LAN, set `CORTEX_BIND_ADDR=0.0.0.0`.
+# To connect from another machine on the LAN, set `CORMEX_BIND_ADDR=0.0.0.0`.
 #
-# **cortexd's own port is not in this group**: a container has to be able to reach it in
+# **cormexd's own port is not in this group**: a container has to be able to reach it in
 # order to call back (writing memory, pulling history), and that route is narrowed down by
 # the sandbox token to 5 allowlisted routes -- that door is left open deliberately.
 services:
 
-  # ─── cortexd: the memory service itself ────────────────────────────
+  # ─── cormexd: the memory service itself ────────────────────────────
   #
   # This one **runs on its own**: Postgres + object storage + a key for one LLM provider,
   # and nothing else in front. The agent side (the conversation loop, container
   # orchestration) is not in this repository, and should not be -- someone using this as a
   # memory layer has no use for a single line of it.
-  cortexd:
+  cormexd:
     build:
       context: .
-      dockerfile: scripts/docker/Dockerfile.cortexd
-    image: ${CORTEXD_IMAGE:-cormex/cortexd:local}
-    container_name: cormex-cortexd
+      dockerfile: scripts/docker/Dockerfile.cormexd
+    image: ${CORMEXD_IMAGE:-cormex/cormexd:local}
+    container_name: cormex-cormexd
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-cortex}:${POSTGRES_PASSWORD:-cortex_dev_only}@postgres:5432/${POSTGRES_DB:-cortex}
+      DATABASE_URL: postgres://${POSTGRES_USER:-cormex}:${POSTGRES_PASSWORD:-cormex_dev_only}@postgres:5432/${POSTGRES_DB:-cormex}
       S3_ENDPOINT: http://rustfs:9000
-      S3_BUCKET: ${S3_BUCKET:-cortex-blobs}
+      S3_BUCKET: ${S3_BUCKET:-cormex-blobs}
       S3_REGION: ${S3_REGION:-us-east-1}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
-      CORTEXD_BIND: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
-      # With no credential configured at all, cortexd **refuses to start**. Switching that
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cormexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cormex_dev_only}
+      CORMEXD_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-cormexd=info,cormex_memory=info,warn}
+      # With no credential configured at all, cormexd **refuses to start**. Switching that
       # off has to be said out loud -- see auth.rs
-      CORTEX_AUTH: ${CORTEX_AUTH:-}
-      CORTEX_TOKEN_SHA256: ${CORTEX_TOKEN_SHA256:-}
-      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
-      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
-      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
-      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
-      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
-      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
-      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
+      CORMEX_AUTH: ${CORMEX_AUTH:-}
+      CORMEX_TOKEN_SHA256: ${CORMEX_TOKEN_SHA256:-}
+      CORMEX_EMBED_BACKEND: ${CORMEX_EMBED_BACKEND:-api}
+      CORMEX_EMBED_MODEL: ${CORMEX_EMBED_MODEL:-}
+      CORMEX_EMBED_ENDPOINT: ${CORMEX_EMBED_ENDPOINT:-}
+      CORMEX_EMBED_API_KEY: ${CORMEX_EMBED_API_KEY:-}
+      CORMEX_LLM_PROVIDER: ${CORMEX_LLM_PROVIDER:-deepseek}
+      CORMEX_LLM_MODEL: ${CORMEX_LLM_MODEL:-}
+      CORMEX_LLM_CHEAP_MODEL: ${CORMEX_LLM_CHEAP_MODEL:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      CORTEX_SECRET_KEY: ${CORTEX_SECRET_KEY:-}
+      CORMEX_SECRET_KEY: ${CORMEX_SECRET_KEY:-}
     ports:
-      - "${CORTEXD_PORT:-8080}:8080"
+      - "${CORMEXD_PORT:-8080}:8080"
     networks:
       - default
   # ─── Postgres + pgvector ──────────────────────────────
@@ -106,9 +106,9 @@ services:
     container_name: cormex-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-cortex}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cortex_dev_only}
-      POSTGRES_DB: ${POSTGRES_DB:-cortex}
+      POSTGRES_USER: ${POSTGRES_USER:-cormex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cormex_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-cormex}
       # Chinese tokenization happens on the Rust side with jieba-rs, so no tokenizer
       # extension is needed here
       #
@@ -140,16 +140,16 @@ services:
       - -c
       - summarize_wal=on
     ports:
-      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+      - "${CORMEX_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       # Backups land in a host directory rather than a named volume: scripts have to be able
       # to read them directly, rclone has to be able to push them to a second store, and
       # they have to still be findable after every container is gone. Defaults to
       # ./data/backup, and the repository's data/ is already in .gitignore.
-      - ${CORTEX_BACKUP_DIR:-./data/backup}:/backup
+      - ${CORMEX_BACKUP_DIR:-./data/backup}:/backup
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cortex} -d ${POSTGRES_DB:-cortex}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cormex} -d ${POSTGRES_DB:-cormex}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -172,8 +172,8 @@ services:
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cortexadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cortex_dev_only}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cormexadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-cormex_dev_only}
       # strict = a write is acknowledged only once it has hit the disk. The precondition for
       # "never lose anything"; do not turn it down to relaxed
       RUSTFS_DURABILITY_MODE: strict
@@ -183,8 +183,8 @@ services:
       RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
       RUSTFS_OBS_LOGGER_LEVEL: info
     ports:
-      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_API_PORT:-9000}:9000"      # S3 API
-      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9001}:9001"  # console
+      - "${CORMEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_API_PORT:-9000}:9000"      # S3 API
+      - "${CORMEX_BIND_ADDR:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9001}:9001"  # console
     volumes:
       - rustfs_data:/data
     healthcheck:
@@ -205,11 +205,11 @@ services:
   #
   # If you would rather not self-host, point .env at any OpenAI-compatible service:
   #
-  #   CORTEX_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
-  #   CORTEX_EMBED_MODEL=text-embedding-v3
-  #   CORTEX_EMBED_API_KEY=sk-...
+  #   CORMEX_EMBED_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   CORMEX_EMBED_MODEL=text-embedding-v3
+  #   CORMEX_EMBED_API_KEY=sk-...
   #
-  # If neither road appeals, offline development can use CORTEX_EMBED_BACKEND=hash --
+  # If neither road appeals, offline development can use CORMEX_EMBED_BACKEND=hash --
   # but bear in mind that **it is not a semantic space**, so retrieval-quality evaluation
   # results mean nothing on top of it.
   #
@@ -220,16 +220,16 @@ services:
     profiles: [embed]
     restart: unless-stopped
     command: >-
-      --model-id ${CORTEX_EMBED_SERVED_MODEL:-BAAI/bge-m3}
+      --model-id ${CORMEX_EMBED_SERVED_MODEL:-BAAI/bge-m3}
       --port 80
       --auto-truncate
     environment:
       HF_HOME: /data
     ports:
-      # During development cortexd runs on the host (not inside compose), so this has to be
+      # During development cormexd runs on the host (not inside compose), so this has to be
       # mapped out. Matches .env:
-      # CORTEX_EMBED_ENDPOINT=http://127.0.0.1:8090/v1/embeddings
-      - "${CORTEX_BIND_ADDR:-127.0.0.1}:${CORTEX_EMBED_PORT:-8090}:80"
+      # CORMEX_EMBED_ENDPOINT=http://127.0.0.1:8090/v1/embeddings
+      - "${CORMEX_BIND_ADDR:-127.0.0.1}:${CORMEX_EMBED_PORT:-8090}:80"
     volumes:
       - embed_models:/data
     healthcheck:
@@ -250,15 +250,15 @@ services:
   #   docker compose --profile sandbox up -d      # or just sandbox-up
   #
   # It is attached to two networks at once:
-  #   cortex-sandbox-net  internal, where the sandboxes live, **with no default route**
+  #   cormex-sandbox-net  internal, where the sandboxes live, **with no default route**
   #   default             an ordinary bridge, which is how it gets out
   #
   # That makes it the only point in this topology able to reach both sides, and it serves
   # both directions: egress (sandbox → the permitted outside world) and the reverse relay
-  # (cortexd → a designated sandbox container).
+  # (cormexd → a designated sandbox container).
 networks:
   default:
-    name: cortex_default
+    name: cormex_default
 
 volumes:
   pg_data:

@@ -90,7 +90,7 @@ jobs:
       #   resolved migrations` -- it is looking at the first set's bookkeeping.
       #
       #   The runtime path does this correctly (`Store::migrate_global` creates the schema
-      #   and opens its own connection with `search_path=cortex_auth`, precisely because
+      #   and opens its own connection with `search_path=cormex_auth`, precisely because
       #   `search_path` is a connection-level property and cannot be changed on a live
       #   pool). CI has to mirror it rather than assume two commands are two namespaces.
       #
@@ -101,10 +101,10 @@ jobs:
       #   path. `state.rs` puts exactly this pair on the accounts pool, same note.
       - name: Apply migrations
         run: |
-          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
+          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cormex_auth'
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations-global \
-            --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth%2Cpublic"
+            --database-url "$DATABASE_URL?options=-csearch_path%3Dcormex_auth%2Cpublic"
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
           PGPASSWORD: postgres

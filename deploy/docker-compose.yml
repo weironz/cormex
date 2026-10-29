@@ -95,7 +95,7 @@ services:
   #
   # Vectorising has two routes, and this file defaults to the first:
   #
-  #   1. CORTEX_EMBED_BACKEND=api against a hosted endpoint -- no container, no
+  #   1. CORMEX_EMBED_BACKEND=api against a hosted endpoint -- no container, no
   #      resident memory, one network call per vectorisation.
   #   2. The same, pointed at this container.
   #
@@ -106,8 +106,8 @@ services:
   #
   #     # in .env
   #     COMPOSE_PROFILES=embed
-  #     CORTEX_EMBED_ENDPOINT=http://embeddings/v1/embeddings
-  #     CORTEX_EMBED_MODEL=bge-m3
+  #     CORMEX_EMBED_ENDPOINT=http://embeddings/v1/embeddings
+  #     CORMEX_EMBED_MODEL=bge-m3
   #
   # ★ The model must be 1024-dimensional -- the schema pins VECTOR(1024).
   # OpenAI's text-embedding-3-small is 1536 and large is 3072; either is
@@ -153,8 +153,8 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cormexadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
 
-      CORTEXD_BIND: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-cortexd=info,cortex_memory=info,warn}
+      CORMEXD_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-cormexd=info,cormex_memory=info,warn}
 
       # ★ Authentication. The server refuses to start without this, on purpose:
       # the 0.0.0.0 bind above is exactly what it guards against.
@@ -163,18 +163,18 @@ services:
       #
       # That prints the token once, and the hash to paste here. Only the hash
       # belongs on this machine.
-      CORTEX_AUTH_TOKEN_SHA256: ${CORTEX_AUTH_TOKEN_SHA256:?required -- see .env.example for how to generate it}
+      CORMEX_AUTH_TOKEN_SHA256: ${CORMEX_AUTH_TOKEN_SHA256:?required -- see .env.example for how to generate it}
 
       # ★ These have no usable default. An empty endpoint fails at the first
       # vectorisation rather than at startup -- so after `up`, read /health and
       # confirm `embedding.model` says `api:<the model you set>`.
-      CORTEX_EMBED_BACKEND: ${CORTEX_EMBED_BACKEND:-api}
-      CORTEX_EMBED_ENDPOINT: ${CORTEX_EMBED_ENDPOINT:-}
-      CORTEX_EMBED_MODEL: ${CORTEX_EMBED_MODEL:-}
-      CORTEX_EMBED_API_KEY: ${CORTEX_EMBED_API_KEY:-}
+      CORMEX_EMBED_BACKEND: ${CORMEX_EMBED_BACKEND:-api}
+      CORMEX_EMBED_ENDPOINT: ${CORMEX_EMBED_ENDPOINT:-}
+      CORMEX_EMBED_MODEL: ${CORMEX_EMBED_MODEL:-}
+      CORMEX_EMBED_API_KEY: ${CORMEX_EMBED_API_KEY:-}
       # Per-request ceiling. 10 is not tuning, it is the lowest common
       # denominator: TEI allows 32, some hosted endpoints stop at 10.
-      CORTEX_EMBED_BATCH: ${CORTEX_EMBED_BATCH:-}
+      CORMEX_EMBED_BATCH: ${CORMEX_EMBED_BATCH:-}
 
       # LLM provider. Keys come from the environment, never from a tracked file.
       #
@@ -182,14 +182,14 @@ services:
       # named here never reaches the process. That is the trap of allowlists --
       # an omitted knob does not exist in production, and the way it surfaces
       # is that someone changes it, restarts, and nothing happens.
-      CORTEX_LLM_PROVIDER: ${CORTEX_LLM_PROVIDER:-deepseek}
-      CORTEX_LLM_MODEL: ${CORTEX_LLM_MODEL:-}
-      CORTEX_LLM_CHEAP_MODEL: ${CORTEX_LLM_CHEAP_MODEL:-}
+      CORMEX_LLM_PROVIDER: ${CORMEX_LLM_PROVIDER:-deepseek}
+      CORMEX_LLM_MODEL: ${CORMEX_LLM_MODEL:-}
+      CORMEX_LLM_CHEAP_MODEL: ${CORMEX_LLM_CHEAP_MODEL:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
-      - workspace:/var/lib/cortex/workspace
+      - workspace:/var/lib/cormex/workspace
 
   # ── The memory browser ────────────────────────────────
   #

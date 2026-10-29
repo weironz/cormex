@@ -1,0 +1,40 @@
+[package]
+name = "cormex-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Cormex provider layer: wraps goose-providers so LLMs can be swapped"
+
+[dependencies]
+cormex-core.workspace = true
+# Depends on goose-providers alone: it already does
+# `pub use goose_provider_types::{base, conversation, model, ...}`, exposing the whole type
+# layer. The root Cargo.toml also wrote `features = ["rustls-tls"]` for goose-provider-types,
+# but that crate has no such feature at all (neither alpha.1 nor alpha.5 does; the TLS
+# backend is forwarded to reqwest solely by goose-providers' own feature), so referring to
+# it directly makes resolution fail.
+goose-providers.workspace = true
+# goose's `Tool` is rmcp's `Tool`. goose-provider-types does not re-export rmcp, so a copy
+# has to be pulled in here -- at the same version as goose, relying on cargo's feature
+# unification to guarantee it really is the same type.
+# The root Cargo.toml has no entry for it, so by convention the full declaration is written
+# inside this crate.
+rmcp = { version = "1.8", default-features = false }
+# Image blocks have to encode &[u8] into base64. goose already uses 0.22 internally, and
+# pinning the same major version keeps a second base64 implementation out. As above, the
+# root Cargo.toml is not this crate's to maintain, so the declaration is written out in full.
+base64 = "0.22"
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dotenvy.workspace = true
+tracing-subscriber.workspace = true

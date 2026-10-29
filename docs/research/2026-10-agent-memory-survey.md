@@ -11,7 +11,7 @@
 >
 > 不想读全文的话，§0 和 §9 各一页。
 >
-> **相关文档**（2026-08 的上一轮调研与设计，2026-10-29 从 Cortex 仓库迁入，正文未改）：
+> **相关文档**（2026-08 的上一轮调研与设计，2026-10-29 迁入，正文未改）：
 > - [memory.md](../memory.md)：记忆系统怎么工作（存储模型、双时间轴、检索、同步）
 > - [memory-content.md](../memory-content.md)：什么东西有资格进记忆（58 个系统的全景调研）
 >
@@ -317,10 +317,10 @@ CLAUDE.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每�
 
 ### 6.5 顺带发现的问题（不属于本需求，单独处理）
 
-1. **`as_of` 回放忽略了 `revoke`**。`crates/cortex-store/src/recall.rs` 里的 `as_of_snapshot!` 只要看到时刻 T 之前有过 `invalidate` 就排除这条事实，**不看之后有没有 `revoke` 把它恢复**；而 `fact_status` 视图是「以最后一条状态事件为准」。两者在「失效后又恢复」这种情况下结论相反。现在线上**没有任何代码写 `revoke`**（只有测试写），所以还是潜在问题；一旦做「用户手工恢复一条记忆」，回放就会静默出错。`tests/replay.rs` 里也没有覆盖这种情况
+1. **`as_of` 回放忽略了 `revoke`**。`crates/cormex-store/src/recall.rs` 里的 `as_of_snapshot!` 只要看到时刻 T 之前有过 `invalidate` 就排除这条事实，**不看之后有没有 `revoke` 把它恢复**；而 `fact_status` 视图是「以最后一条状态事件为准」。两者在「失效后又恢复」这种情况下结论相反。现在线上**没有任何代码写 `revoke`**（只有测试写），所以还是潜在问题；一旦做「用户手工恢复一条记忆」，回放就会静默出错。`tests/replay.rs` 里也没有覆盖这种情况
 2. **MCP 依赖落后两个大版本**：仓库锁的是 `rmcp` 1.8，crates.io 上已经是 3.8（2026-10-26）。MCP 的 **2026-07-28 修订版是一次无状态化的破坏性变更**：去掉了 session 和 `initialize` 握手，`resources/subscribe` 换成 `subscriptions/listen`，资源读取结果新增 `ttlMs` / `cacheScope`，Streamable HTTP 要求带 `Mcp-Method` / `Mcp-Name` 头。`ttlMs` / `cacheScope` 恰好能更好地表达「profile 是可缓存前缀」。复核 rmcp 的 CHANGELOG：3.0.0（2026-07-28）起支持这一版，**2026-07-28 的请求一律无状态服务**，老版本客户端走 `legacy_session_mode`（原来的 `stateful_mode` 改名而来）；但 2.0 → 3.x 之间有十几条破坏性变更（cache hints、MRTR、server/discover、标准 HTTP 头等），升级是一项独立的工作
 3. **L2 `summaries` 建了没人调**：只有测试写它。这正是 `routes.rs` 注释里说的「这个仓库头号复发病：built and never called」
-4. **profile 资源的 URI 文档与代码不一致**：代码里是 `cortex://profile`（`mcp.rs` 的 `PROFILE_URI`），CLAUDE.md 和 roadmap 也这么写，但 README 写成了 `cormex://profile`。照 README 配置的人会读不到资源。新增的会话资源用哪个 scheme，要和这一处一起定
+4. **profile 资源的 URI 文档与代码不一致**：代码里是 `cormex://profile`（`mcp.rs` 的 `PROFILE_URI`），CLAUDE.md 和 roadmap 也这么写，但 README 写成了 `cormex://profile`。照 README 配置的人会读不到资源。新增的会话资源用哪个 scheme，要和这一处一起定
 
 ---
 
@@ -449,7 +449,7 @@ D   派生物（现有）  观察日志 / 交接简报（L2 summaries）、事�
 | **同一个 agent，换台机器继续** | `cormex restore <session>`：把 R 层的原始字节还原成该 agent 的会话文件，再用它自己的 `claude --resume` / `codex resume` 之类原生续聊 | **这是字节级保真最大的回报**：不用转换、不丢信息、thinking 签名和缓存行为都由宿主自己负责。需要处理 cwd 路径的映射（还原出来的是派生物，可以改路径，R 层不动）；跨宿主版本的兼容性不保证 |
 | **换一个 agent 继续** | 给一份**交接简报**（目标、约束、已做的决定和日期、当前状态、下一步、未决问题、关键文件和命令，每条带出处链接），原文按需逐层钻取 | 成本可控，对缓存友好；出处链接让 agent 需要时自己去拿原文 |
 
-取回的东西不管是简报还是原文，**一律经过 `cortex_core::injection` 的框定**再出去。
+取回的东西不管是简报还是原文，**一律经过 `cormex_core::injection` 的框定**再出去。
 
 #### ⑥ 时间语义：回填历史会让 `as_of` 变得反直觉
 
@@ -464,7 +464,7 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 
 #### ⑦ 范围：不是所有「agent」都有可采的本地文件
 
-- **网页聊天**（ChatGPT、Claude.ai、Gemini 网页版等）：本地没有文件，只能走**官方导出 → 现有的 `cortex-import`**（已经支持 ChatGPT / Claude 的导出文件）。浏览器扩展可以另议，不在第一期
+- **网页聊天**（ChatGPT、Claude.ai、Gemini 网页版等）：本地没有文件，只能走**官方导出 → 现有的 `cormex-import`**（已经支持 ChatGPT / Claude 的导出文件）。浏览器扩展可以另议，不在第一期
 - **ChatGPT mac 桌面版** v2 以后本地数据是加密的；**Windsurf** 据报道是不透明的 `.pb`。只能存字节，不承诺解析
 - **Antigravity** 的会话库里是 protobuf，但它另外有一份干净的 `transcript.jsonl`，优先采后者
 
@@ -478,7 +478,7 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 #### ⑨ 「快速部署到各种环境」：客户端和服务端要分开说
 
 - **服务端**已经有两个镜像，但**空库起不来**（roadmap A ❌）。「到处部署」的前提是服务端能从零装起来，所以那一条要先修
-- **客户端**是新东西：一个**静态单二进制** `cormex`，不链接 sqlx、pgvector 这些服务端依赖，只依赖 `cortex-proto` 和 HTTP 客户端，体积小，冷启动快。见 §8.4.5
+- **客户端**是新东西：一个**静态单二进制** `cormex`，不链接 sqlx、pgvector 这些服务端依赖，只依赖 `cormex-proto` 和 HTTP 客户端，体积小，冷启动快。见 §8.4.5
 
 #### ⑩ 身份：设备、会话、项目都要能跨机器对上
 
@@ -506,14 +506,14 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 | Factory Droid / pi / Kimi Code / Grok Build / OpenClaw / OpenHands / Amp | 各自的 home 目录，多数是 JSONL | 多为追加 | 少数有 | 尾随 / 快照 | P3 |
 | Antigravity | `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`，另有 `conversations/<uuid>.db`（SQLite 里存 protobuf） | 混合 | — | 采 `transcript.jsonl`，db 只存不解析 | P3 |
 | Windsurf | 据报道是 `~/.codeium/windsurf/cascade/*.pb` | 不透明 | — | 只存字节 | 不承诺 |
-| ChatGPT / Claude.ai / Gemini 网页版 | 本地没有文件 | — | — | 官方导出 → `cortex-import` | 已有 |
+| ChatGPT / Claude.ai / Gemini 网页版 | 本地没有文件 | — | — | 官方导出 → `cormex-import` | 已有 |
 
 两个值得留意的信号：
 
 - **Grok Build 直接把 ACP 的 session-update 流作为它的落盘格式**（`updates.jsonl`）。ACP（Agent Client Protocol，Zed 发起，JetBrains 内置，Zed 1.0 主打）正在成为「编辑器 ↔ agent」的事实标准，Rust 有官方 crate（`agent-client-protocol` 3.6.0）
 - **Copilot CLI 能把会话导出成 OpenTelemetry GenAI 语义约定（`gen_ai.*`）的事件文件**
 
-所以 P 层的归一化 schema **建议对齐 ACP 的内容块**（消息块、tool_call / tool_call_update、diff、plan、thought），但定义在 Cormex 自己的 `cortex-proto` 里，不直接用 ACP 的类型，免得被它的版本节奏绑住。这样以后原生说 ACP 的 agent，事件流几乎可以直接收。
+所以 P 层的归一化 schema **建议对齐 ACP 的内容块**（消息块、tool_call / tool_call_update、diff、plan、thought），但定义在 Cormex 自己的 `cormex-proto` 里，不直接用 ACP 的类型，免得被它的版本节奏绑住。这样以后原生说 ACP 的 agent，事件流几乎可以直接收。
 
 ### 8.4 推荐方案（概要；细节留给架构设计阶段）
 
@@ -522,7 +522,7 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 ```
  每台机器 / 每个环境                                         中央（cormex 服务端，已有）
 ┌────────────────────────────────────────────────┐        ┌────────────────────────────────────────────┐
-│ agent 宿主：Claude Code / Codex / Cursor / …    │        │ cortexd                                    │
+│ agent 宿主：Claude Code / Codex / Cursor / …    │        │ cormexd                                    │
 │   │ 写自己的会话文件（我们只读，不改）          │        │  POST /captures/*  ← 新：分块、幂等、可续传 │
 │   │                                             │        │   ├─ 原始字节 → RustFS（内容寻址，zstd）    │
 │   │ hooks ──调起 cormex hook（立刻返回）─┐      │        │   ├─ 采集元数据 → Postgres（append-only）   │
@@ -544,13 +544,13 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 - 解析器在服务端升级之后，**可以对全部历史重跑**，不需要每台机器都升级客户端
 - 解析器坏了（格式变了）的时候，采集照常进行，字节一个不丢，修好解析器再补投影
 
-这和 CLAUDE.md 讲 `cortex-import` 时说的「同一个解析器在几处跑，漂移的症状很难看」是同一个教训。解析器只存在一份。
+这和 CLAUDE.md 讲 `cormex-import` 时说的「同一个解析器在几处跑，漂移的症状很难看」是同一个教训。解析器只存在一份。
 
 #### 8.4.2 数据分层与现有 schema 的关系
 
 | 层 | 表（建议） | 和现有的关系 |
 |---|---|---|
-| R 原始层 | `capture_sources`（设备 × agent × 原生会话 id × 路径）、`capture_chunks`（偏移、长度、sha256、blob 引用、观察时间）、`capture_snapshots`（整文件 / 整行快照） | 新表，新 migration。字节放在 RustFS，复用 `cortex-blob` 的内容寻址 |
+| R 原始层 | `capture_sources`（设备 × agent × 原生会话 id × 路径）、`capture_chunks`（偏移、长度、sha256、blob 引用、观察时间）、`capture_snapshots`（整文件 / 整行快照） | 新表，新 migration。字节放在 RustFS，复用 `cormex-blob` 的内容寻址 |
 | P 归一化投影 | `transcript_events`（会话、序号、角色 / 类型、ACP 风格的内容块、`parser_version`、指回 R 的定位符） | **建议不往 `episodes` 里塞**，理由见下 |
 | 原文档案索引 | `archive_chunks`（P 层文本分块的 BM25；遮罩区间不进） | 新表；只在 `scope="archive"` 时使用，不参与默认排序；可按项目关掉，可从 R 层重建（§10.2 第 6 条） |
 | L2 | `summaries`（scope 用 `session`；观察日志、交接简报） | 现有表，**第一次有生产者** |
@@ -570,7 +570,7 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 | 交接简报 | 结构化的续聊简报 | 便宜模型 | **懒生成**：第一次被取回时才生成，生成后缓存 |
 | 事实抽取 | L1 facts | 便宜模型 | **按策略**：默认只抽用户发言和最终结论，工具输出不抽（trust tier 3） |
 
-成本控制沿用 `cortex-import` 的传统：**默认 dry-run，先把数字摆出来**；设每日预算上限；历史回填单独排队、单独限速。
+成本控制沿用 `cormex-import` 的传统：**默认 dry-run，先把数字摆出来**；设每日预算上限；历史回填单独排队、单独限速。
 
 #### 8.4.4 取回接口（R7）
 
@@ -583,7 +583,7 @@ MCP 工具按**三层渐进披露**设计（借 claude-mem）：
 | `session_search(…, scope="archive")` | 在**原文档案索引**里检索（含工具输出），返回命中的会话和位置。需要 `raw:read` | 同上 |
 | `memory_search`（已有） | 事实；每条带出处，可一路还原到原文 | 不变 |
 
-可缓存的内容（项目简报、会话简报）**同时提供成 resource**（比如 `cortex://session/{id}/brief`、`cortex://project/{key}/brief`；scheme 见 §6.5 第 4 条），配上 2026-07-28 版 MCP 的 `ttlMs` / `cacheScope`，让宿主放进可缓存前缀，和 `cortex://profile` 是同一个思路。
+可缓存的内容（项目简报、会话简报）**同时提供成 resource**（比如 `cormex://session/{id}/brief`、`cormex://project/{key}/brief`；scheme 见 §6.5 第 4 条），配上 2026-07-28 版 MCP 的 `ttlMs` / `cacheScope`，让宿主放进可缓存前缀，和 `cormex://profile` 是同一个思路。
 
 CLI 提供对应的命令：`cormex sessions ls / show / brief / restore`。
 
@@ -694,7 +694,7 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 | 6 | 加密：服务端可读还是端到端 | 默认服务端可读加静态加密；端到端按来源可选（代价是该来源不能加工） |
 | 7 | 设备凭据 | 新的凭据类型，用户自己登录签发，可按设备吊销；不复用 `/delegated-tokens` |
 | 8 | 项目身份 | 规范化的 git remote 优先；映射用 append-only 事件 |
-| 9 | 客户端 crate 命名和依赖 | 二进制叫 `cormex`；crate 只依赖 `cortex-proto` 和 HTTP 客户端，**不依赖 sqlx**。现有 crate 都叫 `cortex-*`，新 crate 是否改用 `cormex-*` 前缀要定一次 |
+| 9 | 客户端 crate 命名和依赖 | 二进制叫 `cormex`；crate 只依赖 `cormex-proto` 和 HTTP 客户端，**不依赖 sqlx**。现有 crate 都叫 `cormex-*`，新 crate 是否改用 `cormex-*` 前缀要定一次 |
 | 10 | MCP 升级 | rmcp 1.8 → 3.x，对齐 2026-07-28 无状态版本；**和本需求并行，但要早于新增 MCP 工具** |
 | 11 | 采集上传协议 | 分块，幂等键 =（来源文件 id、偏移、长度、sha256）；文件变短或 inode 变了视为换代 |
 | 12 | 解析器回归测试 | 每个适配器一组**金标准夹具**（真实文件脱敏后入库）+ **字节级往返测试**（R 层还原出的文件和原文件 sha256 一致）；遇到不认识的记录类型保留为不透明事件，**不丢弃** |
@@ -748,7 +748,7 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 
 ## 10. 与 2026-08 调研的合并
 
-2026-08 在 Cortex 仓库里做过一轮更大的调研，产出两份文档：[memory.md](../memory.md)（记忆系统怎么工作）和 [memory-content.md](../memory-content.md)（什么东西有资格进记忆）。两份开头都写着「这份文档描述的是 Cormex，不是本仓库」，但拆仓时没有跟过来。于是本仓库的代码和 migration 注释一直在引用 `docs/memory.md` §七 / §九 / §十一，这个文件却不存在。这次一并迁入，正文未改。
+2026-08 做过一轮更大的调研，产出两份文档：[memory.md](../memory.md)（记忆系统怎么工作）和 [memory-content.md](../memory-content.md)（什么东西有资格进记忆）。两份现在都在 `docs/` 下，正文未改。
 
 | | 2026-08（memory-content.md） | 2026-10（本文） |
 |---|---|---|
@@ -820,10 +820,10 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 | 位置 | 原文说的 | 现在 |
 |---|---|---|
 | memory-content §二②、§九、§十三 等 | `live.rs` 的 `tool_path()`、agent 的 `read_file`、「把 `render_profile_block` 接进 live 的 prompt 组装」 | agent 循环已从本仓库删除（CLAUDE.md「这里不跑 agent 循环」），`tool_path()` 已不存在；`render_profile_block` 现在由 MCP 的 profile 资源调用（`live.rs`） |
-| memory-content §8.6① | 多租户「被五条具体论证明确否决」，没有加归属列 | 已改成**每用户一个 schema**（`crates/cortex-store/src/tenant.rs`），并有账号注册。「没有归属列」仍然成立，但「不为他人处理数据」已不成立 |
+| memory-content §8.6① | 多租户「被五条具体论证明确否决」，没有加归属列 | 已改成**每用户一个 schema**（`crates/cormex-store/src/tenant.rs`），并有账号注册。「没有归属列」仍然成立，但「不为他人处理数据」已不成立 |
 | memory-content §十三 第一批第 1、2 条 | `trust_tier`、派生边是待办 | 已落地：`source_channel` / `trust_tier`（`migrations/20260807000006_fact_provenance.sql`）、`derivations` 表；`insert_summary` 拒绝没有出处的摘要 |
 | memory.md §十二「检索评测体系」 | LongMemEval-S 回放 + 自建中英双语集 | 只有自建集（`evals/`）；LongMemEval-S 没做 |
-| 两份文档里提到的 `roadmap.md` / `operations.md` / `CLAUDE.md` | 指 Cortex 仓库里的同名文件 | 本仓库的 `roadmap.md` 和 `CLAUDE.md` 是拆仓后重写的，内容不同；`operations.md` 本仓库没有 |
+| 两份文档里提到的 `roadmap.md` / `operations.md` / `CLAUDE.md` | 写于 2026-08，指当时的同名文件 | 现在的 `roadmap.md` 和 `CLAUDE.md` 内容已经不同；`operations.md` 目前没有 |
 
 ---
 
