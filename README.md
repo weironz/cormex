@@ -23,20 +23,29 @@ knew at any past instant.**
 "Why do you believe the current answer?"    → [this conversation, 2026-06-14]
 ```
 
-Three things make that possible, and no other memory layer does all three:
+Two time axes are part of how that works, but they are no longer unusual — 
+Graphiti and Zep have them too, and say so in their READMEs. What is still hard
+to find elsewhere:
 
-**Two time axes.** Every fact carries both *valid time* (when it was true in the
-world) and *transaction time* (when this system learned it). Queries take an
-`as_of` — you get the memory as it stood then, not a filtered view of today's.
+**Replay of what was injected, not just what was stored.** `episode_memories`
+records which memories were actually put in front of the model on each turn. So
+"what did the agent see when it answered this" is a question with an answer —
+not "what was in the database at the time", which is a different question and
+the only one most systems can answer.
 
-**Append-only, always.** Facts are never updated or deleted. Invalidation is a
-new row in `fact_events`. So "what changed and when" is not an audit log bolted
-on the side — it *is* the storage model.
+**Deterministic invalidation.** Conflicts are not adjudicated by asking a model.
+A fact stops holding through a new row in `fact_events`, and the reason is one
+of four (`superseded` / `corrected` / `retracted` / `expired`) with different
+temporal meanings. Graphiti has a model nominate the contradiction and then
+rewrites the old edge's timestamps in place.
 
-**Provenance to the source.** Every fact points back at the episode it was
-extracted from, with a trust tier attached. A fact that came from a tool's
-output is not the same kind of thing as one you said out loud, and the system
-knows the difference.
+**Provenance with a trust tier.** Every fact points back at the episode it was
+extracted from, and `source_channel` + `trust_tier` are locked down by CHECK
+constraints. A fact that came from a tool's output is not the same kind of thing
+as one you said out loud, and the system knows the difference.
+
+**And it all runs on Postgres alone.** Both time axes and the four retrieval
+channels are SQL. Graphiti needs a graph database alongside.
 
 ## MCP-native
 
