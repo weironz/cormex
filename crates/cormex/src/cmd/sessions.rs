@@ -204,9 +204,7 @@ fn event_text(e: &TranscriptEventDto) -> String {
     // right to call that out
     match e.content.first() {
         Some(b) => match b {
-            ContentBlock::Text { text } | ContentBlock::Thought { text } => {
-                text.replace('\n', " ")
-            }
+            ContentBlock::Text { text } | ContentBlock::Thought { text } => text.replace('\n', " "),
             ContentBlock::ToolCall { name, .. } => name.clone(),
             ContentBlock::ToolResult { output, .. } => output.replace('\n', " "),
             ContentBlock::Diff { path, .. } => path.clone(),
