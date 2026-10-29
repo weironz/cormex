@@ -186,7 +186,12 @@ async fn sync_one(
     opts: &SyncOptions,
     budget: &mut Budget,
 ) -> Result<Option<i64>> {
-    let reader = LogicalReader::open(&file.physical_path, file.compressed)?;
+    // A SQLite row has no file to open: its bytes were taken at discovery
+    // time, and re-reading would race the host's own writer
+    let reader = match &file.bytes {
+        Some(bytes) => LogicalReader::from_bytes(bytes.clone()),
+        None => LogicalReader::open(&file.physical_path, file.compressed)?,
+    };
     let snapshot = file.framing == cormex_proto::capture::Framing::Snapshot;
 
     let mut state = db.file(local_key)?.unwrap_or_else(|| FileState {

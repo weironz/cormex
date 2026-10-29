@@ -30,6 +30,13 @@ pub const TAIL_WINDOW: u64 = 4096;
 pub struct LogicalReader {
     path: PathBuf,
     compressed: bool,
+    /// The bytes, when the source is not a file (a SQLite row, P4-0).
+    ///
+    /// A row has no path to seek in: it was read out of a database that the
+    /// host may rewrite at any moment, so the bytes are taken once and the
+    /// reader works on that copy. Holding them is bounded by the row's size,
+    /// and a row is a conversation bubble rather than a file.
+    memory: Option<Vec<u8>>,
     /// The logical length, in uncompressed bytes.
     ///
     /// For a plaintext file this is the file's size. For a compressed one it is
@@ -72,8 +79,23 @@ impl LogicalReader {
         Ok(Self {
             path: path.to_path_buf(),
             compressed,
+            memory: None,
             len,
         })
+    }
+
+    /// A reader over bytes that are already in memory (a SQLite row).
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        Self {
+            // No path: nothing can be re-read, and the `memory` field is what
+            // every read consults first
+            path: PathBuf::new(),
+            compressed: false,
+            memory: Some(bytes),
+            len,
+        }
     }
 
     /// The logical length.
@@ -97,6 +119,14 @@ impl LogicalReader {
             return Ok(Vec::new());
         }
         let want = usize::try_from((self.len - offset).min(len as u64)).unwrap_or(len);
+
+        if let Some(bytes) = &self.memory {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let end = start.saturating_add(want).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
 
         if !self.compressed {
             let mut file = std::fs::File::open(&self.path)
@@ -152,6 +182,9 @@ impl LogicalReader {
     /// # Errors
     /// The file cannot be read.
     pub fn whole_hash(&self) -> Result<String> {
+        if let Some(bytes) = &self.memory {
+            return Ok(sha256_hex(bytes));
+        }
         if self.compressed {
             // Stream it: a large rollout decompressed into memory just to hash
             // it is the one place this client would allocate without bound

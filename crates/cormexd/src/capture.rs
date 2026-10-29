@@ -40,7 +40,7 @@ use cormex_core::Id;
 use cormex_proto::capture::{
     ChunkAck, FileEventOp, FileRole, Framing, GenerationReason, HEADER_CONTENT_SHA256,
     HEADER_OBSERVED_AT, NewGenerationRequest, OffsetMismatchBody, RegisterFileRequest,
-    RegisterFileResponse,
+    RegisterFileResponse, SnapshotBatchResponse, SnapshotEntry, SnapshotResult, SnapshotStatus,
 };
 use cormex_store::{
     AppendOutcome, ChunkEncoding, GenerationReason as StoreReason, NewCaptureChunk, NewCaptureFile,
@@ -136,6 +136,199 @@ pub async fn register_file(
             end_offset: registered.end_offset,
         },
     }))
+}
+
+/// `POST /capture/snapshots` — store a batch of small snapshots (P4-0).
+///
+/// # What this is for
+///
+/// A SQLite source has no file to append to: each row is its own snapshot. A
+/// machine with ten thousand rows would otherwise make ten thousand
+/// register + open-generation + put-chunk round trips. This is one request.
+///
+/// # The order inside one entry is the same as `put_chunk`'s
+///
+/// object before row, because the other order leaves a row pointing at a
+/// missing object and that can never be healed. A batch is **not** atomic
+/// across entries: one bad entry does not roll back the ones before it, and the
+/// response says per entry what happened. That is deliberate — a batch of ten
+/// thousand rows that fails entirely because row 9000 has a bad hash would mean
+/// the client re-sends all of it.
+///
+/// # Errors
+/// The caller is not a device key with `capture:write` (403), the body is not
+/// NDJSON (400), or a batch is too large (413).
+pub async fn put_snapshots(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    body: Bytes,
+) -> Result<axum::Json<SnapshotBatchResponse>, ApiError> {
+    let (tenant, device_id) = capture_caller(&st, &principal).await?;
+    let store = tenant
+        .store()
+        .cloned()
+        .map_err(|e| ApiError::unsupported(e.to_string()))?;
+
+    let entries = parse_snapshot_lines(&body)?;
+    if entries.is_empty() {
+        return Err(ApiError::bad_request("the batch is empty"));
+    }
+    if entries.len() > MAX_SNAPSHOT_BATCH {
+        return Err(ApiError::payload_too_large(format!(
+            "this batch has {} entries, past the {MAX_SNAPSHOT_BATCH} ceiling",
+            entries.len()
+        )));
+    }
+
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in entries {
+        results.push(store_one_snapshot(&st, &tenant, &store, &device_id, entry).await?);
+    }
+    Ok(axum::Json(SnapshotBatchResponse { results }))
+}
+
+/// The most entries one batch may carry.
+///
+/// Not a resource limit but a **latency** one: the handler processes entries in
+/// sequence, and a batch large enough to take a minute is one whose client will
+/// time out and re-send, which is worse than two batches.
+const MAX_SNAPSHOT_BATCH: usize = 500;
+
+/// Split the body into entries, failing on the first bad line.
+///
+/// # Why the whole batch is parsed before anything is written
+///
+/// A malformed line in the middle would otherwise leave the entries before it
+/// stored and the ones after it not, with a 400 that says nothing about which.
+/// Parsing first makes "the body is wrong" a single, clean answer.
+fn parse_snapshot_lines(body: &[u8]) -> Result<Vec<SnapshotEntry>, ApiError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| ApiError::bad_request("the batch must be UTF-8 NDJSON"))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: SnapshotEntry = serde_json::from_str(line).map_err(|e| {
+            ApiError::bad_request(format!("line {} is not a snapshot entry: {e}", i + 1))
+        })?;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// Store one entry: object, then row.
+async fn store_one_snapshot(
+    st: &AppState,
+    tenant: &Tenant,
+    store: &cormex_store::Store,
+    device_id: &str,
+    entry: SnapshotEntry,
+) -> Result<SnapshotResult, ApiError> {
+    use base64::Engine as _;
+
+    let logical = base64::engine::general_purpose::STANDARD
+        .decode(entry.data_b64.trim())
+        .map_err(|e| ApiError::bad_request(format!("data_b64 is not base64: {e}")))?;
+    let actual = cormex_blob::hash::sha256_hex(&logical);
+    if actual != entry.content_sha256 {
+        return Err(ApiError::unprocessable(format!(
+            "the entry's sha256 is {actual}, but content_sha256 says {}",
+            entry.content_sha256
+        )));
+    }
+    let observed_at = chrono::DateTime::parse_from_rfc3339(entry.observed_at.trim())
+        .map_err(|e| ApiError::bad_request(format!("observed_at is not RFC 3339: {e}")))?
+        .with_timezone(&chrono::Utc);
+
+    let registered = store
+        .archive_txn(async |t| {
+            t.register_capture_file(&NewCaptureFile {
+                id: Id::new(),
+                native_session_id: entry.file.native_session_id.clone(),
+                parent_native_session_id: entry.file.parent_native_session_id.clone(),
+                device_id: device_id.to_owned(),
+                agent: entry.file.agent.clone(),
+                logical_path: entry.file.logical_path.clone(),
+                role: store_role(entry.file.role),
+                framing: store_framing(entry.file.framing),
+                cwd: entry.file.cwd.clone(),
+                project_key: entry.file.project_key.clone(),
+            })
+            .await
+        })
+        .await
+        .map_err(store_err)?;
+
+    // **A snapshot source rewrites its file.** The newest generation already
+    // holding exactly these bytes means nothing changed; anything else means a
+    // new generation, because appending to a snapshot would make it a mix of
+    // two versions
+    if registered.end_offset == i64::try_from(logical.len()).unwrap_or(i64::MAX) {
+        let existing = store
+            .chunks_overlapping(&registered.generation.id, 0, i64::MAX / 2)
+            .await
+            .map_err(store_err)?;
+        let same = existing.len() == 1
+            && existing[0].content_sha256 == actual
+            && existing[0].byte_offset == 0;
+        if same {
+            return Ok(SnapshotResult {
+                file_id: registered.file.id,
+                generation_id: registered.generation.id,
+                status: SnapshotStatus::Unchanged,
+            });
+        }
+    }
+
+    let generation = if registered.end_offset == 0 {
+        registered.generation
+    } else {
+        store
+            .archive_txn(async |t| {
+                t.open_generation(&registered.file.id, StoreReason::Snapshot)
+                    .await
+            })
+            .await
+            .map_err(store_err)?
+    };
+
+    let prefix = tenant_prefix(tenant)?;
+    let compressed = zstd::encode_all(logical.as_slice(), 3)
+        .map_err(|e| ApiError::internal(format!("could not compress the entry: {e}")))?;
+    let key = cormex_blob::hash::capture_key(&prefix, &actual)
+        .map_err(|e| ApiError::internal(format!("could not build the capture key: {e}")))?;
+    st.put_capture_object(&key, Bytes::from(compressed))
+        .await
+        .map_err(|e| ApiError::internal(format!("could not store the entry: {e}")))?;
+
+    store
+        .archive_txn(async |t| {
+            t.append_chunk(&NewCaptureChunk {
+                id: Id::new(),
+                generation_id: generation.id.parse().map_err(|_| {
+                    cormex_store::StoreError::Invalid("the generation id is not a ULID".into())
+                })?,
+                byte_offset: 0,
+                byte_length: i64::try_from(logical.len()).map_err(|_| {
+                    cormex_store::StoreError::Invalid("the entry length overflows i64".into())
+                })?,
+                content_sha256: actual.clone(),
+                storage_key: key.clone(),
+                encoding: ChunkEncoding::Zstd,
+                observed_at,
+            })
+            .await
+        })
+        .await
+        .map_err(store_err)?;
+
+    Ok(SnapshotResult {
+        file_id: registered.file.id,
+        generation_id: generation.id,
+        status: SnapshotStatus::Stored,
+    })
 }
 
 /// `POST /capture/files/{id}/generations` — open the next generation.
@@ -910,6 +1103,156 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+
+        db.drop().await;
+    }
+
+    // ── snapshot batches (P4-0) ────────────────────────────
+
+    /// A batch stores its entries, and a replay reports them unchanged.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_snapshot_batch_stores_and_replays_as_unchanged() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let app = crate::routes::router(st.clone());
+
+        let user = st
+            .create_account("snapshot-user", "correct horse battery")
+            .await
+            .expect("create the account");
+        let token = st
+            .access_book()
+            .issue_for_test(&user, std::time::Duration::from_secs(600));
+        let (status, body) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/devices",
+            Some(&token),
+            Some(serde_json::json!({
+                "label": "snapshot-device",
+                "scopes": ["capture:write"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let issued: cormex_proto::devices::DeviceKeyIssued =
+            serde_json::from_value(body).expect("a key");
+
+        use base64::Engine as _;
+        let row = br#"{"bubbleId":"b1","text":"hello from a sqlite row"}"#;
+        let entry = serde_json::json!({
+            "file": {
+                "agent": "cursor",
+                "native_session_id": "composer-1",
+                "logical_path": "sqlite:state.vscdb#cursorDiskKV/b1",
+                "role": "row",
+                "framing": "snapshot",
+            },
+            "content_sha256": cormex_blob::hash::sha256_hex(row),
+            "data_b64": base64::engine::general_purpose::STANDARD.encode(row),
+            "observed_at": "2026-10-30T00:00:00Z",
+        });
+        let body = format!("{entry}\n");
+
+        let (status, resp) = crate::test_support::call_bytes(
+            &app,
+            Method::POST,
+            "/capture/snapshots",
+            &issued.key,
+            &[("content-type", "application/x-ndjson".to_owned())],
+            body.clone().into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let batch: SnapshotBatchResponse = serde_json::from_slice(&resp).expect("a batch");
+        assert_eq!(batch.results.len(), 1);
+        assert_eq!(batch.results[0].status, SnapshotStatus::Stored);
+
+        // The replay is `unchanged`, not a second generation
+        let (status, resp) = crate::test_support::call_bytes(
+            &app,
+            Method::POST,
+            "/capture/snapshots",
+            &issued.key,
+            &[("content-type", "application/x-ndjson".to_owned())],
+            body.into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let batch: SnapshotBatchResponse = serde_json::from_slice(&resp).expect("a batch");
+        assert_eq!(
+            batch.results[0].status,
+            SnapshotStatus::Unchanged,
+            "a replayed snapshot opened a second generation"
+        );
+
+        db.drop().await;
+    }
+
+    /// A wrong hash is refused, and nothing is written.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_snapshot_with_a_wrong_hash_is_refused() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let app = crate::routes::router(st.clone());
+
+        let user = st
+            .create_account("snapshot-user-2", "correct horse battery")
+            .await
+            .expect("create the account");
+        let token = st
+            .access_book()
+            .issue_for_test(&user, std::time::Duration::from_secs(600));
+        let (status, body) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/devices",
+            Some(&token),
+            Some(serde_json::json!({
+                "label": "snapshot-device-2",
+                "scopes": ["capture:write"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let issued: cormex_proto::devices::DeviceKeyIssued =
+            serde_json::from_value(body).expect("a key");
+
+        use base64::Engine as _;
+        let entry = serde_json::json!({
+            "file": {
+                "agent": "cursor",
+                "native_session_id": "composer-2",
+                "logical_path": "sqlite:state.vscdb#cursorDiskKV/b2",
+                "role": "row",
+                "framing": "snapshot",
+            },
+            "content_sha256": "0".repeat(64),
+            "data_b64": base64::engine::general_purpose::STANDARD.encode(b"actual bytes"),
+            "observed_at": "2026-10-30T00:00:00Z",
+        });
+        let (status, _) = crate::test_support::call_bytes(
+            &app,
+            Method::POST,
+            "/capture/snapshots",
+            &issued.key,
+            &[("content-type", "application/x-ndjson".to_owned())],
+            format!("{entry}\n").into_bytes(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a body that does not match its declared sha256 was accepted"
+        );
 
         db.drop().await;
     }

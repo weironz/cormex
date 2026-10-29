@@ -156,6 +156,8 @@ impl DeviceScope {
                 // request, so an exact-string table cannot express them
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "generations"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "events"]))
+                // A batch of small snapshots (P4-0): SQLite rows
+                || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "snapshots"]))
                 || (is(Method::PUT)
                     && matches!(segs.as_slice(), ["capture", "generations", _, "chunks", _]));
             if capture {

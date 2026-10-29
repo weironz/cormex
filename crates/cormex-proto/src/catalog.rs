@@ -108,6 +108,52 @@ pub struct SourceSpec {
     pub parent_session_id: Option<SessionIdRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<CwdRule>,
+    /// Read rows out of a SQLite database instead of files (P4-0).
+    ///
+    /// `None` = an ordinary file source. When present, `glob` names the
+    /// database file and this says how to read rows out of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<SqliteSpec>,
+}
+
+/// How to read one SQLite source (P4-0).
+///
+/// # Why the query lives in the catalog rather than in the client
+///
+/// A host's schema is data about that host, and the catalog is where "what this
+/// host writes and where" already lives (D8). Putting the query in the CLI
+/// would mean a code change per host, and the whole point of the catalog is
+/// that adding a host is a data change.
+///
+/// # Why `key_column` is separate from the query
+///
+/// The key is what makes a row's logical path stable across runs — it is the
+/// deduplication identity. Deriving it from the result set by position would
+/// break the moment somebody reorders the SELECT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteSpec {
+    /// The SELECT. Every column it returns is stored in the row's snapshot.
+    pub query: String,
+    /// Which returned column identifies the row.
+    pub key_column: String,
+    /// Which returned column carries the conversation text, if any.
+    ///
+    /// `None` = the whole row is the content (the JSON of every column). That
+    /// is the right default for a schema we do not model: the bytes are kept,
+    /// and the server's parser decides later what is in them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_column: Option<String>,
+    /// How long to wait for a lock before giving up, in milliseconds.
+    ///
+    /// A host with the database open in WAL mode lets us read concurrently; one
+    /// in rollback-journal mode does not, and a zero timeout would fail the
+    /// whole run every time the host happened to be writing.
+    #[serde(default = "default_busy_timeout_ms")]
+    pub busy_timeout_ms: u64,
+}
+
+fn default_busy_timeout_ms() -> u64 {
+    5_000
 }
 
 /// How to derive a session id from a path.

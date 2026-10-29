@@ -30,6 +30,14 @@ use crate::blobs::{DIRECT_UPLOAD_LIMIT, RangeSpec, parse_range};
 /// frame header — and the handler enforces the logical ceiling itself, because
 /// this one cannot see through the compression.
 const MAX_CAPTURE_BODY: usize = cormex_proto::capture::MAX_CHUNK_BYTES + (64 << 10);
+
+/// The ceiling on one snapshot batch's body.
+///
+/// 500 entries of at most 64 KiB each, base64-encoded (4/3) plus the JSON
+/// around them. The entry ceiling is enforced in the handler; this is the
+/// transport-level backstop, so a body that is simply enormous is rejected
+/// before it is parsed.
+const MAX_SNAPSHOT_BODY: usize = 500 * ((64 << 10) * 4 / 3 + 1024);
 use crate::dto::*;
 use crate::state::AppState;
 use cormex_proto::episodes::{EpisodeAck, NewEpisodeRequest};
@@ -133,6 +141,10 @@ protected_routes! {
     "/capture/files" [POST] => post(crate::capture::register_file),
     "/capture/files/{id}/generations" [POST] => post(crate::capture::open_generation),
     "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
+    // A batch of small snapshots (P4-0): SQLite rows, which have no file to
+    // append to. One request rather than three per row
+    "/capture/snapshots" [POST] => post(crate::capture::put_snapshots)
+        .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY)),
     "/capture/generations/{id}/chunks/{offset}" [PUT] => axum::routing::put(crate::capture::put_chunk)
         .layer(DefaultBodyLimit::max(MAX_CAPTURE_BODY)),
     // ── The archive browser (§7.2) ─────────────────────────

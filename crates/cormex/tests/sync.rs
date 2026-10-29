@@ -32,6 +32,7 @@ fn catalog(home: &std::path::Path) -> cormex_proto::catalog::Catalog {
                 session_id: SessionIdRule::Stem {},
                 parent_session_id: None,
                 cwd: None,
+                sqlite: None,
             }],
             hooks: None,
             retention: None,

@@ -301,3 +301,64 @@ mod tests {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════
+//  Snapshot batches (P4-0)
+// ══════════════════════════════════════════════════════════
+
+/// One entry in `POST /capture/snapshots`.
+///
+/// # Why this exists at all
+///
+/// A SQLite source (Cursor's `state.vscdb`, OpenCode's `opencode.db`, …) has no
+/// file to append to: each row is its own snapshot, and a machine with ten
+/// thousand rows would otherwise make ten thousand register + open-generation +
+/// put-chunk round trips. One batch request turns that into one.
+///
+/// # Why the bytes are base64 rather than a separate multipart part
+///
+/// A multipart body would need a parser on the server and a writer on the
+/// client, for a payload that is small by construction: a row is a conversation
+/// bubble, not a file. Base64 costs 33% and buys a body that is one NDJSON line
+/// per entry — which is also what makes a partial batch legible in a log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    /// The same shape `POST /capture/files` takes. Registering is idempotent,
+    /// so a batch that is replayed after a crash does not create duplicates.
+    pub file: RegisterFileRequest,
+    /// SHA-256 of the **logical** bytes, lowercase hex. The client computes it;
+    /// the server verifies it.
+    pub content_sha256: String,
+    /// The logical bytes, base64.
+    pub data_b64: String,
+    /// RFC 3339.
+    pub observed_at: String,
+}
+
+/// What happened to one entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotResult {
+    pub file_id: String,
+    pub generation_id: String,
+    pub status: SnapshotStatus,
+}
+
+/// `stored` or `unchanged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStatus {
+    /// The bytes were new and are now in the archive.
+    Stored,
+    /// The newest generation already ends with exactly these bytes.
+    ///
+    /// **Not an error, and not a no-op the client can skip**: the client sent
+    /// them because it could not know, and answering "unchanged" is what lets
+    /// it record the row as done.
+    Unchanged,
+}
+
+/// `POST /capture/snapshots` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotBatchResponse {
+    pub results: Vec<SnapshotResult>,
+}

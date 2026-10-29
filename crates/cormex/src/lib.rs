@@ -31,6 +31,7 @@ pub mod credentials;
 pub mod git_meta;
 pub mod hook;
 pub mod install;
+pub mod sqlite_source;
 pub mod state;
 pub mod sync;
 

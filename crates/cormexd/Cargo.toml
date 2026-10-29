@@ -107,6 +107,9 @@ ring = "0.17"
 # its top 48 bits are a timestamp, leaving only 80 random bits, and "the window is very
 # short" has no business being counted as entropy. See src/confirm.rs.
 getrandom = "0.3"
+# Snapshot batches carry their bytes as base64 (P4-0). Already in the tree via cormex-llm's
+# image blocks; declared here so the dependency is not transitive.
+base64 = "0.22"
 # Password hashing. **The sha2 above must not be reused** -- the argument in auth.rs that "a
 # slow KDF is not required" rests on a premise: that the token is high-entropy and random. A
 # password chosen by a human does not satisfy it.

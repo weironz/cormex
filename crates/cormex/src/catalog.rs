@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use cormex_proto::capture::{FileRole, Framing};
 use cormex_proto::catalog::{AgentEntry, Catalog, HomeRoot, SessionIdRule, SourceSpec};
 
@@ -42,6 +42,12 @@ pub struct DiscoveredFile {
     pub cwd: Option<String>,
     /// Whether `cwd` was decoded out of the path rather than supplied.
     pub cwd_guessed: bool,
+    /// The bytes, when the source is a SQLite row rather than a file (P4-0).
+    ///
+    /// Read at discovery time rather than at upload time: the host may rewrite
+    /// its database between the two, and what gets uploaded should be the row
+    /// as it was when the run decided to send it.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Resolve an agent's home directory.
@@ -110,6 +116,11 @@ fn discover_source(
     cfg: &Config,
     device_id: &str,
 ) -> Result<Vec<DiscoveredFile>> {
+    // A SQLite source has no files to glob: `glob` names one database, and the
+    // spec says how to read rows out of it
+    if let Some(spec) = &source.sqlite {
+        return discover_sqlite(agent, source, spec, home, cfg, device_id);
+    }
     // **`literal_separator(true)` is mandatory.** Without it globset's `*`
     // matches `/` as well, so `projects/*/*.jsonl` would also match
     // `projects/a/subagents/child.jsonl` — and the sub-agent's transcript would
@@ -186,6 +197,7 @@ fn discover_source(
         };
 
         let file = DiscoveredFile {
+            bytes: None,
             agent: agent.id.clone(),
             role: source.role,
             framing: source.framing,
@@ -214,6 +226,72 @@ fn discover_source(
     }
 
     Ok(by_logical.into_values().collect())
+}
+
+/// Discover a SQLite source's rows (P4-0).
+///
+/// Each row becomes one logical file with `framing = snapshot`: a row is
+/// rewritten in place, so there is nothing to append to. The logical path is
+/// `sqlite:<db relative path>#<key>`, which is stable across runs and across
+/// machines — the absolute path would make the same row look like two files.
+fn discover_sqlite(
+    agent: &AgentEntry,
+    source: &SourceSpec,
+    spec: &cormex_proto::catalog::SqliteSpec,
+    home: &Path,
+    cfg: &Config,
+    device_id: &str,
+) -> Result<Vec<DiscoveredFile>> {
+    let db = crate::sqlite_source::db_path(home, &source.glob);
+    if !db.exists() {
+        // A host that has never run has no database. Not an error: the same
+        // rule as a home that does not exist
+        return Ok(Vec::new());
+    }
+    let db_rel = crate::sqlite_source::db_rel_path(home, &db);
+    let rows = crate::sqlite_source::read_rows(&db, &db_rel, spec)
+        .with_context(|| format!("agent {}: reading {}", agent.id, db.display()))?;
+
+    // The session id comes from the source's rule applied to the **logical
+    // path**, so a catalog can use the database's name or the row key
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let segments: Vec<&str> = row.logical_path.split('/').collect();
+        let Some(native_session_id) = session_id(&source.session_id, &row.logical_path, &segments)
+        else {
+            tracing::debug!(
+                agent = %agent.id,
+                path = %row.logical_path,
+                "no session id could be derived; skipping"
+            );
+            continue;
+        };
+        let logical_path = row.logical_path.clone();
+        let file = DiscoveredFile {
+            agent: agent.id.clone(),
+            role: source.role,
+            framing: source.framing,
+            logical_path,
+            // No physical path: the bytes are already in hand, and there is no
+            // file to re-read
+            physical_path: PathBuf::new(),
+            compressed: false,
+            native_session_id: native_session_id.clone(),
+            parent_native_session_id: source
+                .parent_session_id
+                .as_ref()
+                .and_then(|rule| session_id(rule, &native_session_id, &segments)),
+            cwd: None,
+            cwd_guessed: false,
+            bytes: Some(row.bytes),
+        };
+        if excluded(cfg, &file) {
+            continue;
+        }
+        out.push(file);
+    }
+    let _ = device_id;
+    Ok(out)
 }
 
 /// Apply the session-id rule to a path.
@@ -406,5 +484,106 @@ mod tests {
             per_device: true,
         };
         assert_eq!(session_id(&rule, "x", &[]).as_deref(), Some("memory"));
+    }
+
+    /// A SQLite source's rows become logical files with a stable path.
+    ///
+    /// The path is `sqlite:<db relative>#<key>`, which is what makes the same
+    /// row on two machines one file rather than two.
+    #[test]
+    fn a_sqlite_source_yields_one_file_per_row() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let db = home.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO kv VALUES ('a', 'one'), ('b', 'two');",
+        )
+        .expect("seed");
+        drop(conn);
+
+        let agent = AgentEntry {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            home: vec![HomeRoot::Path {
+                path: home.path().display().to_string(),
+            }],
+            sources: vec![SourceSpec {
+                role: FileRole::Row,
+                glob: "state.vscdb".into(),
+                framing: Framing::Snapshot,
+                also_compressed: None,
+                session_id: SessionIdRule::Const {
+                    value: "cursor-history".into(),
+                    per_device: false,
+                },
+                parent_session_id: None,
+                cwd: None,
+                sqlite: Some(cormex_proto::catalog::SqliteSpec {
+                    query: "SELECT key, value FROM kv ORDER BY key".into(),
+                    key_column: "key".into(),
+                    text_column: Some("value".into()),
+                    busy_timeout_ms: 1000,
+                }),
+            }],
+            hooks: None,
+            retention: None,
+        };
+        let catalog = Catalog {
+            schema: 1,
+            version: "test".into(),
+            agents: vec![agent],
+        };
+
+        let files = discover(&catalog, &Config::default(), "dev").expect("discover");
+        assert_eq!(files.len(), 2, "one file per row");
+        assert_eq!(files[0].logical_path, "sqlite:state.vscdb#a");
+        assert_eq!(files[0].bytes.as_deref(), Some(&b"one"[..]));
+        assert_eq!(files[0].native_session_id, "cursor-history");
+        assert_eq!(files[0].framing, Framing::Snapshot);
+        assert!(
+            files[0].physical_path.as_os_str().is_empty(),
+            "a row has no file to re-read"
+        );
+    }
+
+    /// A SQLite source whose database does not exist yields nothing, not an
+    /// error.
+    #[test]
+    fn a_missing_sqlite_database_is_not_an_error() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let catalog = Catalog {
+            schema: 1,
+            version: "test".into(),
+            agents: vec![AgentEntry {
+                id: "cursor".into(),
+                name: "Cursor".into(),
+                home: vec![HomeRoot::Path {
+                    path: home.path().display().to_string(),
+                }],
+                sources: vec![SourceSpec {
+                    role: FileRole::Row,
+                    glob: "state.vscdb".into(),
+                    framing: Framing::Snapshot,
+                    also_compressed: None,
+                    session_id: SessionIdRule::Const {
+                        value: "x".into(),
+                        per_device: false,
+                    },
+                    parent_session_id: None,
+                    cwd: None,
+                    sqlite: Some(cormex_proto::catalog::SqliteSpec {
+                        query: "SELECT 1".into(),
+                        key_column: "1".into(),
+                        text_column: None,
+                        busy_timeout_ms: 1000,
+                    }),
+                }],
+                hooks: None,
+                retention: None,
+            }],
+        };
+        let files = discover(&catalog, &Config::default(), "dev").expect("discover");
+        assert!(files.is_empty());
     }
 }
