@@ -66,6 +66,33 @@ fn installers(cfg: &Config, agents: &[String]) -> Vec<Box<dyn Installer>> {
     out
 }
 
+/// The MCP registration installers, which need the server URL and the key.
+///
+/// Separate from [`installers`] because they cannot be planned without a
+/// credential: the Claude Code entry embeds the device key, and a plan that
+/// says "register Cormex" while the key is missing would be a change that
+/// cannot be applied.
+fn mcp_installers(
+    cfg: &Config,
+    config_dir: &std::path::Path,
+    agents: &[String],
+) -> Vec<Box<dyn Installer>> {
+    let wants = |id: &str| agents.is_empty() || agents.iter().any(|a| a == id);
+    let Ok((key, _)) = crate::credentials::load(config_dir, &cfg.server_url) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Box<dyn Installer>> = Vec::new();
+    if wants("claude_code") {
+        out.push(Box::new(
+            crate::install::mcp_register::ClaudeCodeMcp::discover(&cfg.server_url, &key),
+        ));
+    }
+    if wants("codex") {
+        out.push(Box::new(crate::install::mcp_register::CodexMcp::discover()));
+    }
+    out
+}
+
 /// Plan, then (unless `dry_run`) apply.
 ///
 /// `confirm` is called once per change; `--yes` replaces it with "always".
@@ -82,7 +109,8 @@ pub async fn run(
     let db = crate::state::StateDb::open(data_dir)?;
     let mut report = InitReport::default();
 
-    let plan: Vec<Box<dyn Installer>> = installers(cfg, &opts.agents);
+    let mut plan: Vec<Box<dyn Installer>> = installers(cfg, &opts.agents);
+    plan.extend(mcp_installers(cfg, config_dir, &opts.agents));
     for installer in &plan {
         for change in installer.plan()? {
             if !report.planned.contains(&change) {
@@ -124,7 +152,6 @@ pub async fn run(
         report.backfill_ran = true;
     }
 
-    let _ = config_dir;
     Ok(report)
 }
 

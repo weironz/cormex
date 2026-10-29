@@ -156,6 +156,32 @@ The device key is scoped: `capture:write` by default, plus `session:read` and
 `memory:read`. `raw:read` — the original, unmasked bytes — has to be asked for
 explicitly, so a lost laptop does not hand over every conversation.
 
+### Connect an agent over MCP
+
+`cormex init` registers Cormex with the agents it finds. To do it by hand:
+
+**Claude Code** (streamable HTTP):
+
+```bash
+claude mcp add --transport http cormex https://memory.example.com/mcp \
+  --header "Authorization: Bearer <device key>"
+```
+
+**Codex** (stdio — Codex spawns a child process, and `cormex mcp` forwards to
+the server):
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.cormex]
+command = "/usr/local/bin/cormex"
+args = ["mcp"]
+```
+
+Either way the agent gets `memory_search`, `remember`, `session_search` and
+`session_get`, plus the `cortex://profile` resource. The session tools are the
+reason to connect: they let an agent answer "what did we decide last week, and
+why" from the actual conversation rather than from a summary of it.
+
 `cormex doctor` answers "why is this machine not capturing": server
 reachability, credential storage, queue backlog, last successful run, whether
 the hooks are still in place.
