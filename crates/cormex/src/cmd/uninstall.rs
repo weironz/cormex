@@ -103,8 +103,12 @@ mod tests {
     /// Deleting it means the next run re-uploads everything from zero: correct,
     /// because the server deduplicates, but an hour of bandwidth on a large
     /// history.
-    #[test]
-    fn keep_data_keeps_the_state_database() {
+    #[tokio::test]
+    async fn keep_data_keeps_the_state_database() {
+        // The **shared** lock: `cmd::init` sets the same two variables, and a
+        // per-module lock would protect this test from itself and from nobody
+        // else
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
         unsafe {
@@ -129,8 +133,9 @@ mod tests {
     }
 
     /// Without `--keep-data`, the state database goes.
-    #[test]
-    fn the_default_keeps_it_and_the_flag_removes_it() {
+    #[tokio::test]
+    async fn the_default_keeps_it_and_the_flag_removes_it() {
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
         unsafe {

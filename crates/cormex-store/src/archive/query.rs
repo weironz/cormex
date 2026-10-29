@@ -139,6 +139,34 @@ impl Store {
         after: Option<(&DateTime<Utc>, &str)>,
         limit: i64,
     ) -> Result<Vec<ArchiveSessionRow>> {
+        self.archive_sessions_at(agent, project_key, since, until, None, None, after, limit)
+            .await
+    }
+
+    /// The same list, on **both time axes** (D13).
+    ///
+    /// - `at` filters on `transcript_events.occurred_at` — when the
+    ///   conversation happened. A session backfilled from six months ago has
+    ///   old `occurred_at` values, so `at` finds it.
+    /// - `as_of` filters on `transcript_events.created_at` — when Cormex came
+    ///   to know about it. The same backfilled session was projected minutes
+    ///   ago, so `as_of` set to six months ago does **not** find it.
+    ///
+    /// That asymmetry is the whole point of the two axes, and it is the
+    /// acceptance test for this card. Both may be given at once; then both
+    /// apply (the intersection).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn archive_sessions_at(
+        &self,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        at: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        after: Option<(&DateTime<Utc>, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ArchiveSessionRow>> {
         let rows = sqlx::query_as::<_, ArchiveSessionRow>(
             "WITH agg AS (
                  SELECT s.id, s.agent,
@@ -147,6 +175,8 @@ impl Store {
                         count(*)           AS event_count
                    FROM capture_sessions s
                    JOIN transcript_events e ON e.session_id = s.id
+                  WHERE ($8::timestamptz IS NULL OR e.occurred_at <= $8)
+                    AND ($9::timestamptz IS NULL OR e.created_at <= $9)
                   GROUP BY s.id, s.agent
              )
              SELECT a.id, a.agent, a.first_at, a.last_at, a.event_count,
@@ -176,6 +206,8 @@ impl Store {
         .bind(after.map(|(t, _)| *t))
         .bind(after.map(|(_, id)| id))
         .bind(limit.clamp(1, 200))
+        .bind(at)
+        .bind(as_of)
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
@@ -314,6 +346,28 @@ impl Store {
         until: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<ConversationHit>> {
+        self.search_conversation_at(tsquery_input, agent, project_key, since, until, None, limit)
+            .await
+    }
+
+    /// The same search, with `as_of` on the system-time axis (D13).
+    ///
+    /// `until` is the event-time cut (`occurred_at`); `as_of` is the
+    /// system-time cut (`created_at`). A session backfilled today has old
+    /// `occurred_at` and fresh `created_at`, so "what had been said by June"
+    /// and "what did Cormex know in June" are different questions with
+    /// different answers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_conversation_at(
+        &self,
+        tsquery_input: &str,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<ConversationHit>> {
         if tsquery_input.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -336,6 +390,7 @@ impl Store {
                              WHERE f.session_id = e.session_id AND f.project_key = $3))
                     AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
                     AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
+                    AND ($7::timestamptz IS NULL OR e.created_at <= $7)
              )
              SELECT session_id, event_id, occurred_at, text, score
                FROM scored WHERE rn = 1
@@ -348,6 +403,7 @@ impl Store {
         .bind(since)
         .bind(until)
         .bind(limit.clamp(1, 200))
+        .bind(as_of)
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
@@ -369,6 +425,22 @@ impl Store {
         project_key: Option<&str>,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<ArchiveHit>> {
+        self.search_archive_at(tsquery_input, agent, project_key, since, until, None, limit)
+            .await
+    }
+
+    /// The same search, with `as_of` on the system-time axis (D13).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_archive_at(
+        &self,
+        tsquery_input: &str,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<ArchiveHit>> {
         if tsquery_input.trim().is_empty() {
@@ -394,6 +466,7 @@ impl Store {
                              WHERE f.session_id = c.session_id AND f.project_key = $3))
                     AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
                     AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
+                    AND ($7::timestamptz IS NULL OR e.created_at <= $7)
                     -- A project excluded from the archive index is skipped
                     -- here, not at write time: turning it back on must not
                     -- require re-indexing
@@ -416,6 +489,7 @@ impl Store {
         .bind(since)
         .bind(until)
         .bind(limit.clamp(1, 200))
+        .bind(as_of)
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
@@ -550,12 +624,34 @@ impl Store {
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<TranscriptEvent>> {
+        self.transcript_page_at(session_id, parser_version, after_seq, None, None, limit)
+            .await
+    }
+
+    /// The same page, on **both time axes** (D13).
+    ///
+    /// `at` cuts on `occurred_at` (what the conversation had said by then);
+    /// `as_of` cuts on `created_at` (what Cormex had projected by then). A
+    /// session backfilled today has events with old `occurred_at` and fresh
+    /// `created_at`, so the two give different answers — which is exactly what
+    /// the two axes are for.
+    pub async fn transcript_page_at(
+        &self,
+        session_id: &str,
+        parser_version: &str,
+        after_seq: i64,
+        at: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<TranscriptEvent>> {
         let rows = sqlx::query_as::<_, TranscriptEvent>(
             "SELECT id, session_id, parser_version, seq, kind, occurred_at, content,
                     text, tool_name, tool_call_id,
                     src_generation_id, src_offset, src_length, created_at
                FROM transcript_events
               WHERE session_id = $1 AND parser_version = $2 AND seq > $3
+                AND ($5::timestamptz IS NULL OR occurred_at <= $5)
+                AND ($6::timestamptz IS NULL OR created_at <= $6)
               ORDER BY seq ASC
               LIMIT $4",
         )
@@ -563,6 +659,8 @@ impl Store {
         .bind(parser_version)
         .bind(after_seq)
         .bind(limit.clamp(1, 1000))
+        .bind(at)
+        .bind(as_of)
         .fetch_all(self.pool())
         .await?;
         Ok(rows)

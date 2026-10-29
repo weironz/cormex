@@ -37,3 +37,24 @@ pub mod sync;
 pub use client::{ApiClient, ExitCode};
 pub use config::{Config, Dirs};
 pub use state::StateDb;
+
+/// A process-wide lock for tests that mutate environment variables.
+///
+/// # Why one lock rather than one per module
+///
+/// `set_var` is process-global, and `cargo test` runs every test in one binary
+/// on a thread pool. Three modules (`cmd::init`, `cmd::uninstall`, `catalog`)
+/// each point `CLAUDE_CONFIG_DIR` at their own temporary home; a per-module
+/// lock protects each from itself and **none of them from the other two**.
+///
+/// The failure that produces is the worst shape a test can have: each passes
+/// alone, and a full run fails intermittently — `init` looks for transcript
+/// files in another test's temporary directory and finds none.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// Held for the whole of a test that sets or removes an environment
+    /// variable. `tokio::sync::Mutex` rather than `std::sync::Mutex`: the
+    /// guard is held across `await`, and a std guard there blocks the worker
+    /// thread (clippy's `await_holding_lock` is right to refuse it).
+    pub static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+}

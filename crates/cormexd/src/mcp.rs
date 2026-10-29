@@ -122,6 +122,16 @@ pub struct SessionSearchParams {
     /// RFC 3339. Only sessions with events at or before this.
     #[serde(default)]
     pub until: Option<String>,
+    /// Event time (RFC 3339): only what the conversation had said by then.
+    ///
+    /// The other axis from `as_of`. A session backfilled from six months ago
+    /// is found by `at` and **not** by `as_of` — that asymmetry is the point
+    /// of having two axes (D13).
+    #[serde(default)]
+    pub at: Option<String>,
+    /// System time (RFC 3339): only what Cormex had been told by then.
+    #[serde(default)]
+    pub as_of: Option<String>,
     /// `conversation` (the default) or `archive`. `archive` searches tool
     /// output too, and needs `raw:read`.
     #[serde(default)]
@@ -144,6 +154,12 @@ pub struct SessionGetParams {
     /// Rough token budget for this response. Default 4000.
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// Event time (RFC 3339): read only what had been said by then.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// System time (RFC 3339): read only what Cormex had projected by then.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -202,7 +218,10 @@ impl MemoryMcp {
                        than about a fact. Returns a compact index (id, title, agent, \
                        project, dates, one line each); call session_get with an id to \
                        read one. scope=archive also searches tool output, which needs \
-                       the raw:read scope."
+                       the raw:read scope. Two time axes: at (RFC 3339) is when the \
+                       conversation happened, as_of is when Cormex was told about it -- \
+                       a session backfilled from last year is found by at and not by \
+                       as_of."
     )]
     async fn session_search(
         &self,
@@ -236,18 +255,27 @@ impl MemoryMcp {
 
         let tsquery = cormex_memory::tokenize::to_tsquery_input(&p.query);
         let since = parse_time_param(p.since.as_deref())?;
-        let until = parse_time_param(p.until.as_deref())?;
+        // `until` and `at` are the same axis; take the earlier so both apply
+        let until = match (
+            parse_time_param(p.until.as_deref())?,
+            parse_time_param(p.at.as_deref())?,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let as_of = parse_time_param(p.as_of.as_deref())?;
         let limit = p.limit.unwrap_or(10);
 
         let mut items = Vec::new();
         if scope == "archive" {
             for h in store
-                .search_archive(
+                .search_archive_at(
                     &tsquery,
                     p.agent.as_deref(),
                     p.project.as_deref(),
                     since,
                     until,
+                    as_of,
                     limit,
                 )
                 .await
@@ -265,12 +293,13 @@ impl MemoryMcp {
             }
         } else {
             for h in store
-                .search_conversation(
+                .search_conversation_at(
                     &tsquery,
                     p.agent.as_deref(),
                     p.project.as_deref(),
                     since,
                     until,
+                    as_of,
                     limit,
                 )
                 .await
@@ -303,7 +332,8 @@ impl MemoryMcp {
                        with tool calls collapsed; view=transcript is the full \
                        conversation; view=raw is the original record and needs the \
                        raw:read scope. Responses are truncated to max_tokens and carry \
-                       a cursor to continue."
+                       a cursor to continue. Two time axes: at (RFC 3339) is when the \
+                       conversation happened, as_of is when Cormex was told about it."
     )]
     async fn session_get(
         &self,
@@ -383,7 +413,14 @@ impl MemoryMcp {
                 ErrorData::invalid_params("the cursor is not a seq number".to_string(), None)
             })?;
         let events = store
-            .transcript_page(&p.id, "claude_code@1", after_seq, 200)
+            .transcript_page_at(
+                &p.id,
+                "claude_code@1",
+                after_seq,
+                parse_time_param(p.at.as_deref())?,
+                parse_time_param(p.as_of.as_deref())?,
+                200,
+            )
             .await
             .map_err(store_mcp_error)?;
 

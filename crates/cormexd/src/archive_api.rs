@@ -59,6 +59,15 @@ pub struct ListQuery {
     pub until: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<i64>,
+    /// Event time: only sessions whose conversation had happened by then.
+    ///
+    /// The other axis from `as_of`. `at` asks "what had been said by that
+    /// moment"; `as_of` asks "what had Cormex been told by that moment". A
+    /// session backfilled from six months ago is found by `at` and not by
+    /// `as_of` — that asymmetry is the point of having two axes (D13).
+    pub at: Option<String>,
+    /// System time: only sessions Cormex had projected by then.
+    pub as_of: Option<String>,
 }
 
 /// `GET /archive/sessions/{id}/events`.
@@ -68,6 +77,10 @@ pub struct EventsQuery {
     pub view: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<i64>,
+    /// Event time: only events that had happened by then.
+    pub at: Option<String>,
+    /// System time: only events Cormex had projected by then.
+    pub as_of: Option<String>,
 }
 
 /// `GET /archive/search`.
@@ -80,6 +93,14 @@ pub struct SearchQuery {
     pub project: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Event time: only hits whose conversation had happened by then.
+    ///
+    /// The same axis as `until` — both cut on `occurred_at`, and both apply if
+    /// given. `at` exists as its own name because the two axes need to be
+    /// nameable side by side with `as_of`; see D13.
+    pub at: Option<String>,
+    /// System time: only hits Cormex had projected by then.
+    pub as_of: Option<String>,
     pub limit: Option<i64>,
 }
 
@@ -261,17 +282,27 @@ pub async fn search(
     let store = archive_store(&st, &principal).await?;
     let tsquery = cormex_memory::tokenize::to_tsquery_input(&q.q);
     let since = parse_time(q.since.as_deref())?;
-    let until = parse_time(q.until.as_deref())?;
+    // `until` and `at` are the same axis; take the earlier of the two so both
+    // apply
+    let until = match (
+        parse_time(q.until.as_deref())?,
+        parse_time(q.at.as_deref())?,
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let as_of = parse_time(q.as_of.as_deref())?;
     let limit = q.limit.unwrap_or(20);
 
     let hits = if scope == "archive" {
         store
-            .search_archive(
+            .search_archive_at(
                 &tsquery,
                 q.agent.as_deref(),
                 q.project.as_deref(),
                 since,
                 until,
+                as_of,
                 limit,
             )
             .await
@@ -287,12 +318,13 @@ pub async fn search(
             .collect()
     } else {
         store
-            .search_conversation(
+            .search_conversation_at(
                 &tsquery,
                 q.agent.as_deref(),
                 q.project.as_deref(),
                 since,
                 until,
+                as_of,
                 limit,
             )
             .await
@@ -325,15 +357,19 @@ pub async fn list_sessions(
 
     let since = parse_time(q.since.as_deref())?;
     let until = parse_time(q.until.as_deref())?;
+    let at = parse_time(q.at.as_deref())?;
+    let as_of = parse_time(q.as_of.as_deref())?;
     let after = q.cursor.as_deref().map(parse_cursor).transpose()?;
     let limit = q.limit.unwrap_or(50);
 
     let rows = store
-        .archive_sessions(
+        .archive_sessions_at(
             q.agent.as_deref(),
             q.project.as_deref(),
             since,
             until,
+            at,
+            as_of,
             after.as_ref().map(|(t, id)| (t, id.as_str())),
             limit,
         )
@@ -429,7 +465,14 @@ pub async fn get_events(
     let digest = q.view.as_deref() == Some("digest");
 
     let events = store
-        .transcript_page(&id, PARSER_VERSION, after_seq.unwrap_or(-1), limit)
+        .transcript_page_at(
+            &id,
+            PARSER_VERSION,
+            after_seq.unwrap_or(-1),
+            parse_time(q.at.as_deref())?,
+            parse_time(q.as_of.as_deref())?,
+            limit,
+        )
         .await
         .map_err(store_err)?;
 

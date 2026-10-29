@@ -1908,6 +1908,113 @@ mod tests {
         db.drop().await;
     }
 
+    // ── the two time axes (D13) ────────────────────────────
+
+    /// A **backfilled** session is found by `at` and not by `as_of`.
+    ///
+    /// This is the card's acceptance, and it is the whole reason the two axes
+    /// exist. The session's events happened in June (`occurred_at`), but Cormex
+    /// only learned about them today (`created_at`, set by the projector). So:
+    ///
+    /// - `at = July` finds it: the conversation had happened by then
+    /// - `as_of = July` does **not**: Cormex had not been told about it yet
+    ///
+    /// Getting this backwards would make a history import look like it was
+    /// always there, and "what did I know in June" would return sessions from
+    /// June that were imported last week.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_backfilled_session_is_found_by_at_and_not_by_as_of() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        // The transcript says June; the projector writes it today
+        let body = br#"{"type":"user","message":{"role":"user","content":"the storage decision"},"timestamp":"2026-06-01T09:00:00Z"}
+"#;
+        let (session, _tenant) = seed_projected_session(&st, &store, body).await;
+
+        let july = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 1, 0, 0, 0).unwrap();
+        let found_at = store
+            .archive_sessions_at(None, None, None, None, Some(july), None, None, 10)
+            .await
+            .expect("at query");
+        assert_eq!(
+            found_at.len(),
+            1,
+            "at=July should find a session whose conversation happened in June"
+        );
+        assert_eq!(found_at[0].id, session);
+
+        let found_as_of = store
+            .archive_sessions_at(None, None, None, None, None, Some(july), None, 10)
+            .await
+            .expect("as_of query");
+        assert!(
+            found_as_of.is_empty(),
+            "as_of=July found a session Cormex only learned about today -- the two axes have \
+             been collapsed into one"
+        );
+
+        // The events page agrees
+        let events_at = store
+            .transcript_page_at(&session, "claude_code@1", -1, Some(july), None, 10)
+            .await
+            .expect("at page");
+        assert_eq!(events_at.len(), 1);
+        let events_as_of = store
+            .transcript_page_at(&session, "claude_code@1", -1, None, Some(july), 10)
+            .await
+            .expect("as_of page");
+        assert!(
+            events_as_of.is_empty(),
+            "the event page collapsed the two axes"
+        );
+
+        db.drop().await;
+    }
+
+    /// Both axes at once means both apply.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn both_axes_apply_together() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"the storage decision"},"timestamp":"2026-06-01T09:00:00Z"}
+"#;
+        let (session, _tenant) = seed_projected_session(&st, &store, body).await;
+
+        let july = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 1, 0, 0, 0).unwrap();
+        // `at` matches, `as_of` does not: the intersection is empty
+        let both = store
+            .archive_sessions_at(None, None, None, None, Some(july), Some(july), None, 10)
+            .await
+            .expect("both");
+        assert!(
+            both.is_empty(),
+            "both axes given must mean both apply; this returned the session, so one of them \
+             was ignored"
+        );
+
+        // And with `as_of` in the future both match
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        let both = store
+            .archive_sessions_at(None, None, None, None, Some(july), Some(future), None, 10)
+            .await
+            .expect("both");
+        assert_eq!(both.len(), 1, "session {session}");
+
+        db.drop().await;
+    }
+
     /// Promotion can be turned off.
     #[tokio::test]
     #[ignore = "needs a database; run with just test-db"]
