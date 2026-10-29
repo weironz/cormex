@@ -95,6 +95,10 @@ pub struct Runtime {
     /// `AccessBook` would turn "what may this token do" into a question that has
     /// to be answered all over the call sites.
     pub delegations: Arc<crate::delegated_token::DelegatedTokens>,
+    /// Device keys. `None` when there is no accounts database — the key table
+    /// lives in `cormex_auth`, so a deployment without one cannot have device
+    /// keys at all, and the branch in `auth::require` is simply not taken.
+    pub device_keys: Option<Arc<crate::device_keys::DeviceKeys>>,
 }
 
 /// The two account-related handles.
@@ -165,6 +169,7 @@ impl Runtime {
             // restart, and that is correct — the callers holding them need to be
             // taken over again anyway
             delegations: Arc::new(crate::delegated_token::DelegatedTokens::default()),
+            device_keys: None,
         })
     }
 }
@@ -464,6 +469,30 @@ impl AppState {
     #[must_use]
     pub fn delegations(&self) -> &crate::delegated_token::DelegatedTokens {
         &self.inner.rt.delegations
+    }
+
+    /// The device-key store.
+    ///
+    /// Returns a shared no-op when there is none: `auth::require` calls this on
+    /// every request, and an `Option` there would mean every caller has to
+    /// decide what "no accounts database" means for a device key — the answer
+    /// is always "no key resolves", and that belongs here rather than repeated.
+    #[must_use]
+    pub fn device_keys(&self) -> &crate::device_keys::DeviceKeys {
+        static NONE: std::sync::OnceLock<Arc<crate::device_keys::DeviceKeys>> =
+            std::sync::OnceLock::new();
+        match &self.inner.rt.device_keys {
+            Some(d) => d,
+            None => NONE.get_or_init(|| {
+                // A pool that never connects: `resolve` fails on the query and
+                // returns `None`, which is exactly "no device key resolves
+                // here"
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://device-keys-unavailable")
+                    .expect("a lazy pool does not connect, so this cannot fail");
+                Arc::new(crate::device_keys::DeviceKeys::new(pool))
+            }),
+        }
     }
 
     // ─────────────────────── multi-tenancy ──────────────────

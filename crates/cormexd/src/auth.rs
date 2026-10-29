@@ -381,6 +381,41 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
         // boundary** (memory written through them will be retrieved in every
         // future session, on every device). Full reasoning in `sandbox_token`'s
         // module docs.
+        // A device key from `cormex login`. Like the delegated branch, it
+        // carries a scope -- recognising it is not enough, we still have to ask
+        // "can it reach this route".
+        //
+        // This branch sits **after** the delegated one only because the two
+        // token spaces are disjoint; order does not matter for correctness, but
+        // keeping the two scope-bearing branches adjacent makes the shape
+        // obvious.
+        if let Some(scope) = st.device_keys().resolve(tok).await {
+            let (method, path) = (req.method().clone(), req.uri().path().to_owned());
+            if scope.allows(&method, &path) {
+                let principal = crate::principal::Principal::Device(scope);
+                return next.run(with_principal(req, principal)).await;
+            }
+            tracing::warn!(
+                device = %scope.device_id, %method, %path,
+                "the device key's scopes do not cover this route"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(crate::dto::ErrorBody {
+                    error: format!(
+                        "this device key may not access {method} {path}; its scopes are {}",
+                        scope
+                            .scopes
+                            .iter()
+                            .map(|s| s.as_wire())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }),
+            )
+                .into_response();
+        }
+
         if let Some(scope) = st.delegations().resolve(tok) {
             let (method, path) = (req.method().clone(), req.uri().path().to_owned());
             if scope.allows(&method, &path) {

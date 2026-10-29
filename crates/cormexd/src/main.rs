@@ -13,6 +13,8 @@ mod cors;
 mod credentials;
 mod cursor;
 mod delegated_token;
+mod device_keys;
+mod devices_api;
 mod import;
 mod live;
 /// Memory's outward-facing MCP frontage. See that module's header comment.
@@ -26,6 +28,8 @@ mod snapshots;
 mod state;
 mod sync_notify;
 mod sync_payload;
+#[cfg(test)]
+mod test_support;
 mod ws;
 
 // The wire protocol lives in `cormex-proto`, because the agent side has to
@@ -118,6 +122,11 @@ async fn main() -> anyhow::Result<()> {
     match state::Accounts::connect(&config.database_url).await {
         Ok(accounts) => {
             tracing::info!("the accounts system is attached (cormex_auth)");
+            // Device keys live in `cormex_auth`, so they exist exactly when the
+            // accounts database does
+            rt.device_keys = Some(std::sync::Arc::new(crate::device_keys::DeviceKeys::new(
+                accounts.pool.clone(),
+            )));
             rt.accounts = Some(accounts);
         }
         Err(e) => {

@@ -54,6 +54,9 @@ pub enum Principal {
     User { user_id: String },
     /// A sandbox token: bound to one user, one session, and a route allow-list.
     Delegated(DelegatedScope),
+    /// A device key from `cormex login`: bound to one user and one machine,
+    /// with a set of scopes.
+    Device(crate::device_keys::DeviceScope),
 }
 
 impl Principal {
@@ -67,6 +70,26 @@ impl Principal {
             Self::LegacyOwner => crate::accounts::owner_user_id(st).await,
             Self::User { user_id } => Some(user_id.clone()),
             Self::Delegated(scope) => Some(scope.owner.clone()),
+            Self::Device(scope) => Some(scope.user_id.clone()),
+        }
+    }
+
+    /// Whether this caller carries a scope.
+    ///
+    /// A full user credential (and the legacy operator token) has **every**
+    /// scope: scopes exist to narrow a machine's key, not to narrow a person.
+    ///
+    /// Used by the archive and MCP handlers (P2-5 / P3-4), which have to answer
+    /// "may this caller see the raw bytes" per call rather than per route. Those
+    /// callers do not exist yet, so this is allowed as scaffolding rather than
+    /// deleted — deleting it would mean writing it again in P2-5, and unlike a
+    /// dead route it cannot go stale in the meantime.
+    #[allow(dead_code)]
+    pub fn has_scope(&self, scope: crate::device_keys::Scope) -> bool {
+        match self {
+            Self::LegacyOwner | Self::User { .. } => true,
+            Self::Delegated(_) => false,
+            Self::Device(d) => d.has(scope),
         }
     }
 
@@ -84,6 +107,15 @@ impl Principal {
     pub fn delegated(&self) -> Option<&DelegatedScope> {
         match self {
             Self::Delegated(scope) => Some(scope),
+            _ => None,
+        }
+    }
+
+    /// The device scope, if this is a device key.
+    #[must_use]
+    pub fn device(&self) -> Option<&crate::device_keys::DeviceScope> {
+        match self {
+            Self::Device(scope) => Some(scope),
             _ => None,
         }
     }
@@ -150,139 +182,7 @@ mod tests {
     //  End to end, against a real database
     // ══════════════════════════════════════════════════════════
 
-    use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode, header};
-    use tower::ServiceExt as _;
-
-    /// A brand-new database, so `cormex_auth` and `public` are both empty.
-    ///
-    /// The shared development database cannot be used: the first account lands
-    /// in `public` by design, so the test would write into whatever memory is
-    /// already there, and the assertion "A's database does not contain B's row"
-    /// would be measured against somebody else's data.
-    struct FreshDb {
-        url: String,
-        admin: sqlx::PgPool,
-        name: String,
-    }
-
-    impl FreshDb {
-        async fn create(base_url: &str) -> Self {
-            let admin = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .connect(base_url)
-                .await
-                .expect("the test role should be able to connect");
-            let millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("the clock should not predate 1970")
-                .as_millis();
-            let name = format!("cormex_principal_{}_{}", std::process::id(), millis);
-            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
-                .execute(&admin)
-                .await
-                .expect("the test role should be allowed to create a database");
-            let (base, _) = base_url
-                .rsplit_once('/')
-                .expect("DATABASE_URL should end in /<database>");
-            Self {
-                url: format!("{base}/{name}"),
-                admin,
-                name,
-            }
-        }
-
-        async fn drop(self) {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
-                self.name
-            )))
-            .execute(&self.admin)
-            .await;
-            self.admin.close().await;
-        }
-    }
-
-    fn database_url() -> Option<String> {
-        let _ = dotenvy::dotenv();
-        std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())
-    }
-
-    /// Build a live state on `url`, with the accounts system attached.
-    async fn live_state(url: &str) -> (crate::state::AppState, crate::state::Runtime) {
-        let config = cormex_core::config::Config {
-            database_url: url.to_owned(),
-            bind: "127.0.0.1:0".into(),
-            s3: cormex_core::config::S3Config {
-                endpoint: String::new(),
-                bucket: String::new(),
-                region: String::new(),
-                access_key: String::new(),
-                secret_key: String::new(),
-            },
-            // Ollama needs no key, and construction touches no network — the
-            // test never makes a model call, it only needs `Live` to exist
-            llm: cormex_core::config::LlmConfig {
-                provider: "ollama".into(),
-                model: "test-model".into(),
-                cheap_model: "test-model".into(),
-                base_url: Some("http://127.0.0.1:1".into()),
-            },
-            device_id: "principal-test".into(),
-        };
-
-        // The hash embedder: no model download, no network. Retrieval quality is
-        // irrelevant here, and the episode write path does not embed at all when
-        // `retrieve = false`
-        let embedder = cormex_memory::embed::build_embedder(cormex_memory::embed::Backend::Hash)
-            .await
-            .expect("the hash embedder should always build");
-
-        let live = crate::live::Live::new(&config, embedder)
-            .await
-            .expect("the live backend should attach to the fresh database");
-        let accounts = crate::state::Accounts::connect(url)
-            .await
-            .expect("the accounts pool should attach");
-
-        let rt = crate::state::Runtime {
-            auth: crate::auth::AuthMode::Token { digest: [0u8; 32] },
-            tickets: std::sync::Arc::new(crate::auth::TicketBook::default()),
-            accounts: Some(accounts),
-            access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
-            delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
-        };
-        let st = crate::state::AppState::for_tests_live(live, rt.clone(), config);
-        (st, rt)
-    }
-
-    async fn call(
-        app: &axum::Router,
-        method: Method,
-        path: &str,
-        bearer: Option<&str>,
-        body: Option<serde_json::Value>,
-    ) -> (StatusCode, serde_json::Value) {
-        let mut req = Request::builder().method(method).uri(path);
-        if let Some(t) = bearer {
-            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
-        }
-        let req = req
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.map_or_else(String::new, |v| v.to_string())))
-            .expect("building the request must not fail");
-        let resp = app
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("the router's error type is Infallible");
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .expect("the response body should be readable");
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
+    use axum::http::{Method, StatusCode};
 
     /// **A delegated token acts as its own owner, not as user #1.**
     ///
@@ -296,12 +196,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a database; run with just test-db"]
     async fn tenant_isolation_by_principal() {
-        let Some(base) = database_url() else {
+        let Some(base) = crate::test_support::database_url() else {
             eprintln!("skipped: DATABASE_URL is not set");
             return;
         };
-        let db = FreshDb::create(&base).await;
-        let (st, _rt) = live_state(&db.url).await;
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
 
         // A is the first account, so it lands in `public`; B gets a schema of
         // its own. That is the shape production has, and it is exactly the
@@ -322,7 +222,8 @@ mod tests {
             .issue_for_test(&b, std::time::Duration::from_secs(600));
 
         // ── /auth/me says B ──
-        let (status, me) = call(&app, Method::GET, "/auth/me", Some(&b_token), None).await;
+        let (status, me) =
+            crate::test_support::call(&app, Method::GET, "/auth/me", Some(&b_token), None).await;
         assert_eq!(status, StatusCode::OK, "/auth/me should answer 200");
         assert_eq!(
             me["user_id"], b,
@@ -332,7 +233,7 @@ mod tests {
 
         // ── Issue a delegated token for one of B's sessions ──
         let session = "sess-bravo";
-        let (status, delegation) = call(
+        let (status, delegation) = crate::test_support::call(
             &app,
             Method::POST,
             "/delegated-tokens",
@@ -355,7 +256,8 @@ mod tests {
             .to_owned();
 
         // ── /auth/me with the delegated token still says B ──
-        let (status, me) = call(&app, Method::GET, "/auth/me", Some(&delegated), None).await;
+        let (status, me) =
+            crate::test_support::call(&app, Method::GET, "/auth/me", Some(&delegated), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             me["user_id"], b,
@@ -365,7 +267,7 @@ mod tests {
 
         // ── Write an episode through the delegated token ──
         let episode_id = cormex_core::Id::new().to_string();
-        let (status, ack) = call(
+        let (status, ack) = crate::test_support::call(
             &app,
             Method::POST,
             "/episodes",
@@ -417,13 +319,15 @@ mod tests {
         );
 
         // ── The ticket path carries the identity too ──
-        let (status, ticket) = call(&app, Method::POST, "/auth/ticket", Some(&b_token), None).await;
+        let (status, ticket) =
+            crate::test_support::call(&app, Method::POST, "/auth/ticket", Some(&b_token), None)
+                .await;
         assert_eq!(status, StatusCode::OK, "issuing a ticket should succeed");
         let ticket = ticket["ticket"]
             .as_str()
             .expect("the response should carry a ticket")
             .to_owned();
-        let (status, me) = call(
+        let (status, me) = crate::test_support::call(
             &app,
             Method::GET,
             &format!("/auth/me?ticket={ticket}"),

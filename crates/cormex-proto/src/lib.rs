@@ -28,6 +28,7 @@
 
 pub mod auth;
 pub mod delegate;
+pub mod devices;
 pub mod dto;
 pub mod episodes;
 pub mod import;

@@ -95,6 +95,16 @@ macro_rules! protected_routes {
 protected_routes! {
     state;
     "/auth/ticket" [POST] => post(issue_ticket),
+    // Device keys (D9). `POST` mints, `GET` lists, `DELETE` revokes.
+    //
+    // **`POST` refuses a device key and a delegated token**: a credential that
+    // can mint another credential can widen its own scope, which is the one
+    // thing the scope list exists to prevent. The handler does that check
+    // rather than the allow-list, because the allow-list answers "may this
+    // credential reach this route" and the answer here depends on the method's
+    // *meaning*, not on its path.
+    "/devices" [GET, POST] => get(crate::devices_api::list).post(crate::devices_api::create),
+    "/devices/{id}" [DELETE] => axum::routing::delete(crate::devices_api::revoke),
     // Bring-your-own API key. Three actions on one path: read status / store /
     // withdraw
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)
@@ -1160,6 +1170,7 @@ mod tests {
             accounts: None,
             access: std::sync::Arc::new(crate::accounts::AccessBook::default()),
             delegations: std::sync::Arc::new(crate::delegated_token::DelegatedTokens::default()),
+            device_keys: None,
             // The route tests do not touch docker. A request with
             // `sandbox: true` gets "this deployment has no cloud sandbox" here,
             // which is exactly what it should get
