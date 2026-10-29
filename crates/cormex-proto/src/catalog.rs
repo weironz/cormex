@@ -439,7 +439,7 @@ mod tests {
         // The parser crate depends on this one, so the check lives here as a
         // list rather than a call: adding an agent to `agents.toml` without
         // adding it here is exactly the omission this test exists to catch
-        const PARSED: &[&str] = &["claude_code", "codex", "gemini_cli"];
+        const PARSED: &[&str] = &["claude_code", "codex", "gemini_cli", "cline", "roo_code"];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent
                 .sources

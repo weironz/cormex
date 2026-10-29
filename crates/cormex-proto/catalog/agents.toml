@@ -128,3 +128,46 @@ home = [
   kind = "gemini_settings"
   events = ["AfterAgent", "SessionEnd"]
 
+[[agents]]
+id = "cline"
+name = "Cline"
+# VS Code's global storage. The extension id is the directory name; Roo Code is a
+# fork with its own id and the same file layout, so it gets its own entry below
+home = [
+  { env = "CLINE_GLOBAL_STORAGE" },
+  { path = "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev" },
+  { path = "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" },
+  { path = "~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev" },
+]
+
+  # 上游 `apps/vscode/src/core/storage/disk.ts`：`tasks/<taskId>/<file>`，
+  # `api_conversation_history.json` 是发给模型的 `Anthropic.MessageParam[]`，
+  # 也就是对话本身。**整份重写**，所以是 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "tasks/*/api_conversation_history.json"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1 }
+
+  # UI 自己的事件日志。**不采**：它与上面那份是同一段对话的两种写法，两份都采
+  # 会让每条消息出现两次。留在这里是为了让下一个人知道它是故意漏掉的
+  # [[agents.source]]
+  # role = "sidecar"
+  # glob = "tasks/*/ui_messages.json"
+
+[[agents]]
+id = "roo_code"
+name = "Roo Code"
+home = [
+  { env = "ROO_GLOBAL_STORAGE" },
+  { path = "~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline" },
+  { path = "~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline" },
+  { path = "~/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "tasks/*/api_conversation_history.json"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1 }
+

@@ -129,6 +129,10 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("gemini_cli", FileRole::Transcript | FileRole::Subagent) => {
             Some(Box::new(crate::gemini::GeminiParser::new()))
         }
+        // Cline and Roo Code are the same fork; one parser serves both
+        ("cline" | "roo_code", FileRole::Transcript) => {
+            Some(Box::new(crate::cline::ClineParser::new()))
+        }
         _ => None,
     }
 }
