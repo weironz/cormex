@@ -29,7 +29,7 @@
 - [ ] 新 migration：新文件、LF 行尾、sha256 加进 `crates/cortex-store/tests/migrations_are_immutable.rs` 的 `PINNED`；**已有 migration 一个字节都不改**
 - [ ] crate 里的注释和 rustdoc 用**英文**，解释**为什么**（参考 `crates/cortex-core/src/id.rs` 的密度）；`docs/` 用中文；`app/` 新写的注释用英文
 - [ ] 测试的断言消息能独立读懂失败原因
-- [ ] 不出现密钥、节点地址、域名、账号（公开仓库）；夹具里的「密钥」只能用 `redaction.rs` 测试里那种明显假的样本
+- [ ] 不出现密钥、节点地址、域名、账号（公开仓库）；夹具里的「密钥」只能用 `redaction.rs` 测试里那种明显假的样本；**来自真实会话的夹具必须经过 P2-0 的工具**，不得手工复制粘贴真实会话片段
 - [ ] 遇到 dead_code 警告，优先让代码真的被用起来，不加 `#[allow]`
 - [ ] 卡片里的「验收」逐条在 PR 描述里打勾，并贴出关键命令的输出
 
@@ -338,10 +338,31 @@
 
 ## 4. 阶段 2：解析与浏览
 
+### P2-0 本机采样与结构保持脱敏（夹具来源）· M
+
+- **依赖**：P1-8（复用 catalog 发现）
+- **为什么**：解析器要用真实会话当夹具，但仓库是公开的。会话文件里有对话正文、读过的文件内容、命令输出，还会有 system prompt 和身份信息（Claude Code 官方文档写明 transcript 会包含发给模型的 system prompt 与工具定义）。**正文没法靠「抹掉密钥」脱敏干净**，所以这里只保留结构、替换全部自由文本
+- **怎么取样**：**直接扫描执行者所在机器上装了的 agent**（所有者 2026-10-29 的决定），不需要所有者提供样本
+- **改动**：
+  - 建 `crates/cortex-transcript/` 的骨架（`Cargo.toml` + 空 `lib.rs`），P2-1 在其上继续
+  - `crates/cortex-transcript/examples/sample_fixtures.rs`（dev 工具，`cargo run -p cortex-transcript --example sample_fixtures -- --out <dir>`）；dev-dependencies：`cormex`（发现）、`cortex-memory`（`redaction`）、`cortex-proto`（catalog）
+  - 选样：每个 agent 最多 3 个会话：最小的一个、中位数大小的一个、记录类型最多样的一个；每个文件截到 2000 行或 2 MiB（按行边界）
+  - **结构保持的匿名化**（规则版本号写进输出）：
+    - 保留：JSON 结构、全部键名、布尔、数字、null；白名单键的值（按 agent 配置：`type`、`role`、`subtype`、工具名 `name`、`stop_reason`、`media_type`、`operation`、`mode`、`level` 等枚举类字段）
+    - 时间戳：整体平移一个常量（保留先后顺序和格式）
+    - UUID / id：**一致映射**（同一输入映射到同一个假 id），保住 `parentUuid ↔ uuid`、`tool_use_id ↔ tool_result` 这类引用
+    - 路径：home 目录、用户名、项目名换成一致的占位（`/home/user/project-a`）
+    - 其余所有字符串：换成长度相近、文字种类相同（ASCII / 中文 / 混合）的合成文本，保留换行数
+    - 长的 base64 / 签名类字符串（thinking 签名、内联图片）：换成同长度级别的占位；图片块换成一张合法的 1×1 PNG，保证解码路径能测
+  - **安全网**（任一命中则工具失败退出，不写文件）：输出过 `redaction::scan`；再扫一遍本机的 hostname、用户名、邮箱样式、IPv4、`/home/<真实用户名>` 样式
+  - 输出 `crates/cortex-transcript/tests/fixtures/<agent>/<名字>.jsonl` 与同目录的 `MANIFEST.md`（来源 agent 版本、记录类型统计、匿名化规则版本、`real-derived` / `synthetic` 标记）
+- **本机没有装的 agent**：按上游开源的类型定义手写夹具（Codex：`openai/codex` 的 `codex-rs/protocol`；Gemini CLI：`packages/core/src/services/chatRecordingTypes.ts`；OpenCode、Goose 同理），在 `MANIFEST.md` 里标 `synthetic`。云端会话通常**只有 Claude Code**（参考：2026-10-29 在本仓库的云端会话里扫描，只找到 `~/.claude/projects` 下当前会话自己的 transcript）。所有者之后在自己的机器上跑一次这个工具，就能把 `synthetic` 换成 `real-derived`
+- **测试**：匿名化函数的单元测试（id 一致映射、引用不断、白名单值保留、自由文本被替换、安全网能拦住植入的假密钥和假邮箱）
+- **验收**：PR 附 `MANIFEST.md`；PR 描述里写明执行者已人工过目输出、确认没有残留的私人内容
+
 ### P2-1 `cortex-transcript` crate 与两个解析器 · L
 
-- **依赖**：P1-5
-- **前置**：所有者提供 Claude Code 与 Codex 各 2–3 个真实会话（脱敏，见 §10）
+- **依赖**：P1-5、P2-0（夹具）
 - **改动**：
   - `crates/cortex-proto/src/transcript.rs`：`TranscriptKind`、`ContentBlock`（`Text{text}`、`Thought{text}`、`ToolCall{tool_call_id,name,input}`、`ToolResult{tool_call_id,output,is_error}`、`Diff{path,old,new}`、`Plan{entries}`、`Image{blob_ref}`、`ResourceRef{generation_id,offset,length,mime}`、`Unknown{raw_type}`）、`TranscriptEventDto`（设计 §7.2）
   - 新 crate `crates/cortex-transcript/`：
@@ -362,6 +383,7 @@
     pub fn parser_for(agent: &str, role: FileRole) -> Option<Box<dyn Parser>>;
     ```
   - `src/jsonl.rs`：行切分（跨 `feed` 调用的半行缓冲）、坏行 → `Unknown` 事件（**不丢弃**，保留偏移）
+  - **非消息记录占多数**：2026-10-29 在一个真实的 Claude Code 会话（1455 行）里数到的记录类型有 `assistant` 487、`attachment` 375、`user` 287、`last-prompt` 103、`atis-latch` 102、`mode` 62、`tools-used` 16、`queue-operation` 14、`system` 6、`cost-state` 3。只认 `user` / `assistant` 会把一半以上的记录当成坏行，所以每种不认识的 `type` 都要落成 `Meta` 或 `Unknown`，并在夹具里各有一例
   - `src/claude_code.rs`：逐行按 `type` 分派（`user` / `assistant` / `system` / `summary` / 其他）；`message.content` 可能是字符串或块数组；`tool_use` → `ToolCall`；`tool_result`（在 user 消息里）→ `ToolResult`，并用 `tool_use_id → name` 映射补上工具名（映射放进 checkpoint）；`thinking` → `Thought`；不认识的 `type` → `Unknown`
   - `src/codex.rs`：`RolloutLine { timestamp, type, payload }`；`session_meta` / `turn_context` → `Meta`；`response_item` 的 `message`（`input_text` / `output_text`）、`reasoning`、`function_call`、`function_call_output`、`local_shell_call` 等 → 对应块；`event_msg` 默认 `Meta`（不重复展示）；`compacted` → `System`。字段以上游 `openai/codex` 的 `codex-rs/protocol` 类型定义为准（Apache-2.0；若照抄定义需在 NOTICE 署名）
   - **独立实现**：不得参考或复制 cass / franken_agent_detection 的代码（前者许可证 rider；后者为保持边界干净也不抄）
@@ -614,15 +636,13 @@
 
 ## 10. 所有者需要提供的东西
 
-| 什么 | 给谁用 | 什么时候 |
-|---|---|---|
-| 每种 agent 2–3 个真实会话样本（**先脱敏**：替换密钥、内网地址、账号、私人内容；保留结构和记录类型） | P2-1、阶段 4 各卡 | P2-1 开工前 |
-| 本机容量测量：`du -sh ~/.claude/projects ~/.codex/sessions …`、会话数、日增量 | 设计 §9.4 的容量附录 | 阶段 1 期间 |
-| 是否有多用户部署（决定 P0-2 的紧急程度） | P0-2 | 尽快 |
-| `NPM_TOKEN`（可选） | P6-5 | 阶段 6 |
-| 晋升策略的默认值确认（默认：用户消息 + 每轮最后一条 agent 消息） | P5-4 | 阶段 5 前 |
-
----
+| 什么 | 给谁用 | 什么时候 | 备注 |
+|---|---|---|---|
+| ~~真实会话样本~~ | — | — | **不需要**：执行者用 P2-0 的工具扫描所在机器自动取样并脱敏（2026-10-29 决定）。所有者愿意的话，之后在自己的机器上跑一次同一个工具，把 `synthetic` 夹具换成真实来源的 |
+| ~~容量测量~~ | — | — | **不需要手工做**：`cormex detect`（P1-8）会报每个 agent 的会话数和字节数，`cormex init`（P1-11）在回填前给出估算 |
+| 是否有多用户部署 | P0-2 的紧急程度 | 尽快 | 「多用户」= Cormex 服务端里有两个及以上账号。只影响 P0-2 要不要当作紧急安全修复先做；无论答案如何，P0-2 都要做（P1-1 依赖它） |
+| `NPM_TOKEN`（可选） | P6-5 | 阶段 6 | 没有就跳过 npm 分发 |
+| 晋升策略的默认值确认（默认：用户消息 + 每轮最后一条 agent 消息） | P5-4 | 阶段 5 前 | |
 
 ## 11. 交接提示词模板
 

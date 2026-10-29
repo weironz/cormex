@@ -135,7 +135,7 @@ cormex-web（Flutter）：会话列表 / 对话视图 / 原始切换 / 两条时
 | HTTP 客户端 | `reqwest` 0.13（rustls，workspace 已有） | ureq | 与服务端一致；需要流式上传和异步 |
 | 客户端本机状态 | **`rusqlite` 0.41，`bundled`**（D22） | JSON 文件、sled | 多个 hook 进程会并发改状态：SQLite 的 WAL + `busy_timeout` + `BEGIN IMMEDIATE` 是现成的跨进程事务；读宿主 SQLite 来源（Cursor / OpenCode / Goose）本来也要它 |
 | 读宿主 SQLite | rusqlite 只读打开（`file:…?mode=ro`），**按行读取** | 复制 `.db` 文件 | WAL 模式下复制文件拿到的是不一致的状态；Cursor 的 `state.vscdb` 可能几百 MB |
-| 压缩 | `zstd` 0.14（两端） | gzip | Codex 本来就用 zstd 压冷文件；JSONL 压缩比高 |
+| 压缩 | `zstd` 0.14（两端） | gzip | Codex 本来就用 zstd 压冷文件；JSONL 可压缩（实测约 3.5 倍，见 §9.4） |
 | 内容哈希 | SHA-256（`sha2`） | blake3 | 数据库的 `sha256` DOMAIN 已经定了；与 `blobs` 一致 |
 | 凭据存储 | `keyring` 4（系统钥匙串），失败时退回 0600 文件 | 只用文件 | 设备密钥是长期凭据；无钥匙串的服务器 / 容器上退回文件并在 `doctor` 里提示 |
 | 平台目录 | `directories` 6 | 手写 | 三平台的 config / data / cache 目录规则 |
@@ -818,7 +818,9 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 
 ### 9.4 容量估算方法
 
-不在文档里拍数字。上线前在所有者的机器上量：`du -sh ~/.claude/projects ~/.codex/sessions …`、`zstd -19` 后的体积、会话数、日增量；写进 `docs/plan/` 的容量附录。存储（RustFS）按「压缩后体积 × 1.1」规划，Postgres 按「事件数 × 约 2 KiB」规划。
+不靠人工测量：`cormex detect` 报每个 agent 的会话数和字节数，`cormex init` 在回填前给出估算（逻辑字节、预计压缩后体积、预计事件数）。存储（RustFS）按「压缩后体积 × 1.1」规划，Postgres 按「事件数 × 约 2 KiB」规划。
+
+一个实测数据点（2026-10-29，本仓库的一个云端 Claude Code 会话，约 3 小时的持续工作）：1455 条记录、5.7 MB 逻辑字节，gzip -9 后 1.66 MB，**约 3.5 倍**。比通常对 JSONL 的预期（5–10 倍）低，原因之一是 thinking 块的签名一类字符串几乎不可压缩。规划时按 3 倍算。
 
 ---
 
@@ -836,7 +838,7 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 | 安装器 | 合并配置不破坏用户已有条目；uninstall 还原到字节一致 | 用夹具配置文件做前后对比 |
 | 检索 | 会话检索和原文档案检索的召回 | `evals/` 新题集（第 7 阶段） |
 
-夹具来源：所有者提供每种 agent 2–3 个真实会话（脱敏后），加上照上游源码类型手写的边界样例。**夹具里不能有真实密钥、节点地址、域名、账号**（公开仓库）。
+夹具来源：执行者在所在机器上用采样工具（计划 P2-0）扫描已装的 agent，做**结构保持的匿名化**（保留结构、键名、枚举值和引用关系，替换全部自由文本）；本机没有的 agent 照上游源码类型手写，标 `synthetic`。**夹具里不能有真实密钥、节点地址、域名、账号、对话正文**（公开仓库）。
 
 ---
 
