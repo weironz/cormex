@@ -177,6 +177,31 @@ impl ApiClient {
         Ok((status, bytes))
     }
 
+    /// `GET` raw bytes, with extra query parameters.
+    ///
+    /// The archive's raw endpoint returns file content, not JSON — and that
+    /// content is not guaranteed to be UTF-8, so it comes back as bytes rather
+    /// than a string.
+    ///
+    /// # Errors
+    /// As [`Self::get_json`].
+    pub async fn get_bytes(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<u8>, ClientError> {
+        let mut req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.key);
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        let resp = req.send().await.map_err(unreachable)?;
+        self.check_status(resp.status(), path)?;
+        Ok(resp.bytes().await.map_err(unreachable)?.to_vec())
+    }
+
     /// `DELETE`, expecting no body.
     ///
     /// # Errors

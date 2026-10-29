@@ -9,5 +9,6 @@ pub mod doctor;
 pub mod init;
 pub mod login;
 pub mod logout;
+pub mod sessions;
 pub mod status;
 pub mod uninstall;

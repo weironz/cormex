@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{detect, doctor, init, login, logout, status, uninstall};
+use cormex::cmd::{detect, doctor, init, login, logout, sessions, status, uninstall};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -105,6 +105,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Browse the sessions captured on the server.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
     /// List the agents and session files found on this machine.
     ///
     /// Reads paths and metadata only -- never a session's contents.
@@ -112,6 +117,37 @@ enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsCommand {
+    /// List the captured sessions.
+    Ls {
+        /// Only this agent's sessions.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only this project's sessions.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one session's events.
+    Show {
+        /// The session id, from `sessions ls`.
+        id: String,
+        /// `transcript` (the default) or `digest`.
+        #[arg(long, default_value = "transcript")]
+        view: String,
+        /// Print the original record instead of the conversation.
+        #[arg(long)]
+        raw: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
 }
 
@@ -302,6 +338,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 ExitCode::PartialFailure
             })
+        }
+        Command::Sessions { command } => {
+            let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
+            let client = cormex::ApiClient::new(&cfg.server_url, &key)?;
+            let out = match command {
+                SessionsCommand::Ls {
+                    agent,
+                    project,
+                    limit,
+                    json,
+                } => {
+                    sessions::ls(&client, agent.as_deref(), project.as_deref(), limit, json).await?
+                }
+                SessionsCommand::Show {
+                    id,
+                    view,
+                    raw,
+                    limit,
+                } => sessions::show(&client, &id, &view, raw, limit).await?,
+            };
+            print!("{out}");
+            Ok(ExitCode::Ok)
         }
         Command::Detect { json } => {
             let catalog = cormex_proto::catalog::Catalog::builtin().clone();
