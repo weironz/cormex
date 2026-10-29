@@ -528,6 +528,7 @@ pub async fn whoami(
             user_id,
             username: r.get("username"),
             schema_name: r.get("schema_name"),
+            device_id: principal.device().map(|d| d.device_id.clone()),
         })),
         // The legacy token path maps to user #1, and user #1 may not be in the
         // users table yet (the deployment predates the accounts system). This is
@@ -536,6 +537,7 @@ pub async fn whoami(
             user_id,
             username: "(no account yet)".into(),
             schema_name: "public".into(),
+            device_id: principal.device().map(|d| d.device_id.clone()),
         })),
     }
 }
