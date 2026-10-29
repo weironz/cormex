@@ -56,6 +56,7 @@
 //! # }
 //! ```
 
+pub mod archive;
 mod bootstrap;
 mod error;
 mod model;
@@ -66,6 +67,11 @@ mod sync;
 mod tenant;
 mod txn;
 
+pub use archive::{
+    AppendOutcome, ArchiveTxn, CaptureChunk, CaptureFile, CaptureSession, ChunkEncoding,
+    FileEventOp, FileRole, Framing, Generation, GenerationReason, NewCaptureChunk, NewCaptureFile,
+    NewCaptureFileEvent, NewCaptureMask, NewCaptureSession, NewMaskProgress, RegisteredFile,
+};
 pub use bootstrap::{TenantMigration, migrate_all, provision};
 pub use error::{Result, StoreError};
 pub use model::{

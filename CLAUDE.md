@@ -78,9 +78,19 @@ app/            3.2k   记忆浏览器（Flutter，Web 与桌面同一份源码�
 
 - **全链路 append-only。** fact 不 update 不 delete，作废是 `fact_events`
   里的一条新行。「什么时候变的」因此不是旁挂的审计日志，**它就是存储模型本身**。
-- **写事务必须走 `store.write_txn`**（内含 `pg_advisory_xact_lock` 串行化
-  提交顺序）。裸 `BIGSERIAL` 游标会永久漏行 —— 实测 32 个并发写稳定漏 12 条以上，
-  而漏掉的行不会有任何错误，只是同步的下游永远看不见它们。
+- **写事务分两条通道，都不允许裸事务**：
+  - **同步表**（`table::ALL`）必须走 `store.write_txn`（内含
+    `pg_advisory_xact_lock` 串行化提交顺序）。裸 `BIGSERIAL` 游标会永久漏行 ——
+    实测 32 个并发写稳定漏 12 条以上，而漏掉的行不会有任何错误，只是同步的下游
+    永远看不见它们。
+  - **归档表**（`table::ARCHIVE`：`capture_*`，阶段 2 再加 `transcript_*` /
+    `archive_*`）必须走 `store.archive_txn`。它们**不进 `sync_log`、不下发**
+    （D3），所以不需要那把同步锁：下游消费者用显式的进度表
+    （`capture_mask_progress`、`transcript_projections`），没有「游标跳过未提交行」
+    的问题。拿同步锁的代价是**一个账号上传一年历史会挡住它自己的所有普通写入**。
+    归档层自己只需要一把更细的锁：`append_chunk` 在事务内先
+    `pg_advisory_xact_lock(4273, hashtext(generation_id))` 再读这一代的末尾 ——
+    4273 与同步的 4272 是两把不同的锁，共用任何一个都会让另一个的保证静默失效。
 - **`tsv` 与主行同事务写入。** 分开写的症状是全文检索少了刚写进去的那条，
   而向量检索找得到 —— 看起来像「BM25 效果不好」。
 
