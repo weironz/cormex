@@ -21,9 +21,23 @@ cormex-core.workspace = true
 # `/llm/stream` passes goose's native Message / Tool / ProviderUsage straight through (see
 # src/llm.rs: translating them into OpenAI's shape would lose prompt caching and thinking
 # blocks).
-cormex-llm.workspace = true
+#
+# **Optional, and behind the default-on `llm` feature.** `cormex-llm` is the provider layer:
+# it pulls in goose-providers, reqwest and a TLS stack. The capture CLI (`crates/cormex`)
+# needs this crate for its DTOs and its catalog and makes no model call of its own -- it
+# talks to the server's `/llm/stream`, which is the whole point of that endpoint. Dragging
+# the provider layer into a static single binary for one module it never names is pure
+# weight, so the CLI depends on this crate with `default-features = false`.
+cormex-llm = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-tokio.workspace = true
-tracing.workspace = true
+# The built-in source catalog (`catalog/agents.toml`) is parsed at first use, not at build
+# time: a `build.rs` would have to re-run whenever the file changes, and getting that
+# dependency wrong means a stale catalog compiled into the binary with nothing to notice it
+regex = { workspace = true }
+toml = "0.9"
+
+[features]
+default = ["llm"]
+llm = ["dep:cormex-llm"]
