@@ -1184,8 +1184,6 @@ dependencies = [
  "cormex-llm",
  "serde",
  "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]

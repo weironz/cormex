@@ -65,6 +65,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
 
+      # The capture CLI (`crates/cormex`) depends on `cortex-proto` with
+      # `default-features = false`, so that goose-providers and its TLS stack stay out of a
+      # static single binary that never makes a model call of its own. Nothing else in the
+      # workspace does that, so without this step the feature boundary could rot for months:
+      # `cargo clippy --workspace` builds the default features, and a stray `use
+      # cortex_llm::…` outside the `llm` module would compile fine here and break only the
+      # CLI's release build.
+      - name: cortex-proto without the llm feature
+        run: cargo check -p cortex-proto --no-default-features --locked
+
   # ── Tests ──────────────────────────────────────────────
   test:
     name: Tests
