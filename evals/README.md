@@ -207,6 +207,30 @@ them in one table.
 One schema per question, because each question carries its **own** haystack: a
 shared schema would let question A's answer session be retrieved for question B.
 
+### Baseline (2026-10-30, `CORMEX_EMBED_BACKEND=hash`)
+
+All 500 questions, BM25 only — the hash embedder has no semantic ability, so
+the vector leg contributes nothing:
+
+```
+  by type
+    knowledge-update           n=78   R@1 74.4%  R@5 98.7%  R@10 98.7%
+    multi-session              n=133  R@1 56.4%  R@5 86.5%  R@10 94.0%
+    single-session-assistant   n=56   R@1 50.0%  R@5 80.4%  R@10 83.9%
+    single-session-preference  n=30   R@1 10.0%  R@5 33.3%  R@10 56.7%
+    single-session-user        n=70   R@1 58.6%  R@5 81.4%  R@10 90.0%
+    temporal-reasoning         n=133  R@1 52.6%  R@5 89.5%  R@10 96.2%
+
+  overall
+    R@1 55.0%  R@5 84.6%  R@10 91.4%
+```
+
+**This is a floor, not a claim about quality.** With a real embedder the vector
+leg joins the ranking and the numbers move; this run exists so a later one can
+be compared against something. The weak cell is `single-session-preference`
+(R@5 33.3%): those questions ask about a stated preference, and the session
+that holds it uses different words — exactly what a semantic leg is for.
+
 ### Two things the dataset does that the loader has to handle
 
 - **Duplicate session ids.** A handful of questions list the same
