@@ -29,6 +29,8 @@ pub mod cmd;
 pub mod config;
 pub mod credentials;
 pub mod git_meta;
+pub mod hook;
+pub mod install;
 pub mod state;
 pub mod sync;
 
