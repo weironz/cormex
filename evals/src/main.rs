@@ -11,11 +11,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use cormex_evals::DEFAULT_SUITE;
 use cormex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalConfig};
 use cormex_evals::report::render_text;
 use cormex_evals::runner::{RunOptions, run};
 use cormex_evals::suite::Suite;
+use cormex_evals::{DEFAULT_SESSION_SUITE, DEFAULT_SUITE};
 use cormex_memory::retrieval::RecencyMode;
 
 #[derive(Parser)]
@@ -39,13 +39,27 @@ enum Command {
     Run(Box<RunArgs>),
     /// Static validation of the suite only (no database) — CI's first gate
     Validate {
-        #[arg(long, default_value = DEFAULT_SUITE)]
-        suite: PathBuf,
+        /// Defaults to the memory suite, or to the session suite with
+        /// `--sessions`.
+        #[arg(long)]
+        suite: Option<PathBuf>,
+        /// Validate the session-retrieval suite instead of the memory one.
+        #[arg(long)]
+        sessions: bool,
     },
 }
 
 #[derive(Parser)]
 struct RunArgs {
+    /// Which side to evaluate: `memory` runs the fact-retrieval suite,
+    /// `sessions` runs the session-retrieval one.
+    ///
+    /// Two targets rather than one report: they share no table, no index and no
+    /// ranking, so a number from one says nothing about the other, and folding
+    /// them together would let a good memory score hide a broken archive.
+    #[arg(long, value_enum, default_value_t = Target::Memory)]
+    target: Target,
+
     #[arg(long, default_value = DEFAULT_SUITE)]
     suite: PathBuf,
 
@@ -168,6 +182,12 @@ struct RunArgs {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Target {
+    Memory,
+    Sessions,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Judge {
     Prefilter,
     Cheap,
@@ -227,8 +247,22 @@ async fn real_main() -> Result<ExitCode> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { suite } => {
-            let s = Suite::load(&suite)?;
+        Command::Validate { suite, sessions } => {
+            if sessions {
+                let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSION_SUITE));
+                let s = cormex_evals::sessions::SessionSuite::load(&path)?;
+                s.validate()?;
+                println!(
+                    "session suite {} validated: {} sessions / {} events / {} questions",
+                    s.name,
+                    s.sessions.len(),
+                    s.event_count(),
+                    s.questions.len()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_SUITE));
+            let s = Suite::load(&path)?;
             println!(
                 "suite {} validated: {} scenarios / {} turns / {} seeded facts / {} questions",
                 s.name,
@@ -250,6 +284,9 @@ async fn real_main() -> Result<ExitCode> {
 }
 
 async fn run_command(args: RunArgs) -> Result<ExitCode> {
+    if args.target == Target::Sessions {
+        return run_sessions(args).await;
+    }
     let suite = Suite::load(&args.suite)?;
 
     let database_url = std::env::var("DATABASE_URL")
@@ -338,5 +375,72 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
         }
     }
 
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The session-retrieval target.
+///
+/// Its own function rather than a branch inside `run_command`: the two targets
+/// share almost nothing — no suite type, no report type, no gate metric — and
+/// interleaving them would make both harder to read than the duplication costs.
+async fn run_sessions(args: RunArgs) -> Result<ExitCode> {
+    use cormex_evals::sessions::{SessionSuite, run_questions, seed_sessions};
+
+    let path = if args.suite.as_os_str() == DEFAULT_SUITE {
+        // The default points at the memory suite; a `--target sessions` run
+        // without `--suite` means the session one
+        PathBuf::from(DEFAULT_SESSION_SUITE)
+    } else {
+        args.suite.clone()
+    };
+    let suite = SessionSuite::load(&path)?;
+    suite.validate()?;
+
+    let database_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context(
+            "DATABASE_URL is not set. Both archive indexes are SQL, and what you measure              without Postgres is not this search system",
+        )?;
+
+    let db = cormex_evals::harness::EvalDb::create(&database_url).await?;
+    let schema = db.schema().to_owned();
+    let outcome = async {
+        seed_sessions(&db.store, &suite).await?;
+        run_questions(&db.store, &suite).await
+    }
+    .await;
+    let keep = args.keep_schema || outcome.is_err();
+    db.cleanup(keep).await;
+
+    let report = outcome?;
+    let text = report.render();
+    println!("{text}");
+    eprintln!("(schema {schema})");
+
+    if let Some(path) = &args.md {
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("human-readable report: {}", path.display());
+    }
+    if let Some(path) = &args.json {
+        let json = serde_json::to_string_pretty(&report)
+            .context("the session report could not be serialized")?;
+        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("machine-readable report: {}", path.display());
+    }
+
+    // The gate is **accuracy over all questions**, negatives included: a run
+    // that returns everything scores well on the positive questions and fails
+    // the negatives, which is exactly what the gate should catch
+    if let Some(min) = args.min_recall5 {
+        let actual = report.accuracy();
+        if actual < min {
+            eprintln!(
+                "regression gate failed: session accuracy = {actual:.3}, below the {min:.3} \
+                 threshold"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }

@@ -116,7 +116,12 @@ jobs:
       # whose ids do not line up. Its value is precisely "a number to compare
       # every optimisation against", and not running it means there is none.
       - name: eval suite validates
-        run: cargo run -p cormex-evals --locked -- validate
+        run: |
+          cargo run -p cormex-evals --locked -- validate
+          # The session-retrieval suite (P7-2). Its own validation refuses a
+          # suite with no negative question: without one, a search that returns
+          # every session scores 100%
+          cargo run -p cormex-evals --locked -- validate --sessions
 
   # ── Tests ──────────────────────────────────────────────
   test:

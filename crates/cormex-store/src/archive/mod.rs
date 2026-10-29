@@ -714,7 +714,12 @@ impl Store {
 /// at the same time produce the same id: the `ON CONFLICT` then converges on
 /// one row instead of one device winning and the other reading back a
 /// different id than it sent.
-fn session_id_for(agent: &str, native_session_id: &str) -> cormex_core::Id {
+/// The id a capture session gets from its unique key.
+///
+/// Public because a caller that has the host's session id (a restore, an eval)
+/// has to be able to find the row without a lookup query.
+#[must_use]
+pub fn session_id_for(agent: &str, native_session_id: &str) -> cormex_core::Id {
     cormex_core::Id::derived(
         chrono::DateTime::from_timestamp(0, 0).expect("the epoch is a valid timestamp"),
         &format!("capture_session|{agent}|{native_session_id}"),

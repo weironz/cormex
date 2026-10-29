@@ -36,7 +36,13 @@ pub mod matcher;
 pub mod metrics;
 pub mod report;
 pub mod runner;
+pub mod sessions;
 pub mod suite;
 
 /// Default path to the in-repository suite (relative to the repo root).
 pub const DEFAULT_SUITE: &str = "evals/suites/cormex-zh-en-v1.json";
+
+/// The session-retrieval suite (P7-2). A separate file and a separate target:
+/// it measures the archive's two indexes, which share no table and no ranking
+/// with the memory side's four recall legs.
+pub const DEFAULT_SESSION_SUITE: &str = "evals/suites/sessions-zh-en-v1.json";

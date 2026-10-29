@@ -143,6 +143,44 @@ of the extraction side.
 
 ---
 
+## The session-retrieval target (P7-2)
+
+```bash
+cargo run -p cormex-evals -- validate --sessions
+cargo run -p cormex-evals -- run --target sessions
+```
+
+A **separate suite and a separate target**, because it measures something else entirely:
+`cormex-zh-en-v1` measures the memory side (facts, four recall legs, RRF), while this
+measures the archive's two indexes — did `search_conversation` / `search_archive` find the
+session somebody was thinking of. They share no table, no index and no ranking, so a number
+from one says nothing about the other, and folding them into one report would let a good
+memory score hide a broken archive.
+
+Three classes of question, and all three are required:
+
+| class | what it proves |
+|---|---|
+| only the archive finds it | tool output is indexed and reachable |
+| only the conversation finds it | the conversation index is not just the archive |
+| nothing should be found | the search is not returning everything |
+
+The third is not a supplement. Recall alone rewards the degenerate strategy of returning
+every session, and the `expect: []` questions are the only thing that punishes it — which is
+why validation **refuses a suite that has none**.
+
+The scoring differs by class on purpose: a positive question asks "did the right session
+come back" (containment — the index is a ranking, and a query sharing a token with three
+other sessions legitimately returns four), while a negative one asks "did anything come
+back at all" (emptiness).
+
+The corpus is **written, not captured**: hand-written sessions in the shape real ones take.
+Real transcripts cannot go in a public repository, and a fixture anonymized until it says
+nothing measures nothing. What has to be real is the shape — a tool result whose words
+appear nowhere in the conversation is exactly what D4's two indexes exist to separate, and
+`the_archive_only_questions_are_really_archive_only` asserts that property rather than
+assuming it.
+
 ## Question set format
 
 The question set is a single JSON file (`suites/cormex-zh-en-v1.json`).

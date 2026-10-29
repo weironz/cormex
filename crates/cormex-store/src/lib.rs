@@ -73,7 +73,7 @@ pub use archive::{
     Generation, GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent,
     NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession,
     NewMaskProgress, NewProjection, NewTranscriptEvent, Projection, ProjectionStatus,
-    RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    RegisteredFile, TranscriptEvent, TranscriptEventKind, session_id_for,
 };
 pub use bootstrap::{TenantMigration, migrate_all, provision};
 pub use error::{Result, StoreError};

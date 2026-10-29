@@ -238,7 +238,14 @@ fn unique_schema_name() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("the system clock should not predate 1970")
         .as_millis();
-    format!("{SCHEMA_PREFIX}{millis}_{}", std::process::id())
+    // A counter as well as the clock: two evals in the same process can start
+    // in the same millisecond, and `CREATE SCHEMA` then collides on the name —
+    // which reads as "the schema already exists" and points nowhere near the
+    // cause. Hit for real once the session suite started running two evals in
+    // one test binary.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{SCHEMA_PREFIX}{millis}_{}_{seq}", std::process::id())
 }
 
 async fn sweep_stale_schemas(admin: &PgPool) {
