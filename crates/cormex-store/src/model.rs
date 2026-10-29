@@ -129,6 +129,7 @@ pub mod table {
         "distill_progress",
         "session_briefs",
         "promote_progress",
+        "transcript_embeddings",
     ];
 }
 

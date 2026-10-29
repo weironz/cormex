@@ -96,6 +96,12 @@ struct RunArgs {
     #[arg(long)]
     keep_schema: bool,
 
+    /// `--target sessions` only: also build conversation vectors and fuse the
+    /// vector leg with BM25 (P5-6). Off matches the production default; on is
+    /// the A/B that decides whether the leg is worth its cost.
+    #[arg(long)]
+    session_vectors: bool,
+
     /// Turn off domain weighting (do not pass the question's domain to the
     /// retriever). For A/B runs
     #[arg(long)]
@@ -407,7 +413,19 @@ async fn run_sessions(args: RunArgs) -> Result<ExitCode> {
     let schema = db.schema().to_owned();
     let outcome = async {
         seed_sessions(&db.store, &suite).await?;
-        run_questions(&db.store, &suite).await
+        if !args.session_vectors {
+            return run_questions(&db.store, &suite).await;
+        }
+        let embedder = cormex_evals::harness::default_embedder().await?;
+        let n = cormex_evals::sessions::seed_vectors(&db.store, &embedder).await?;
+        eprintln!("wrote {n} conversation vectors ({})", embedder.model_id());
+        cormex_evals::sessions::run_questions_with(
+            &db.store,
+            &suite,
+            cormex_evals::sessions::VectorLeg::On,
+            Some(&embedder),
+        )
+        .await
     }
     .await;
     let keep = args.keep_schema || outcome.is_err();

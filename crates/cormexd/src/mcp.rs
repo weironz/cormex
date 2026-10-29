@@ -293,13 +293,20 @@ impl MemoryMcp {
             }
         } else {
             for h in store
-                .search_conversation_at(
+                .search_conversation_fused(
                     &tsquery,
+                    self.state
+                        .conversation_embedding(&tsquery)
+                        .await
+                        .map_err(to_mcp_error)?
+                        .as_ref()
+                        .map(|(v, m)| (v, m.as_str())),
                     p.agent.as_deref(),
                     p.project.as_deref(),
                     since,
                     until,
                     as_of,
+                    cormex_store::archive::CONVERSATION_DISTANCE_FLOOR,
                     limit,
                 )
                 .await

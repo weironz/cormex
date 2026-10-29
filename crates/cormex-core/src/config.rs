@@ -53,6 +53,16 @@ pub struct DistillConfig {
     /// then be saturated for hours while ordinary conversation queue behind it.
     /// `CORMEX_PROMOTE_PER_ROUND`.
     pub promote_per_round: i64,
+    /// Whether conversation turns get vectors, and `search_conversation`
+    /// fuses BM25 with them (P5-6). `CORMEX_SESSION_EMBEDDINGS`, **default
+    /// off**.
+    ///
+    /// Off by default because the card's acceptance is "a comparable number on
+    /// the session eval suite proves it is worth turning on; otherwise leave it
+    /// off". A vector leg costs an embedding call per conversation turn and a
+    /// second index to keep in step — that has to be paid for with a measured
+    /// improvement, not assumed.
+    pub session_embeddings: bool,
 }
 
 /// The capture endpoints' settings.
@@ -175,6 +185,7 @@ impl Config {
                 daily_tokens: parse_distill_daily()?,
                 promote: parse_bool("CORMEX_PROMOTE_ENABLED", true),
                 promote_per_round: parse_promote_per_round()?,
+                session_embeddings: parse_bool("CORMEX_SESSION_EMBEDDINGS", false),
             },
         })
     }

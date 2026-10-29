@@ -416,6 +416,14 @@ pub struct ArchiveHit {
     pub score: f32,
 }
 
+/// One conversation turn's vector (P5-6).
+#[derive(Debug, Clone)]
+pub struct NewTranscriptEmbedding {
+    pub event_id: cormex_core::Id,
+    pub embedding: crate::Vector,
+    pub embedding_model: String,
+}
+
 /// One exclusion / inclusion of a project's archive index.
 #[derive(Debug, Clone)]
 pub struct NewArchiveIndexEvent {

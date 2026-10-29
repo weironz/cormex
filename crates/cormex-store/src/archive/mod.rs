@@ -54,9 +54,54 @@ pub use model::{
     CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing, Generation,
     GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent, NewCaptureChunk,
     NewCaptureFile, NewCaptureFileEvent, NewCaptureMask, NewCaptureSession, NewMaskProgress,
-    NewProjection, NewTranscriptEvent, Projection, ProjectionStatus, RegisteredFile,
-    TranscriptEvent, TranscriptEventKind,
+    NewProjection, NewTranscriptEmbedding, NewTranscriptEvent, Projection, ProjectionStatus,
+    RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
+
+/// How far a conversation neighbour may be before the vector leg drops it.
+///
+/// Cosine **distance**, so smaller is closer. 0.6 is generous on purpose: the
+/// leg exists to catch phrasings BM25 misses, and a tight floor would make it
+/// return nothing exactly when it is needed. The negative questions in the
+/// session eval are what say whether it is too generous.
+pub const CONVERSATION_DISTANCE_FLOOR: f64 = 0.6;
+
+/// Fuse two per-session ranked lists with RRF.
+///
+/// `cormex_memory::fusion` fuses over facts and lives in the memory engine;
+/// `cormex-store` cannot depend on it (the dependency runs the other way), and
+/// this is the same formula over a different key. The two must stay the same
+/// formula — if one moves, the other has to move with it, which is why the
+/// constant is re-exported rather than re-typed.
+#[must_use]
+pub fn fuse_session_ranks(bm25: &[String], vector: &[String]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    const K: f64 = 60.0;
+    let mut acc: HashMap<&str, (f64, usize)> = HashMap::new();
+    for (rank, id) in bm25.iter().enumerate() {
+        let e = acc.entry(id.as_str()).or_insert((0.0, 0));
+        e.0 += 1.0 / (K + rank as f64 + 1.0);
+        e.1 += 1;
+    }
+    for (rank, id) in vector.iter().enumerate() {
+        let e = acc.entry(id.as_str()).or_insert((0.0, 0));
+        e.0 += 1.0 / (K + rank as f64 + 1.0);
+        e.1 += 1;
+    }
+    let mut out: Vec<(&str, (f64, usize))> = acc.into_iter().collect();
+    // The same three-level sort as `cormex_memory::fusion::rrf`, including the
+    // **key tiebreak**: `HashMap` iteration order varies per process, and ties
+    // are the norm here, so without it the same corpus ranks differently on
+    // every run
+    out.sort_by(|(ka, a), (kb, b)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| ka.cmp(kb))
+    });
+    out.into_iter().map(|(k, _)| k.to_owned()).collect()
+}
 
 /// The advisory lock class for archive-generation appends.
 ///
@@ -560,6 +605,30 @@ impl ArchiveTxn {
         Ok(())
     }
 
+    /// Insert conversation-turn vectors.
+    ///
+    /// `ON CONFLICT DO NOTHING` on `(event_id, embedding_model)`: a re-run of
+    /// the indexer over the same events is a no-op rather than an error, which
+    /// is what makes "the process died after writing half the vectors" safe.
+    pub async fn insert_transcript_embeddings(
+        &mut self,
+        rows: &[crate::archive::model::NewTranscriptEmbedding],
+    ) -> Result<()> {
+        for r in rows {
+            sqlx::query(
+                "INSERT INTO transcript_embeddings (event_id, embedding, embedding_model)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (event_id, embedding_model) DO NOTHING",
+            )
+            .bind(r.event_id.to_string())
+            .bind(&r.embedding)
+            .bind(&r.embedding_model)
+            .execute(&mut *self.inner.tx)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Record an exclusion or an inclusion of a project's archive index.
     pub async fn insert_archive_index_event(&mut self, new: &NewArchiveIndexEvent) -> Result<()> {
         sqlx::query("INSERT INTO archive_index_events (id, project_key, op) VALUES ($1, $2, $3)")
@@ -734,3 +803,43 @@ pub fn session_id_for(agent: &str, native_session_id: &str) -> cormex_core::Id {
 /// saying "not really" — is what makes the disjointness something a test can
 /// assert.
 pub const ARCHIVE_TABLES: &[&str] = table::ARCHIVE;
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::fuse_session_ranks;
+
+    /// A session found by both legs outranks one found by either alone.
+    ///
+    /// That consensus is the whole reason for RRF: a session both a lexical
+    /// and a semantic match agree on is more likely to be the one somebody
+    /// meant.
+    #[test]
+    fn a_session_both_legs_found_wins() {
+        let bm25 = vec!["a".to_owned(), "b".to_owned()];
+        let vector = vec!["b".to_owned(), "c".to_owned()];
+        assert_eq!(fuse_session_ranks(&bm25, &vector)[0], "b");
+    }
+
+    /// The order is deterministic across runs.
+    ///
+    /// `HashMap` iteration order varies per process, and ties are the norm
+    /// here — without the key tiebreak the same corpus ranks differently on
+    /// every run, which makes any A/B meaningless.
+    #[test]
+    fn the_fused_order_is_stable() {
+        let bm25 = vec!["x".to_owned(), "y".to_owned()];
+        let vector = vec!["y".to_owned(), "x".to_owned()];
+        let first = fuse_session_ranks(&bm25, &vector);
+        for _ in 0..20 {
+            assert_eq!(fuse_session_ranks(&bm25, &vector), first);
+        }
+    }
+
+    /// One empty leg leaves the other's ranking alone.
+    #[test]
+    fn an_empty_leg_changes_nothing() {
+        let bm25 = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(fuse_session_ranks(&bm25, &[]), bm25);
+        assert_eq!(fuse_session_ranks(&[], &bm25), bm25);
+    }
+}

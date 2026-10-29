@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use cormex_core::Id;
+use cormex_memory::embed::{Embedder as _, SharedEmbedder};
 use cormex_memory::tokenize;
 use cormex_store::{
     ArchiveTxn, ChunkEncoding, FileRole, Framing, NewCaptureChunk, NewCaptureFile, NewProjection,
@@ -452,11 +453,68 @@ pub async fn seed_sessions(store: &Store, suite: &SessionSuite) -> Result<usize>
     Ok(written)
 }
 
-/// Run the questions against the seeded store.
+/// Whether the vector leg is on for this run.
+///
+/// `Off` is the production default (P5-6 is opt-in), so a plain run measures
+/// what a default deployment does. `On` is the A/B: the card's acceptance is a
+/// **comparable number** proving the leg is worth its cost, and this is the
+/// switch that produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorLeg {
+    Off,
+    On,
+}
+
+/// Write conversation-turn vectors for the corpus, so the A/B has something to
+/// search.
+///
+/// # Errors
+/// The embedding call or the write failed.
+pub async fn seed_vectors(store: &Store, embedder: &SharedEmbedder) -> Result<usize> {
+    let model = embedder.model_id().to_owned();
+    let events = store.events_needing_embedding(&model, 2000).await?;
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<String> = events
+        .iter()
+        .map(|e| e.text.clone().unwrap_or_default())
+        .collect();
+    let vectors = embedder.embed(&texts).await?;
+    let rows: Vec<cormex_store::NewTranscriptEmbedding> = events
+        .iter()
+        .zip(vectors)
+        .map(|(e, v)| cormex_store::NewTranscriptEmbedding {
+            event_id: e.id.parse().expect("a ULID from the database"),
+            embedding: cormex_store::Vector::from(v),
+            embedding_model: model.clone(),
+        })
+        .collect();
+    let n = rows.len();
+    store
+        .archive_txn(async |t| t.insert_transcript_embeddings(&rows).await)
+        .await?;
+    Ok(n)
+}
+
+/// Run the questions against the seeded store, BM25 only.
 ///
 /// # Errors
 /// A search failed.
 pub async fn run_questions(store: &Store, suite: &SessionSuite) -> Result<SessionReport> {
+    run_questions_with(store, suite, VectorLeg::Off, None).await
+}
+
+/// The same, with the vector leg switchable.
+///
+/// # Errors
+/// A search failed, or the query could not be embedded while the leg was on.
+pub async fn run_questions_with(
+    store: &Store,
+    suite: &SessionSuite,
+    vectors: VectorLeg,
+    embedder: Option<&SharedEmbedder>,
+) -> Result<SessionReport> {
     // The fixture's session id is the one a person would use; the database's is
     // derived. The map is what turns a hit back into the id the question names
     let mut by_native: HashMap<String, String> = HashMap::new();
@@ -471,6 +529,16 @@ pub async fn run_questions(store: &Store, suite: &SessionSuite) -> Result<Sessio
         // A **bounded** limit: the negative questions are the ones that punish
         // returning everything, and a limit of 1000 would make every one of
         // them fail for the wrong reason
+        // The query vector, when the leg is on. Computed once per question
+        // rather than per branch: both scopes would use the same one
+        let query_vector = match (vectors, embedder) {
+            (VectorLeg::On, Some(e)) => {
+                let v = e.embed_one(&q.query).await?;
+                Some((cormex_store::Vector::from(v), e.model_id().to_owned()))
+            }
+            _ => None,
+        };
+
         let got: Vec<String> = if q.scope == "archive" {
             store
                 .search_archive(&tsquery, None, None, None, None, 10)
@@ -480,7 +548,17 @@ pub async fn run_questions(store: &Store, suite: &SessionSuite) -> Result<Sessio
                 .collect()
         } else {
             store
-                .search_conversation(&tsquery, None, None, None, None, 10)
+                .search_conversation_fused(
+                    &tsquery,
+                    query_vector.as_ref().map(|(v, m)| (v, m.as_str())),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cormex_store::archive::CONVERSATION_DISTANCE_FLOOR,
+                    10,
+                )
                 .await?
                 .into_iter()
                 .filter_map(|h| by_native.get(&h.session_id).cloned())

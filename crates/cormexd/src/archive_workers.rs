@@ -198,6 +198,19 @@ pub fn spawn(st: AppState) {
                 // running it before the archive work would let a history
                 // import's promotion delay masking and projection, and those
                 // two are what make the archive readable at all
+                // Vectors last and optional: they are the only step here
+                // that is off by default, and running them before the archive
+                // work would make a deployment that turned them on pay for
+                // them before anything is readable
+                match embed_tick(&st, &tenant).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(vectors = n, schema = schema.as_str(), "embedded"),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        schema = schema.as_str(),
+                        "the vector round failed; the next one retries"
+                    ),
+                }
                 match promote_tick(&st, &tenant).await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(promoted = n, schema = schema.as_str(), "promoted"),
@@ -820,6 +833,59 @@ pub(crate) async fn promote_round(
         }
     }
     Ok(promoted)
+}
+
+/// One vector round (P5-6). Returns how many vectors were written.
+///
+/// **Off unless `CORMEX_SESSION_EMBEDDINGS` is set.** The card's acceptance is
+/// "a comparable number on the session eval suite proves it is worth turning
+/// on"; a vector leg costs an embedding call per conversation turn and a second
+/// index to keep in step, and that has to be paid for with a measured
+/// improvement rather than assumed.
+///
+/// # Errors
+/// The todo query failed, or the embedding call failed.
+pub(crate) async fn embed_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
+    if !st.distill_config().session_embeddings {
+        return Ok(0);
+    }
+    let Some(live) = st.live() else {
+        return Ok(0);
+    };
+    let store = tenant.store()?;
+    let model = live.embedder().model_id().to_owned();
+    let todo = store.events_needing_embedding(&model, BATCH * 20).await?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+
+    let texts: Vec<String> = todo
+        .iter()
+        .map(|e| e.text.clone().unwrap_or_default())
+        .collect();
+    let vectors = live.embedder().embed(&texts).await?;
+    if vectors.len() != todo.len() {
+        anyhow::bail!(
+            "the embedder returned {} vectors for {} texts",
+            vectors.len(),
+            todo.len()
+        );
+    }
+
+    let rows: Vec<cormex_store::NewTranscriptEmbedding> = todo
+        .iter()
+        .zip(vectors)
+        .map(|(e, v)| cormex_store::NewTranscriptEmbedding {
+            event_id: e.id.parse().unwrap_or_else(|_| Id::new()),
+            embedding: cormex_store::Vector::from(v),
+            embedding_model: model.clone(),
+        })
+        .collect();
+
+    store
+        .archive_txn(async |t| t.insert_transcript_embeddings(&rows).await)
+        .await?;
+    Ok(rows.len())
 }
 
 /// Split a long text into 2 KiB pieces, on a **character** boundary.
@@ -2011,6 +2077,88 @@ mod tests {
             .await
             .expect("both");
         assert_eq!(both.len(), 1, "session {session}");
+
+        db.drop().await;
+    }
+
+    // ── conversation vectors (P5-6) ────────────────────────
+
+    /// The vector round does nothing while the feature is off.
+    ///
+    /// It is off by default because the card's acceptance is a measured
+    /// improvement, and a feature that spends an embedding call per turn before
+    /// that number exists is a cost with no evidence behind it.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_vector_round_is_off_by_default() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let written = embed_tick(&st, &tenant).await.expect("embed tick");
+        assert_eq!(
+            written, 0,
+            "the vector round wrote vectors while the feature was off"
+        );
+
+        db.drop().await;
+    }
+
+    /// With the feature on, conversation turns get vectors and tool output does
+    /// not.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_vector_round_covers_conversation_turns_only() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+
+        // One user message and one tool result
+        let body = br#"{"type":"user","message":{"role":"user","content":"hello"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"build output"}]}}
+"#;
+        let (session, tenant) = seed_projected_session(&st, &store, body).await;
+
+        let on = st.with_session_embeddings(true);
+        let written = embed_tick(&on, &tenant).await.expect("embed tick");
+        assert_eq!(
+            written, 1,
+            "only the user message should have been embedded; a tool result has no semantic \
+             content worth a vector"
+        );
+
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        let kinds: Vec<(String,)> = sqlx::query_as(
+            "SELECT e.kind FROM transcript_embeddings v
+               JOIN transcript_events e ON e.id = v.event_id
+              WHERE e.session_id = $1",
+        )
+        .bind(&session)
+        .fetch_all(&pool)
+        .await
+        .expect("vectors");
+        pool.close().await;
+        assert_eq!(
+            kinds.into_iter().map(|(k,)| k).collect::<Vec<_>>(),
+            vec!["user_message".to_owned()]
+        );
+
+        // A second round has nothing to do
+        let again = embed_tick(&on, &tenant).await.expect("second round");
+        assert_eq!(
+            again, 0,
+            "the second round re-embedded what was already there"
+        );
 
         db.drop().await;
     }

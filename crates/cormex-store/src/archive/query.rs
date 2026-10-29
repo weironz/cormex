@@ -409,6 +409,215 @@ impl Store {
         Ok(rows)
     }
 
+    /// Conversation events that have no vector yet (P5-6).
+    ///
+    /// Only the kinds that carry meaning: `user_message` / `agent_message` /
+    /// `plan`. Tool output is deliberately excluded — a build log has no
+    /// semantic content worth a vector, and the archive index already covers
+    /// it with BM25.
+    pub async fn events_needing_embedding(
+        &self,
+        embedding_model: &str,
+        limit: i64,
+    ) -> Result<Vec<TranscriptEvent>> {
+        let rows = sqlx::query_as::<_, TranscriptEvent>(
+            "SELECT e.id, e.session_id, e.parser_version, e.seq, e.kind, e.occurred_at,
+                    e.content, e.text, e.tool_name, e.tool_call_id,
+                    e.src_generation_id, e.src_offset, e.src_length, e.created_at
+               FROM transcript_events e
+              WHERE e.kind IN ('user_message', 'agent_message', 'plan')
+                AND e.text IS NOT NULL AND e.text <> ''
+                AND NOT EXISTS (
+                        SELECT 1 FROM transcript_embeddings v
+                         WHERE v.event_id = e.id AND v.embedding_model = $1)
+              ORDER BY e.session_id, e.seq
+              LIMIT $2",
+        )
+        .bind(embedding_model)
+        .bind(limit.clamp(1, 2000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// The vector leg of the conversation search (P5-6).
+    ///
+    /// Returns `(session_id, event_id)` ordered by cosine distance, aggregated
+    /// per session exactly as the BM25 leg is: a search that returns twelve
+    /// hits from one long session buries the other sessions that matched.
+    ///
+    /// `distance_floor` drops far-away neighbours. Without it the vector leg
+    /// always returns `limit` rows — for a query the corpus has nothing to say
+    /// about, that is the leg manufacturing hits, and the negative questions in
+    /// the session eval are what catch it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_conversation_vector(
+        &self,
+        embedding: &crate::Vector,
+        embedding_model: &str,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        distance_floor: f64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "WITH scored AS (
+                 SELECT e.session_id, e.id AS event_id,
+                        v.embedding <=> $1 AS distance,
+                        row_number() OVER (
+                            PARTITION BY e.session_id
+                            ORDER BY v.embedding <=> $1 ASC, e.seq ASC
+                        ) AS rn
+                   FROM transcript_embeddings v
+                   JOIN transcript_events e ON e.id = v.event_id
+                   JOIN capture_sessions s ON s.id = e.session_id
+                  WHERE v.embedding_model = $2
+                    AND v.embedding <=> $1 <= $9
+                    AND ($3::text IS NULL OR s.agent = $3)
+                    AND ($4::text IS NULL OR EXISTS (
+                            SELECT 1 FROM capture_files f
+                             WHERE f.session_id = e.session_id AND f.project_key = $4))
+                    AND ($5::timestamptz IS NULL OR e.occurred_at >= $5)
+                    AND ($6::timestamptz IS NULL OR e.occurred_at <= $6)
+                    AND ($7::timestamptz IS NULL OR e.created_at <= $7)
+             )
+             SELECT session_id, event_id
+               FROM scored WHERE rn = 1
+              ORDER BY distance ASC
+              LIMIT $8",
+        )
+        .bind(embedding)
+        .bind(embedding_model)
+        .bind(agent)
+        .bind(project_key)
+        .bind(since)
+        .bind(until)
+        .bind(as_of)
+        .bind(limit.clamp(1, 200))
+        .bind(distance_floor)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// The conversation search with an **optional vector leg** (P5-6).
+    ///
+    /// # Why the fusion lives here rather than in the caller
+    ///
+    /// Both the REST endpoint and the MCP tool (and the eval) have to produce
+    /// the same ranking; a fusion implemented twice is a ranking that differs
+    /// between two callers, with no error to say so.
+    ///
+    /// # Why RRF and not a weighted sum
+    ///
+    /// BM25 is unbounded tf-idf and cosine distance is [0, 2]; there is no
+    /// weight that makes them commensurable. RRF uses only rank, which is
+    /// exactly what `cormex_memory::fusion` exists for and what the memory
+    /// side's four legs already use.
+    ///
+    /// # Why the vector leg can be absent
+    ///
+    /// `None` means "this deployment has no vectors" (the default). The result
+    /// is then the BM25 ranking, unchanged — not a degraded one, because the
+    /// BM25 leg is what `scope=conversation` was before this card.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_conversation_fused(
+        &self,
+        tsquery_input: &str,
+        embedding: Option<(&crate::Vector, &str)>,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        distance_floor: f64,
+        limit: i64,
+    ) -> Result<Vec<ConversationHit>> {
+        let bm25 = self
+            .search_conversation_at(
+                tsquery_input,
+                agent,
+                project_key,
+                since,
+                until,
+                as_of,
+                limit,
+            )
+            .await?;
+        let Some((vector, model)) = embedding else {
+            return Ok(bm25);
+        };
+
+        let vec_hits = self
+            .search_conversation_vector(
+                vector,
+                model,
+                agent,
+                project_key,
+                since,
+                until,
+                as_of,
+                distance_floor,
+                limit,
+            )
+            .await?;
+        if vec_hits.is_empty() {
+            return Ok(bm25);
+        }
+
+        // Keyed on the **session**: the conversation search aggregates per
+        // session, and fusing on event ids would let one long session's twelve
+        // hits outvote the other sessions that matched
+        let fused = crate::archive::fuse_session_ranks(
+            &bm25
+                .iter()
+                .map(|h| h.session_id.clone())
+                .collect::<Vec<_>>(),
+            &vec_hits.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
+        );
+
+        // Rebuild the hits in fused order. The BM25 hit carries the text and
+        // the score the caller displays; a session the vector leg found but
+        // BM25 did not has no text to show, so its own vector hit supplies one
+        let mut out = Vec::with_capacity(fused.len());
+        for session_id in fused {
+            if let Some(hit) = bm25.iter().find(|h| h.session_id == session_id) {
+                out.push(hit.clone());
+            } else if let Some((_, event_id)) = vec_hits.iter().find(|(s, _)| *s == session_id) {
+                // **Fetched, not invented.** A vector-only hit still has to
+                // show the sentence that matched, and that sentence is in the
+                // database
+                if let Some(event) = self.event(event_id).await? {
+                    out.push(ConversationHit {
+                        session_id,
+                        event_id: event_id.clone(),
+                        occurred_at: event.occurred_at,
+                        text: event.text,
+                        score: 0.0,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One event by id.
+    pub async fn event(&self, event_id: &str) -> Result<Option<TranscriptEvent>> {
+        let row = sqlx::query_as::<_, TranscriptEvent>(
+            "SELECT id, session_id, parser_version, seq, kind, occurred_at, content,
+                    text, tool_name, tool_call_id,
+                    src_generation_id, src_offset, src_length, created_at
+               FROM transcript_events WHERE id = $1",
+        )
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// Search the **archive** layer: everything, tool output included.
     ///
     /// This is the `scope=archive` path, and it requires `raw:read` — a tool's

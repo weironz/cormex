@@ -454,6 +454,22 @@ impl AppState {
     pub fn with_promotion(&self, on: bool) -> Self {
         let mut config = self.inner.config.clone();
         config.distill.promote = on;
+        self.with_config(config)
+    }
+
+    /// The same state with conversation vectors turned on or off (P5-6).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_session_embeddings(&self, on: bool) -> Self {
+        let mut config = self.inner.config.clone();
+        config.distill.session_embeddings = on;
+        self.with_config(config)
+    }
+
+    /// The same state with a different config.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    fn with_config(&self, config: Config) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -507,6 +523,7 @@ impl AppState {
                 daily_tokens: cormex_core::config::DEFAULT_DISTILL_DAILY_TOKENS,
                 promote: true,
                 promote_per_round: cormex_core::config::DEFAULT_PROMOTE_PER_ROUND,
+                session_embeddings: false,
             },
         }
     }
@@ -693,6 +710,40 @@ impl AppState {
     #[must_use]
     pub fn distill_config(&self) -> &cormex_core::config::DistillConfig {
         &self.inner.config.distill
+    }
+
+    /// The query's vector, when this deployment has conversation vectors on
+    /// (P5-6).
+    ///
+    /// `None` when the feature is off **or** the embedding failed. Both mean
+    /// the same thing to the caller: run the BM25 ranking, which is what
+    /// `scope=conversation` was before this card. Failing the whole search
+    /// because an optional leg is unavailable would turn "semantic search is
+    /// off" into "search is broken".
+    ///
+    /// # Errors
+    /// Never — the signature is `Result` only so the caller can `?` it beside
+    /// the other lookups.
+    pub async fn conversation_embedding(
+        &self,
+        query: &str,
+    ) -> Result<Option<(cormex_store::Vector, String)>> {
+        if !self.inner.config.distill.session_embeddings {
+            return Ok(None);
+        }
+        let Some(live) = self.live() else {
+            return Ok(None);
+        };
+        match live.embedder().embed_one(query).await {
+            Ok(v) => Ok(Some((
+                cormex_store::Vector::from(v),
+                live.embedder().model_id().to_owned(),
+            ))),
+            Err(e) => {
+                tracing::warn!(error = %e, "the query could not be embedded; falling back to BM25");
+                Ok(None)
+            }
+        }
     }
 
     /// Which account owns a schema, for per-tenant accounting.

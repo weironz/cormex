@@ -318,13 +318,18 @@ pub async fn search(
             .collect()
     } else {
         store
-            .search_conversation_at(
+            .search_conversation_fused(
                 &tsquery,
+                st.conversation_embedding(&tsquery)
+                    .await?
+                    .as_ref()
+                    .map(|(v, m)| (v, m.as_str())),
                 q.agent.as_deref(),
                 q.project.as_deref(),
                 since,
                 until,
                 as_of,
+                cormex_store::archive::CONVERSATION_DISTANCE_FLOOR,
                 limit,
             )
             .await
