@@ -143,6 +143,11 @@ protected_routes! {
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),
     "/archive/sessions/{id}/export" [GET] => get(crate::archive_api::export),
+    // **The one destructive archive operation.** `DELETE` rather than `POST`:
+    // the verb has to match what happens, and a POST that erases a conversation
+    // is the kind of thing that gets called by accident from a retry
+    "/archive/sessions/{id}" [DELETE] => axum::routing::delete(crate::archive_api::purge_session),
+    "/archive/files/{id}" [DELETE] => axum::routing::delete(crate::archive_api::purge_file),
     "/archive/raw/{generation_id}" [GET] => get(crate::archive_api::get_raw),
     // Full-text search. `scope=archive` needs `raw:read` -- the check is in the
     // handler, because it depends on the query string rather than the path
@@ -1325,12 +1330,22 @@ mod tests {
             // there used to be only two candidates, and adding that route made
             // this panic outright. That is not a bad thing: it forces somebody
             // to come and check that the probe still holds
+            // **A method no route on this path declares**, not just one this
+            // entry does not. `/archive/sessions/{id}` is registered twice (GET
+            // and DELETE), so "not in this entry's methods" can still be a
+            // declared method on the same path — and then the probe reaches the
+            // handler and returns its business status instead of 405
             let unsupported = [Method::DELETE, Method::PUT, Method::PATCH]
                 .into_iter()
-                .find(|m| !methods.contains(m))
+                .find(|m| {
+                    !PROTECTED_ROUTES
+                        .iter()
+                        .filter(|(p, _)| p == pattern)
+                        .any(|(_, ms)| ms.contains(m))
+                })
                 .expect(
-                    "DELETE / PUT / PATCH are all taken by some route — pick another method \
-                     this route does not declare as the probe, or give it a test of its own",
+                    "DELETE / PUT / PATCH are all taken by some route on this path — pick \
+                     another method as the probe, or give it a test of its own",
                 );
             let routed = status_of(&app, &unsupported, &path, Some(&token)).await;
             assert_eq!(

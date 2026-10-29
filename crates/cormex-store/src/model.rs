@@ -547,6 +547,16 @@ text_enum! {
     pub enum RedactionTarget {
         Episode => "episode",
         Blob => "blob",
+        /// A whole captured session: its files, chunks, objects, projections,
+        /// index chunks, and the episodes promoted from its events (P6-2).
+        ///
+        /// **The Rust variant has to be deployed before the migration that
+        /// lets the database store it.** `query_as` stops at the first value
+        /// its `FromStr` does not know, so one row written by a newer schema
+        /// makes every read of `redactions` fail — not just that row.
+        CaptureSession => "capture_session",
+        /// One captured file: the same, scoped to a single transcript.
+        CaptureFile => "capture_file",
     }
 }
 

@@ -1003,6 +1003,18 @@ impl AppState {
         self.inner.blobs.get_keyed(key).await
     }
 
+    /// Delete one captured object. **Purge only** (P6-2).
+    ///
+    /// Its own method rather than exposing `MediaStore`'s delete: the only
+    /// caller is the purge executor, and a general-purpose delete on `AppState`
+    /// is an invitation to use it somewhere else.
+    ///
+    /// # Errors
+    /// The storage backend refused.
+    pub async fn delete_capture_object(&self, key: &str) -> Result<()> {
+        self.inner.blobs.delete_keyed(key).await
+    }
+
     /// Read a captured chunk, decrypting it when it was written with a data
     /// key (P6-1).
     ///

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::archive::model::{
     ArchiveHit, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask, ConversationHit,
-    Generation, Projection, TranscriptEvent,
+    Generation, Projection, PurgeCounts, TranscriptEvent,
 };
 use crate::error::Result;
 use crate::store::Store;
@@ -1024,6 +1024,165 @@ impl Store {
                 .fetch_one(self.pool())
                 .await?;
         Ok(max.unwrap_or(-1))
+    }
+
+    // ── purge (P6-2) ───────────────────────────────────────
+
+    /// Delete a file's data keys. Returns how many rows went.
+    ///
+    /// **The only DELETE in the archive layer**, and it exists because
+    /// crypto-shredding is what makes an append-only object store able to
+    /// forget: with the key gone, the ciphertext is random bytes.
+    ///
+    /// # Errors
+    /// The statement failed.
+    pub async fn delete_capture_keys(&self, file_id: &str) -> Result<usize> {
+        let done = sqlx::query("DELETE FROM capture_keys WHERE file_id = $1")
+            .bind(file_id)
+            .execute(self.pool())
+            .await?;
+        Ok(usize::try_from(done.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    /// Delete the rows a purge covers, in one transaction.
+    ///
+    /// # Order inside the transaction
+    ///
+    /// Children before parents: `archive_chunks` → `transcript_events` →
+    /// `transcript_projections` → `capture_chunks` → `capture_generations` →
+    /// `capture_files`. The foreign keys would enforce it anyway; doing it
+    /// explicitly means the error, if there is one, names the right table
+    /// rather than "a foreign key violation somewhere".
+    ///
+    /// # What is deliberately not here
+    ///
+    /// `capture_sessions` itself. A session row is the identity a tombstone
+    /// points at, and deleting it would make "this was purged" unfollowable.
+    ///
+    /// # Errors
+    /// The transaction failed. Nothing is deleted in that case.
+    pub async fn purge_capture_rows(
+        &self,
+        file_ids: &[String],
+        generation_ids: &[String],
+    ) -> Result<PurgeCounts> {
+        if file_ids.is_empty() {
+            return Ok(PurgeCounts::default());
+        }
+        let mut txn = self.pool().begin().await?;
+
+        // The sessions these files belong to, so the P layer can be scoped
+        let session_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT session_id::text FROM capture_files WHERE id::text = ANY($1)",
+        )
+        .bind(file_ids)
+        .fetch_all(&mut *txn)
+        .await?;
+
+        // The archive index first: it has a foreign key to `transcript_events`
+        sqlx::query("DELETE FROM archive_chunks WHERE session_id::text = ANY($1)")
+            .bind(&session_ids)
+            .execute(&mut *txn)
+            .await?;
+
+        // **The promoted episodes go with the events.** They carry the
+        // transcript text in `content`, so leaving them would leave the
+        // conversation in the memory layer after the archive was purged
+        let episodes: u64 = sqlx::query(
+            "DELETE FROM episodes
+              WHERE content ? 'transcript_event_id'
+                AND session_id = ANY($1)",
+        )
+        .bind(&session_ids)
+        .execute(&mut *txn)
+        .await?
+        .rows_affected();
+
+        let events: u64 =
+            sqlx::query("DELETE FROM transcript_events WHERE session_id::text = ANY($1)")
+                .bind(&session_ids)
+                .execute(&mut *txn)
+                .await?
+                .rows_affected();
+
+        sqlx::query("DELETE FROM transcript_projections WHERE session_id::text = ANY($1)")
+            .bind(&session_ids)
+            .execute(&mut *txn)
+            .await?;
+
+        // Summaries and their provenance edges. A summary derived from a
+        // purged event has to go: it is a paraphrase of the thing being erased
+        let summaries: u64 = sqlx::query(
+            "DELETE FROM summaries
+              WHERE scope = 'session' AND scope_key = ANY($1)",
+        )
+        .bind(&session_ids)
+        .execute(&mut *txn)
+        .await?
+        .rows_affected();
+
+        sqlx::query(
+            "DELETE FROM derivations
+              WHERE derived_kind = 'summary'
+                AND derived_id::text IN (
+                    SELECT id::text FROM summaries WHERE scope = 'session' AND scope_key = ANY($1))
+                OR (source_kind = 'transcript_event' AND source_id::text IN (
+                    SELECT id::text FROM transcript_events WHERE session_id::text = ANY($1)))",
+        )
+        .bind(&session_ids)
+        .execute(&mut *txn)
+        .await?;
+
+        sqlx::query("DELETE FROM session_briefs WHERE session_id::text = ANY($1)")
+            .bind(&session_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM distill_progress WHERE session_id::text = ANY($1)")
+            .bind(&session_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM promote_progress WHERE session_id::text = ANY($1)")
+            .bind(&session_ids)
+            .execute(&mut *txn)
+            .await?;
+
+        // **The count the caller reports is the chunk rows**, not the index
+        // rows: "how many chunks did the purge delete" is a question about the
+        // R layer, and the archive index is derived from it
+        let chunks: u64 =
+            sqlx::query("DELETE FROM capture_chunks WHERE generation_id::text = ANY($1)")
+                .bind(generation_ids)
+                .execute(&mut *txn)
+                .await?
+                .rows_affected();
+        sqlx::query("DELETE FROM capture_masks WHERE generation_id::text = ANY($1)")
+            .bind(generation_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM capture_mask_progress WHERE generation_id::text = ANY($1)")
+            .bind(generation_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM capture_generations WHERE id::text = ANY($1)")
+            .bind(generation_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM capture_file_events WHERE file_id::text = ANY($1)")
+            .bind(file_ids)
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query("DELETE FROM capture_files WHERE id::text = ANY($1)")
+            .bind(file_ids)
+            .execute(&mut *txn)
+            .await?;
+
+        txn.commit().await?;
+        Ok(PurgeCounts {
+            events: usize::try_from(events).unwrap_or(usize::MAX),
+            chunks: usize::try_from(chunks).unwrap_or(usize::MAX),
+            episodes: usize::try_from(episodes).unwrap_or(usize::MAX),
+            summaries: usize::try_from(summaries).unwrap_or(usize::MAX),
+        })
     }
 
     // ── data keys (P6-1) ───────────────────────────────────

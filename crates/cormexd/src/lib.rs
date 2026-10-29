@@ -36,6 +36,7 @@ pub mod live;
 /// Memory's outward-facing MCP frontage. See that module's header comment.
 pub mod mcp;
 pub mod principal;
+pub mod purge;
 pub mod quota;
 pub mod reembed;
 pub mod request_tenant;

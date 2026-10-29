@@ -238,6 +238,132 @@ pub async fn export(
         .into_response())
 }
 
+/// `DELETE /archive/sessions/{id}` — purge a captured session.
+///
+/// # Why this needs more than a DELETE
+///
+/// It destroys the original bytes, the projection, the index, the promoted
+/// episodes and the summaries derived from them. There is no undo, and the
+/// tombstone it leaves is permanent. So it requires:
+///
+/// - `raw:read` — the same scope that can read the original bytes. A credential
+///   that cannot read the conversation must not be able to destroy it
+/// - `?confirm=<session id>` — a **second, explicit** confirmation carrying the
+///   id itself. A bare `DELETE` is one mis-wired client away from erasing
+///   somebody's archive, and requiring the id to be typed means the caller had
+///   to know which one
+///
+/// The Web UI and the CLI both ask before calling this; the parameter is what
+/// makes "asked" enforceable rather than a convention.
+///
+/// # Errors
+/// Missing `raw:read` (403), a missing or wrong `confirm` (400), no such session
+/// (404), or the purge failed.
+pub async fn purge_session(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    purge_common(&st, &principal, &id, &id, q.confirm.as_deref(), None).await
+}
+
+/// `DELETE /archive/files/{id}` — purge one captured file.
+///
+/// The same two gates as the session purge; see [`purge_session`].
+///
+/// # Errors
+/// Missing `raw:read` (403), a missing or wrong `confirm` (400), no such file
+/// (404), or the purge failed.
+pub async fn purge_file(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    purge_common(&st, &principal, &id, &id, q.confirm.as_deref(), Some(&id)).await
+}
+
+/// The confirmation gate, exposed for the purge tests.
+///
+/// The gate is the part of this endpoint that must never be bypassed, and
+/// testing it through the router would mean minting a device key with
+/// `raw:read` — a second thing that could be wrong. This calls the same
+/// function the handler calls.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn purge_common_for_test(
+    st: &AppState,
+    principal: &Principal,
+    target_id: &str,
+    confirm: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    purge_common(st, principal, target_id, target_id, confirm, file_id).await
+}
+
+/// The confirmation parameter.
+#[derive(Debug, Deserialize)]
+pub struct ConfirmQuery {
+    /// Must repeat the target id. See [`purge_session`].
+    pub confirm: Option<String>,
+}
+
+async fn purge_common(
+    st: &AppState,
+    principal: &Principal,
+    target_id: &str,
+    expected_confirm: &str,
+    confirm: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !principal.has_scope(crate::device_keys::Scope::RawRead) {
+        return Err(ApiError::forbidden(
+            "purging requires raw:read: a credential that cannot read the original bytes must              not be able to destroy them",
+        ));
+    }
+    match confirm {
+        Some(c) if c == expected_confirm => {}
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "the confirmation does not match the id being purged",
+            ));
+        }
+        None => {
+            return Err(ApiError::bad_request(format!(
+                "purging destroys the original bytes and cannot be undone. Repeat the id as                  ?confirm={expected_confirm} to proceed"
+            )));
+        }
+    }
+
+    let tenant = principal.tenant(st).await?;
+    let report = match file_id {
+        Some(id) => crate::purge::purge_file(st, &tenant, id).await,
+        None => crate::purge::purge_session(st, &tenant, target_id).await,
+    }
+    .map_err(|e| {
+        let text = e.to_string();
+        if text.contains("no captured file or session") {
+            ApiError::not_found("no such session or file")
+        } else {
+            ApiError::internal(format!("the purge failed: {text}"))
+        }
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "purged": true,
+        "keys_destroyed": report.keys_destroyed,
+        "objects_deleted": report.objects_deleted,
+        // **Reported, not hidden.** An object that survived a purge is the one
+        // thing this operation exists to prevent, and a caller that is told
+        // "purged" while an object remains has been lied to
+        "objects_failed": report.objects_failed,
+        "events_deleted": report.events_deleted,
+        "chunks_deleted": report.chunks_deleted,
+        "promoted_episodes_deleted": report.promoted_episodes_deleted,
+        "summaries_deleted": report.summaries_deleted,
+    })))
+}
+
 /// `GET /archive/raw/{generation_id}`.
 #[derive(Debug, Deserialize)]
 pub struct RawQuery {

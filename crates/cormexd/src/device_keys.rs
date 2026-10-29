@@ -194,7 +194,14 @@ impl DeviceScope {
             let raw = (is(Method::GET) && path == "/archive/search")
                 || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "raw", _]))
                 || (is(Method::GET)
-                    && matches!(segs.as_slice(), ["archive", "sessions", _, "export"]));
+                    && matches!(segs.as_slice(), ["archive", "sessions", _, "export"]))
+                // Purging (P6-2). It sits with `raw:read` rather than with
+                // `session:read` for the same reason the export does: a
+                // credential that cannot read the original bytes must not be
+                // able to destroy them. The handler additionally requires
+                // `?confirm=<id>`
+                || (is(Method::DELETE) && matches!(segs.as_slice(), ["archive", "sessions", _]))
+                || (is(Method::DELETE) && matches!(segs.as_slice(), ["archive", "files", _]));
             if raw {
                 return true;
             }

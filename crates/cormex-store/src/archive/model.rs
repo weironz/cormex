@@ -424,6 +424,15 @@ pub struct NewCaptureKey {
     pub wrapped_key: Vec<u8>,
 }
 
+/// What a purge deleted, per table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeCounts {
+    pub events: usize,
+    pub chunks: usize,
+    pub episodes: usize,
+    pub summaries: usize,
+}
+
 /// One conversation turn's vector (P5-6).
 #[derive(Debug, Clone)]
 pub struct NewTranscriptEmbedding {
