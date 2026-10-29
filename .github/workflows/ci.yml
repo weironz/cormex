@@ -65,6 +65,59 @@ jobs:
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
 
+  # ── Tests that need no database ────────────────────────
+  #
+  # Its own job, and it runs **before** the database one, for two reasons:
+  #
+  # - It is the half that can be trusted to be complete. `test` runs with
+  #   `--include-ignored`, but a test that *should* have been written without a
+  #   database and was not is invisible there: it passes, slowly, and only
+  #   because a database happened to be available.
+  # - It fails in seconds. A parser bug or a broken installer should not wait
+  #   behind a Postgres service container.
+  #
+  # The capture side is what this covers: the transcript parsers and their
+  # fixtures, the CLI's sync decision function, the installers, and the eval
+  # suite's static validation.
+  capture:
+    name: Capture (no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # **`DATABASE_URL` is deliberately unset.** Every test that needs one
+      # skips itself when it is missing, so this job is the check that the
+      # capture half genuinely does not need a database -- if one of them
+      # starts requiring it, it disappears from here rather than failing, which
+      # is why the counts below are asserted.
+      - name: transcript parsers and fixtures
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p cormex-transcript --locked 2>&1)
+          echo "$out"
+          # A test that silently skips looks exactly like one that passed
+          echo "$out" | grep -q "0 failed" || { echo "::error::tests failed"; exit 1; }
+          echo "$out" | grep -qE "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::no tests ran -- did they all start skipping?"; exit 1; }
+
+      - name: the sync decision function and the installers
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p cormex --lib --locked 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "0 failed" || { echo "::error::tests failed"; exit 1; }
+          echo "$out" | grep -qE "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::no tests ran"; exit 1; }
+
+      # The eval suite's static validation: a few seconds, and it is the only
+      # thing that catches a question whose gold answer is not in the corpus or
+      # whose ids do not line up. Its value is precisely "a number to compare
+      # every optimisation against", and not running it means there is none.
+      - name: eval suite validates
+        run: cargo run -p cormex-evals --locked -- validate
+
   # ── Tests ──────────────────────────────────────────────
   test:
     name: Tests
