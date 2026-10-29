@@ -71,7 +71,19 @@ API（部署事实不该编进镜像），生产上那一刀是 traefik 切的�
 `.env.example`，于是新加的 `.env.prod.example` **会被静默忽略** ——
 本机好好的、`git status` 干净、提交也成功，而 clone 的人没有那个文件。
 
-### ❌ 撞出来的：**全新数据库上根本起不来**
+### ✅ 撞出来的：**全新数据库上根本起不来**（2026-10-29 修）
+
+修法取的是上面列的第 1 种：`Store::migrate_global` 在跑全局那套之前，**先用
+同一个 `boot` 连接对 `public` 跑一次租户那套**（`boot` 显式设
+`search_path=public`，否则登录用户同名的 schema 会截胡）。一处覆盖三个调用点，
+不存在「漏一处」；DOMAIN 仍然只有一份定义，没有抄第二遍。重复执行是幂等的
+—— sqlx 在 `public._sqlx_migrations` 里记着已应用的版本。
+
+`crates/cortex-store/tests/fresh_database.rs` 建一个真正空的库来钉这件事
+（`#[ignore]`，`just test-db` 会跑到）。改之前它报
+`type "ulid" does not exist`，改之后通过。
+
+### 原来的记录：**全新数据库上根本起不来**
 
 照着新 README 从零跑一遍（这是这一条一直缺的那次验证），服务端进了重启循环：
 
@@ -108,9 +120,10 @@ type "ulid" does not exist
 ### 还欠的
 
 - **在一台干净机器上完整走一遍**：能起、能开第一个账号、能搜到东西。
-  上面第 ❌ 条挡着，修完再验
-- README 的 quickstart 现在如实挂着那个「Known gap」。**修好之前不要摘掉它**
-  —— 一份声称能跑而跑不起来的 quickstart，比一份诚实说明卡在哪的更糟
+  空库那一条已经修了（见上），这一条现在只剩「真的走一遍」本身
+- README 的「Known gap」已经摘掉 —— 它挡着的那条修好了。摘掉是**跟着修复走
+  的**，不是单独的动作：一份声称能跑而跑不起来的 quickstart，比一份诚实说明
+  卡在哪的更糟，反过来也一样
 
 ## B. 第一次用的人卡在哪
 

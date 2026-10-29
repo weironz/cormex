@@ -105,13 +105,6 @@ a real one takes: an edge proxy splitting `/api` from the browser, WAL
 archiving to a separate disk, volumes that already exist under names nobody can
 change. Read it; do not run it.
 
-> ⚠️ **Known gap: this does not yet come up against an empty database.**
-> The two migration sets have an ordering bug — the global set (accounts) runs
-> first, but uses the `ulid` domain that the per-tenant set creates, so a fresh
-> database stops at `type "ulid" does not exist` and the server restart-loops.
-> Our own deployment never hit it: its `public` schema predates the accounts
-> tables by three days. It is the top item on the [roadmap](docs/roadmap.md).
-
 **The web image carries no domain name.** The API address compiled into it is
 the relative prefix `/api`, which the browser resolves against whatever origin
 served the page. So one published image works for every deployment; you route
