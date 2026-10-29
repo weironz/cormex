@@ -115,6 +115,94 @@ pub async fn get_brief(
     })))
 }
 
+/// `GET /archive/sessions/{id}/export` — every file, as a zstd-compressed tar.
+///
+/// Each file's **newest generation** is reassembled from its chunks and stored
+/// under its `logical_path`, so unpacking the tar reproduces the host's own
+/// directory layout. That is what makes `cormex restore` on another machine a
+/// copy rather than a reconstruction.
+///
+/// Requires `raw:read` and writes an access log row per file: this hands out
+/// every original byte of a session at once.
+///
+/// # Errors
+/// The caller lacks `raw:read` (403), the session does not exist (404), or the
+/// bytes cannot be read.
+pub async fn export(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    if !principal.has_scope(crate::device_keys::Scope::RawRead) {
+        return Err(ApiError::forbidden(
+            "exporting a session returns every original byte of it, and requires raw:read",
+        ));
+    }
+    let store = archive_store(&st, &principal).await?;
+    let files = store.archive_files(&id).await.map_err(store_err)?;
+    if files.is_empty() {
+        return Err(ApiError::not_found("no such session, or it has no files"));
+    }
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let who = principal_name(&principal);
+
+    for (file, generations) in &files {
+        let Some(newest) = generations.last() else {
+            continue;
+        };
+        let end = store.generation_end(&newest.id).await.map_err(store_err)?;
+        let bytes = read_range(&st, &store, &newest.id, 0, end).await?;
+
+        // The tar entry's path is the **logical** one: relative to the agent's
+        // home, forward slashes. Unpacking it into that home reproduces the
+        // layout the host itself uses
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(bytes.len()).unwrap_or(0));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &file.logical_path, bytes.as_slice())
+            .map_err(|e| ApiError::internal(format!("could not build the tar: {e}")))?;
+
+        store
+            .archive_txn(async |t| {
+                t.insert_access_log(&NewAccessLog {
+                    id: Id::new(),
+                    principal: who.clone(),
+                    generation_id: newest.id.parse().map_err(|_| {
+                        cormex_store::StoreError::Invalid("bad generation id".into())
+                    })?,
+                    byte_offset: 0,
+                    byte_length: end,
+                    unmasked: true,
+                })
+                .await
+            })
+            .await
+            .map_err(store_err)?;
+    }
+
+    let tar = builder
+        .into_inner()
+        .map_err(|e| ApiError::internal(format!("could not finish the tar: {e}")))?;
+    let compressed = zstd::encode_all(tar.as_slice(), 3)
+        .map_err(|e| ApiError::internal(format!("could not compress the export: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zstd".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"cormex-session-{id}.tar.zst\""),
+            ),
+        ],
+        compressed,
+    )
+        .into_response())
+}
+
 /// `GET /archive/raw/{generation_id}`.
 #[derive(Debug, Deserialize)]
 pub struct RawQuery {

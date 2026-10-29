@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{detect, doctor, init, login, logout, sessions, status, uninstall};
+use cormex::cmd::{detect, doctor, init, login, logout, restore, sessions, status, uninstall};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -135,6 +135,20 @@ enum SessionsCommand {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+    /// Put a captured session back on disk.
+    Restore {
+        /// The session id, from `sessions ls`.
+        id: String,
+        /// The agent home to restore into. Default: the one the catalog finds.
+        #[arg(long)]
+        to: Option<String>,
+        /// Restore under this project directory instead of the original one.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Overwrite files that already exist.
+        #[arg(long)]
+        force: bool,
     },
     /// Show one session's events.
     Show {
@@ -350,6 +364,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     json,
                 } => {
                     sessions::ls(&client, agent.as_deref(), project.as_deref(), limit, json).await?
+                }
+                SessionsCommand::Restore { id, to, cwd, force } => {
+                    let home = match to {
+                        Some(h) => std::path::PathBuf::from(h),
+                        None => cormex::install::home()?,
+                    };
+                    let report = restore::run(&client, &id, &home, cwd.as_deref(), force).await?;
+                    let mut out = String::new();
+                    for f in &report.files {
+                        out.push_str(&format!("restored {}\n", f.display()));
+                    }
+                    for f in &report.skipped {
+                        out.push_str(&format!(
+                            "skipped {} (it exists; pass --force to overwrite)\n",
+                            f.display()
+                        ));
+                    }
+                    if report.files.is_empty() && report.skipped.is_empty() {
+                        out.push_str("this session has no files to restore\n");
+                    }
+                    out
                 }
                 SessionsCommand::Show {
                     id,

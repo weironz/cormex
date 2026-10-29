@@ -40,6 +40,10 @@ bytes = "1"
 # written once and read many times). Already in the dependency tree through cortex-blob's S3
 # transport? No -- declared explicitly here, and the version matches the CLI's.
 zstd = "0.14"
+# Session export: a tar of the session's files, zstd-compressed. `tar` was
+# removed with the container orchestration (it unpacked workspace tars); this is
+# a different use -- building an archive, not unpacking one.
+tar = "0.4"
 cormex-llm.workspace = true
 cormex-store.workspace = true
 # **There is no `cormex-agent` here, and it must not be added back.**
