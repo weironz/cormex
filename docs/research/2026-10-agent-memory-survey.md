@@ -1,6 +1,8 @@
 # AI agent 记忆系统调研 + 「多 agent 会话中央采集」需求评审
 
-> 日期：2026-10-29 · 状态：**待评审**（评审通过后再出架构设计与代码级开发计划）
+> 日期：2026-10-29 · 状态：**已评审**（所有者的决定见 §9；2026-10-29 网络放开后，关键事实已对照一手来源复核，见 §1）
+>
+> **后续文档**：最终技术选型与架构设计见 [design/session-archive-architecture.md](../design/session-archive-architecture.md)，代码级阶段开发计划见 [plan/session-archive-plan.md](../plan/session-archive-plan.md)。本文 §8.4–§8.7 是评审阶段的方案草图，**与架构文档不一致时以架构文档为准**。
 >
 > 这份文档回答三件事：
 > 1. 主流 agent 记忆系统 / 记忆插件现在长什么样，哪些值得 Cormex 吸收（§1–§5）
@@ -45,8 +47,9 @@
 
 **信息来自哪**：
 
-- 第一手：各项目发在 **PyPI / npm / crates.io 上的 README、包元数据和源码**（这个会话的网络策略拦掉了大部分网站，包仓库能访问）
-- 第二手：网页搜索得到的官方文档摘要和第三方评测。**凡是只来自第二手的说法，文中都标了「据报道」或「未核实」**
+- 第一手：各项目发在 **PyPI / npm / crates.io 上的 README、包元数据和源码**
+- 第一手（2026-10-29 复核）：网络放开后，逐条对照了**官方文档和上游源码**：Claude Code 的 hooks 与 `~/.claude` 目录文档、Codex hooks 文档与 `openai/codex` 的 rollout / memories 源码、Cursor 与 Gemini CLI 的 hooks 文档、`google-gemini/gemini-cli` 的会话记录源码、Graphiti 的 `edge_operations.py`、MCP 2026-07-28 changelog、rmcp 的 CHANGELOG、相关 arXiv 摘要。复核推翻或修正了几条初稿说法，原处已改，并标注「复核」
+- 第二手：网页搜索得到的第三方评测。**仍然只来自第二手的说法，文中标了「据报道」**
 - 上一轮：2026-08 的 [memory-content.md](../memory-content.md)（58 个系统，四轮一手来源核证）。本文是它之后的**增量**，重点在它没覆盖的采集与取回，不重复它已经核证过的内容
 
 **读数字之前要知道**：
@@ -72,12 +75,12 @@
 
 - **时间上下文图谱**：实体（节点）、事实（带有效期窗口的边）、episodes（原始数据，所有派生物都追溯到它）
 - **显式双时间轴**：边上有 `valid_at` / `invalid_at`（现实中何时为真）和 `created_at` / `expired_at`（系统何时记下、何时作废）。文档原话：*"What did the system know about X on date Y?" versus "What was actually true about X on date Y?"*
-- 失效靠 **LLM 判定矛盾**，然后在**旧边上**写 `expired_at` / `invalid_at`（据其文档和论文的描述）。不删，但会改原边
+- 失效分两步（复核源码 `graphiti_core/utils/maintenance/edge_operations.py`）：**LLM 先判定**哪些已有边与新边矛盾（`_dedupe_extracted_edge`），再由**日期比较**决定谁失效（`_apply_temporal_invalidation` / `resolve_edge_contradictions`），然后在**旧边对象上就地**写 `invalid_at` / `expired_at` 并存回。不删，但会改原边
 - 混合检索：语义 + BM25 + 图遍历
 - 需要单独的图数据库：Neo4j / FalkorDB / Neptune（Kuzu 已弃用）
 - Zep 论文（arXiv 2501.13956）自报 LongMemEval 71.2%（GPT-4o）
 
-**对 Cormex 的启示**：这是和 Cormex 理念最接近的一个，也正是它让「没有人做双时间轴」这句话不成立了。两边真正的分歧在于：**Cormex 不让 LLM 裁决失效**（`extract.rs` 第 2 条规则：失效是不可逆的 append-only 写入，模型的判断既不稳定也不可复现），失效原因分四种并且各有不同的时间语义，并且只依赖 Postgres。
+**对 Cormex 的启示**：这是和 Cormex 理念最接近的一个，也正是它让「没有人做双时间轴」这句话不成立了。两边真正的分歧在于：① **谁来提名矛盾**：Graphiti 让 LLM 提名，Cormex 只看两个客观量（同一主语和谓词下宾语是否相同、哪个事件时间在先，`extract.rs` 第 2 条规则）；② **失效怎么落盘**：Graphiti 就地改写旧边，Cormex 追加一条 `fact_events`；③ 失效原因分四种并且各有不同的时间语义；④ 只依赖 Postgres。
 
 ### 2.3 Letta（Apache-2.0，`letta` 0.34.x；Letta Code 0.34.27，2026-10）
 
@@ -122,7 +125,7 @@
   - 曾经的「100%」是针对失败题做定向修复加 LLM 重排后得到的，已撤下
   - 它主打「无损压缩」的 AAAK 让同一指标从 96.6% 掉到 84.2%
   - LoCoMo「100%」用的是 top_k=50，差不多等于把整段对话都取回来了
-  - 有一篇专门批评它的论文（arXiv 2604.21284）
+  - 有一篇专门批评它的论文（arXiv 2604.21284）。复核其摘要：结论是检索表现**主要来自逐字存储 + ChromaDB 默认 embedding**，palace 层级本质上是标准的向量库元数据过滤；同时肯定了四点真正的贡献：逐字优先的存储哲学、约 170 token 的唤醒成本、零 LLM 的确定性写路径、把空间隐喻用作组织原则
 
 **对 Cormex 的启示**：两条，都很重要。① **原文 + 好的 embedding 已经是一条很强的基线**，任何抽取 / 压缩方案都要先打过它。② **不要追分**，MemPalace 是现成的反面教材；Cormex 的 evals 要坚持「口径写清楚、不教题」。
 
@@ -164,10 +167,11 @@
 
 ### 2.12 宿主自带的记忆
 
-- **Claude Code**：用户写的 `CLAUDE.md`（多级作用域），加上 2026-02 起默认开启的 **auto memory**：模型自己记笔记，写在 `~/.claude/projects/<project>/memory/MEMORY.md` 加主题文件里。据报道只自动加载 MEMORY.md 的前 200 行或前 25KB，**只在本机，不共享**
-- Codex、Gemini CLI 也各有一套「把记忆写进 Markdown 文件」的机制
+- **Claude Code**：用户写的 `CLAUDE.md`（多级作用域），加上 2026-02 起默认开启的 **auto memory**：模型自己记笔记，写在 `~/.claude/projects/<project>/memory/MEMORY.md` 加主题文件里。每个会话只自动加载 MEMORY.md 的前 200 行或前 25KB（复核官方文档），**只在本机，不共享**；它不受 `cleanupPeriodDays` 清理
+- **Codex 有一条完整的记忆管线**（复核 `openai/codex` 的 `codex-rs/memories/README.md`）：会话启动时在后台跑两个阶段。第一阶段对每个空闲足够久的 rollout 调模型，抽出 `raw_memory` 和 `rollout_summary`，并对密钥做脱敏；第二阶段把它们合并进 `~/.codex/memories/`（`raw_memories.md`、`rollout_summaries/`），这个目录本身是一个 git 基线，由一个专门的整理子 agent 根据 git diff 改写
+- Gemini CLI 也有一套「把记忆写进 Markdown 文件」的机制（`GEMINI.md`）
 
-**对 Cormex 的启示**：宿主自带的记忆都是**单机、单宿主**的。「跨宿主、跨机器」正是它们的空白，也是 §7 需求的价值所在。
+**对 Cormex 的启示**：宿主自带的记忆都是**单机、单宿主**的。「跨宿主、跨机器」正是它们的空白，也是 §7 需求的价值所在。Codex 的「每个会话先抽摘要、再全局整理」和 Cormex 打算做的观察日志加交接简报是同一个形状，可以直接对照；区别在于它的第二阶段会改写和删除旧内容，Cormex 只追加。
 
 ### 2.13 LangMem（MIT）
 
@@ -211,7 +215,7 @@
 | 项目 | 形态 | 存储 | 写入方式 | 时间模型 | 原文保留 | 取回接口 | 许可 |
 |---|---|---|---|---|---|---|---|
 | Mem0 | 库 / 自托管 / 云 | 向量库 + 可选图 | 单次 LLM，**只 ADD**（2026-04 起） | 时间感知排序 | 不以原文为中心 | SDK / REST / CLI / MCP | Apache-2.0 |
-| Graphiti / Zep | 框架 / 托管 | Neo4j / FalkorDB / Neptune | LLM 抽实体和边，LLM 判冲突 | **显式双时间轴** | episodes 作为出处 | SDK / MCP | Apache-2.0（Zep 闭源） |
+| Graphiti / Zep | 框架 / 托管 | Neo4j / FalkorDB / Neptune | LLM 抽实体和边；LLM 提名矛盾、日期比较定失效，就地改写旧边 | **显式双时间轴** | episodes 作为出处 | SDK / MCP | Apache-2.0（Zep 闭源） |
 | Letta | agent 运行时 | Postgres / git（MemFS） | agent 自己改记忆块，sleep-time 后台整理 | git 历史 | recall memory | 必须用 Letta 运行时 | Apache-2.0 |
 | Hindsight | 服务 | **Postgres + pgvector** | retain：LLM 抽取 + 实体 / 时间 | 时间是召回的一路 | — | REST / `/mcp` | MIT |
 | Mastra OM | 框架功能 | 框架存储 | Observer / Reflector 后台压缩 | 观察带日期 | 被观察日志取代 | 框架 API | 见其仓库 |
@@ -244,11 +248,11 @@
 4. **压缩：追加式观察日志 > 反复重写摘要**。Mastra 的 Observer / Reflector、claude-mem 的 observation 都是这样。对前缀缓存友好，每条观察都带日期
 5. **后台整理成了标配**：Letta 的 sleep-time / dreaming、Mastra 的 Reflector、Hindsight 的 reflect。整理不阻塞对话，也可以换便宜模型做
 6. **取回：渐进披露**。claude-mem 的索引 → 时间线 → 详情，Letta 的常驻 `system/` + 按需文件树，Claude Code MEMORY.md 只加载前 200 行。**先给目录，再给正文**
-7. **采集：从「agent 主动记」转向「宿主 hooks + 读日志」**。Codex（2026，PreCompact/PostCompact 等事件持续在加）、Cursor（beforeSubmitPrompt / afterAgentResponse / stop / preCompact）、Gemini CLI（v0.26+）都有了 hooks；hook 的输入普遍带 `transcript_path`
+7. **采集：从「agent 主动记」转向「宿主 hooks + 读日志」**。复核官方文档：Claude Code（33 个事件）、Codex（**现在默认开启**，含 SessionEnd / PreCompact / PostCompact）、Cursor（sessionStart / sessionEnd / stop / preCompact 等）、Gemini CLI（SessionEnd / AfterAgent / PreCompress 等）**四家的 hook 输入里都有 `transcript_path`**。Codex 文档同时提醒：transcript 的格式**不是稳定接口**，随时可能变
 8. **Markdown 文件作为记忆介质**：Letta MemFS、Basic Memory、Claude Code auto memory。agent 天然会读写文件，git 天然有历史
 9. **分发：一行安装 + agent 自助开通 + Agent Skills**。`mem0 init --agent`、`npx skills add`、MemPalace 的安装 skill、`npx ccusage`
 10. **评测：没有可信的公共排行榜**。LongMemEval / LoCoMo 被刷到 90 分以上，口径各异；更难的 BEAM（ICLR 2026，到 10M token）开始流行；开源评测框架有 Mem0 的 `memory-benchmarks` 和 Supermemory 的 MemoryBench
-11. **安全：记忆投毒进了 OWASP Agentic Top 10（ASI06）**。MINJA 仅凭普通查询就能把恶意条目写进 agent 的长期记忆（据引用，注入成功率超过 95%）；AgentPoison 投毒率低于 0.1% 时攻击成功率仍达 80% 以上。防御大多停留在推理时过滤
+11. **安全：记忆投毒进了 OWASP Agentic Top 10（ASI06）**。MINJA（arXiv 2503.03704）**只靠普通查询和观察输出**就能把恶意记录写进 agent 的记忆库，不需要直接改库的权限（具体成功率见论文正文；二手来源常引用的「注入成功率超过 95%」未在摘要中出现）；AgentPoison 据报道投毒率低于 0.1% 时攻击成功率仍达 80% 以上。防御大多停留在推理时过滤
 
 ---
 
@@ -263,7 +267,7 @@
 | | Cormex | 最接近的同类 |
 |---|---|---|
 | **注入回放** | `episode_memories` 记下每一轮**实际注入了哪些记忆**，回放的是「agent 当时看到了什么」 | 没看到别家做。Graphiti 能回放「库里当时有什么」，但回放不了「当时喂给模型的是什么」 |
-| **确定性失效** | 冲突裁决不问 LLM；失效原因分四种（superseded / corrected / retracted / expired），时间语义各不相同 | Graphiti 由 LLM 判冲突，并改写旧边的时间戳 |
+| **确定性失效** | 冲突裁决不问 LLM；失效原因分四种（superseded / corrected / retracted / expired），时间语义各不相同 | Graphiti 由 LLM 提名矛盾，再就地改写旧边的时间戳 |
 | **信任分层的出处** | `source_channel` + `trust_tier` 由 CHECK 约束锁死 | Mem0 新算法反而把 agent 生成的事实提到了「同等权重」 |
 | **只依赖 Postgres** | 双时间轴和四路召回都建在 SQL 上 | Hindsight 同路；Graphiti 要图数据库 |
 | **缓存友好的注入分工** | profile 走 resource，检索走 tool；框定只在一处实现 | Mastra 的观察日志在思路上一致 |
@@ -306,7 +310,7 @@ CLAUDE.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每�
 ### 6.4 不做什么
 
 - **不做第二个存储后端**。MemPalace 的可插拔后端是反例：六个后端，每个都要一份兼容矩阵
-- **不让 LLM 裁决失效**（Graphiti 那样）。理由写在 `extract.rs` 的第 2 条规则里，这次调研没有发现推翻它的证据
+- **不让 LLM 提名或裁决失效**（Graphiti 由 LLM 提名）。理由写在 `extract.rs` 的第 2 条规则里，这次调研没有发现推翻它的证据
 - **不追 benchmark 分数**。MemPalace 的教训：口径错位、对着题修、撤回，一样都不想要
 - **不把 agent 循环搬回来**。采集器是采集器，不是 agent（§8.4.1）
 - **不依赖 cass**（§3.1）
@@ -314,7 +318,7 @@ CLAUDE.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每�
 ### 6.5 顺带发现的问题（不属于本需求，单独处理）
 
 1. **`as_of` 回放忽略了 `revoke`**。`crates/cortex-store/src/recall.rs` 里的 `as_of_snapshot!` 只要看到时刻 T 之前有过 `invalidate` 就排除这条事实，**不看之后有没有 `revoke` 把它恢复**；而 `fact_status` 视图是「以最后一条状态事件为准」。两者在「失效后又恢复」这种情况下结论相反。现在线上**没有任何代码写 `revoke`**（只有测试写），所以还是潜在问题；一旦做「用户手工恢复一条记忆」，回放就会静默出错。`tests/replay.rs` 里也没有覆盖这种情况
-2. **MCP 依赖落后两个大版本**：仓库锁的是 `rmcp` 1.8，crates.io 上已经是 3.8（2026-10-26）。MCP 的 **2026-07-28 修订版是一次无状态化的破坏性变更**：去掉了 session 和 `initialize` 握手，`resources/subscribe` 换成 `subscriptions/listen`，资源读取结果新增 `ttlMs` / `cacheScope`，Streamable HTTP 要求带 `Mcp-Method` / `Mcp-Name` 头。`ttlMs` / `cacheScope` 恰好能更好地表达「profile 是可缓存前缀」。升级前要先确认 rmcp 3.x 对这一版的支持程度
+2. **MCP 依赖落后两个大版本**：仓库锁的是 `rmcp` 1.8，crates.io 上已经是 3.8（2026-10-26）。MCP 的 **2026-07-28 修订版是一次无状态化的破坏性变更**：去掉了 session 和 `initialize` 握手，`resources/subscribe` 换成 `subscriptions/listen`，资源读取结果新增 `ttlMs` / `cacheScope`，Streamable HTTP 要求带 `Mcp-Method` / `Mcp-Name` 头。`ttlMs` / `cacheScope` 恰好能更好地表达「profile 是可缓存前缀」。复核 rmcp 的 CHANGELOG：3.0.0（2026-07-28）起支持这一版，**2026-07-28 的请求一律无状态服务**，老版本客户端走 `legacy_session_mode`（原来的 `stateful_mode` 改名而来）；但 2.0 → 3.x 之间有十几条破坏性变更（cache hints、MRTR、server/discover、标准 HTTP 头等），升级是一项独立的工作
 3. **L2 `summaries` 建了没人调**：只有测试写它。这正是 `routes.rs` 注释里说的「这个仓库头号复发病：built and never called」
 4. **profile 资源的 URI 文档与代码不一致**：代码里是 `cortex://profile`（`mcp.rs` 的 `PROFILE_URI`），CLAUDE.md 和 roadmap 也这么写，但 README 写成了 `cormex://profile`。照 README 配置的人会读不到资源。新增的会话资源用哪个 scheme，要和这一处一起定
 
@@ -395,7 +399,7 @@ D   派生物（现有）  观察日志 / 交接简报（L2 summaries）、事�
 
 #### ③ R4「不过滤」：存储不过滤 ≠ 不保护
 
-原始会话里**一定有密钥**：agent 读过的 `.env`、打印出来的 token、`env` 的输出。据报道 Claude Code 的 transcript 本身不加密，唯一的保护是本机文件权限。把所有机器的会话汇到一个中央库，这个库就成了**高价值目标**。
+原始会话里**一定有密钥**：agent 读过的 `.env`、打印出来的 token、`env` 的输出。Claude Code 官方文档明说：transcript 不加密，唯一的保护是本机文件权限；工具读过 `.env` 或命令打印了凭据，这个值就会写进会话文件（复核）。把所有机器的会话汇到一个中央库，这个库就成了**高价值目标**。
 
 **改成**：采纳「存储不过滤」，但出口和权限上要做足：
 
@@ -410,11 +414,13 @@ D   派生物（现有）  观察日志 / 交接简报（L2 summaries）、事�
 
 | 写入方式 | 代表 | 采集单元 |
 |---|---|---|
-| 追加式 JSONL | Claude Code、Codex、Copilot CLI、Kimi、pi | 按字节偏移尾随，只传新增区间 |
+| 追加式 JSONL | Claude Code、Codex、Gemini CLI（新版）、Copilot CLI、Kimi、pi | 按字节偏移尾随，只传新增区间 |
 | 对象变更日志（会周期性压实重写） | VS Code Copilot Chat 1.109+ | 尾随；检测到压实重写后换一代 |
-| 整文件重写的 JSON | Gemini CLI（json 版）、Qwen Code、Cline / Roo | **快照**，内容寻址去重 |
+| 整文件重写的 JSON | Gemini CLI（旧版 `.json`）、Qwen Code、Cline / Roo | **快照**，内容寻址去重 |
 | SQLite | Cursor、OpenCode、Goose、Crush、Hermes、Kilo | **只读连接，按行采集**（主键 + 原始值字节）；**不要**每次把整个 `.db` 文件传一遍（Cursor 的 `state.vscdb` 可能几百 MB），也**不要**在宿主写入时直接复制 db 文件（WAL 模式下拷到的是不一致的状态） |
 | 不透明 / 加密 | Windsurf（据报道是 `.pb`）、ChatGPT mac 版 v2+ | 能拿到字节就存字节，不承诺解析 |
+
+**复核源码后要加一条通用规则：「追加」的文件也会被改写、改名或压缩。** 例子：Codex 把冷的会话文件在后台压成 `.jsonl.zst`，续聊时再解压回 `.jsonl` 接着追加；Gemini CLI 平时追加，个别情况下写临时文件再整体改名覆盖；Claude Code 会把旧版本另存成 `<session>.jsonl.superseded-<时间>` 或 `.orphaned-…`。所以采集必须**认「逻辑文件」而不是「物理文件」**：同一个会话的明文和压缩形式是同一份内容，采的是解压后的逻辑字节；新内容如果不是旧内容的延续（前缀哈希对不上），就开新的一代，旧的一代原样保留。
 
 所以「实时追加」在实现上是：**hooks 或文件监听触发 → 按格式选采集单元 → 分块上传（内容寻址、幂等、可续传）**。另外还要一条**定时全量扫描**兜底：hooks 会漏（Cursor 论坛里有队列消息不触发 hook 的 bug 报告），文件监听也会漏（休眠、网络盘）。
 
@@ -482,14 +488,14 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 
 ### 8.3 各 agent 会话存储现状（2026-10 快照）
 
-> 路径和格式会随版本变。来源：各宿主的 hooks 官方文档、franken_agent_detection 的模块文档、ccusage 的数据源说明，以及第三方报道（标「据报道」的未核实）。
+> 路径和格式会随版本变。来源：Claude Code / Codex / Cursor / Gemini CLI 四行已对照**官方文档和上游源码**复核（2026-10-29）；其余行来自 franken_agent_detection 的模块文档和 ccusage 的数据源说明，标「据报道」的仍未核实。
 
 | Agent | 默认位置 | 格式 / 写入方式 | 实时信号 | 采集单元 | 优先级 |
 |---|---|---|---|---|---|
-| **Claude Code** | `~/.claude/projects/<编码后的 cwd>/<session>.jsonl`；子 agent 在 `<session>/subagents/agent-*.jsonl` | JSONL，追加 | hooks：SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / PreCompact / SessionEnd，输入带 `transcript_path` | 字节尾随 | **P0** |
-| **Codex CLI** | `$CODEX_HOME`（默认 `~/.codex`）`/sessions/YYYY/MM/DD/rollout-*.jsonl`，另有 `archived_sessions/` | JSONL（`session_meta` / `response_item` / `event_msg` …），追加 | hooks（要在 `config.toml` 打开 feature；SessionStart 带 `transcript_path`，可能为空） | 字节尾随 | **P0** |
-| Gemini CLI | `~/.gemini/tmp/<项目哈希>/chats/session-*.json`（新版本出现了 `.jsonl`） | JSON 整文件重写 / JSONL | hooks（v0.26+；SessionStart 带 `transcript_path`；有 AfterAgent / SessionEnd） | 快照 / 尾随 | P1 |
-| Cursor（IDE） | `state.vscdb`（`globalStorage` 和 `workspaceStorage/<id>/`）的 `cursorDiskKV`：`composerData:{id}`、`bubbleId:{composer}:{bubble}`；据报道 hooks 的 `transcript_path` 指向 `~/.cursor/projects` 下的 `.jsonl` | SQLite KV（值是 JSON）/ JSONL | hooks：beforeSubmitPrompt / afterAgentResponse / afterAgentThought / stop / preCompact / 子 agent 起止 | 按行 / 尾随 | P1 |
+| **Claude Code** | `~/.claude/projects/<编码后的 cwd>/<session>.jsonl`；同名目录下 `subagents/`（子 agent，同格式）、`tool-results/`（溢出的大块工具输出）；图片在临时目录的 `images/`（旧版 `~/.claude/image-cache/<session>/`）；大段粘贴在 `~/.claude/paste-cache/`；被替换的旧版本另存为 `.jsonl.superseded-<时间>` / `.orphaned-…`。auto memory 在 `projects/<项目>/memory/`。会话文件里还会有 system prompt、工具定义和请求参数 | JSONL，追加；偶有另存换代 | hooks（33 个事件，含 SessionStart / Stop / PreCompact / SessionEnd），**所有事件的输入都带 `transcript_path`**；支持 `"async": true` 不阻塞；SessionEnd 默认 1.5 秒预算 | 一组文件；字节尾随 + 换代检测 | **P0** |
+| **Codex CLI** | `$CODEX_HOME`（默认 `~/.codex`）`/sessions/YYYY/MM/DD/rollout-*.jsonl`，归档在 `archived_sessions/`；**冷文件会在后台压成 `.jsonl.zst`**，续聊时解压回 `.jsonl`；自带记忆在 `~/.codex/memories/`（`raw_memories.md`、`rollout_summaries/`，目录本身是 git 基线） | JSONL（`session_meta` / `response_item` / `event_msg` …），追加；明文与 zstd 两种表示 | hooks **默认开启**（配置键 `hooks`，旧名 `codex_hooks` 仍可用；`hooks.json` 或 `config.toml` 的 `[hooks]`），输入带 `transcript_path`；SessionEnd 总是同步执行，默认 1 秒、最多 3 秒；官方注明 transcript 格式不是稳定接口 | 逻辑字节尾随（透明解压） | **P0** |
+| Gemini CLI | `~/.gemini/tmp/<项目哈希>/chats/session-<时间>-<短 id>.jsonl`；子 agent 嵌套在父会话 id 目录下；旧版 `.json` 会被规范成 `.jsonl` | **JSONL 追加**（`appendFileSync`），个别情况写临时文件再整体改名覆盖 | hooks（SessionStart / SessionEnd / AfterAgent / PreCompress 等，配置在 `settings.json`），**公共输入带 `transcript_path`** | 尾随 + 换代检测 | P1 |
+| Cursor（IDE） | hooks 给出的 `transcript_path`（**所有 hook 输入都有，关闭 transcript 时为 null**，另有环境变量 `CURSOR_TRANSCRIPT_PATH`；子 agent 有单独的 `agent_transcript_path`）；历史数据在 `state.vscdb`（`globalStorage` 和 `workspaceStorage/<id>/`）的 `cursorDiskKV`：`composerData:{id}`、`bubbleId:{composer}:{bubble}` | transcript 文件 / SQLite KV（值是 JSON） | hooks（`~/.cursor/hooks.json` 或项目 `.cursor/hooks.json`；sessionStart / sessionEnd / stop / preCompact / beforeSubmitPrompt / afterAgentResponse 等）；**云端 agent 不触发 sessionEnd** | transcript 尾随；历史按行 | P1 |
 | VS Code Copilot Chat | `workspaceStorage/<id>/chatSessions/<id>.jsonl`（1.109+）、`.json`（2025-03 到 1.108）、`state.vscdb`（更早） | **对象变更日志**（kind 0 快照、1 设值、2 数组追加、3 删除），会压实重写 | 无 | 尾随 + 换代检测 | P1 |
 | Copilot CLI | `~/.copilot/session-state/<session>/events.jsonl` | JSONL，追加 | — | 尾随 | P2 |
 | Cline / Roo Code | VS Code `globalStorage/<扩展 id>/tasks/<task>/api_conversation_history.json` 和 `ui_messages.json` | JSON 整文件重写 | — | 快照 | P2 |
@@ -620,13 +626,13 @@ CLI 提供对应的命令：`cormex sessions ls / show / brief / restore`。
 | 类型 | 它在会话文件里的样子 | R 层（原样） | P 层（展示） | D 层（记忆 / 检索） |
 |---|---|---|---|---|
 | **代码** | agent 读文件时，工具结果里有它读到的那一段；改文件时，工具参数里有改动前后的片段或整份新文件；对话里贴的代码片段 | 随会话原样存 | 代码块、diff，可折叠 | **不索引读到的文件内容**（原文档案索引除外，§10.2 第 6 条）。只记「路径 + 行范围」引用，以及「改了什么、为什么改」的结论。代码以 git 为准（memory-content §二④） |
-| **图片** | Claude Code 把粘贴的图片和读取的截图以 base64 直接写进会话文件；其他宿主有的只存本地路径，适配时逐家确认 | 随会话原样存 | 解码后另存为 RustFS 里的独立 blob（去重，UI 直接显示） | 可选生成文字描述（现有的 vision caption / OCR 管线，`transcribe.rs`），描述进 `blob_transcripts`，可检索 |
+| **图片** | 复核 Claude Code 官方文档：粘贴和附加的图片**另存为文件**，新版本放在临时目录下每个会话一个的 `images/`（受 `CLAUDE_CODE_TMPDIR` 控制），v2.1.274 及更早放在 `~/.claude/image-cache/<session>/`；MCP 工具返回的图片全尺寸副本在 `<session>/tool-results/`。会话文件里是否同时内联 base64，要用真实文件做夹具确认。其他宿主逐家确认 | 随会话原样存 | 解码后另存为 RustFS 里的独立 blob（去重，UI 直接显示） | 可选生成文字描述（现有的 vision caption / OCR 管线，`transcribe.rs`），描述进 `blob_transcripts`，可检索 |
 | **Office / PDF** | 用户直接拖进对话的文件会被内联；agent 用脚本读 Excel 时，会话里只有脚本打印出来的文字 | 随会话原样存 | 内联的文件可下载、预览 | 目前**只存不抽**：`blob_transcripts.kind` 还没有 Office 文本这一档（memory-content §二⑤） |
 | **其他二进制** | agent 一般读不了，会话里通常只有一行报错或几句描述 | 随会话原样存 | — | — |
 
 **边界上的两处细节：**
 
-1. **宿主自己的附件目录算会话的一部分**。有些宿主把用户贴进对话的附件另存到它自己的缓存目录，会话文件里只留路径。这些附件是对话的一部分，而且宿主清理时会一起消失，所以要采；但**只限宿主自己的附件目录**，用户项目里的文件永远不采
+1. **宿主自己的附件目录算会话的一部分**。附件是对话的一部分，而且宿主清理时会一起消失，所以要采；但**只限宿主自己的附件目录**，用户项目里的文件永远不采。以 Claude Code 为例（复核官方文档），一个会话是一**组**文件：`<session>.jsonl`，加上 `<session>/subagents/`（子 agent 的会话）、`<session>/tool-results/`（**放不进会话文件的大块工具输出**）、临时目录下的 `images/`、`~/.claude/paste-cache/`（大段粘贴）。只采 `.jsonl` 会丢东西
 2. **Claude Code 的 `~/.claude/file-history/`**（它给改过的文件做的备份，用于回退）属于代码内容，**默认不采**，留一个开关
 
 **可选**：采集器在会话开始时读一次 git 的当前提交号（只读一个哈希值，不读任何文件内容），让「路径 + 行范围」的引用能精确对回 git 里的版本。
@@ -675,6 +681,8 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 它只是不适合做第三件事：把会话内容读出来再交给 Cormex。
 
 ### 8.5 留给架构阶段拍板的问题（附建议）
+
+> **已在架构文档里全部拍板**，见 [design/session-archive-architecture.md](../design/session-archive-architecture.md) §1 的 D1–D23。下表保留评审时的建议，供追溯。
 
 | # | 问题 | 建议 |
 |---|---|---|
@@ -843,7 +851,11 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 - cass（crate `coding-agent-search` 0.7.0）：<https://crates.io/crates/coding-agent-search> · <https://github.com/Dicklesworthstone/coding_agent_session_search>
 - franken_agent_detection（crate 0.3.10）：<https://crates.io/crates/franken-agent-detection>
 - ccusage（npm 20.0.45）：<https://www.npmjs.com/package/ccusage>
-- Claude Code 的 30 天删除：<https://brycewatson.com/blog/28-claude-code-deletes-old-logs> · <https://claudeissues.com/issue/62476-bug-claude-code-silently-deletes-conversation-transcripts-after-30-days-by-defau>
+- Claude Code 官方文档（复核）：hooks <https://code.claude.com/docs/en/hooks> · `~/.claude` 目录与保留策略 <https://code.claude.com/docs/en/claude-directory> · 记忆 <https://code.claude.com/docs/en/memory>
+- Codex 源码（复核）：rollout 压缩 <https://github.com/openai/codex/blob/main/codex-rs/rollout/src/compression.rs> · 记忆管线 <https://github.com/openai/codex/blob/main/codex-rs/memories/README.md>
+- Gemini CLI 源码与文档（复核）：会话记录 <https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/services/chatRecordingService.ts> · hooks 参考 <https://geminicli.com/docs/hooks/reference.md>
+- Graphiti 失效逻辑（复核）：<https://github.com/getzep/graphiti/blob/main/graphiti_core/utils/maintenance/edge_operations.py>
+- Claude Code 的 30 天删除（第三方）：<https://brycewatson.com/blog/28-claude-code-deletes-old-logs> · <https://claudeissues.com/issue/62476-bug-claude-code-silently-deletes-conversation-transcripts-after-30-days-by-defau>
 - Codex hooks：<https://developers.openai.com/codex/hooks>
 - Cursor hooks：<https://cursor.com/docs/agent/hooks>
 - Gemini CLI hooks：<https://geminicli.com/docs/hooks.md>
@@ -853,6 +865,7 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 协议、基准与安全：
 
 - MCP 2026-07-28 changelog：<https://modelcontextprotocol.io/specification/2026-07-28/changelog> · RC 说明 <https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/>
-- rmcp：<https://crates.io/crates/rmcp>
+- rmcp：<https://crates.io/crates/rmcp> · CHANGELOG（复核）<https://github.com/modelcontextprotocol/rust-sdk/blob/main/crates/rmcp/CHANGELOG.md>
+- OWASP Agentic Top 10 ASI06（二手解读）：<https://vectorize.io/articles/owasp-asi06>
 - BEAM（ICLR 2026）：<https://arxiv.org/abs/2510.27246>
 - 记忆投毒：MINJA <https://arxiv.org/abs/2503.03704> · 攻防评估 <https://arxiv.org/abs/2601.05504> · 综述 <https://vectorize.io/articles/ai-memory-poisoning>

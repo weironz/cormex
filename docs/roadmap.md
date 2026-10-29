@@ -161,6 +161,18 @@ type "ulid" does not exist
 
 ---
 
+## F. 会话档案（下一条主线）
+
+**2026-10-29 立项。** 把各台机器上各家 agent 的原始会话字节级采进中央库，在 Web 上像原始对话一样浏览，并让任何 agent 经 MCP 取回交接简报或原文。
+
+| | |
+|---|---|
+| 为什么做、评审结论 | [research/2026-10-agent-memory-survey.md](research/2026-10-agent-memory-survey.md) §7–§10 |
+| 技术选型与架构（唯一设计权威，D1–D23） | [design/session-archive-architecture.md](design/session-archive-architecture.md) |
+| 代码级阶段开发计划（任务卡 P0-1 … P7-3） | [plan/session-archive-plan.md](plan/session-archive-plan.md) |
+
+阶段 0 的 P0-1 就是上面 A 节的「全新数据库上起不来」，修法已定（D20）。P0-2 修的是委托令牌会落进 1 号用户租户的隔离问题，多用户部署下应优先处理。
+
 ## 不做
 
 - **不为 Cortex 做任何事。** 它是另一个产品、另一个仓库。这边只保证 HTTP 契约
