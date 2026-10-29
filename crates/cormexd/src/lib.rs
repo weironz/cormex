@@ -16,6 +16,7 @@
 //! stable, and this one is not an API at all.
 
 pub mod accounts;
+pub mod archive_workers;
 pub mod auth;
 pub mod backfill;
 pub mod blobs;

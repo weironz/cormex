@@ -34,6 +34,103 @@ impl Store {
         Ok(row)
     }
 
+    /// Generations that have bytes the masker has not scanned yet.
+    ///
+    /// The todo is derived from the data rather than kept in a queue: a
+    /// generation is done when its end is at or below the scanner's progress,
+    /// so a restarted process loses nothing and there is no job table to fall
+    /// out of step with the rows.
+    pub async fn generations_needing_masks(
+        &self,
+        scanner: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT g.id, coalesce(max(c.byte_offset + c.byte_length), 0) AS end
+               FROM capture_generations g
+               JOIN capture_chunks c ON c.generation_id = g.id
+               LEFT JOIN LATERAL (
+                    SELECT p.through_offset
+                      FROM capture_mask_progress p
+                     WHERE p.generation_id = g.id AND p.scanner = $1
+                     ORDER BY p.created_at DESC, p.id DESC
+                     LIMIT 1
+               ) prog ON true
+              GROUP BY g.id, prog.through_offset
+             HAVING coalesce(max(c.byte_offset + c.byte_length), 0) > coalesce(prog.through_offset, 0)
+              ORDER BY g.id
+              LIMIT $2",
+        )
+        .bind(scanner)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Sessions that have bytes the projector has not projected yet.
+    ///
+    /// Returns `(session_id, agent)` — the agent picks the parser.
+    pub async fn sessions_needing_projection(
+        &self,
+        parser_version_filter: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        // A session is done when every one of its generations is fully
+        // projected. `through` is a JSON map from generation id to a **record**
+        // — `{offset, parser}` — not a bare number: the offset alone cannot
+        // resume a parser, because the parser holds a line buffer and feeding
+        // it a chunk that starts mid-file fails its contiguity check.
+        //
+        // `-> g.id ->> 'offset'` reaches the number; `coalesce(…, 0)` treats
+        // "never projected" as 0.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT s.id, s.agent
+               FROM capture_sessions s
+               JOIN capture_files f ON f.session_id = s.id
+               JOIN capture_generations g ON g.file_id = f.id
+               JOIN capture_chunks c ON c.generation_id = g.id
+               LEFT JOIN LATERAL (
+                    SELECT p.through
+                      FROM transcript_projections p
+                     WHERE p.session_id = s.id AND p.parser_version = $1
+                     ORDER BY p.created_at DESC, p.id DESC
+                     LIMIT 1
+               ) prog ON true
+              GROUP BY s.id, s.agent, g.id, prog.through
+             HAVING coalesce(max(c.byte_offset + c.byte_length), 0)
+                    > coalesce(
+                        ((prog.through -> g.id::text) ->> 'offset')::bigint,
+                        0
+                      )
+              ORDER BY s.id
+              LIMIT $2",
+        )
+        .bind(parser_version_filter)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every file of a session.
+    ///
+    /// The projector needs all of them: a session's conversation may be spread
+    /// across the main transcript, a sub-agent's own file, and the host's
+    /// memory pseudo-session.
+    pub async fn capture_files_of_session(&self, session_id: &str) -> Result<Vec<CaptureFile>> {
+        let rows = sqlx::query_as::<_, CaptureFile>(
+            "SELECT id, session_id, device_id, agent, logical_path, role, framing,
+                    cwd, project_key, first_seen_at
+               FROM capture_files WHERE session_id = $1
+              ORDER BY id",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
     /// One capture file by its id.
     ///
     /// Used by the capture API to answer "does this file belong to the device

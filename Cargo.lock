@@ -1283,6 +1283,7 @@ dependencies = [
  "cormex-memory",
  "cormex-proto",
  "cormex-store",
+ "cormex-transcript",
  "dotenvy",
  "futures",
  "getrandom 0.3.4",

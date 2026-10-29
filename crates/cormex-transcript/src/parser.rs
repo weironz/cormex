@@ -84,7 +84,7 @@ impl ParsedEvent {
 ///
 /// One instance per file: the state (the line buffer, the tool-name map) is
 /// per-file, and sharing it across files would mix two conversations' ids.
-pub trait Parser: Send {
+pub trait Parser: Send + Sync {
     /// The version string, e.g. `claude_code@1`.
     ///
     /// It is stored with every projected event, so a parser change means a new

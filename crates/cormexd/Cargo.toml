@@ -58,6 +58,9 @@ cormex-store.workspace = true
 cormex-proto = { workspace = true, features = ["llm"] }
 # The import parsers are shared by all three sites, see the crate docs of cormex-import
 cormex-import.workspace = true
+# The server-side parsers (P2-1). The client never parses (D2), so this edge
+# exists only here.
+cormex-transcript.workspace = true
 
 cormex-blob.workspace = true
 

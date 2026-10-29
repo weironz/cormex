@@ -374,6 +374,10 @@ impl AppState {
         // authoritative inventory and picks them back up. It does not start
         // itself when no vision model is configured.
         crate::backfill::spawn(st.clone(), blobs);
+        // The archive workers: the masker (R-layer byte ranges) and the
+        // projector (R → P). Both derive their todo from the data, so a restart
+        // loses nothing — see `archive_workers`'s module docs
+        crate::archive_workers::spawn(st.clone());
         // Fill in the vectors for old facts after an embedding model change. On
         // by default — the cost of turning it off (old memory permanently
         // exiting vector retrieval) has no symptom at all, while the cost of
@@ -881,6 +885,14 @@ impl AppState {
             .blobs
             .put_keyed(key, bytes, "application/zstd")
             .await
+    }
+
+    /// Read a captured chunk's stored bytes by its key.
+    ///
+    /// The masker and the projector both need this: the object is zstd, and
+    /// what they work on is the logical bytes.
+    pub async fn get_capture_object(&self, key: &str) -> Result<Bytes> {
+        self.inner.blobs.get_keyed(key).await
     }
 
     pub async fn blob_meta(&self, tenant: &Tenant, hash: &str) -> Result<(String, i64)> {
