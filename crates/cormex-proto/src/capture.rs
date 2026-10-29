@@ -136,7 +136,7 @@ pub struct NewGenerationRequest {
 }
 
 /// `PUT …/chunks/{offset}` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkAck {
     /// Where the generation now ends. The client's next append goes here.
     pub end_offset: i64,
