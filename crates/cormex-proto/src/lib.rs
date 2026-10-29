@@ -27,10 +27,16 @@
 //! service's wire protocol should not have to work out which half applies.
 
 pub mod auth;
+pub mod capture;
+pub mod catalog;
 pub mod delegate;
 pub mod dto;
 pub mod episodes;
 pub mod import;
+/// The LLM proxy's wire protocol. Behind the default-on `llm` feature: it is the only module
+/// that names `cormex-llm` (the provider layer), and the capture CLI turns the feature off so
+/// that goose-providers and a TLS stack stay out of its binary. See `Cargo.toml`.
+#[cfg(feature = "llm")]
 pub mod llm;
 
 /// The wire protocol version this side speaks. **Bump it only when the

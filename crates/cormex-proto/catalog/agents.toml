@@ -1,0 +1,90 @@
+# 来源目录：哪个 agent 的会话文件在哪、怎么从路径里认出会话 id。
+#
+# 这是**数据不是代码**（D8）。加一个 agent 只改这份文件加一个服务端解析器，
+# CLI 一行不动。`cormex-proto::catalog::Catalog::builtin()` 用 `include_str!`
+# 把它编进二进制，CLI 与服务端共用同一份；服务端可以用
+# `CORMEX_CAPTURE_CATALOG` 指向一份更新的文件。
+#
+# 规矩：
+# - 所有路径相对 agent 的 home，正斜杠分隔
+# - 解析 cwd 与 session_id **只看路径**，不读文件内容（D2）
+# - `glob` 用 globset 语法；`**` 匹配任意深度
+
+schema = 1
+version = "2026-11-01"
+
+[[agent]]
+id = "claude_code"
+name = "Claude Code"
+home = [
+  { env = "CLAUDE_CONFIG_DIR" },
+  { path = "~/.claude" },
+]
+
+  # 主 transcript。Claude Code 一个项目一个目录，目录名是 cwd 把 `/` 换成 `-`
+  [[agent.source]]
+  role = "transcript"
+  glob = "projects/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  cwd = { from = "parent_dir", decode = "claude_project_dir" }
+
+  # 子 agent 的 transcript：projects/<项目>/<父会话>/subagents/<子会话>.jsonl
+  [[agent.source]]
+  role = "subagent"
+  glob = "projects/*/*/subagents/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 2 }
+
+  # 溢出的工具输出。归属父会话；用正向下标，因为 `**` 的深度不定
+  [[agent.source]]
+  role = "sidecar"
+  glob = "projects/*/*/tool-results/**"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 2 }
+
+  # 每个项目一个 memory 伪会话。`prefix` 拼在前面，避免伪会话 id 与真实会话 id 撞车
+  [[agent.source]]
+  role = "memory"
+  glob = "projects/*/memory/**"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1, prefix = "memory:" }
+
+  [agent.hooks]
+  kind = "claude_code_settings"
+  events = ["Stop", "SubagentStop", "PreCompact", "SessionEnd"]
+
+  [agent.retention]
+  setting = "cleanupPeriodDays"
+  file = "settings.json"
+  default_days = 30
+
+[[agent]]
+id = "codex"
+name = "Codex CLI"
+home = [
+  { env = "CODEX_HOME" },
+  { path = "~/.codex" },
+]
+
+  # rollout 文件。`also_compressed` 说同名 `.jsonl.zst` 是**同一个逻辑文件**：
+  # 采集端只保留一个（明文优先），逻辑路径一律是明文名
+  [[agent.source]]
+  role = "transcript"
+  glob = "{sessions,archived_sessions}/**/rollout-*.jsonl"
+  framing = "append"
+  also_compressed = ".zst"
+  session_id = { from = "stem_regex", regex = "rollout-[0-9T-]+-(?P<id>[0-9a-f-]{36})" }
+
+  # 全局记忆。每台机器各一份，所以 `per_device`：不拼的话两台机器的记忆会被
+  # 合并成一个会话，而它们的内容并不相同
+  [[agent.source]]
+  role = "memory"
+  glob = "memories/{raw_memories.md,rollout_summaries/**}"
+  framing = "snapshot"
+  session_id = { from = "const", value = "memory", per_device = true }
+
+  [agent.hooks]
+  kind = "codex_hooks_json"
+  events = ["Stop", "PreCompact", "SessionEnd"]
