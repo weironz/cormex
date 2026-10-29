@@ -1250,6 +1250,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cormex-transcript"
+version = "0.1.11"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cormex",
+ "cormex-core",
+ "cormex-memory",
+ "cormex-proto",
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "cormexd"
 version = "0.1.11"
 dependencies = [

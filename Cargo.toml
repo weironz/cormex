@@ -11,6 +11,7 @@ members = [
     "crates/cormexd",
     "crates/cormex",
     "crates/e2e-capture",
+    "crates/cormex-transcript",
     "evals",
 ]
 
@@ -34,6 +35,7 @@ cormex-memory = { path = "crates/cormex-memory" }
 cormex-proto = { path = "crates/cormex-proto", default-features = false }
 cormex = { path = "crates/cormex" }
 cormexd = { path = "crates/cormexd" }
+cormex-transcript = { path = "crates/cormex-transcript" }
 cormex-blob = { path = "crates/cormex-blob" }
 
 # Provider layer: lifted from goose (Apache-2.0).

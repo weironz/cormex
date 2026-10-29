@@ -1,0 +1,11 @@
+{"timestamp":"2027-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"01234567-89ab-cdef-0123-456789abcdef","timestamp":"2027-01-01T00:00:00.000Z","cwd":"/home/user/project-a","originator":"codex_cli_rs","cli_version":"0.0.0","instructions":null,"source":"cli"}}
+{"timestamp":"2027-01-01T00:00:01.000Z","type":"turn_context","payload":{"cwd":"/home/user/project-a","approval_policy":"on-request","sandbox_policy":{"mode":"workspace-write"},"model":"gpt-5.5","effort":"medium","summary":"auto"}}
+{"timestamp":"2027-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"aaaa bbbb cccc dddd"}]}}
+{"timestamp":"2027-01-01T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"aaaa bbbb cccc dddd"}}
+{"timestamp":"2027-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"eeee ffff gggg"}],"content":null,"encrypted_content":"[blob:2048]"}}
+{"timestamp":"2027-01-01T00:00:05.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"ls\"]}","call_id":"call-0001"}}
+{"timestamp":"2027-01-01T00:00:06.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-0001","output":"hhhh iiii jjjj"}}
+{"timestamp":"2027-01-01T00:00:07.000Z","type":"response_item","payload":{"type":"local_shell_call","status":"completed","action":{"type":"exec","command":["pwd"],"timeout_ms":1000},"call_id":"call-0002"}}
+{"timestamp":"2027-01-01T00:00:08.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"kkkk llll mmmm"}]}}
+{"timestamp":"2027-01-01T00:00:09.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":20}}}}
+{"timestamp":"2027-01-01T00:00:10.000Z","type":"compacted","payload":{"message":"nnnn oooo pppp"}}
