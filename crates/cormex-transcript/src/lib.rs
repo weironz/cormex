@@ -24,6 +24,7 @@ pub mod codex;
 pub mod gemini;
 pub mod jsonl;
 pub mod parser;
+pub mod rows;
 
 pub use anonymize::{Anonymizer, RULES_VERSION, synthetic_text};
 pub use parser::{ParsedEvent, Parser, parser_for};

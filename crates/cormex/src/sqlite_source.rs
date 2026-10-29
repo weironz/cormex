@@ -30,6 +30,9 @@ use cormex_proto::catalog::SqliteSpec;
 pub struct RowFile {
     /// `sqlite:<db rel path>#<key>`.
     pub logical_path: String,
+    /// The conversation this row belongs to, when the spec names a column for
+    /// it. `None` = the source's `session_id` rule decides.
+    pub session: Option<String>,
     /// The bytes to store: the text column when the spec names one, otherwise
     /// the whole row as a JSON object.
     pub bytes: Vec<u8>,
@@ -71,6 +74,14 @@ pub fn read_rows(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<
                 spec.key_column
             )
         })?;
+    let session_idx = match &spec.session_column {
+        Some(name) => Some(columns.iter().position(|c| c == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the catalog says the session column is {name:?}, but the query returns {columns:?}"
+            )
+        })?),
+        None => None,
+    };
     let text_idx = match &spec.text_column {
         Some(name) => Some(columns.iter().position(|c| c == name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -100,6 +111,10 @@ pub fn read_rows(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<
         };
         out.push(RowFile {
             logical_path: format!("sqlite:{db_rel}#{key}"),
+            session: match session_idx {
+                Some(i) => Some(value_as_string(row, i)?),
+                None => None,
+            },
             bytes,
         });
     }
@@ -195,6 +210,7 @@ mod tests {
             query: "SELECT key, value FROM kv ORDER BY key".into(),
             key_column: "key".into(),
             text_column: text_column.map(str::to_owned),
+            session_column: None,
             busy_timeout_ms: 1000,
         }
     }

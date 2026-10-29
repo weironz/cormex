@@ -171,3 +171,77 @@ home = [
   framing = "snapshot"
   session_id = { from = "path_segment", index = 1 }
 
+[[agents]]
+id = "opencode"
+name = "OpenCode"
+home = [
+  { env = "OPENCODE_DATA" },
+  { path = "~/.local/share/opencode" },
+  { path = "~/Library/Application Support/opencode" },
+]
+
+  # 上游 `sst/opencode`（MIT）`packages/core/src/session/sql.ts`：
+  # `session_message(id, session_id, type, seq, data)` 与
+  # `session_part(message_id, session_id, ordinal, type, call_id, data)`。
+  # assistant 消息的内容在 **另一张表** 里，所以查询把 parts 聚合成一个数组 ——
+  # 解析器拿不到数据库，只能拿到这一行的字节
+  [[agents.source]]
+  role = "row"
+  glob = "opencode.db"
+  framing = "snapshot"
+  session_id = { from = "const", value = "opencode", per_device = true }  # 仅当查询没有 session_column 时使用
+  [agents.source.sqlite]
+  key_column = "id"
+  session_column = "session_id"
+  text_column = "row_json"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT m.id AS id,
+           m.session_id AS session_id,
+           json_object(
+             'type', m.type,
+             'data', json(m.data),
+             'parts', (SELECT json_group_array(json_object('type', p.type, 'data', json(p.data)))
+                         FROM session_part p
+                        WHERE p.message_id = m.id
+                        ORDER BY p.ordinal)
+           ) AS row_json
+      FROM session_message m
+     ORDER BY m.session_id, m.seq
+  """
+
+[[agents]]
+id = "goose"
+name = "Goose"
+home = [
+  { env = "GOOSE_DATA" },
+  { path = "~/.local/share/goose/sessions" },
+  { path = "~/Library/Application Support/goose/sessions" },
+]
+
+  # 上游 `block/goose`（Apache-2.0）`crates/goose/src/session/session_manager.rs`：
+  # `messages(id, message_id, session_id, role, content_json, created_timestamp)`。
+  # 一行一条消息
+  [[agents.source]]
+  role = "row"
+  glob = "sessions.db"
+  framing = "snapshot"
+  session_id = { from = "const", value = "goose", per_device = true }
+  [agents.source.sqlite]
+  key_column = "id"
+  session_column = "session_id"
+  text_column = "row_json"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT id AS id,
+           session_id AS session_id,
+           json_object(
+             'role', role,
+             'content_json', content_json,
+             'created_timestamp', created_timestamp,
+             'session_id', session_id
+           ) AS row_json
+      FROM messages
+     ORDER BY session_id, created_timestamp, id
+  """
+

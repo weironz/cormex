@@ -133,6 +133,13 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("cline" | "roo_code", FileRole::Transcript) => {
             Some(Box::new(crate::cline::ClineParser::new()))
         }
+        // SQLite rows (P4-5). One row is one logical file, so the role is `Row`
+        ("opencode", FileRole::Row) => Some(Box::new(crate::rows::RowParser::new(
+            crate::rows::RowFormat::OpenCode,
+        ))),
+        ("goose", FileRole::Row) => Some(Box::new(crate::rows::RowParser::new(
+            crate::rows::RowFormat::Goose,
+        ))),
         _ => None,
     }
 }

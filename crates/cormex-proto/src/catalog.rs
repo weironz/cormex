@@ -143,6 +143,18 @@ pub struct SqliteSpec {
     /// and the server's parser decides later what is in them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_column: Option<String>,
+    /// Which returned column names the **conversation** the row belongs to.
+    ///
+    /// Without it every row of the database lands in one session, because a
+    /// row's logical path carries only its key. A host with ten thousand
+    /// messages across four hundred conversations would then read as one
+    /// enormous session, and `session_search` would return that one session for
+    /// every query.
+    ///
+    /// `None` = the source's `session_id` rule applies, which is right for a
+    /// database that holds a single conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_column: Option<String>,
     /// How long to wait for a lock before giving up, in milliseconds.
     ///
     /// A host with the database open in WAL mode lets us read concurrently; one
@@ -439,7 +451,15 @@ mod tests {
         // The parser crate depends on this one, so the check lives here as a
         // list rather than a call: adding an agent to `agents.toml` without
         // adding it here is exactly the omission this test exists to catch
-        const PARSED: &[&str] = &["claude_code", "codex", "gemini_cli", "cline", "roo_code"];
+        const PARSED: &[&str] = &[
+            "claude_code",
+            "codex",
+            "gemini_cli",
+            "cline",
+            "roo_code",
+            "opencode",
+            "goose",
+        ];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent
                 .sources
