@@ -66,12 +66,11 @@ impl Store {
     /// # Errors
     /// The query failed.
     pub async fn facts_from_episode(&self, episode_id: &str) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT id::text FROM facts WHERE source_episode_id = $1 ORDER BY id",
-        )
-        .bind(episode_id)
-        .fetch_all(self.pool())
-        .await?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT id::text FROM facts WHERE source_episode_id = $1 ORDER BY id")
+                .bind(episode_id)
+                .fetch_all(self.pool())
+                .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
@@ -86,12 +85,17 @@ impl Store {
     /// # Errors
     /// The statement failed.
     pub async fn redact_fact_content(&self, fact_id: &str) -> Result<usize> {
+        // **`object_text` is blanked to a placeholder, not to NULL.** The table
+        // has `CHECK (object_text IS NOT NULL OR object_entity_id IS NOT NULL)`,
+        // and a fact whose object is a literal has `object_entity_id` NULL — so
+        // setting `object_text` to NULL would violate the check and abort the
+        // whole cascade. The placeholder carries no content either way
         let done = sqlx::query(
             "UPDATE facts
-                SET statement       = '[redacted]',
-                    tsv             = NULL,
-                    embedding       = NULL,
-                    object_text     = NULL
+                SET statement   = '[redacted]',
+                    tsv         = NULL,
+                    embedding   = NULL,
+                    object_text = CASE WHEN object_text IS NULL THEN NULL ELSE '[redacted]' END
               WHERE id = $1 AND statement <> '[redacted]'",
         )
         .bind(fact_id)
@@ -158,12 +162,11 @@ impl Store {
     /// # Errors
     /// The query failed.
     pub async fn blob_referenced_anywhere(&self, blob_hash: &str) -> Result<bool> {
-        let (exists,): (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM episode_blobs WHERE blob_hash = $1)",
-        )
-        .bind(blob_hash)
-        .fetch_one(self.pool())
-        .await?;
+        let (exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM episode_blobs WHERE blob_hash = $1)")
+                .bind(blob_hash)
+                .fetch_one(self.pool())
+                .await?;
         Ok(exists)
     }
 
@@ -276,6 +279,28 @@ impl Store {
             counts.events += usize::try_from(events).unwrap_or(usize::MAX);
         }
         Ok(counts)
+    }
+
+    /// The promoted episodes belonging to these capture sessions.
+    ///
+    /// A promoted episode is one whose `content` carries
+    /// `transcript_event_id` (P5-4). They are the bridge between the archive
+    /// and the memory layer, and the reason a purge has to run the redact
+    /// cascade as well as delete its own rows.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub async fn promoted_episodes_of(&self, session_ids: &[String]) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id::text FROM episodes
+              WHERE content ? 'transcript_event_id'
+                AND session_id = ANY($1)
+              ORDER BY id",
+        )
+        .bind(session_ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Redacted-at timestamp for a target, when there is one.

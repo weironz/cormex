@@ -203,7 +203,12 @@ impl DeviceScope {
                 // able to destroy them. The handler additionally requires
                 // `?confirm=<id>`
                 || (is(Method::DELETE) && matches!(segs.as_slice(), ["archive", "sessions", _]))
-                || (is(Method::DELETE) && matches!(segs.as_slice(), ["archive", "files", _]));
+                || (is(Method::DELETE) && matches!(segs.as_slice(), ["archive", "files", _]))
+                // Redaction (docs/memory.md §十一). With `raw:read` for the
+                // same reason as purge: a credential that cannot read the
+                // original bytes must not be able to destroy them
+                || (is(Method::POST) && matches!(segs.as_slice(), ["episodes", _, "redact"]))
+                || (is(Method::POST) && matches!(segs.as_slice(), ["blobs", _, "redact"]));
             if raw {
                 return true;
             }

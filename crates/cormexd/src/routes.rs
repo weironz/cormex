@@ -164,6 +164,11 @@ protected_routes! {
     // is the kind of thing that gets called by accident from a retry
     "/archive/sessions/{id}" [DELETE] => axum::routing::delete(crate::archive_api::purge_session),
     "/archive/files/{id}" [DELETE] => axum::routing::delete(crate::archive_api::purge_file),
+    // **The memory layer's destructive operation** (docs/memory.md §十一). The
+    // only place in the system where UPDATE and DELETE are permitted, and the
+    // cascade has to cover every landing point or the promise is a lie
+    "/episodes/{id}/redact" [POST] => post(crate::archive_api::redact_episode),
+    "/blobs/{hash}/redact" [POST] => post(crate::archive_api::redact_blob),
     "/archive/raw/{generation_id}" [GET] => get(crate::archive_api::get_raw),
     // Full-text search. `scope=archive` needs `raw:read` -- the check is in the
     // handler, because it depends on the query string rather than the path

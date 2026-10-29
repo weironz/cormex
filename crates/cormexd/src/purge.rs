@@ -52,7 +52,11 @@ pub struct PurgeReport {
     pub objects_failed: usize,
     pub events_deleted: usize,
     pub chunks_deleted: usize,
-    pub promoted_episodes_deleted: usize,
+    /// Promoted episodes whose content was blanked and whose facts were
+    /// invalidated. **Not deleted** — see the comment at the call site.
+    pub promoted_episodes_redacted: usize,
+    /// Facts whose statement / vector were cleared.
+    pub facts_redacted: usize,
     pub summaries_deleted: usize,
 }
 
@@ -68,7 +72,7 @@ pub async fn purge_session(
     session_id: &str,
 ) -> Result<PurgeReport> {
     let store = tenant.store()?;
-    purge(st, store, session_id, None).await
+    purge(st, tenant, store, session_id, None).await
 }
 
 /// Purge one captured file.
@@ -77,12 +81,13 @@ pub async fn purge_session(
 /// The file does not exist, or a database write failed.
 pub async fn purge_file(st: &AppState, tenant: &Tenant, file_id: &str) -> Result<PurgeReport> {
     let store = tenant.store()?;
-    purge(st, store, file_id, Some(file_id)).await
+    purge(st, tenant, store, file_id, Some(file_id)).await
 }
 
 /// The shared body. `file_id` is `Some` when the target is a single file.
 async fn purge(
     st: &AppState,
+    tenant: &Tenant,
     store: &Store,
     target_id: &str,
     file_id: Option<&str>,
@@ -156,12 +161,38 @@ async fn purge(
         }
     }
 
-    // ── 3–4. The rows ──
+    // ── 3. The memory layer, through the redact cascade ──
+    //
+    // **Before the archive rows**, because the cascade needs the promoted
+    // episode's `content` to find the `transcript_event_id` it came from — and
+    // the archive purge clears the events that id points at.
+    //
+    // Each promoted episode is redacted rather than deleted:
+    // `facts.source_episode_id` is `NOT NULL REFERENCES episodes(id)` with no
+    // `ON DELETE CASCADE`, so a promoted episode that has facts **cannot** be
+    // deleted, and having facts is the normal case — promotion exists to feed
+    // extraction. §十一's answer for an episode is the same one: blank the
+    // content, invalidate the derived facts, keep the row.
+    let promoted = store.promoted_episodes_of(&session_ids).await?;
+    for episode_id in &promoted {
+        let r = crate::redact::redact_episode(
+            st,
+            tenant,
+            episode_id,
+            RedactionMode::Purge,
+            "the captured session it was promoted from was purged",
+        )
+        .await?;
+        report.facts_redacted += r.facts_cleared;
+        report.summaries_deleted += r.summaries_deleted;
+    }
+    report.promoted_episodes_redacted = promoted.len();
+
+    // ── 4. The archive rows ──
     let counts = store.purge_capture_rows(&file_ids, &generation_ids).await?;
     report.events_deleted = counts.events;
     report.chunks_deleted = counts.chunks;
-    report.promoted_episodes_deleted = counts.episodes;
-    report.summaries_deleted = counts.summaries;
+    report.summaries_deleted += counts.summaries;
 
     // ── 5. The tombstone ──
     //
@@ -484,6 +515,130 @@ mod tests {
             "a refused purge left a tombstone"
         );
         let _ = tenant;
+
+        db.drop().await;
+    }
+
+    /// A promoted episode **with facts** is redacted, not deleted.
+    ///
+    /// `facts.source_episode_id` is `NOT NULL REFERENCES episodes(id)` with no
+    /// `ON DELETE CASCADE`, so deleting a promoted episode that has facts fails
+    /// outright — and having facts is the normal case, because promotion exists
+    /// to feed extraction. Before this test, the purge would have aborted with a
+    /// foreign-key violation the first time anybody purged a session that had
+    /// been extracted.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_promoted_episode_with_facts_is_redacted_not_deleted() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (session_id, _generation, _key) = seed(&st, &store).await;
+
+        // A promoted episode: `content` carries `transcript_event_id`
+        let episode_id = Id::new();
+        store
+            .write_txn(async |t| {
+                t.insert_episode(&cormex_store::NewEpisode {
+                    id: episode_id,
+                    session_id: session_id.clone(),
+                    role: cormex_store::Role::User,
+                    content: serde_json::json!({
+                        "transcript_event_id": Id::new().to_string(),
+                        "text": "the secret decision",
+                    }),
+                    text: Some("the secret decision".into()),
+                    tsv_source: Some("the secret decision".into()),
+                    domain: None,
+                    device_id: "server".into(),
+                    occurred_at: chrono::Utc::now(),
+                })
+                .await
+            })
+            .await
+            .expect("promote an episode");
+
+        // A fact derived from it — the thing that makes DELETE fail
+        let entity = cormex_store::NewEntity {
+            id: Id::new(),
+            kind: "concept".into(),
+            name: "RustFS".into(),
+            summary: None,
+            embedding: Some(cormex_store::Vector::from(vec![0.1f32; 1024])),
+            embedding_model: "test".into(),
+            device_id: "server".into(),
+        };
+        let entity_id = entity.id;
+        let fact = cormex_store::NewFact {
+            id: Id::new(),
+            subject_id: entity_id,
+            predicate: "uses".into(),
+            object_text: Some("RustFS".into()),
+            object_entity_id: None,
+            statement: "cormex 使用 RustFS".into(),
+            tsv_source: Some("cormex 使用 RustFS".into()),
+            embedding: Some(cormex_store::Vector::from(vec![0.1f32; 1024])),
+            embedding_model: "test".into(),
+            domain: None,
+            confidence: 1.0,
+            valid_at: None,
+            source_episode_id: episode_id,
+            source: cormex_store::FactSource::Conversation,
+            derived_from: Vec::new(),
+            extracted_by: "test".into(),
+            device_id: "server".into(),
+        };
+        let fact_id = fact.id;
+        store
+            .write_txn(async |t| {
+                t.insert_entity(&entity).await?;
+                t.insert_fact(&fact).await
+            })
+            .await
+            .expect("a fact from the promoted episode");
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        let report = purge_session(&st, &tenant, &session_id)
+            .await
+            .expect("the purge must not abort on the foreign key");
+
+        assert_eq!(
+            report.promoted_episodes_redacted, 1,
+            "the promoted episode was not redacted"
+        );
+        assert_eq!(report.facts_redacted, 1, "the fact was not cleared");
+
+        // The episode row is still there, blanked
+        let episode = store.episode(&episode_id.to_string()).await.expect("query");
+        let episode = episode.expect("the episode row must survive: facts point at it");
+        assert_eq!(
+            episode.content,
+            serde_json::json!({"redacted": true}),
+            "the episode's content was not blanked"
+        );
+        assert!(episode.text.is_none(), "the episode's text survived");
+
+        // The fact's content is gone, and it is out of retrieval
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        let (statement, has_embedding): (String, bool) =
+            sqlx::query_as("SELECT statement, embedding IS NOT NULL FROM facts WHERE id = $1")
+                .bind(fact_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("the fact row");
+        pool.close().await;
+        assert_eq!(statement, "[redacted]");
+        assert!(
+            !has_embedding,
+            "the embedding survived -- a vector can be inverted approximately, so it is a \
+             recoverable copy of the thing being erased"
+        );
 
         db.drop().await;
     }

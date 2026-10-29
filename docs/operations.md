@@ -84,21 +84,24 @@ curl -X DELETE "https://<域名>/api/archive/sessions/<session_id>?confirm=<sess
 墓碑最后写是有意的：中途崩溃留下的是「部分消失、但仍被列出」的会话，运维看得见、
 能接着做。反过来会留下「看起来已擦除、字节还在」，而那样就再没人会看第二眼。
 
-### ⚠️ 它**没有**清理抽出来的事实
+### 它现在**会**清理抽出来的事实
 
-purge 删掉晋升出的 `episodes` 行，但**由它们抽出、已经写进 `facts` 的记忆仍然
-可读**。清理那些需要 memory 层的 redact 执行器，而它尚未实现（只有墓碑写入）。
+purge 对每个晋升出的 episode 跑一遍 redact 级联：清 episode 正文、清派生 fact 的
+`statement` / `tsv` / `embedding`（向量可近似反演原文，必须清）、追加
+`fact_events` 的 `invalidate`、删派生 summary、清档案侧的事件与索引块。
 
-要彻底擦除，现在只能手工：
+**晋升出的 episode 行本身不删**，只清空正文。`facts.source_episode_id` 是
+`NOT NULL REFERENCES episodes(id)` 且没有 `ON DELETE CASCADE` —— 删掉一个已经抽出
+过事实的 episode 会直接违反外键，而「抽出过事实」正是晋升的常态。
 
-```sql
--- 找出从某个采集会话晋升出来的 episode，再顺着它们找 facts
-SELECT id FROM episodes WHERE session_id = '<capture_session_id>';
-SELECT * FROM facts WHERE source_episode_id = ANY('<上面那些 id>');
+### 单独擦除一条记忆
+
+```bash
+curl -X POST "https://<域名>/api/episodes/<episode_id>/redact?confirm=<episode_id>" \
+  -H "Authorization: Bearer <token>"
 ```
 
-然后按 `docs/memory.md` §十一 的级联表逐项清（statement 写占位、tsv/embedding 置
-NULL、追加 `fact_events` 的 `invalidate`）。**这一步没有自动化**，也没有 CLI 入口。
+同样两道闸：`raw:read` 与 `?confirm=`。响应里逐项报告清了哪些落点。
 
 ### 响应里的 `objects_failed`
 

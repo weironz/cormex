@@ -1085,18 +1085,27 @@ impl Store {
             .execute(&mut *txn)
             .await?;
 
-        // **The promoted episodes go with the events.** They carry the
-        // transcript text in `content`, so leaving them would leave the
-        // conversation in the memory layer after the archive was purged
-        let episodes: u64 = sqlx::query(
-            "DELETE FROM episodes
+        // **The promoted episodes are redacted, not deleted.**
+        //
+        // They carry the transcript text in `content`, so leaving them alone
+        // would leave the conversation in the memory layer after the archive
+        // was purged. But `facts.source_episode_id` is
+        // `NOT NULL REFERENCES episodes(id)` with no `ON DELETE CASCADE`, so
+        // deleting a promoted episode that has facts **fails outright** — and
+        // that is the normal case, because promotion exists to feed extraction.
+        //
+        // The design's answer is the same one §十一 gives for an episode:
+        // blank the content, invalidate the derived facts, keep the row. The
+        // caller runs that cascade first; this only counts what it touched.
+        let (episodes,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM episodes
               WHERE content ? 'transcript_event_id'
                 AND session_id = ANY($1)",
         )
         .bind(&session_ids)
-        .execute(&mut *txn)
-        .await?
-        .rows_affected();
+        .fetch_one(&mut *txn)
+        .await?;
+        let episodes = u64::try_from(episodes).unwrap_or(u64::MAX);
 
         let events: u64 =
             sqlx::query("DELETE FROM transcript_events WHERE session_id::text = ANY($1)")

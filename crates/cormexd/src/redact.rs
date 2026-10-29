@@ -52,9 +52,7 @@
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use cormex_core::Id;
-use cormex_store::{
-    Actor, NewFactEvent, RedactionMode, RedactionTarget, Store, StoreError,
-};
+use cormex_store::{Actor, NewFactEvent, RedactionMode, RedactionTarget, Store, StoreError};
 
 use crate::request_tenant::Tenant;
 use crate::state::AppState;
@@ -87,21 +85,24 @@ pub async fn redact_episode(
     reason: &str,
 ) -> Result<RedactReport> {
     let store = tenant.store()?;
-    let id = episode_id
+    // Validated before anything is written: a malformed id would otherwise
+    // fail halfway through the cascade, leaving the episode partly cleared
+    episode_id
         .parse::<Id>()
         .map_err(|_| anyhow::anyhow!("{episode_id} is not a ULID"))?;
-
-    let mut report = RedactReport::default();
 
     // ── The episode itself ──
     //
     // `content` gets a placeholder rather than being deleted: the row is the
     // identity every `fact.source_episode_id` points at, and removing it would
     // turn a cascade into a dangling reference
-    report.episodes_cleared = store
-        .redact_episode_content(episode_id)
-        .await
-        .context("clearing the episode failed")?;
+    let mut report = RedactReport {
+        episodes_cleared: store
+            .redact_episode_content(episode_id)
+            .await
+            .context("clearing the episode failed")?,
+        ..RedactReport::default()
+    };
 
     // ── Facts derived from it ──
     //
@@ -134,12 +135,13 @@ pub async fn redact_episode(
             // **Only when nothing else references it.** Content addressing means
             // one blob may be attached to several episodes, and deleting the
             // object would break the others
-            if !store.blob_referenced_elsewhere(&blob_hash, episode_id).await? {
-                if let Ok(key) = store.blob_storage_key(&blob_hash).await {
-                    if st.delete_capture_object(&key).await.is_ok() {
-                        report.blobs_deleted += 1;
-                    }
-                }
+            if !store
+                .blob_referenced_elsewhere(&blob_hash, episode_id)
+                .await?
+                && let Ok(key) = store.blob_storage_key(&blob_hash).await
+                && st.delete_capture_object(&key).await.is_ok()
+            {
+                report.blobs_deleted += 1;
             }
         }
     }
@@ -151,7 +153,9 @@ pub async fn redact_episode(
     // redacted episode" is what this does: the deletion is here, the
     // regeneration is the distiller's next round, which reads
     // `transcript_events` — and those are cleared below
-    let summaries = store.summaries_derived_from(RedactionTarget::Episode, episode_id).await?;
+    let summaries = store
+        .summaries_derived_from(RedactionTarget::Episode, episode_id)
+        .await?;
     for summary_id in &summaries {
         report.summaries_deleted += store.delete_summary(summary_id).await?;
     }
@@ -199,19 +203,21 @@ pub async fn redact_blob(
     reason: &str,
 ) -> Result<RedactReport> {
     let store = tenant.store()?;
-    let mut report = RedactReport::default();
 
-    report.blob_transcripts_cleared = store
-        .redact_blob_transcript(blob_hash)
-        .await
-        .context("clearing the blob's transcripts failed")?;
+    let mut report = RedactReport {
+        blob_transcripts_cleared: store
+            .redact_blob_transcript(blob_hash)
+            .await
+            .context("clearing the blob's transcripts failed")?,
+        ..RedactReport::default()
+    };
 
-    if mode == RedactionMode::Purge && !store.blob_referenced_anywhere(blob_hash).await? {
-        if let Ok(key) = store.blob_storage_key(blob_hash).await
-            && st.delete_capture_object(&key).await.is_ok()
-        {
-            report.blobs_deleted += 1;
-        }
+    if mode == RedactionMode::Purge
+        && !store.blob_referenced_anywhere(blob_hash).await?
+        && let Ok(key) = store.blob_storage_key(blob_hash).await
+        && st.delete_capture_object(&key).await.is_ok()
+    {
+        report.blobs_deleted += 1;
     }
 
     let tombstone = cormex_store::NewRedaction {
@@ -258,4 +264,272 @@ pub async fn already_redacted(
 #[must_use]
 pub fn describe(err: &StoreError) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The cascade, against a real database.
+    //!
+    //! What these measure is the part that is silent when it is wrong: a
+    //! landing point the cascade forgot still holds the content, and nothing
+    //! fails — the content is gone from the place you looked and present in the
+    //! place you did not.
+
+    use super::*;
+    use cormex_store::{
+        FactSource, NewEntity, NewEpisode, NewFact, NewSummary, ProvenanceRef, Role, SourceKind,
+        SummaryScope, Vector,
+    };
+
+    /// One episode, one fact from it, one summary derived from it, one
+    /// transcript event.
+    async fn seed(store: &Store) -> (String, String, String, String) {
+        let episode = NewEpisode {
+            id: Id::new(),
+            session_id: "redact-test".into(),
+            role: Role::User,
+            content: serde_json::json!({"role":"user","text":"my key is AKIAIOSFODNN7EXAMPLE"}),
+            text: Some("my key is AKIAIOSFODNN7EXAMPLE".into()),
+            tsv_source: Some("my key is AKIAIOSFODNN7EXAMPLE".into()),
+            domain: None,
+            device_id: "test".into(),
+            occurred_at: Utc::now(),
+        };
+        let episode_id = episode.id;
+        store
+            .write_txn(async |t| t.insert_episode(&episode).await)
+            .await
+            .expect("episode");
+
+        let entity = NewEntity {
+            id: Id::new(),
+            kind: "concept".into(),
+            name: "RustFS".into(),
+            summary: None,
+            embedding: Some(Vector::from(vec![0.1f32; 1024])),
+            embedding_model: "test".into(),
+            device_id: "test".into(),
+        };
+        let entity_id = entity.id;
+        let fact = NewFact {
+            id: Id::new(),
+            subject_id: entity_id,
+            predicate: "uses".into(),
+            object_text: Some("RustFS".into()),
+            object_entity_id: None,
+            statement: "cormex 使用 RustFS".into(),
+            tsv_source: Some("cormex 使用 RustFS".into()),
+            embedding: Some(Vector::from(vec![0.1f32; 1024])),
+            embedding_model: "test".into(),
+            domain: None,
+            confidence: 1.0,
+            valid_at: None,
+            source_episode_id: episode_id,
+            source: FactSource::Conversation,
+            derived_from: Vec::new(),
+            extracted_by: "test".into(),
+            device_id: "test".into(),
+        };
+        let fact_id = fact.id;
+        store
+            .write_txn(async |t| {
+                t.insert_entity(&entity).await?;
+                t.insert_fact(&fact).await
+            })
+            .await
+            .expect("fact");
+
+        let summary = NewSummary {
+            id: Id::new(),
+            scope: SummaryScope::Session,
+            scope_key: "redact-test".into(),
+            text: "the user pasted a key".into(),
+            tsv_source: Some("the user pasted a key".into()),
+            embedding: None,
+            embedding_model: "none".into(),
+            covers_from: None,
+            covers_to: None,
+            sources: vec![ProvenanceRef {
+                kind: SourceKind::Episode,
+                id: episode_id,
+            }],
+            device_id: "test".into(),
+        };
+        let summary_id = summary.id;
+        store
+            .write_txn(async |t| t.insert_summary(&summary).await)
+            .await
+            .expect("summary");
+
+        (
+            episode_id.to_string(),
+            fact_id.to_string(),
+            summary_id.to_string(),
+            "redact-test".into(),
+        )
+    }
+
+    /// Every landing point is cleared, and the tombstone is written.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn every_landing_point_is_cleared() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (episode_id, fact_id, summary_id, _) = seed(&store).await;
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        let report = redact_episode(
+            &st,
+            &tenant,
+            &episode_id,
+            RedactionMode::Redact,
+            "a key was pasted",
+        )
+        .await
+        .expect("redact");
+
+        assert_eq!(report.episodes_cleared, 1);
+        assert_eq!(report.facts_cleared, 1);
+        assert_eq!(report.facts_invalidated, 1);
+        assert_eq!(report.summaries_deleted, 1);
+
+        // The episode's content is the placeholder
+        let episode = store.episode(&episode_id).await.expect("q").expect("row");
+        assert_eq!(episode.content, serde_json::json!({"redacted": true}));
+        assert!(episode.text.is_none());
+
+        // The fact's content and vector are gone
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        let (statement, has_vec, object): (String, bool, Option<String>) = sqlx::query_as(
+            "SELECT statement, embedding IS NOT NULL, object_text FROM facts WHERE id = $1",
+        )
+        .bind(&fact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fact row");
+        assert_eq!(statement, "[redacted]");
+        assert!(!has_vec, "the embedding survived");
+        assert_eq!(
+            object.as_deref(),
+            Some("[redacted]"),
+            "the object text survived"
+        );
+
+        // The fact is out of retrieval
+        let active: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM active_facts WHERE id = $1)")
+                .bind(&fact_id)
+                .fetch_one(&pool)
+                .await
+                .expect("active_facts");
+        assert!(!active.0, "the fact is still in active_facts");
+
+        // The summary is gone
+        let gone: (bool,) =
+            sqlx::query_as("SELECT NOT EXISTS(SELECT 1 FROM summaries WHERE id = $1)")
+                .bind(&summary_id)
+                .fetch_one(&pool)
+                .await
+                .expect("summary");
+        assert!(gone.0, "the derived summary survived");
+        pool.close().await;
+
+        // The tombstone is there
+        assert!(
+            already_redacted(
+                &store,
+                RedactionTarget::Episode,
+                &episode_id,
+                RedactionMode::Redact
+            )
+            .await
+            .expect("check"),
+            "no tombstone"
+        );
+
+        db.drop().await;
+    }
+
+    /// Running the cascade twice is safe.
+    ///
+    /// Every step matches nothing the second time, which is what makes "resume
+    /// after a crash" mean "run it again".
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_cascade_is_idempotent() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (episode_id, _, _, _) = seed(&store).await;
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+
+        let first = redact_episode(&st, &tenant, &episode_id, RedactionMode::Redact, "first")
+            .await
+            .expect("first");
+        assert_eq!(first.episodes_cleared, 1);
+
+        let second = redact_episode(&st, &tenant, &episode_id, RedactionMode::Redact, "second")
+            .await
+            .expect("second");
+        assert_eq!(
+            second.episodes_cleared, 0,
+            "the second run cleared the episode again"
+        );
+        assert_eq!(
+            second.facts_cleared, 0,
+            "the second run cleared a fact again"
+        );
+
+        db.drop().await;
+    }
+
+    /// A fact whose object is an entity keeps its `object_entity_id`.
+    ///
+    /// The table's CHECK is `object_text IS NOT NULL OR object_entity_id IS NOT
+    /// NULL`; blanking `object_text` on a literal-object fact would violate it
+    /// and abort the whole cascade. The placeholder keeps both cases legal.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_literal_object_fact_stays_legal_after_redaction() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (episode_id, _, _, _) = seed(&store).await;
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+
+        // The seed's fact has a literal object, so this is exactly the case
+        let result = redact_episode(
+            &st,
+            &tenant,
+            &episode_id,
+            RedactionMode::Redact,
+            "literal object",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "the cascade aborted on the facts CHECK: {result:?}"
+        );
+
+        db.drop().await;
+    }
 }

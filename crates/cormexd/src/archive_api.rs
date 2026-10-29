@@ -359,8 +359,137 @@ async fn purge_common(
         "objects_failed": report.objects_failed,
         "events_deleted": report.events_deleted,
         "chunks_deleted": report.chunks_deleted,
-        "promoted_episodes_deleted": report.promoted_episodes_deleted,
+        "promoted_episodes_redacted": report.promoted_episodes_redacted,
+        "facts_redacted": report.facts_redacted,
         "summaries_deleted": report.summaries_deleted,
+    })))
+}
+
+/// `POST /episodes/{id}/redact` — erase one episode and everything derived
+/// from it.
+///
+/// # The cascade this runs
+///
+/// `docs/memory.md` §十一. The episode's content, every fact extracted from it,
+/// the blob transcripts of its attachments, the summaries derived from it, and
+/// the archive's own copies. The tombstone is written last.
+///
+/// # Two gates, same shape as the archive purge
+///
+/// `raw:read` — a credential that cannot read the original bytes must not be
+/// able to destroy them. And `?confirm=<id>`, because a bare POST that erases a
+/// conversation is one mis-wired client away from being called by a retry.
+///
+/// # Errors
+/// Missing `raw:read` (403), a missing or wrong `confirm` (400), no such episode
+/// (404), or the cascade failed.
+pub async fn redact_episode(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    redact_common(
+        &st,
+        &principal,
+        &id,
+        q.confirm.as_deref(),
+        RedactionKind::Episode,
+    )
+    .await
+}
+
+/// `POST /blobs/{hash}/redact` — erase one blob's transcripts, and its object
+/// when the mode is purge.
+///
+/// # Errors
+/// Missing `raw:read` (403), a missing or wrong `confirm` (400), or the cascade
+/// failed.
+pub async fn redact_blob(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(hash): Path<String>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    redact_common(
+        &st,
+        &principal,
+        &hash,
+        q.confirm.as_deref(),
+        RedactionKind::Blob,
+    )
+    .await
+}
+
+/// Which kind of target a redact is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedactionKind {
+    Episode,
+    Blob,
+}
+
+async fn redact_common(
+    st: &AppState,
+    principal: &Principal,
+    target_id: &str,
+    confirm: Option<&str>,
+    kind: RedactionKind,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !principal.has_scope(crate::device_keys::Scope::RawRead) {
+        return Err(ApiError::forbidden(
+            "redacting requires raw:read: a credential that cannot read the original bytes must \
+             not be able to destroy them",
+        ));
+    }
+    match confirm {
+        Some(c) if c == target_id => {}
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "the confirmation does not match the id being redacted",
+            ));
+        }
+        None => {
+            return Err(ApiError::bad_request(format!(
+                "redacting erases the content and everything derived from it, and cannot be \
+                 undone. Repeat the id as ?confirm={target_id} to proceed"
+            )));
+        }
+    }
+
+    let tenant = principal.tenant(st).await?;
+    let report = match kind {
+        RedactionKind::Episode => {
+            crate::redact::redact_episode(
+                st,
+                &tenant,
+                target_id,
+                cormex_store::RedactionMode::Redact,
+                "requested through the API",
+            )
+            .await
+        }
+        RedactionKind::Blob => {
+            crate::redact::redact_blob(
+                st,
+                &tenant,
+                target_id,
+                cormex_store::RedactionMode::Redact,
+                "requested through the API",
+            )
+            .await
+        }
+    }
+    .map_err(|e| ApiError::internal(format!("the redaction failed: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "redacted": true,
+        "episodes_cleared": report.episodes_cleared,
+        "facts_cleared": report.facts_cleared,
+        "facts_invalidated": report.facts_invalidated,
+        "blob_transcripts_cleared": report.blob_transcripts_cleared,
+        "summaries_deleted": report.summaries_deleted,
+        "transcript_events_cleared": report.transcript_events_cleared,
+        "archive_chunks_deleted": report.archive_chunks_deleted,
     })))
 }
 

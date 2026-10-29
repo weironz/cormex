@@ -93,9 +93,9 @@ pub use model::{
     TranscriptKind, WORKSPACE_PATH_MAX_CHARS, table,
 };
 pub use query::EpisodeCursor;
-pub use redact::ArchiveClearCounts;
 #[doc(hidden)]
 pub use recall::RECALL_VECTOR_SQL;
+pub use redact::ArchiveClearCounts;
 pub use store::{SessionDigest, Store};
 pub use sync::{SyncLogEntry, SyncNotifications, SyncPayload, SyncRecord, SyncSignal};
 pub use tenant::{MAX_RESIDENT_TENANTS, PER_TENANT_CONNECTIONS, SchemaName, TenantPools};
