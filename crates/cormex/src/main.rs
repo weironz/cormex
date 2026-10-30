@@ -53,6 +53,21 @@ enum Command {
         #[arg(long)]
         username: Option<String>,
     },
+    /// Put a ChatGPT or Claude export into the archive (P4-7).
+    ///
+    /// Each conversation becomes its own captured session, browsable and
+    /// searchable like any other. **Dry run by default**: an export is
+    /// somebody's entire history.
+    Import {
+        /// The export's `conversations.json`.
+        path: std::path::PathBuf,
+        /// `chatgpt` or `claude`. Sniffed from the file when omitted.
+        #[arg(long)]
+        platform: Option<String>,
+        /// Really upload.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Revoke this machine's key and forget it.
     Logout {
         /// Clear the local copy without contacting the server.
@@ -262,6 +277,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("scopes: {}", outcome.scopes.join(", "));
             }
             println!("key stored in: {}", outcome.stored_in);
+            Ok(ExitCode::Ok)
+        }
+        Command::Import {
+            path,
+            platform,
+            yes,
+        } => {
+            let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
+            let client = cormex::ApiClient::new(&cfg.server_url, &key)?;
+            let platform = match platform.as_deref() {
+                None => None,
+                Some("chatgpt") => Some(cormex_transcript::export::ExportPlatform::ChatGpt),
+                Some("claude") => Some(cormex_transcript::export::ExportPlatform::Claude),
+                Some(other) => {
+                    anyhow::bail!("--platform accepts `chatgpt` or `claude`, not {other:?}")
+                }
+            };
+            let report = cormex::cmd::import::run(client, &path, platform, !yes).await?;
+            println!(
+                "{} conversations, {} bytes ({})",
+                report.conversations, report.bytes, report.platform
+            );
+            if !yes {
+                println!("dry run: nothing was uploaded. Pass --yes to upload.");
+            } else {
+                println!("uploaded {}", report.uploaded);
+            }
             Ok(ExitCode::Ok)
         }
         Command::Logout { forget } => {

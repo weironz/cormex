@@ -25,6 +25,9 @@ path = "src/main.rs"
 # static single binary. See `crates/cormex-proto/Cargo.toml`.
 cormex-proto.workspace = true
 cormex-core.workspace = true
+# The ChatGPT / Claude export splitter, shared with the server's projector so
+# there is one parser for that format rather than two that drift
+cormex-transcript.workspace = true
 
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "time", "process"] }

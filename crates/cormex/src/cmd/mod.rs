@@ -6,6 +6,7 @@
 
 pub mod detect;
 pub mod doctor;
+pub mod import;
 pub mod init;
 pub mod login;
 pub mod logout;
