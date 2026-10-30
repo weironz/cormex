@@ -3,9 +3,9 @@ import 'json.dart';
 /// 一条只增不改的归档对话轮次 —— 每条记忆事实的出处所指
 /// （`GET /episodes/{id}`）。
 ///
-/// # 这个类是从 Cortex 那边**拆**过来的，不是搬过来的
+/// # 这个类是从 Cormex 那边**拆**过来的，不是搬过来的
 ///
-/// Cortex 的 `Episode` 还带着 `attachments`、`memories`、`tool_calls` 三段，
+/// Cormex 的 `Episode` 还带着 `attachments`、`memories`、`tool_calls` 三段，
 /// 于是它一个类要拖进 `Attachment` / `InjectedMemory` / `ToolCall` 三个模型
 /// —— 而那三样全是 agent 那一侧的东西：附件是给模型读的 blob，注入记忆是
 /// 「为什么记得这个」抽屉，工具调用只有会话里才有。

@@ -1,9 +1,9 @@
-//! The `cortex-evals` command line.
+//! The `cormex-evals` command line.
 //!
 //! ```bash
-//! cargo run -p cortex-evals -- validate   # validate the suite only, no database needed
-//! cargo run -p cortex-evals -- run        # run the default suite, produce baseline numbers
-//! cargo run -p cortex-evals -- run --json out.json --md out.md
+//! cargo run -p cormex-evals -- validate   # validate the suite only, no database needed
+//! cargo run -p cormex-evals -- run        # run the default suite, produce baseline numbers
+//! cargo run -p cormex-evals -- run --json out.json --md out.md
 //! ```
 
 use std::path::PathBuf;
@@ -11,17 +11,17 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use cortex_evals::DEFAULT_SUITE;
-use cortex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalConfig};
-use cortex_evals::report::render_text;
-use cortex_evals::runner::{RunOptions, run};
-use cortex_evals::suite::Suite;
-use cortex_memory::retrieval::RecencyMode;
+use cormex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalConfig};
+use cormex_evals::report::render_text;
+use cormex_evals::runner::{RunOptions, run};
+use cormex_evals::suite::Suite;
+use cormex_evals::{DEFAULT_SESSION_SUITE, DEFAULT_SUITE};
+use cormex_memory::retrieval::RecencyMode;
 
 #[derive(Parser)]
 #[command(
-    name = "cortex-evals",
-    about = "Cortex retrieval-quality evaluation",
+    name = "cormex-evals",
+    about = "Cormex retrieval-quality evaluation",
     version
 )]
 struct Cli {
@@ -39,13 +39,27 @@ enum Command {
     Run(Box<RunArgs>),
     /// Static validation of the suite only (no database) — CI's first gate
     Validate {
-        #[arg(long, default_value = DEFAULT_SUITE)]
-        suite: PathBuf,
+        /// Defaults to the memory suite, or to the session suite with
+        /// `--sessions`.
+        #[arg(long)]
+        suite: Option<PathBuf>,
+        /// Validate the session-retrieval suite instead of the memory one.
+        #[arg(long)]
+        sessions: bool,
     },
 }
 
 #[derive(Parser)]
 struct RunArgs {
+    /// Which side to evaluate: `memory` runs the fact-retrieval suite,
+    /// `sessions` runs the session-retrieval one.
+    ///
+    /// Two targets rather than one report: they share no table, no index and no
+    /// ranking, so a number from one says nothing about the other, and folding
+    /// them together would let a good memory score hide a broken archive.
+    #[arg(long, value_enum, default_value_t = Target::Memory)]
+    target: Target,
+
     #[arg(long, default_value = DEFAULT_SUITE)]
     suite: PathBuf,
 
@@ -81,6 +95,23 @@ struct RunArgs {
     /// hand
     #[arg(long)]
     keep_schema: bool,
+
+    /// `--target longmemeval` only: the dataset file.
+    ///
+    /// Not in the repository: 277 MB, MIT-licensed but not ours. Get it from
+    /// `xiaowu0162/longmemeval-cleaned` on Hugging Face.
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+
+    /// `--target longmemeval` only: which k values to score.
+    #[arg(long, value_delimiter = ',', default_value = "1,5,10")]
+    ks: Vec<usize>,
+
+    /// `--target sessions` only: also build conversation vectors and fuse the
+    /// vector leg with BM25 (P5-6). Off matches the production default; on is
+    /// the A/B that decides whether the leg is worth its cost.
+    #[arg(long)]
+    session_vectors: bool,
 
     /// Turn off domain weighting (do not pass the question's domain to the
     /// retriever). For A/B runs
@@ -168,6 +199,14 @@ struct RunArgs {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Target {
+    Memory,
+    Sessions,
+    /// LongMemEval-S retrieval recall (P7-3).
+    Longmemeval,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Judge {
     Prefilter,
     Cheap,
@@ -220,15 +259,29 @@ async fn real_main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cortex_evals=info,warn".into()),
+                .unwrap_or_else(|_| "cormex_evals=info,warn".into()),
         )
         .with_target(false)
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { suite } => {
-            let s = Suite::load(&suite)?;
+        Command::Validate { suite, sessions } => {
+            if sessions {
+                let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSION_SUITE));
+                let s = cormex_evals::sessions::SessionSuite::load(&path)?;
+                s.validate()?;
+                println!(
+                    "session suite {} validated: {} sessions / {} events / {} questions",
+                    s.name,
+                    s.sessions.len(),
+                    s.event_count(),
+                    s.questions.len()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_SUITE));
+            let s = Suite::load(&path)?;
             println!(
                 "suite {} validated: {} scenarios / {} turns / {} seeded facts / {} questions",
                 s.name,
@@ -250,6 +303,12 @@ async fn real_main() -> Result<ExitCode> {
 }
 
 async fn run_command(args: RunArgs) -> Result<ExitCode> {
+    if args.target == Target::Sessions {
+        return run_sessions(args).await;
+    }
+    if args.target == Target::Longmemeval {
+        return run_longmemeval(args).await;
+    }
     let suite = Suite::load(&args.suite)?;
 
     let database_url = std::env::var("DATABASE_URL")
@@ -338,5 +397,145 @@ async fn run_command(args: RunArgs) -> Result<ExitCode> {
         }
     }
 
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The session-retrieval target.
+///
+/// Its own function rather than a branch inside `run_command`: the two targets
+/// share almost nothing — no suite type, no report type, no gate metric — and
+/// interleaving them would make both harder to read than the duplication costs.
+async fn run_sessions(args: RunArgs) -> Result<ExitCode> {
+    use cormex_evals::sessions::{SessionSuite, run_questions, seed_sessions};
+
+    let path = if args.suite.as_os_str() == DEFAULT_SUITE {
+        // The default points at the memory suite; a `--target sessions` run
+        // without `--suite` means the session one
+        PathBuf::from(DEFAULT_SESSION_SUITE)
+    } else {
+        args.suite.clone()
+    };
+    let suite = SessionSuite::load(&path)?;
+    suite.validate()?;
+
+    let database_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context(
+            "DATABASE_URL is not set. Both archive indexes are SQL, and what you measure              without Postgres is not this search system",
+        )?;
+
+    let db = cormex_evals::harness::EvalDb::create(&database_url).await?;
+    let schema = db.schema().to_owned();
+    let outcome = async {
+        seed_sessions(&db.store, &suite).await?;
+        if !args.session_vectors {
+            return run_questions(&db.store, &suite).await;
+        }
+        let embedder = cormex_evals::harness::default_embedder().await?;
+        let n = cormex_evals::sessions::seed_vectors(&db.store, &embedder).await?;
+        eprintln!("wrote {n} conversation vectors ({})", embedder.model_id());
+        cormex_evals::sessions::run_questions_with(
+            &db.store,
+            &suite,
+            cormex_evals::sessions::VectorLeg::On,
+            Some(&embedder),
+        )
+        .await
+    }
+    .await;
+    let keep = args.keep_schema || outcome.is_err();
+    db.cleanup(keep).await;
+
+    let report = outcome?;
+    let text = report.render();
+    println!("{text}");
+    eprintln!("(schema {schema})");
+
+    if let Some(path) = &args.md {
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("human-readable report: {}", path.display());
+    }
+    if let Some(path) = &args.json {
+        let json = serde_json::to_string_pretty(&report)
+            .context("the session report could not be serialized")?;
+        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))?;
+        eprintln!("machine-readable report: {}", path.display());
+    }
+
+    // The gate is **accuracy over all questions**, negatives included: a run
+    // that returns everything scores well on the positive questions and fails
+    // the negatives, which is exactly what the gate should catch
+    if let Some(min) = args.min_recall5 {
+        let actual = report.accuracy();
+        if actual < min {
+            eprintln!(
+                "regression gate failed: session accuracy = {actual:.3}, below the {min:.3} \
+                 threshold"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The LongMemEval-S target (P7-3).
+///
+/// Its own function for the same reason as `run_sessions`: the three targets
+/// share no suite type, no report type and no gate metric.
+async fn run_longmemeval(args: RunArgs) -> Result<ExitCode> {
+    let Some(path) = args.dataset.clone() else {
+        anyhow::bail!(
+            "--target longmemeval needs --dataset <longmemeval_s_cleaned.json>. The file is \
+             277 MB and not in this repository; get it from \
+             https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned"
+        );
+    };
+    let questions = cormex_evals::longmemeval::load(&path)?;
+    if questions.is_empty() {
+        anyhow::bail!("{} holds no questions", path.display());
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("DATABASE_URL is not set. The search is SQL, and what you measure without                   Postgres is not this search system")?;
+
+    let report = cormex_evals::longmemeval::run(
+        &database_url,
+        &path.display().to_string(),
+        &questions,
+        &args.ks,
+    )
+    .await?;
+
+    let text = report.render();
+    println!("{text}");
+    if let Some(path) = &args.md {
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    if let Some(path) = &args.json {
+        let json =
+            serde_json::to_string_pretty(&report).context("the report could not be serialized")?;
+        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+
+    // **The gate is R@k, and the flag is named for what it measures.** Reusing
+    // `--min-recall5` would be a lie in the other two targets' direction; a
+    // separate name keeps the two numbers apart even in a shell history
+    if let Some(min) = args.min_recall5 {
+        let actual = report
+            .recall
+            .iter()
+            .find(|(k, _)| *k == 5)
+            .map_or(0.0, |(_, r)| *r);
+        if actual < min {
+            eprintln!(
+                "regression gate failed: LongMemEval-S R@5 = {actual:.3}, below the {min:.3} \
+                 threshold (this is retrieval recall, not QA accuracy)"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }

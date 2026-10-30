@@ -1,0 +1,68 @@
+[package]
+name = "cormex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Cormex capture CLI: reads AI agent session files and sends them to a Cormex server"
+
+# A lib *and* a bin: the end-to-end test in P1-12 drives the sync engine
+# directly rather than shelling out, and `main.rs` should be nothing but
+# argument parsing and exit-code mapping.
+[lib]
+name = "cormex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cormex"
+path = "src/main.rs"
+
+[dependencies]
+# **`default-features = false`**: the CLI needs the DTOs and the catalog, and
+# makes no model call of its own -- it talks to the server's `/llm/stream`.
+# Turning the `llm` feature off keeps goose-providers and a TLS stack out of a
+# static single binary. See `crates/cormex-proto/Cargo.toml`.
+cormex-proto.workspace = true
+cormex-core.workspace = true
+# The ChatGPT / Claude export splitter, shared with the server's projector so
+# there is one parser for that format rather than two that drift
+cormex-transcript.workspace = true
+
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.9"
+# The local state database (D22). `bundled` so that a static binary has no
+# libsqlite3 dependency on the target machine -- which is the whole point of
+# shipping one binary per platform.
+rusqlite = { version = "0.37", features = ["bundled"] }
+zstd = "0.14"
+# Reading the export tar. The same crate the server uses to build it.
+tar = "0.4"
+sha2 = "0.10"
+keyring = "3"
+directories = "6"
+fs4 = "0.13"
+async-trait.workspace = true
+rpassword = "7"
+chrono.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+globset = "0.4"
+regex = { workspace = true }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tar = "0.4"
+zstd = "0.14"
+# A fake server for the login test: `axum` is already in the workspace, and a
+# mock object would assert the calls were made rather than that the second one
+# carried the token the first one returned
+tokio = { workspace = true, features = ["net"] }
+axum.workspace = true
+tower = { version = "0.5", features = ["util"] }

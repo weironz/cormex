@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'core/theme.dart';
 import 'features/connect/connect_page.dart';
-import 'features/memory/memory_browser.dart';
+import 'features/home/home_page.dart';
 import 'state/connection_controller.dart';
 
 class CormexApp extends StatelessWidget {
@@ -42,7 +42,7 @@ class _Gate extends ConsumerWidget {
           ),
         ),
       ),
-      ConnectionPhase.connected => const MemoryBrowser(),
+      ConnectionPhase.connected => const HomePage(),
       // connecting 也留在连接页：那上面有按钮的忙碌态和错误框，
       // 换一块转圈的白屏只会让失败时没地方显示原因。
       _ => const ConnectPage(),

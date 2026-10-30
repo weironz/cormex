@@ -1,0 +1,144 @@
+# ══════════════════════════════════════════════════════════
+#  cormexd 生产镜像
+#
+#  构建（在仓库根执行）：
+#    docker build -f scripts/docker/Dockerfile.cormexd -t cormex/cormexd .
+#  或直接：
+#    just prod-build
+#
+#  ── 两阶段的分法 ──────────────────────────────────────────
+#  第一阶段编译，第二阶段只带运行时。
+#
+#  ── 【这个镜像不编 local-embed】 ─────────────────────────
+#
+#  以前编。去掉的理由不是那 22 MB（52.6 → 30.5 MB），是**进程常驻内存**：
+#  载入 bge-m3 后 cormexd 常驻 1.03 GiB，而生产节点 2C/3.5G 上已经跑着
+#  19 个容器，余量 0.5~0.7 GiB —— 也就是「API 服务器顺手把推理也做了」
+#  这一个选择，单独吃掉了整台机器能跑的沙箱数量。
+#
+#  embedding 有独立容器（`docker-compose.yml` 的 `embeddings`，TEI），
+#  也有走云 API 的一档。两条路都不需要 cormexd 自己链 ONNX Runtime。
+#
+#  **谁想加回来先读这段**：加回 `--features cormex-memory/local-embed`
+#  会连带要求构建/运行底座都是 trixie —— ort 那份预编译 ONNX Runtime 是
+#  GCC 13+ 编的，引用 `std::__cxx11::basic_string<wchar_t>::_M_replace_cold`
+#  这类符号，bookworm 的 GCC 12.2 libstdc++ 没有，链接期会以一串
+#  `rust-lld: error: undefined symbol` 失败，报错里完全看不出「是发行版太老」。
+#  已实测。现在没有这个约束了，但两个底座仍保持 trixie 对齐（见下）。
+# ══════════════════════════════════════════════════════════
+
+# ── 构建阶段 ──────────────────────────────────────────────
+#
+# 构建与运行底座**必须同一个 debian 代号**：二进制动态链 glibc，
+# 新 glibc 编的东西放进老底座会在启动时报 `GLIBC_2.xx not found`。
+FROM rust:1.97.1-trixie AS builder
+
+WORKDIR /build
+
+# 先只拷清单，让「依赖没变就复用上一层」这件事真的发生。
+# 直接 COPY . . 会让任何一次源码改动都重编全部依赖树（Cormex 依赖 goose
+# 供应商层，那是几百个 crate，冷编按十分钟计）。
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/cormex-core/Cargo.toml   crates/cormex-core/
+COPY crates/cormex-llm/Cargo.toml    crates/cormex-llm/
+COPY crates/cormex-store/Cargo.toml  crates/cormex-store/
+COPY crates/cormex-memory/Cargo.toml crates/cormex-memory/
+COPY crates/cormex-blob/Cargo.toml   crates/cormex-blob/
+COPY crates/cormex-proto/Cargo.toml  crates/cormex-proto/
+COPY crates/cormex-import/Cargo.toml crates/cormex-import/
+COPY crates/cormexd/Cargo.toml       crates/cormexd/
+COPY evals/Cargo.toml                evals/
+
+# 造出空的 lib/main，让 cargo 能解析并预编译依赖
+RUN set -eux; \
+    for d in crates/*/ evals/; do \
+        mkdir -p "$d/src"; \
+        echo '' > "$d/src/lib.rs"; \
+        echo 'fn main() {}' > "$d/src/main.rs"; \
+    done; \
+    cargo build --release --locked -p cormexd 2>/dev/null || true
+
+# 真正的源码。上面那层的产物在依赖没变时命中缓存
+COPY crates/ crates/
+COPY evals/ evals/
+COPY migrations/ migrations/
+# 全局 schema（cormex_auth）的 migration。**漏了这行会在编译期就炸** ——
+# `sqlx::migrate!` 是宏，目录不在构建上下文里就没得编译，
+# 而本机构建照样是绿的（目录在那儿）。v0.1.5 发版时实际撞到过
+COPY migrations-global/ migrations-global/
+
+# 触碰一下自家 crate 的时间戳，否则 cargo 会拿上一步的空壳当成已构建
+# ★ `--locked` 不能省。这个仓库有一颗**跨 semver 组**的依赖范围：
+#   pgvector 声明的 sqlx 范围会把 sqlx 解回 0.8，于是构建里同时存在两份
+#   sqlx-core，`pgvector::Vector` 实现的是另一份的 `Decode` —— 报出来是
+#   几十条「trait not implemented」，而**本机是绿的**（Cargo.lock 钉住了）。
+#   没有 --locked 时 docker 构建允许重新解析，这个仓库刚从上游拆出来时
+#   就是这么炸的第一次。
+RUN set -eux; \
+    find crates evals -name '*.rs' -exec touch {} +; \
+    cargo build --release --locked -p cormexd; \
+    strip target/release/cormexd target/release/cormex || true
+
+# ── sqlx-cli ──────────────────────────────────────────────
+# 独立一个 stage 而不是塞进 builder：它与本项目源码毫无关系，
+# 放进 builder 会让每次改代码都可能连它一起重编。独立之后 BuildKit
+# 还能把两个 stage 并行跑。
+#
+# 为什么运行镜像里要有它：cormexd **不在启动时自动迁移**
+# （schema 变更在运行中的集群上自动执行是运维事故的常见起点）。
+# 部署机上不该为了跑一次 migration 去装 Rust 工具链，
+# 所以把 sqlx 一起塞进镜像，`just prod-migrate` 直接用。
+FROM rust:1.97.1-trixie AS sqlx
+# 版本必须钉在 0.9：Cargo.lock 把 sqlx 钉在 0.9（pgvector 的依赖范围会把它
+# 拉回 0.8 并造成两份 sqlx-core 共存，见 CLAUDE.md）。migration 记录表的
+# 格式跟 sqlx 大版本走，CLI 与库对不上会在应用 migration 时出怪问题。
+# `^0.9` 而不是 `0.9`：cargo install 的 --version 要完整 SemVer 或显式范围限定符。
+RUN cargo install sqlx-cli --version '^0.9' \
+        --no-default-features --features rustls,postgres --locked
+
+# ── 运行阶段 ──────────────────────────────────────────────
+# 与 builder 同代号（trixie）。用 bookworm-slim 的话构建能过、
+# 启动时才 `GLIBC_2.xx not found` —— 比构建期失败还难查。
+FROM debian:trixie-slim AS runtime
+
+# 三个二进制实测只链 libgcc/libm/libc（`ldd` 验过），底座自带。
+# 这里装的两样都不是给链接器的：
+#   ca-certificates  rustls-native-certs 从 /etc/ssl/certs 读信任根，
+#                    少了它 **编译和启动都正常**，只有对外 TLS 全部失败
+#   curl             HEALTHCHECK 用
+#
+# 曾经还有 libssl3 与 libgomp1 —— 那是 ONNX Runtime 的，随 local-embed 一起删了。
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl; \
+    rm -rf /var/lib/apt/lists/*
+
+# 不用 root 跑。容器逃逸的门槛低得惊人，而 cormexd 完全不需要特权。
+RUN useradd --system --uid 10001 --create-home --home-dir /home/cormex cormex
+
+COPY --from=builder /build/target/release/cormexd /usr/local/bin/cormexd
+COPY --from=sqlx    /usr/local/cargo/bin/sqlx     /usr/local/bin/sqlx
+# migration 随镜像走：`just prod-migrate` 直接在容器里跑，
+# 部署机上不需要另外弄一份仓库
+COPY --from=builder /build/migrations /opt/cormex/migrations
+COPY --from=builder /build/migrations-global /opt/cormex/migrations-global
+
+RUN mkdir -p /var/lib/cormex/workspace \
+    && chown -R cormex:cormex /var/lib/cormex
+
+USER cormex
+WORKDIR /var/lib/cormex
+
+ENV CORMEXD_BIND=0.0.0.0:8080 \
+    RUST_LOG=cormexd=info,cormex_memory=info,warn
+
+EXPOSE 8080
+
+# 探活打到 cormexd 自己的健康端点。用 curl 而不是 wget：
+# slim 镜像里 wget 是 busybox 版，不支持 --spider 的部分行为
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=5 \
+    CMD curl -fsS "http://127.0.0.1:${CORMEXD_PORT:-8080}/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/cormexd"]

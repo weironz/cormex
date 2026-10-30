@@ -1,0 +1,30 @@
+[package]
+name = "cormex-transcript"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Server-side parsers: logical bytes from an agent's session file to normalized transcript events"
+
+[dependencies]
+cormex-proto.workspace = true
+cormex-core.workspace = true
+# The ChatGPT / Claude export parser (P4-7). Reused rather than reimplemented:
+# two parsers for one file format is one parser that drifts, and the import path
+# already handles the format drift this format is prone to
+cormex-import.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+# The fixture sampler is a dev tool, not part of the crate: it needs the CLI's
+# discovery and the memory crate's redaction scanner, and neither belongs in a
+# parser's dependency tree
+cormex = { workspace = true }
+cormex-memory.workspace = true
+tempfile = "3"
+directories = "6"
+anyhow.workspace = true

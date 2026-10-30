@@ -1,25 +1,28 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart' as http;
 
 import '../models/account.dart';
+import '../models/archive_session.dart';
 import '../models/auth_tokens.dart';
 import '../models/episode.dart';
 import '../models/health_status.dart';
 import '../models/json.dart';
 import '../models/memory_search_result.dart';
+import '../models/transcript_event.dart';
 import 'api_exception.dart';
 import 'http_client_factory.dart';
 
-/// 对着一台真实的 cortexd 说话。
+/// 对着一台真实的 cormexd 说话。
 ///
 /// # 为什么这里没有 `abstract interface class`
 ///
-/// Cortex 那边有一层抽象接口，因为它有两个实现（真后端 + 一整套 mock
+/// Cormex 那边有一层抽象接口，因为它有两个实现（真后端 + 一整套 mock
 /// fixture）。Cormex 只有一个。给单实现套接口不是解耦，是把每次改动都变成
-/// 改两个文件 —— 而那个抽象层在 Cortex 那边有 501 行。
+/// 改两个文件 —— 而那个抽象层在 Cormex 那边有 501 行。
 class CormexApi {
   CormexApi({
     required String baseUrl,
@@ -51,7 +54,7 @@ class CormexApi {
 
   /// 空地址 = **同源**（在浏览器里），不是「没配」。
   ///
-  /// 这两件事在别处栽过：把空串换成一个默认地址，会让「Web 界面与 cortexd
+  /// 这两件事在别处栽过：把空串换成一个默认地址，会让「Web 界面与 cormexd
   /// 同源反代」那套拓扑整个走不通 —— 浏览器随即因为 CORS 把响应丢掉，
   /// 报的是「Failed to fetch」，一句看起来像后端没起来的错。
   ///
@@ -228,6 +231,93 @@ class CormexApi {
   Future<Episode> episode(String id) async =>
       Episode.fromJson(await _getJson('/episodes/${Uri.encodeComponent(id)}'));
 
+  // ─────────────────────────────── 会话档案 ───────────────────────────────
+
+  /// `GET /archive/sessions` —— 采集进来的会话列表。
+  ///
+  /// 过滤与分页都在**服务端**：先取 `limit` 条再在内存里过滤，会让被过滤掉
+  /// 的那些**占掉配额** —— 按 agent 一筛，列表就少了几条，而且没有任何提示。
+  Future<ArchiveSessionsPage> listArchiveSessions({
+    String? agent,
+    String? project,
+    DateTime? since,
+    DateTime? until,
+    String? cursor,
+    int limit = 50,
+  }) async {
+    final json = await _getJson('/archive/sessions', {
+      if (agent != null && agent.isNotEmpty) 'agent': agent,
+      if (project != null && project.isNotEmpty) 'project': project,
+      if (since != null) 'since': since.toUtc().toIso8601String(),
+      if (until != null) 'until': until.toUtc().toIso8601String(),
+      if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+      'limit': '$limit',
+    });
+    return ArchiveSessionsPage.fromJson(json);
+  }
+
+  /// `GET /archive/sessions/{id}` —— 会话详情：元数据、文件与代。
+  Future<ArchiveSessionDetail> archiveSession(String id) async =>
+      ArchiveSessionDetail.fromJson(
+        await _getJson('/archive/sessions/${Uri.encodeComponent(id)}'),
+      );
+
+  /// `GET /archive/sessions/{id}/events` —— 一页事件。
+  ///
+  /// [view] 是 `transcript`（默认）或 `digest`。digest 把工具结果截到 2 KiB
+  /// 并折叠工具调用 —— 用来快速扫一段对话，而不是读一份构建日志。
+  Future<TranscriptEventsPage> sessionEvents(
+    String id, {
+    String view = 'transcript',
+    String? cursor,
+    int limit = 100,
+  }) async {
+    final json = await _getJson(
+      '/archive/sessions/${Uri.encodeComponent(id)}/events',
+      {
+        'view': view,
+        if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+        'limit': '$limit',
+      },
+    );
+    return TranscriptEventsPage.fromJson(json);
+  }
+
+  /// `GET /archive/raw/{generationId}` —— 原始字节。
+  ///
+  /// 默认返回**遮罩后**的字节（疑似密钥换成 `[masked:<rule>]`）；
+  /// [unmask] 为 true 时原样返回。两种都要求 `raw:read`，且都会在服务端
+  /// 写一条访问日志 —— 一次遮罩读和一次未遮罩读在请求日志里长得一样，
+  /// 那条日志是事后唯一能区分它们的东西。
+  ///
+  /// 返回的是原始 `Uint8List` 而不是 `String`：这是文件字节，不保证是
+  /// UTF-8，按文本解码会把非 UTF-8 的部分弄坏。
+  Future<Uint8List> rawSlice(
+    String generationId, {
+    int? offset,
+    int? length,
+    bool unmask = false,
+  }) async {
+    final query = {
+      if (offset != null) 'offset': '$offset',
+      if (length != null) 'length': '$length',
+      if (unmask) 'unmask': 'true',
+    };
+    final http.Response response;
+    try {
+      response = await _client.get(
+        _uri('/archive/raw/${Uri.encodeComponent(generationId)}', query),
+        headers: _headers(const {'accept': 'application/octet-stream'}),
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+    return response.bodyBytes;
+  }
+
   // ─────────────────────────────── 账号 ───────────────────────────────
 
   /// `POST /auth/login` —— 用户名 + 密码换一对令牌。
@@ -309,12 +399,12 @@ class CormexApi {
   }
 
   String _unreachableMessage(Object e) =>
-      '连不上 cortexd（$_base）。确认它已启动、地址与端口正确，'
+      '连不上 cormexd（$_base）。确认它已启动、地址与端口正确，'
       '并且允许了这个页面的跨源请求。\n$e';
 
   /// 从错误响应里挖出服务端写给人看的那句话。
   ///
-  /// cortexd 的错误体是 `{"error": "…"}`，而那句话是专门措辞给用户看的
+  /// cormexd 的错误体是 `{"error": "…"}`，而那句话是专门措辞给用户看的
   /// （比如路径校验的拒绝理由）。挖不出来就退回原始 body —— 编一句更友好的
   /// 通用文案，只会盖掉唯一有信息量的东西。
   String _errorMessage(http.Response response) {
@@ -338,7 +428,7 @@ class CormexApi {
   /// `FormatException: Unexpected character (at character 1) <!DOCTYPE html>`。
   /// 那句话技术上完全正确，而且**是首次连接最可能撞上的失败**：最顺手输入
   /// 的地址是浏览器里访问的那个，而 API 常常在深一层路径上
-  /// （`https://host` → Web 界面，`https://host/api` → cortexd）。
+  /// （`https://host` → Web 界面，`https://host/api` → cormexd）。
   Map<String, dynamic> _decodeObject(String what, String body) {
     final Object? decoded;
     try {
@@ -360,8 +450,8 @@ class CormexApi {
       // 再猜就比没用还糟 —— 说出观察到的事实然后打住。
       final bare = _base.path.replaceAll('/', '').isEmpty;
       final hint = bare
-          ? '自托管部署通常把 cortexd 挂在 /api 下 —— 试试 $_base/api。'
-          : '确认这个地址指向 cortexd 本身，而不是 Web 界面或反代的默认站点。';
+          ? '自托管部署通常把 cormexd 挂在 /api 下 —— 试试 $_base/api。'
+          : '确认这个地址指向 cormexd 本身，而不是 Web 界面或反代的默认站点。';
       return '$what：这个地址返回的是网页，不是 API。$hint';
     }
     return '$what：返回的不是 JSON。\n${_trim(body)}';

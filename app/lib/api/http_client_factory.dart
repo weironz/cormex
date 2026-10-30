@@ -8,7 +8,7 @@
 /// `XMLHttpRequest` 上，并且**不发送**跨源预检之外的那套 fetch 语义；
 /// `fetch_client` 实现同一个 `http.Client` 接口，但走浏览器的 `fetch`，
 /// CORS 模式与凭据策略都能显式说清楚 —— 而这个客户端天生就是要跨源去打
-/// 一台别的机器上的 cortexd。
+/// 一台别的机器上的 cormexd。
 library;
 
 export 'http_client_factory_io.dart'

@@ -26,5 +26,5 @@ flutter build web --release
 把地址烤进构建里等于让每个部署者都得自己编一份客户端。凭据同理 ——
 理由见 `lib/auth/credential_store.dart` 的模块注释。
 
-需要一台跑着的 cortexd。凭据用 `cortexd --generate-token` 生成，
+需要一台跑着的 cormexd。凭据用 `cormexd --generate-token` 生成，
 或者用账号密码（若该部署接了账号体系）。

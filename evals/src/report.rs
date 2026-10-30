@@ -152,7 +152,7 @@ const WORST_SAMPLE: usize = 12;
 pub fn render_text(report: &Report) -> String {
     let mut s = String::with_capacity(8192);
 
-    let _ = writeln!(s, "# Cortex retrieval evaluation report");
+    let _ = writeln!(s, "# Cormex retrieval evaluation report");
     let _ = writeln!(s);
     let _ = writeln!(
         s,

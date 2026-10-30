@@ -1,18 +1,18 @@
 [package]
-name = "cortex-evals"
+name = "cormex-evals"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cortex retrieval-quality evaluation -- without it, tuning is just superstition"
+description = "Cormex retrieval-quality evaluation -- without it, tuning is just superstition"
 publish = false
 
 [dependencies]
-cortex-core.workspace = true
-cortex-llm.workspace = true
-cortex-store.workspace = true
-cortex-memory.workspace = true
+cormex-core.workspace = true
+cormex-llm.workspace = true
+cormex-store.workspace = true
+cormex-memory.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

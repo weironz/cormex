@@ -1,0 +1,541 @@
+//! The source catalog: where each agent keeps its session files, and how to
+//! recognise a session id from a path.
+//!
+//! Design: docs/design/session-archive-architecture.md §5.2 (D8).
+//!
+//! # Why this is data
+//!
+//! "Which file belongs to which agent, and what is its session id" changes
+//! whenever an upstream agent changes its storage layout — which is often, and
+//! never on our schedule. Written as code, every such change is a release of
+//! the CLI; written as data, it is a TOML file that the server can hand out a
+//! newer copy of (`GET /capture/catalog`) and the client can pick up without
+//! being rebuilt.
+//!
+//! The built-in copy is compiled in with `include_str!`, so a fresh install
+//! works with no network at all, and the server's copy is an **override**, not
+//! a requirement.
+//!
+//! # Everything here works from the path alone
+//!
+//! The `cwd` decode and the `session_id` rules read the path and nothing else
+//! (D2). Reading a file's contents to find its session id would mean the
+//! discovery step — which is supposed to be cheap enough to run on every hook —
+//! opens every transcript in the directory.
+
+use std::sync::LazyLock;
+
+use serde::{Deserialize, Serialize};
+
+/// The built-in catalog, compiled into the binary.
+const BUILTIN_TOML: &str = include_str!("../catalog/agents.toml");
+
+/// The parsed built-in catalog.
+///
+/// `LazyLock` rather than parsing per call: discovery runs on every hook, and
+/// re-parsing a few kilobytes of TOML each time is pure waste — but more to the
+/// point, a parse error would then surface at a random moment during a sync
+/// rather than at the first use.
+pub static BUILTIN: LazyLock<Catalog> = LazyLock::new(|| {
+    Catalog::parse(BUILTIN_TOML).expect(
+        "the built-in catalog is compiled in and must parse; a failure here is a build-time \
+         mistake in crates/cormex-proto/catalog/agents.toml, not a runtime condition",
+    )
+});
+
+/// The whole catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Catalog {
+    /// The catalog format version. Bumping it means a client that does not
+    /// understand the new shape should refuse the file rather than guess.
+    pub schema: u32,
+    /// The data's own version, for "is the server's copy newer than mine".
+    pub version: String,
+    /// The agents.
+    ///
+    /// `agents` in both the TOML and the JSON: the wire shape in the design is
+    /// `{"schema":1,"version":…,"agents":[…]}` (`GET /capture/catalog`), and
+    /// having the TOML spell it `[[agent]]` would mean two names for one thing —
+    /// with the JSON one silently wrong, since nothing deserialises it back.
+    #[serde(default)]
+    pub agents: Vec<AgentEntry>,
+}
+
+/// One agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEntry {
+    /// Lowercase identifier, matching `capture_sessions.agent`'s CHECK.
+    pub id: String,
+    /// What to show a human.
+    pub name: String,
+    /// Where the agent keeps its files, in the order to try them.
+    #[serde(default)]
+    pub home: Vec<HomeRoot>,
+    #[serde(default, rename = "source")]
+    pub sources: Vec<SourceSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HookSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionSpec>,
+    /// This agent has **no home to discover**: its files are produced by
+    /// `cormex import`, not read off the disk (P4-7).
+    ///
+    /// Without the flag, "no home" and "a home that was forgotten" look the
+    /// same, and the catalog test that catches the latter would have to be
+    /// weakened to accept both.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub import_only: bool,
+    /// This agent's files are only captured when the user names them with
+    /// `cormex sources add` (P4-6).
+    ///
+    /// Distinct from [`Self::import_only`] because the reason is different:
+    /// Aider's history file lives **in the project directory**, and D7 forbids
+    /// reading project directories by default. The path therefore lives in each
+    /// machine's `config.toml`, not in this shared catalog — but the agent id
+    /// still has to exist here, because `capture_sessions.agent` has a CHECK
+    /// and the parser dispatch is keyed on the same id.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual_only: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One candidate home directory.
+///
+/// An environment variable first, a literal path second: `CLAUDE_CONFIG_DIR`
+/// wins when set, because that is how a user says "my config is not in the
+/// default place", and ignoring it would capture the wrong directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HomeRoot {
+    Env { env: String },
+    Path { path: String },
+}
+
+/// One kind of file within an agent's home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSpec {
+    pub role: super::capture::FileRole,
+    /// Relative to the home, forward slashes, globset syntax.
+    pub glob: String,
+    pub framing: super::capture::Framing,
+    /// When set, a sibling with this suffix is the **same logical file**
+    /// (Codex's `.jsonl.zst`). The client keeps one of them — plaintext wins —
+    /// and the logical path is always the plaintext name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub also_compressed: Option<String>,
+    pub session_id: SessionIdRule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionIdRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<CwdRule>,
+    /// Read rows out of a SQLite database instead of files (P4-0).
+    ///
+    /// `None` = an ordinary file source. When present, `glob` names the
+    /// database file and this says how to read rows out of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<SqliteSpec>,
+}
+
+/// How to read one SQLite source (P4-0).
+///
+/// # Why the query lives in the catalog rather than in the client
+///
+/// A host's schema is data about that host, and the catalog is where "what this
+/// host writes and where" already lives (D8). Putting the query in the CLI
+/// would mean a code change per host, and the whole point of the catalog is
+/// that adding a host is a data change.
+///
+/// # Why `key_column` is separate from the query
+///
+/// The key is what makes a row's logical path stable across runs — it is the
+/// deduplication identity. Deriving it from the result set by position would
+/// break the moment somebody reorders the SELECT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteSpec {
+    /// The SELECT. Every column it returns is stored in the row's snapshot.
+    pub query: String,
+    /// Which returned column identifies the row.
+    pub key_column: String,
+    /// Which returned column carries the conversation text, if any.
+    ///
+    /// `None` = the whole row is the content (the JSON of every column). That
+    /// is the right default for a schema we do not model: the bytes are kept,
+    /// and the server's parser decides later what is in them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_column: Option<String>,
+    /// Which returned column names the **conversation** the row belongs to.
+    ///
+    /// Without it every row of the database lands in one session, because a
+    /// row's logical path carries only its key. A host with ten thousand
+    /// messages across four hundred conversations would then read as one
+    /// enormous session, and `session_search` would return that one session for
+    /// every query.
+    ///
+    /// `None` = the source's `session_id` rule applies, which is right for a
+    /// database that holds a single conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_column: Option<String>,
+    /// How long to wait for a lock before giving up, in milliseconds.
+    ///
+    /// A host with the database open in WAL mode lets us read concurrently; one
+    /// in rollback-journal mode does not, and a zero timeout would fail the
+    /// whole run every time the host happened to be writing.
+    #[serde(default = "default_busy_timeout_ms")]
+    pub busy_timeout_ms: u64,
+}
+
+fn default_busy_timeout_ms() -> u64 {
+    5_000
+}
+
+/// How to derive a session id from a path.
+///
+/// The variants are the ones the surveyed hosts actually need; a new host that
+/// needs something else is a new variant here plus one arm in the CLI, which is
+/// still much cheaper than a per-agent code path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum SessionIdRule {
+    /// The file stem, minus any compression suffix.
+    ///
+    /// A struct variant with no fields rather than a unit variant: serde's
+    /// internally-tagged representation cannot express a unit variant, and the
+    /// TOML spelling `{ from = "stem" }` is what the catalog uses.
+    Stem {},
+    /// A capture group named `id` in a regex applied to the file stem.
+    StemRegex { regex: String },
+    /// The `index`-th segment of the logical path, counting from zero.
+    ///
+    /// Negative indices count from the end. **Only positive indices are
+    /// meaningful when the glob contains `**`**: the depth is not fixed, so
+    /// "third from the end" addresses a different segment depending on how deep
+    /// the match went.
+    PathSegment {
+        index: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+    /// A fixed value.
+    ///
+    /// `per_device = true` appends `@<device_id>`: the host keeps one global
+    /// memory file per machine, and without the suffix two machines' memories
+    /// would merge into one session — whose contents do not agree.
+    Const {
+        value: String,
+        #[serde(default)]
+        per_device: bool,
+    },
+}
+
+/// How to derive a working directory from a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CwdRule {
+    /// `parent_dir`: the directory containing the file.
+    pub from: String,
+    /// `claude_project_dir`: Claude Code encodes a path by replacing `/` with
+    /// `-`. The decode is **lossy** (a directory name containing a literal `-`
+    /// is ambiguous), so the result is a fallback for when a hook did not
+    /// supply the cwd, and the client marks it as guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode: Option<String>,
+}
+
+/// The host's hook mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSpec {
+    /// Which installer to use: `claude_code_settings` (merge into
+    /// `settings.json`), `codex_hooks_json` (write `hooks.json`).
+    pub kind: String,
+    /// The lifecycle events to hook.
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+/// The host's own session-file retention, which the CLI offers to raise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionSpec {
+    pub setting: String,
+    pub file: String,
+    pub default_days: u32,
+}
+
+impl Catalog {
+    /// Parse a catalog from TOML.
+    ///
+    /// # Errors
+    /// The TOML is malformed, or a field has the wrong shape. The message is
+    /// the parser's, which names the line — that is the whole reason a catalog
+    /// author gets anything useful out of a typo.
+    pub fn parse(toml_text: &str) -> Result<Self, String> {
+        toml::from_str(toml_text).map_err(|e| e.to_string())
+    }
+
+    /// The built-in catalog.
+    #[must_use]
+    pub fn builtin() -> &'static Catalog {
+        &BUILTIN
+    }
+
+    /// One agent by id.
+    #[must_use]
+    pub fn agent(&self, id: &str) -> Option<&AgentEntry> {
+        self.agents.iter().find(|a| a.id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The built-in catalog parses, and its ids match the database's CHECK.
+    ///
+    /// `capture_sessions.agent` is constrained to `^[a-z][a-z0-9_]{1,31}$`. An
+    /// id outside that shape is rejected by Postgres at insert time — after the
+    /// client has already discovered and uploaded the file — so the check
+    /// belongs here, where the message can say which agent and why.
+    #[test]
+    fn the_builtin_catalog_parses_and_its_ids_match_the_ddl() {
+        let c = Catalog::builtin();
+        assert_eq!(c.schema, 1, "the built-in catalog's schema version");
+        assert!(
+            !c.agents.is_empty(),
+            "the built-in catalog has no agents -- the include_str! is pointing at the wrong file"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for a in &c.agents {
+            assert!(
+                seen.insert(a.id.clone()),
+                "agent id {:?} appears twice; discovery would then register the same file under \
+                 two agents",
+                a.id
+            );
+            let ok = (2..=32).contains(&a.id.len())
+                && a.id.starts_with(|c: char| c.is_ascii_lowercase())
+                && a.id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            assert!(
+                ok,
+                "agent id {:?} does not match ^[a-z][a-z0-9_]{{1,31}}$ -- capture_sessions.agent \
+                 has that CHECK, so the insert would be rejected after the upload",
+                a.id
+            );
+            assert!(
+                a.import_only || a.manual_only || !a.home.is_empty(),
+                "agent {:?} has no home; discovery would find nothing. If it is fed by \
+                 `cormex import` set `import_only`, or by `cormex sources add` set `manual_only`",
+                a.id
+            );
+            // An agent may legitimately have no sources yet: Cursor's hooks are
+            // installed and queue the transcript path, but its transcript
+            // format is undocumented, so registering a source without a parser
+            // would capture files that never project. `hooks.is_some()` is the
+            // other way an agent can be useful before it has a parser
+            assert!(
+                !a.sources.is_empty() || a.hooks.is_some() || a.import_only || a.manual_only,
+                "agent {:?} has neither sources nor hooks and is not fed by `cormex import` or \
+                 `cormex sources add`, so it does nothing at all",
+                a.id
+            );
+        }
+    }
+
+    /// Every regex in the catalog compiles.
+    ///
+    /// A bad regex would otherwise surface as a panic or a skipped file during
+    /// discovery — on somebody's machine, at hook time, where the output is
+    /// discarded.
+    #[test]
+    fn every_regex_compiles() {
+        for a in &Catalog::builtin().agents {
+            for s in &a.sources {
+                for rule in std::iter::once(&s.session_id).chain(s.parent_session_id.as_ref()) {
+                    if let SessionIdRule::StemRegex { regex } = rule {
+                        regex::Regex::new(regex).unwrap_or_else(|e| {
+                            panic!(
+                                "agent {:?} has a session_id regex that does not compile: {e}\n\
+                                 the pattern is {regex:?}",
+                                a.id
+                            )
+                        });
+                        assert!(
+                            regex.contains("(?P<id>"),
+                            "agent {:?}'s regex {regex:?} has no named `id` group, so it can \
+                             never produce a session id",
+                            a.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Claude Code's memory pseudo-sessions are **per project**, Codex's are
+    /// **per device**.
+    ///
+    /// Both are easy to get backwards, and both failures are silent: the first
+    /// merges every project's memory into one session; the second merges two
+    /// machines' memories into one, and their contents do not agree.
+    #[test]
+    fn the_two_memory_pseudo_sessions_are_scoped_differently() {
+        let c = Catalog::builtin();
+
+        let claude = c
+            .agent("claude_code")
+            .expect("claude_code is in the catalog");
+        let memory = claude
+            .sources
+            .iter()
+            .find(|s| s.role == super::super::capture::FileRole::Memory)
+            .expect("Claude Code has a memory source");
+        match &memory.session_id {
+            SessionIdRule::PathSegment { index, prefix } => {
+                assert_eq!(
+                    *index, 1,
+                    "Claude Code's memory glob is projects/*/memory/**, so the project segment is \
+                     index 1"
+                );
+                assert_eq!(
+                    prefix.as_deref(),
+                    Some("memory:"),
+                    "the pseudo-session id needs a prefix, or it collides with a real session id \
+                     that happens to equal the project directory name"
+                );
+            }
+            other => {
+                panic!("Claude Code's memory session_id should be a path segment, got {other:?}")
+            }
+        }
+
+        let codex = c.agent("codex").expect("codex is in the catalog");
+        let memory = codex
+            .sources
+            .iter()
+            .find(|s| s.role == super::super::capture::FileRole::Memory)
+            .expect("Codex has a memory source");
+        match &memory.session_id {
+            SessionIdRule::Const { value, per_device } => {
+                assert_eq!(value, "memory");
+                assert!(
+                    *per_device,
+                    "Codex's memory is one file per machine; without per_device the two machines' \
+                     memories merge into one session whose contents do not agree"
+                );
+            }
+            other => panic!("Codex's memory session_id should be a constant, got {other:?}"),
+        }
+    }
+
+    /// Codex's `.jsonl.zst` is the same logical file as the `.jsonl`.
+    #[test]
+    fn codex_declares_its_compressed_sibling() {
+        let codex = Catalog::builtin().agent("codex").expect("codex");
+        let transcript = codex
+            .sources
+            .iter()
+            .find(|s| s.role == super::super::capture::FileRole::Transcript)
+            .expect("Codex has a transcript source");
+        assert_eq!(
+            transcript.also_compressed.as_deref(),
+            Some(".zst"),
+            "without this, a cold Codex rollout would be captured twice -- once as .jsonl.zst and \
+             once as .jsonl -- and the two would be different sessions' worth of duplicate bytes"
+        );
+    }
+
+    /// The catalog survives a round trip through JSON, which is how the server
+    /// hands it out (`GET /capture/catalog` returns "the TOML's JSON form").
+    #[test]
+    fn the_catalog_round_trips_through_json() {
+        let c = Catalog::builtin();
+        let json = serde_json::to_string(c).expect("serialize");
+        let back: Catalog = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            &back, c,
+            "the catalog changed shape on the way through JSON"
+        );
+    }
+
+    /// A malformed catalog is an error, not a panic.
+    #[test]
+    fn a_malformed_catalog_is_an_error() {
+        assert!(
+            Catalog::parse("schema = ").is_err(),
+            "truncated TOML must be reported, not accepted"
+        );
+        assert!(
+            Catalog::parse("schema = 1\nversion = \"x\"\n[[agents]]\nid = 3").is_err(),
+            "an agent id of the wrong type must be reported"
+        );
+    }
+
+    /// Every agent in the built-in catalog has a parser for its conversation
+    /// roles.
+    ///
+    /// The failure this catches is the one that has no symptom: a catalog entry
+    /// whose agent id does not match any parser means the files are captured,
+    /// stored, and **never projected** — the archive fills up and every session
+    /// reads as empty.
+    #[test]
+    fn every_catalogued_agent_has_a_parser() {
+        // The parser crate depends on this one, so the check lives here as a
+        // list rather than a call: adding an agent to `agents.toml` without
+        // adding it here is exactly the omission this test exists to catch
+        const PARSED: &[&str] = &[
+            "claude_code",
+            "codex",
+            "gemini_cli",
+            "cline",
+            "roo_code",
+            "opencode",
+            "goose",
+            "qwen_code",
+            "copilot_chat",
+            "chatgpt_export",
+            "claude_export",
+            "aider",
+            "cursor",
+            "copilot_cli",
+        ];
+        for agent in &Catalog::builtin().agents {
+            let conversation_roles = agent
+                .sources
+                .iter()
+                .any(|s| matches!(s.role, crate::capture::FileRole::Transcript));
+            if !conversation_roles {
+                continue;
+            }
+            assert!(
+                PARSED.contains(&agent.id.as_str()),
+                "the catalog captures {} but no parser handles it, so its sessions would be \
+                 stored and never projected. Add a parser, or add the id to PARSED here if one \
+                 already exists",
+                agent.id
+            );
+        }
+    }
+
+    /// The SQLite sources all name a database, not a pattern.
+    ///
+    /// A `glob` with a wildcard in a SQLite source would be read as a literal
+    /// path, and the failure is "the database does not exist" for every run.
+    #[test]
+    fn a_sqlite_source_names_one_database() {
+        for agent in &Catalog::builtin().agents {
+            for source in &agent.sources {
+                if source.sqlite.is_some() {
+                    assert!(
+                        !source.glob.contains('*') && !source.glob.contains('?'),
+                        "agent {} has a SQLite source whose glob is a pattern: {}",
+                        agent.id,
+                        source.glob
+                    );
+                }
+            }
+        }
+    }
+}

@@ -70,14 +70,14 @@ gave it that token. No service key, no privilege escalation surface.
 ## What's in the box
 
 ```
-cortex-core     types / ids / config / errors
-cortex-llm      provider layer (wraps goose-providers)
-cortex-store    sqlx repositories + the sync log
-cortex-memory   tokenization / embeddings / extraction / 4-way recall + RRF
-cortex-blob     content-addressed blob storage (S3 / local)
-cortex-proto    the wire protocol
-cortex-import   importers for ChatGPT / Claude conversation exports
-cortexd         the server: HTTP + SSE + WebSocket + MCP
+cormex-core     types / ids / config / errors
+cormex-llm      provider layer (wraps goose-providers)
+cormex-store    sqlx repositories + the sync log
+cormex-memory   tokenization / embeddings / extraction / 4-way recall + RRF
+cormex-blob     content-addressed blob storage (S3 / local)
+cormex-proto    the wire protocol
+cormex-import   importers for ChatGPT / Claude conversation exports
+cormexd         the server: HTTP + SSE + WebSocket + MCP
 app/            the memory browser (Flutter — web and desktop from one source)
 ```
 
@@ -105,13 +105,6 @@ a real one takes: an edge proxy splitting `/api` from the browser, WAL
 archiving to a separate disk, volumes that already exist under names nobody can
 change. Read it; do not run it.
 
-> ⚠️ **Known gap: this does not yet come up against an empty database.**
-> The two migration sets have an ordering bug — the global set (accounts) runs
-> first, but uses the `ulid` domain that the per-tenant set creates, so a fresh
-> database stops at `type "ulid" does not exist` and the server restart-loops.
-> Our own deployment never hit it: its `public` schema predates the accounts
-> tables by three days. It is the top item on the [roadmap](docs/roadmap.md).
-
 **The web image carries no domain name.** The API address compiled into it is
 the relative prefix `/api`, which the browser resolves against whatever origin
 served the page. So one published image works for every deployment; you route
@@ -121,6 +114,88 @@ hostname appears.
 
 That relative-prefix detail is the difference between an image anyone can pull
 and an image whose first job is to be rebuilt.
+
+## Capture your agent sessions
+
+A small CLI reads the session files your AI agents already write to disk and
+sends them, byte for byte, to your Cormex server. It never modifies them and
+never parses what it reads — parsing happens on the server, so twenty hosts'
+worth of format churn is maintained in one place rather than in every installed
+binary.
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.ps1 | iex
+
+# or, if you already have Node
+npm install -g cormex
+```
+
+Then:
+
+```bash
+cormex login --server https://memory.example.com   # asks for your account password
+cormex init                                        # hooks, scheduler, backfill
+```
+
+On a machine with no browser (a server, a container), use the device-code flow
+instead — it prints a short code, you type it into a browser you are already
+logged into, and the machine polls until a key appears:
+
+```bash
+cormex login --server https://memory.example.com --device-code
+```
+
+`cormex init` shows every change before making it: hooks in the agent's own
+settings file, a periodic sync, and a raised `cleanupPeriodDays` (the host
+deletes old sessions, and a capture client cannot recover what is already gone).
+`cormex uninstall` restores each file from a backup — byte for byte, not
+"removes what it thinks it added".
+
+### What it reads, and what it does not
+
+| | |
+|---|---|
+| **Reads** | the agent's own directories: `~/.claude/projects`, `~/.codex/sessions`, and so on |
+| **Does not read** | your project directories, your source code, anything outside those homes |
+| **The one exception** | `git remote get-url origin` and `git rev-parse HEAD` in a session's working directory, for the project filter. Turn it off with `git_metadata = false` |
+
+The device key is scoped: `capture:write` by default, plus `session:read` and
+`memory:read`. `raw:read` — the original, unmasked bytes — has to be asked for
+explicitly, so a lost laptop does not hand over every conversation.
+
+### Connect an agent over MCP
+
+`cormex init` registers Cormex with the agents it finds. To do it by hand:
+
+**Claude Code** (streamable HTTP):
+
+```bash
+claude mcp add --transport http cormex https://memory.example.com/mcp \
+  --header "Authorization: Bearer <device key>"
+```
+
+**Codex** (stdio — Codex spawns a child process, and `cormex mcp` forwards to
+the server):
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.cormex]
+command = "/usr/local/bin/cormex"
+args = ["mcp"]
+```
+
+Either way the agent gets `memory_search`, `remember`, `session_search` and
+`session_get`, plus the `cortex://profile` resource. The session tools are the
+reason to connect: they let an agent answer "what did we decide last week, and
+why" from the actual conversation rather than from a summary of it.
+
+`cormex doctor` answers "why is this machine not capturing": server
+reachability, credential storage, queue backlog, last successful run, whether
+the hooks are still in place.
 
 ## Status
 

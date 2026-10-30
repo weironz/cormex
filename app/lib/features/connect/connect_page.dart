@@ -8,7 +8,7 @@ import '../../state/connection_controller.dart';
 /// 凭据的两种形态。
 ///
 /// 服务端的认证中间件两种都当 `Authorization: Bearer` 收（见
-/// `cortexd::auth::require`），差别只在**这一把是从哪儿来的**：
+/// `cormexd::auth::require`），差别只在**这一把是从哪儿来的**：
 /// 一个是运维手上那串，一个要拿账号密码去换。
 enum _CredentialMode { token, password }
 
@@ -170,8 +170,8 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      '部署时用 `cortexd --generate-token` 生成，只显示一次。'
-                      '认证关着（CORTEX_AUTH=disabled）时留空即可。',
+                      '部署时用 `cormexd --generate-token` 生成，只显示一次。'
+                      '认证关着（CORMEX_AUTH=disabled）时留空即可。',
                       style: theme.textTheme.labelSmall,
                     ),
                   ] else ...[

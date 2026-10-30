@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A/B 扫描的跑腿脚本 —— 一次跑一组配置，把关键数字拉平成一张表。
 
-评测本体不做这件事是刻意的：`cortex-evals` 的产物是**一次**运行的报告，
+评测本体不做这件事是刻意的：`cormex-evals` 的产物是**一次**运行的报告，
 把「跑 N 次再对比」塞进它会让 CI 的那条路径也背上一堆用不到的旋钮。
 扫描是人在调参时的临时工具，放在这里，别进 CI。
 
@@ -23,7 +23,7 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = Path(tempfile.gettempdir()) / "cortex-sweep"
+OUT = Path(tempfile.gettempdir()) / "cormex-sweep"
 OUT.mkdir(exist_ok=True)
 
 KINDS = ["中文语义", "专名精确", "时间回放", "关系推理", "跨域检索", "应召不到"]
@@ -32,7 +32,7 @@ CHANNELS = ["bm25", "vector", "graph", "recency", "episode"]
 
 def run(name, args):
     path = OUT / f"{name}.json"
-    cmd = ["cargo", "run", "-q", "-p", "cortex-evals", "--", "run", "--json", str(path)] + args
+    cmd = ["cargo", "run", "-q", "-p", "cormex-evals", "--", "run", "--json", str(path)] + args
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0 or not path.exists():

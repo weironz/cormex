@@ -8,12 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use cortex_evals::matcher::Matcher;
-use cortex_evals::suite::{Lang, QuestionKind, Suite};
+use cormex_evals::matcher::Matcher;
+use cormex_evals::suite::{Lang, QuestionKind, Suite};
 
 fn suite_path() -> PathBuf {
     // A test's working directory is the crate directory (evals/)
-    PathBuf::from("suites/cortex-zh-en-v1.json")
+    PathBuf::from("suites/cormex-zh-en-v1.json")
 }
 
 fn load() -> Suite {
@@ -295,7 +295,7 @@ fn unanswerable_questions_have_tempting_distractors() {
 //  select questions backwards from the results.
 // ══════════════════════════════════════════════════════════
 
-fn tool_questions(suite: &Suite) -> Vec<&cortex_evals::suite::Question> {
+fn tool_questions(suite: &Suite) -> Vec<&cormex_evals::suite::Question> {
     suite
         .questions
         .iter()

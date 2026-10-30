@@ -3,7 +3,7 @@ import 'package:web/web.dart' as web;
 import 'stored_credential.dart';
 
 /// 浏览器标签页没有环境。留着这个名字只为让缝的两侧暴露同一组符号。
-const String kTokenEnvVar = 'CORTEXD_TOKEN';
+const String kTokenEnvVar = 'CORMEXD_TOKEN';
 
 const bool kCanRememberCredential = true;
 
@@ -18,7 +18,7 @@ const String _baseUrlKey = 'cormex.base_url';
 ///
 /// 这个区分是真实的、也值得多写一句：把「记住」读成「安全存储」的人，会做出
 /// 与把它读成「本页上任何脚本都读得到」的人**不同的部署决定**（比如把
-/// cortexd 直接挂到公网上）。
+/// cormexd 直接挂到公网上）。
 const String kCredentialStorageNote =
     '浏览器里没有安全的凭据存储：sessionStorage 与 localStorage 一样，'
     '会被本页面上运行的任何脚本读到。这里只用 sessionStorage —— '

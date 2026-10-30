@@ -1,0 +1,176 @@
+{
+  "name": "sessions-zh-en-v1",
+  "version": "2026-10-30",
+  "description": "会话检索评测集。覆盖三类：「只有原文档案能找到」（工具输出）、「只有对话能找到」（说过的话）、「应当找不到」。素材取自脱敏后的真实会话形状，不是从别处抄来的题。",
+  "sessions": [
+    {
+      "id": "s-storage",
+      "agent": "claude_code",
+      "project": "github.com/acme/cormex",
+      "events": [
+        {
+          "kind": "user_message",
+          "occurred_at": "2026-03-02T09:12:00Z",
+          "text": "对象存储这块最后定下来用 RustFS，不用 MinIO 了。license 变更那事儿之后法务那边过不去。"
+        },
+        {
+          "kind": "agent_message",
+          "occurred_at": "2026-03-02T09:13:00Z",
+          "text": "记下了，对象存储改用 RustFS。配置项我会同步改，S3 兼容层不用动。"
+        },
+        {
+          "kind": "tool_call",
+          "occurred_at": "2026-03-02T09:20:00Z",
+          "text": "cargo build --release --locked",
+          "tool_name": "bash"
+        },
+        {
+          "kind": "tool_result",
+          "occurred_at": "2026-03-02T09:21:00Z",
+          "text": "error[E0433]: failed to resolve: use of undeclared crate or module `rustfs_sdk`\n  --> src/blob/rustfs.rs:14:5\n\nerror: could not compile `cormex-blob` (lib) due to 1 previous error",
+          "tool_name": "bash"
+        }
+      ]
+    },
+    {
+      "id": "s-deploy",
+      "agent": "claude_code",
+      "project": "github.com/acme/cormex",
+      "events": [
+        {
+          "kind": "user_message",
+          "occurred_at": "2026-03-05T14:02:00Z",
+          "text": "部署脚本里那个健康检查一直超时，帮我看看是不是端口写错了。"
+        },
+        {
+          "kind": "agent_message",
+          "occurred_at": "2026-03-05T14:05:00Z",
+          "text": "查到了：compose 里写的是 8080，但服务实际监听 CORMEXD_BIND 的默认值 127.0.0.1:8080 —— 容器里绑 127.0.0.1 等于只绑回环，健康检查从外面连不进来。改成 0.0.0.0:8080 就好。"
+        },
+        {
+          "kind": "tool_call",
+          "occurred_at": "2026-03-05T14:08:00Z",
+          "text": "docker compose ps --format json",
+          "tool_name": "bash"
+        },
+        {
+          "kind": "tool_result",
+          "occurred_at": "2026-03-05T14:08:30Z",
+          "text": "{\"Name\":\"cormex-cormexd-1\",\"State\":\"running\",\"Status\":\"Up 3 minutes (unhealthy)\",\"Ports\":\"127.0.0.1:8080->8080/tcp\"}",
+          "tool_name": "bash"
+        }
+      ]
+    },
+    {
+      "id": "s-eval",
+      "agent": "codex",
+      "project": "github.com/acme/cormex",
+      "events": [
+        {
+          "kind": "user_message",
+          "occurred_at": "2026-03-09T10:30:00Z",
+          "text": "评测集里那条 LongMemEval 的召回率，报告里得写清楚口径，别跟别家的 QA 分数摆一起。"
+        },
+        {
+          "kind": "agent_message",
+          "occurred_at": "2026-03-09T10:33:00Z",
+          "text": "明白。报告里会单独一节写「召回不是 QA 准确率」，并且不与别家的 QA 分数并列。"
+        }
+      ]
+    },
+    {
+      "id": "s-unrelated",
+      "agent": "claude_code",
+      "project": "github.com/acme/website",
+      "events": [
+        {
+          "kind": "user_message",
+          "occurred_at": "2026-03-11T16:20:00Z",
+          "text": "官网首页那个 hero 图换成新拍的，文案先别动。"
+        },
+        {
+          "kind": "agent_message",
+          "occurred_at": "2026-03-11T16:22:00Z",
+          "text": "换好了，只动了图片资源，文案没碰。"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "s001",
+      "scope": "conversation",
+      "query": "对象存储最后用的什么",
+      "expect": [
+        "s-storage"
+      ],
+      "note": "只有对话能找到：这是用户自己说的一句话，工具输出里没有「RustFS 定了」这个结论"
+    },
+    {
+      "id": "s002",
+      "scope": "conversation",
+      "query": "健康检查为什么超时",
+      "expect": [
+        "s-deploy"
+      ],
+      "note": "只有对话能找到：结论在 agent 的消息里"
+    },
+    {
+      "id": "s003",
+      "scope": "conversation",
+      "query": "召回率报告口径",
+      "expect": [
+        "s-eval"
+      ],
+      "note": "换个说法问同一件事，验证中文分词"
+    },
+    {
+      "id": "s004",
+      "scope": "archive",
+      "query": "E0433 rustfs_sdk",
+      "expect": [
+        "s-storage"
+      ],
+      "note": "**只有原文档案能找到**：这段编译错误只存在于工具输出里，对话正文一个字都没提"
+    },
+    {
+      "id": "s005",
+      "scope": "archive",
+      "query": "unhealthy",
+      "expect": [
+        "s-deploy"
+      ],
+      "note": "只有原文档案能找到：docker compose ps 的 JSON 输出里那个状态词，对话正文里说的是「超时」"
+    },
+    {
+      "id": "s006",
+      "scope": "conversation",
+      "query": "E0433",
+      "expect": [],
+      "note": "**应当找不到**：这个错误码只在工具输出里。conversation scope 下必须为空 —— 工具输出不进对话索引（D4）。这条同时钉住「两个 scope 是两个索引」"
+    },
+    {
+      "id": "s007",
+      "scope": "conversation",
+      "query": "Kubernetes 集群证书轮换",
+      "expect": [],
+      "note": "应当找不到：库里根本没有这个话题。没有这一类题，把召回宽度调到无穷大就能拿满分"
+    },
+    {
+      "id": "s008",
+      "scope": "archive",
+      "query": "Kubernetes",
+      "expect": [],
+      "note": "应当找不到，archive scope 同样"
+    },
+    {
+      "id": "s009",
+      "scope": "conversation",
+      "query": "hero 图 文案",
+      "expect": [
+        "s-unrelated"
+      ],
+      "note": "干扰项：另一个项目里的话题，用来验证结果不会串到不相关的会话上"
+    }
+  ]
+}

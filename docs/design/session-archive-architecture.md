@@ -18,7 +18,7 @@
 **一句话架构**：
 
 ```
-各机器                          中央 cortexd                                   读者
+各机器                          中央 cormexd                                   读者
 cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Postgres 元数据，只追加，不同步）
   ▲ 被 hooks / 定时任务调起       │ 解析（服务端，带版本，可重算）
   │ 做完即退                      ▼
@@ -55,17 +55,17 @@ cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Po
 | **D8** | 「哪个 agent 的文件在哪」是**数据**（来源目录 catalog），CLI 内置一份，服务端提供可更新的一份 | 报告 §8.4.8 |
 | **D9** | 设备凭据是**不轮换的设备密钥**（256 位随机数，服务端只存 SHA-256），由用户用**自己的** bearer 签发，带作用域，可按设备吊销。**不复用** refresh token（轮换 + 重放检测会把并发的 hook 进程判成「泄露」并吊销整条链） | 本文 §6.1 |
 | **D10** | 「这个请求是谁」在认证中间件里**解析一次**，以扩展形式交给 handler；不再在 handler 里重新解析 header 并回落到 1 号用户 | 本文 §6.2（修掉现存 bug） |
-| **D11** | P 层 schema 自定义（`cortex-proto`），但**对齐 ACP 的内容块**（消息、思考、工具调用 / 结果、diff、计划） | 报告 §8.3 |
-| **D12** | 取回走三层渐进披露（索引 → 简报 / 摘要视图 → 原文）；所有输出经 `cortex_core::injection` 框定 | 报告 §8.4.4 |
+| **D11** | P 层 schema 自定义（`cormex-proto`），但**对齐 ACP 的内容块**（消息、思考、工具调用 / 结果、diff、计划） | 报告 §8.3 |
+| **D12** | 取回走三层渐进披露（索引 → 简报 / 摘要视图 → 原文）；所有输出经 `cormex_core::injection` 框定 | 报告 §8.4.4 |
 | **D13** | 两条时间轴：`as_of`（Cormex 何时知道，系统时间）与 `at`（会话里何时发生，事件时间） | 报告 §8.2⑥ |
 | **D14** | 加工：观察日志（追加式）+ 交接简报（懒生成）写进现有 `summaries`；事实抽取通过**按策略晋升**为 `episodes` 复用现有抽取管线 | 报告 §8.4.3 |
-| **D15** | 原文档案索引用 **Postgres tsvector（jieba 分词，复用 `cortex_memory::tokenize`）**，不引入 Tantivy | CLAUDE.md「不加第二个存储后端」 |
+| **D15** | 原文档案索引用 **Postgres tsvector（jieba 分词，复用 `cormex_memory::tokenize`）**，不引入 Tantivy | CLAUDE.md「不加第二个存储后端」 |
 | **D16** | RustFS 里采集数据用独立的 key 命名空间 `capture/`，与媒体 `blobs/` 分开；每个分块记自己的 `storage_key` | 本文 §4.3 |
-| **D17** | 加密：MVP 依赖传输 TLS + 部署层的静态加密；第 6 阶段引入每来源数据密钥（用 `CORTEX_SECRET_KEY` 包裹）做 crypto-shredding，并如实写清备份的限制 | 报告 §10.2、memory-content §8.6② |
+| **D17** | 加密：MVP 依赖传输 TLS + 部署层的静态加密；第 6 阶段引入每来源数据密钥（用 `CORMEX_SECRET_KEY` 包裹）做 crypto-shredding，并如实写清备份的限制 | 报告 §10.2、memory-content §8.6② |
 | **D18** | CLI 分发：单个静态二进制；GitHub Release + `install.sh` / `install.ps1` + npm 包装（主包 + 平台子包）；版本号与 workspace 同一条线 | 报告 §8.4.5 |
-| **D19** | MCP 依赖 rmcp 1.8 → 3.x（MCP 2026-07-28 无状态版），作为独立阶段，**早于**新增会话 MCP 工具。rmcp 钉在 1.8 是因为 goose-providers 0.1.0-alpha.1 的 `Tool` 类型用的是它；goose-providers 0.1.0-alpha.13 要求 rmcp `^3.4.1`，所以**两者必须在同一次改动里一起升**，否则会有两份 rmcp 共存 | 报告 §6.5（复核）、`crates/cortexd/Cargo.toml` 注释 |
+| **D19** | MCP 依赖 rmcp 1.8 → 3.x（MCP 2026-07-28 无状态版），作为独立阶段，**早于**新增会话 MCP 工具。rmcp 钉在 1.8 是因为 goose-providers 0.1.0-alpha.1 的 `Tool` 类型用的是它；goose-providers 0.1.0-alpha.13 要求 rmcp `^3.4.1`，所以**两者必须在同一次改动里一起升**，否则会有两份 rmcp 共存 | 报告 §6.5（复核）、`crates/cormexd/Cargo.toml` 注释 |
 | **D20** | 空库启动修复：`Store::migrate_global` 内部先对 `public` 跑一次租户 `MIGRATOR`，一处覆盖全部三个调用点 | 本文 §9.1 |
-| **D21** | `cortex-proto` 的 `llm` 模块放进默认开启的 feature；CLI 关掉它，不把 goose-providers 拖进客户端 | 本文 §3 |
+| **D21** | `cormex-proto` 的 `llm` 模块放进默认开启的 feature；CLI 关掉它，不把 goose-providers 拖进客户端 | 本文 §3 |
 | **D22** | CLI 本机状态用 SQLite（rusqlite，bundled），不用 JSON 文件：多个 hook 进程会并发写状态 | 本文 §5.4 |
 | **D23** | 归档表走新的 `Store::archive_txn`：**不拿 sync 的 advisory lock、不写 sync_log**，只开放归档表的写方法；`write_txn` 的纪律对同步表不变 | 本文 §4.4 |
 
@@ -91,14 +91,14 @@ cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Po
 └───────────────────────────────┬────────────────────────────────────────┘
                                 │ HTTPS，Authorization: Bearer <设备密钥>
 ┌───────────────────────────────▼──────────── 中央 ─────────────────────┐
-│ cortexd                                                                │
+│ cormexd                                                                │
 │  auth::require ── Principal 扩展（D10）                                 │
-│  /devices        设备密钥（D9）                    cortex_auth.device_keys
+│  /devices        设备密钥（D9）                    cormex_auth.device_keys
 │  /capture/*      采集写入（R 层）                   capture_* 表 + RustFS capture/
 │  /archive/*      会话浏览、原文读取、检索           transcript_* / archive_* 表
 │  /mcp            memory_search / remember / session_search / session_get
 │  后台 worker（每租户轮询，backfill.rs 的模式）：
-│    projector   R → P（cortex-transcript 解析器 + 文本遮罩）
+│    projector   R → P（cormex-transcript 解析器 + 文本遮罩）
 │    masker      R 层字节区间遮罩覆盖层
 │    indexer     P → 原文档案索引 / 会话检索索引 / 向量
 │    distiller   P → 观察日志、交接简报（summaries）；按策略晋升 episodes → 现有抽取
@@ -113,16 +113,16 @@ cormex-web（Flutter）：会话列表 / 对话视图 / 原始切换 / 两条时
 
 | crate | 新 / 改 | 职责 | 关键依赖 |
 |---|---|---|---|
-| `cortex-proto` | 改 | 新增 `capture` 模块：采集线协议 DTO、来源目录（catalog）类型与内置数据、P 层事件类型（ACP 对齐）；`llm` 模块挪到默认 feature 后面（D21） | serde、chrono |
-| `cortex-transcript` | **新** | 服务端解析器：逻辑字节 → `TranscriptEvent` 序列。纯函数，无 IO，按 agent 分模块，夹具测试 | cortex-proto、serde_json |
-| `cortex-store` | 改 | 新增归档表的模型、`ArchiveTxn`（D23）、查询；新 migration | sqlx |
-| `cortex-blob` | 改 | 新增按 key 读写的接口与 `capture/` 命名空间（D16） | — |
-| `cortex-memory` | 改 | `redaction::scan_spans`（返回全部命中区间）；文本遮罩函数 | — |
-| `cortexd` | 改 | `/devices`、`/capture/*`、`/archive/*`、MCP 工具、后台 worker、Principal 中间件 | — |
+| `cormex-proto` | 改 | 新增 `capture` 模块：采集线协议 DTO、来源目录（catalog）类型与内置数据、P 层事件类型（ACP 对齐）；`llm` 模块挪到默认 feature 后面（D21） | serde、chrono |
+| `cormex-transcript` | **新** | 服务端解析器：逻辑字节 → `TranscriptEvent` 序列。纯函数，无 IO，按 agent 分模块，夹具测试 | cormex-proto、serde_json |
+| `cormex-store` | 改 | 新增归档表的模型、`ArchiveTxn`（D23）、查询；新 migration | sqlx |
+| `cormex-blob` | 改 | 新增按 key 读写的接口与 `capture/` 命名空间（D16） | — |
+| `cormex-memory` | 改 | `redaction::scan_spans`（返回全部命中区间）；文本遮罩函数 | — |
+| `cormexd` | 改 | `/devices`、`/capture/*`、`/archive/*`、MCP 工具、后台 worker、Principal 中间件 | — |
 | `cormex` | **新** | 客户端二进制 | clap、reqwest、rusqlite、zstd、keyring、directories、fs4、notify（可选） |
 | `app/` | 改 | Flutter 会话视图 | Riverpod |
 
-**依赖方向**（不得反转）：`cortex-core ← cortex-proto ← {cortex-transcript, cormex}`；`cortex-store`、`cortex-blob` 只被 `cortexd` 用；`cormex` **不依赖** `cortex-store` / `cortex-blob` / `cortex-memory` / `cortex-llm` / `sqlx`。
+**依赖方向**（不得反转）：`cormex-core ← cormex-proto ← {cormex-transcript, cormex}`；`cormex-store`、`cormex-blob` 只被 `cormexd` 用；`cormex` **不依赖** `cormex-store` / `cormex-blob` / `cormex-memory` / `cormex-llm` / `sqlx`。
 
 ---
 
@@ -142,27 +142,27 @@ cormex-web（Flutter）：会话列表 / 对话视图 / 原始切换 / 两条时
 | 进程互斥 | `fs4` 文件锁（每个逻辑文件的采集只有一个进程在做） | 只靠 SQLite | SQLite 管状态的原子性，文件锁避免两个进程白跑同一份活 |
 | 文件监听（可选） | `notify` 8，只用于 `cormex watch` | — | 默认不装（D1） |
 | 服务端存储 | Postgres + pgvector（元数据、P 层、索引）+ RustFS（字节） | — | 现有唯一硬依赖 |
-| 原文档案索引 | Postgres `tsvector` + jieba（D15） | Tantivy、Meilisearch | 不加第二个检索后端；中文分词复用 `cortex_memory::tokenize` |
-| 解析 | 新 crate `cortex-transcript`，serde_json 流式逐行 | 让客户端解析 | 解析器只存在一份（D2） |
+| 原文档案索引 | Postgres `tsvector` + jieba（D15） | Tantivy、Meilisearch | 不加第二个检索后端；中文分词复用 `cormex_memory::tokenize` |
+| 解析 | 新 crate `cormex-transcript`，serde_json 流式逐行 | 让客户端解析 | 解析器只存在一份（D2） |
 | P 层 schema | 自定义，对齐 ACP 内容块（D11） | 直接依赖 `agent-client-protocol` crate | 不被 ACP 的版本节奏绑住；字段对齐即可 |
-| LLM 加工 | `cortex-llm`（goose providers），便宜模型 | — | 现有供应商层；约束 5 |
+| LLM 加工 | `cormex-llm`（goose providers），便宜模型 | — | 现有供应商层；约束 5 |
 | MCP | rmcp 3.x，连同 goose-providers alpha.1 → alpha.13 一起升（D19） | 继续用 1.8 | 2026-07-28 无状态版；`ttlMs` / `cacheScope` 正好表达可缓存的简报资源 |
 | Web | Flutter + Riverpod（现有） | — | 现有 |
 | 发布 | GitHub Actions 矩阵构建（Linux musl 用 `cargo-zigbuild`；macOS / Windows 用原生 runner）+ 手写 npm 包装（D18） | cargo-dist | cargo-dist 会接管 `release.yml`，和现有的镜像发布流水线冲突；手写矩阵可控 |
 
-**`cortex-proto` 的 feature 拆分**（D21）：
+**`cormex-proto` 的 feature 拆分**（D21）：
 
 ```toml
-# crates/cortex-proto/Cargo.toml
+# crates/cormex-proto/Cargo.toml
 [features]
 default = ["llm"]
-llm = ["dep:cortex-llm"]
+llm = ["dep:cormex-llm"]
 
 [dependencies]
-cortex-llm = { workspace = true, optional = true }
+cormex-llm = { workspace = true, optional = true }
 ```
 
-`src/lib.rs` 里 `#[cfg(feature = "llm")] pub mod llm;`。`cormex` 用 `cortex-proto = { workspace = true, default-features = false }`。`cortexd` 不变（默认开启）。
+`src/lib.rs` 里 `#[cfg(feature = "llm")] pub mod llm;`。`cormex` 用 `cormex-proto = { workspace = true, default-features = false }`。`cormexd` 不变（默认开启）。
 
 ---
 
@@ -170,7 +170,7 @@ cortex-llm = { workspace = true, optional = true }
 
 ### 4.1 新的租户 migration：`migrations/20261101000001_capture_archive.sql`
 
-> 规矩：新文件、LF 行尾、写进 `crates/cortex-store/tests/migrations_are_immutable.rs` 的 `PINNED`。主键一律 `ulid`，时间一律 `clock_timestamp()`。**全部 append-only**：没有 UPDATE，没有 DELETE（purge 例外，见 §8.4）。
+> 规矩：新文件、LF 行尾、写进 `crates/cormex-store/tests/migrations_are_immutable.rs` 的 `PINNED`。主键一律 `ulid`，时间一律 `clock_timestamp()`。**全部 append-only**：没有 UPDATE，没有 DELETE（purge 例外，见 §8.4）。
 
 ```sql
 -- 一个「被采集的会话」= 某个宿主里的一段对话。跨设备合并：同一个 agent 的同一个原生会话 id 只有一行。
@@ -187,7 +187,7 @@ CREATE TABLE capture_sessions (
 CREATE TABLE capture_files (
     id             ulid        PRIMARY KEY,
     session_id     ulid        NOT NULL REFERENCES capture_sessions(id),
-    device_id      ulid        NOT NULL,          -- cortex_auth.device_keys.id；跨 schema，不建外键
+    device_id      ulid        NOT NULL,          -- cormex_auth.device_keys.id；跨 schema，不建外键
     agent          TEXT        NOT NULL,
     logical_path   TEXT        NOT NULL CHECK (length(logical_path) BETWEEN 1 AND 4096),
     role           TEXT        NOT NULL CHECK (role IN
@@ -323,7 +323,7 @@ CREATE INDEX idx_archive_chunks_tsv ON archive_chunks USING gin (tsv);
 {tenant}/capture/aa/bb/{sha256}.zst        新增：采集分块，hash = 逻辑（未压缩）字节的 SHA-256，内容是 zstd 帧
 ```
 
-- `cortex-blob` 增加 `BlobStore::put_keyed(key, bytes, mime)` / `get_keyed(key)` / `delete_keyed(key)`，以及 `hash::capture_key(tenant, sha256) -> String`。key 仍然经过 `validate_hash` 那一道防路径穿越
+- `cormex-blob` 增加 `BlobStore::put_keyed(key, bytes, mime)` / `get_keyed(key)` / `delete_keyed(key)`，以及 `hash::capture_key(tenant, sha256) -> String`。key 仍然经过 `validate_hash` 那一道防路径穿越
 - **key 由调用方给出完整值，实现不得再拼接构造时配置的前缀**：现在 `MediaStore::current_tenant()` 把媒体的租户前缀写死成 `public`（多租户尚未接到对象存储这一层），采集数据不能沿用这个过渡做法。`capture_key` 的 `tenant` 参数取请求所属租户的 schema 名（`Tenant::schema()`）
 - 采集分块**不写 `blobs` 表**：`blobs` 会进 `sync_log` 下发到设备，而 R 层不下发（D3）。将来给媒体做 GC 时以 `blobs` 表为准，`capture/` 命名空间天然不受影响
 - 同一租户内，相同的逻辑分块只存一份（内容寻址），比如同一个会话在两台机器上都被采到
@@ -338,7 +338,7 @@ CREATE INDEX idx_archive_chunks_tsv ON archive_chunks USING gin (tsv);
 所以新增一条**并列的**写通道：
 
 ```rust
-// crates/cortex-store/src/archive.rs（新文件）
+// crates/cormex-store/src/archive.rs（新文件）
 impl Store {
     /// Write transaction for the server-only archive tables (capture_* / transcript_* / archive_*).
     pub async fn archive_txn<T, F>(&self, f: F) -> Result<T>
@@ -380,9 +380,9 @@ CLAUDE.md 约束 1 的「写事务必须走 `store.write_txn`」要改成：**�
 ### 4.5 全局 migration：`migrations-global/20261101000001_device_keys.sql`
 
 ```sql
-CREATE TABLE cortex_auth.device_keys (
+CREATE TABLE cormex_auth.device_keys (
     id            ulid        PRIMARY KEY,
-    user_id       ulid        NOT NULL REFERENCES cortex_auth.users(id),
+    user_id       ulid        NOT NULL REFERENCES cormex_auth.users(id),
     key_sha256    sha256      NOT NULL UNIQUE,
     label         TEXT        NOT NULL CHECK (length(label) BETWEEN 1 AND 100),
     scopes        TEXT[]      NOT NULL CHECK (scopes <@ ARRAY[
@@ -392,10 +392,10 @@ CREATE TABLE cortex_auth.device_keys (
     last_seen_at  TIMESTAMPTZ,
     revoked_at    TIMESTAMPTZ
 );
-CREATE INDEX idx_device_keys_user ON cortex_auth.device_keys (user_id);
+CREATE INDEX idx_device_keys_user ON cormex_auth.device_keys (user_id);
 ```
 
-`cortex_auth` 本来就用 UPDATE 记 `rotated_at` / `revoked_at`（它不是记忆表，不受 append-only 约束）；`last_seen_at` 最多每 10 分钟更新一次，避免每个请求一次写。
+`cormex_auth` 本来就用 UPDATE 记 `rotated_at` / `revoked_at`（它不是记忆表，不受 append-only 约束）；`last_seen_at` 最多每 10 分钟更新一次，避免每个请求一次写。
 
 ---
 
@@ -425,7 +425,7 @@ CREATE INDEX idx_device_keys_user ON cortex_auth.device_keys (user_id);
 
 ### 5.2 来源目录（catalog，D8）
 
-数据文件 `crates/cortex-proto/catalog/agents.toml`，`include_str!` 进 `cortex-proto`，CLI 与服务端共用；服务端的 `GET /capture/catalog` 可以用环境变量 `CORMEX_CAPTURE_CATALOG` 指向一份更新的文件。
+数据文件 `crates/cormex-proto/catalog/agents.toml`，`include_str!` 进 `cormex-proto`，CLI 与服务端共用；服务端的 `GET /capture/catalog` 可以用环境变量 `CORMEX_CAPTURE_CATALOG` 指向一份更新的文件。
 
 ```toml
 schema = 1
@@ -619,7 +619,7 @@ CREATE TABLE installs (                  -- init 改过哪些配置，uninstall 
 改法：认证中间件在验证通过的分支里插入一个扩展
 
 ```rust
-// crates/cortexd/src/principal.rs（新文件）
+// crates/cormexd/src/principal.rs（新文件）
 #[derive(Debug, Clone)]
 pub enum Principal {
     /// The legacy pre-shared token: maps to user #1 by definition.
@@ -643,7 +643,7 @@ impl Principal {
 
 ## 7. 线协议
 
-所有 DTO 在 `cortex-proto::capture`。JSON 字段 snake_case；时间 RFC 3339；id 是 ULID 字符串。
+所有 DTO 在 `cormex-proto::capture`。JSON 字段 snake_case；时间 RFC 3339；id 是 ULID 字符串。
 
 ### 7.1 采集（`capture:write`）
 
@@ -743,16 +743,16 @@ DELETE /devices/{id}     204
 | `session_search` | `query`、`agent?`、`project?`、`since?`、`until?`、`as_of?`、`scope?`（`conversation` 默认 / `archive`） | 紧凑索引：每条 id、标题、agent、项目、时间、一行摘要（约 50–100 token） | `session:read`（`archive` 需 `raw:read`） |
 | `session_get` | `id`、`view`（`brief` 默认 / `digest` / `transcript` / `raw`）、`cursor?`、`max_tokens?`（默认 4000） | 经 `injection` 框定的文本块，超出预算则给续页 cursor | `session:read`（`raw` 需 `raw:read`） |
 | `memory_search` / `remember` | 不变 | 不变 | `memory:read` / `memory:write` |
-| 资源 `cortex://session/{id}/brief` | — | 交接简报，带 `ttlMs`、`cacheScope: private` | `session:read` |
-| 资源 `cortex://project/{key}/brief` | — | 项目简报 | `session:read` |
+| 资源 `cormex://session/{id}/brief` | — | 交接简报，带 `ttlMs`、`cacheScope: private` | `session:read` |
+| 资源 `cormex://project/{key}/brief` | — | 项目简报 | `session:read` |
 
-URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档错误，计划 P0-5 修正）。
+URI scheme 沿用代码里的 `cormex://`（README 写成 `cormex://` 是文档错误，计划 P0-5 修正）。
 
 ---
 
 ## 8. 后台加工
 
-全部沿用 `crates/cortexd/src/backfill.rs` 的模式：`spawn(st)` 起一个周期任务，每轮列出租户（`st.tenant_schemas()`），每个租户查「待办」，有界并发处理，失败记日志、下一轮重来。**以表为准，不另建作业队列**：待办永远可以从数据推出来，进程重启不丢活。
+全部沿用 `crates/cormexd/src/backfill.rs` 的模式：`spawn(st)` 起一个周期任务，每轮列出租户（`st.tenant_schemas()`），每个租户查「待办」，有界并发处理，失败记日志、下一轮重来。**以表为准，不另建作业队列**：待办永远可以从数据推出来，进程重启不丢活。
 
 ### 8.1 masker（R 层遮罩，第 2 阶段）
 
@@ -763,7 +763,7 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 ### 8.2 projector（R → P，第 2 阶段）
 
 - 待办：会话的任一文件的最新一代末尾 > 最新 `transcript_projections.through`，或 `parser_version` 升级
-- 处理：取该会话全部相关代的新增逻辑字节 → `cortex_transcript::parse(agent, role, bytes, state)` → 事件序列 → 对每个文本字段做**文本级遮罩**（`redaction::mask_text`，替换为 `[已遮罩:<rule>]`）→ 大于 16 KiB 的内容块换成 `resource_ref` → 分批（≤ 500 行）`insert_transcript_events`
+- 处理：取该会话全部相关代的新增逻辑字节 → `cormex_transcript::parse(agent, role, bytes, state)` → 事件序列 → 对每个文本字段做**文本级遮罩**（`redaction::mask_text`，替换为 `[已遮罩:<rule>]`）→ 大于 16 KiB 的内容块换成 `resource_ref` → 分批（≤ 500 行）`insert_transcript_events`
 - 解析器有内部状态（跨块的未完成行、Copilot 变更日志的重放状态），每次从上一个进度点恢复：状态序列化在 `transcript_projections.through` 里
 - 事件 id 用 `Id::derived(occurred_at, seed)`，重跑同一版本的解析器是幂等的
 - 新一代（改写）：同一会话的新代按新代重新投影，旧代的事件保留；UI 默认展示最新一代
@@ -778,7 +778,7 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 - **观察日志**：会话空闲 ≥ 30 分钟或结束后，取新增事件（工具结果截断到 512 字节）→ 便宜模型生成**带日期的观察条目** → 追加进 `summaries`（`scope='session'`、`scope_key=<capture_session_id>`），并写 `derivations`（`source_kind='transcript_event'`，需要扩展 CHECK 的新 migration）
 - **交接简报**：`session_get(view=brief)` 第一次被请求时生成并缓存为一条 summary；会话有新事件后失效，下次请求时重新生成（新行，旧行保留）
 - **晋升与抽取**（D14）：按策略选出值得抽事实的轮次（默认：用户消息 + 每轮最后一条 agent 消息；工具输出不晋升）→ 写成 `episodes`（`session_id` = capture 会话 id，`content` 里带 `transcript_event_id`，`device_id` = 设备 id）→ **复用现有抽取管线**（`/episodes` 的 anchor 机制和 `extract.rs`）。抽取前照样过 `redaction::scan`（约束：写侧负过滤在 LLM 之前）
-- **成本控制**：每租户每日预算（token 数，复用 `quota.rs`）；历史回填单独排队、单独限速；`cormex init` 在回填前给出估算（沿用 `cortex-import` 默认 dry-run 的传统）
+- **成本控制**：每租户每日预算（token 数，复用 `quota.rs`）；历史回填单独排队、单独限速；`cormex init` 在回填前给出估算（沿用 `cormex-import` 默认 dry-run 的传统）
 
 ### 8.5 purge（第 6 阶段）
 
@@ -797,7 +797,7 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 - 不复制 DOMAIN 定义（roadmap 方案 1 的代价），不新增编号更早的 migration（方案 3 的冲突）
 - 租户 migration 本身幂等，`Live::new` 之后再跑一次是空操作
 
-配一条测试：建一个全新数据库，只调 `migrate_global`，断言成功且 `cortex_auth.users` 存在。
+配一条测试：建一个全新数据库，只调 `migrate_global`，断言成功且 `cormex_auth.users` 存在。
 
 ### 9.2 发布（D18）
 
@@ -828,10 +828,10 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 
 | 层 | 测什么 | 怎么测 |
 |---|---|---|
-| 解析器 | 每个 agent 的每种记录类型；跨块的行；未知记录保留为 `unknown`；解析器版本号变化 | `crates/cortex-transcript/tests/fixtures/<agent>/*.jsonl` + 金标准 `*.expected.json`（`cargo insta` 风格的快照，或手写对比） |
+| 解析器 | 每个 agent 的每种记录类型；跨块的行；未知记录保留为 `unknown`；解析器版本号变化 | `crates/cormex-transcript/tests/fixtures/<agent>/*.jsonl` + 金标准 `*.expected.json`（`cargo insta` 风格的快照，或手写对比） |
 | R 层往返 | **还原出的逻辑文件 sha256 = 原文件**；追加、截断、改写、zstd 表示切换 | `cormex` 的同步引擎对一个临时 home 目录跑，服务端用进程内 axum + 测试库（`#[ignore]`，`just test-db`） |
-| 连续性 | 并发追加同一代；重复上传；乱序；409 后恢复 | `cortex-store` 集成测试 |
-| 隔离 | 设备密钥 / 委托令牌只能落到自己的租户；作用域越界 403 | `cortexd` 测试，两个账号 |
+| 连续性 | 并发追加同一代；重复上传；乱序；409 后恢复 | `cormex-store` 集成测试 |
+| 隔离 | 设备密钥 / 委托令牌只能落到自己的租户；作用域越界 403 | `cormexd` 测试，两个账号 |
 | 不同步 | 归档表永不出现在 `sync_log`；`table::ALL ∩ table::ARCHIVE = ∅` | 单元 + 集成 |
 | 遮罩 | 遮罩区间不进 P 层文本、不进任何索引；`unmask=true` 才见原文 | 集成测试，用 `redaction.rs` 已有的样本密钥 |
 | hook | `cormex hook` 在 stdin 为空、坏 JSON、服务端不可达、SQLite 被锁时都在 200 ms 内退出 0 | CLI 集成测试（计时） |
@@ -863,9 +863,9 @@ URI scheme 沿用代码里的 `cortex://`（README 写成 `cormex://` 是文档�
 |---|---|
 | 1. 存储三条纪律 | 归档表 append-only；同步表照旧走 `write_txn`；归档表走 `archive_txn`（D23，CLAUDE.md 同步修订）；`tsv` 同事务 |
 | 2. migration 只增不改、LF | 新文件 + PINNED；`.gitattributes` 已覆盖 `*.sql` |
-| 3. 两套 migration 的 search_path | 全局新表在 `cortex_auth`，用 `public` 的 DOMAIN；D20 修空库顺序 |
-| 4. 注入走 `cortex_core::injection` | 会话工具的输出一律经 `render_*` 框定（D12）；需要新的渲染函数时**两个仓库一起改**并跑 `scripts/injection-drift.py` |
+| 3. 两套 migration 的 search_path | 全局新表在 `cormex_auth`，用 `public` 的 DOMAIN；D20 修空库顺序 |
+| 4. 注入走 `cormex_core::injection` | 会话工具的输出一律经 `render_*` 框定（D12）；需要新的渲染函数时，若本仓库之外还有一份实现就一起改，并跑 `scripts/injection-drift.py` |
 | 5. 不做最小公倍数供应商抽象 | 归一化只用于展示和检索，不进模型调用链 |
 | 6. 委托凭据用调用者自己的 bearer | 设备密钥由用户自己的 bearer 签发，不能用设备密钥再签发（D9） |
-| 这里不跑 agent 循环 | CLI 是采集器；`routes::cortexd_serves_no_agent_shaped_route` 不动 |
+| 这里不跑 agent 循环 | CLI 是采集器；`routes::cormexd_serves_no_agent_shaped_route` 不动 |
 | 这里不知道 agent 服务在哪 | 不引入任何「agent 服务地址」配置 |

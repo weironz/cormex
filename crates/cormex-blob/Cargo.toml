@@ -1,0 +1,57 @@
+[package]
+name = "cormex-blob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cormex object storage: content-addressed blob reads and writes"
+
+[dependencies]
+cormex-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+
+# ── S3 client ──
+# default-features = false, then picked by hand:
+#   rt-tokio                -- reuse the workspace's tokio runtime
+#   behavior-version-latest -- do not pin the behavior version, or Client::from_conf panics outright
+#   http-1x                 -- the same generation as the workspace's hyper 1.x / reqwest 0.13
+#   default-https-client    -- rustls + aws-lc-rs, the same TLS backend as reqwest uses,
+#                              so ring and hyper 0.14 are not dragged in on top
+# sigv4a is deliberately left off: it is the signing variant for multi-region access points,
+# which RustFS / R2 / single-region S3 have no use for -- an encryption path carried for nothing.
+aws-sdk-s3 = { version = "1.141", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+    "http-1x",
+    "default-https-client",
+] }
+aws-credential-types = "1.3"
+aws-smithy-types = "1.6"
+
+bytes = "1.12"
+sha2 = "0.10"
+hex = "0.4"
+url = "2.5"
+
+# Media probing: both are lightweight libraries that read the file header only and never decode.
+# Not the image crate -- it would drag in a dozen codecs just to obtain width and height.
+infer = { version = "0.22", default-features = false }
+imagesize = "0.15"
+
+[dev-dependencies]
+# Used in tests only: to check the JSON contract of BlobRef (the production path never
+# touches JSON; serialization is done by cormexd in its own response layer)
+serde_json.workspace = true
+tempfile = "3"
+# The backup/restore drill walks a directory tree, the way `tar` would
+walkdir = "2"
+# `put_keyed` takes `bytes::Bytes`, which this crate does not re-export
+bytes = "1"
+dotenvy.workspace = true
+reqwest.workspace = true

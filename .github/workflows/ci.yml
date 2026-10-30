@@ -1,9 +1,19 @@
 name: CI
 
+# ══════════════════════════════════════════════════════════
+#  **Manual only.** No `push`, no `pull_request`.
+#
+#  GitHub Actions minutes are exhausted, and an automatic trigger spends
+#  them on every push to every branch of a 50-branch stack. Until the quota
+#  is restored, the checks run locally through `just ci` / `just test-db`
+#  (see the justfile), which is the same set of commands this file runs —
+#  `just ci` is not an approximation of CI, it is the same steps.
+#
+#  Keeping the workflow dispatchable rather than deleting it: it is the
+#  record of what "green" means, and the moment the quota comes back the
+#  triggers are two lines to restore.
+# ══════════════════════════════════════════════════════════
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -65,6 +75,64 @@ jobs:
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
 
+  # ── Tests that need no database ────────────────────────
+  #
+  # Its own job, and it runs **before** the database one, for two reasons:
+  #
+  # - It is the half that can be trusted to be complete. `test` runs with
+  #   `--include-ignored`, but a test that *should* have been written without a
+  #   database and was not is invisible there: it passes, slowly, and only
+  #   because a database happened to be available.
+  # - It fails in seconds. A parser bug or a broken installer should not wait
+  #   behind a Postgres service container.
+  #
+  # The capture side is what this covers: the transcript parsers and their
+  # fixtures, the CLI's sync decision function, the installers, and the eval
+  # suite's static validation.
+  capture:
+    name: Capture (no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # **`DATABASE_URL` is deliberately unset.** Every test that needs one
+      # skips itself when it is missing, so this job is the check that the
+      # capture half genuinely does not need a database -- if one of them
+      # starts requiring it, it disappears from here rather than failing, which
+      # is why the counts below are asserted.
+      - name: transcript parsers and fixtures
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p cormex-transcript --locked 2>&1)
+          echo "$out"
+          # A test that silently skips looks exactly like one that passed
+          echo "$out" | grep -q "0 failed" || { echo "::error::tests failed"; exit 1; }
+          echo "$out" | grep -qE "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::no tests ran -- did they all start skipping?"; exit 1; }
+
+      - name: the sync decision function and the installers
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p cormex --lib --locked 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "0 failed" || { echo "::error::tests failed"; exit 1; }
+          echo "$out" | grep -qE "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::no tests ran"; exit 1; }
+
+      # The eval suite's static validation: a few seconds, and it is the only
+      # thing that catches a question whose gold answer is not in the corpus or
+      # whose ids do not line up. Its value is precisely "a number to compare
+      # every optimisation against", and not running it means there is none.
+      - name: eval suite validates
+        run: |
+          cargo run -p cormex-evals --locked -- validate
+          # The session-retrieval suite (P7-2). Its own validation refuses a
+          # suite with no negative question: without one, a search that returns
+          # every session scores 100%
+          cargo run -p cormex-evals --locked -- validate --sessions
+
   # ── Tests ──────────────────────────────────────────────
   test:
     name: Tests
@@ -90,7 +158,7 @@ jobs:
       #   resolved migrations` -- it is looking at the first set's bookkeeping.
       #
       #   The runtime path does this correctly (`Store::migrate_global` creates the schema
-      #   and opens its own connection with `search_path=cortex_auth`, precisely because
+      #   and opens its own connection with `search_path=cormex_auth`, precisely because
       #   `search_path` is a connection-level property and cannot be changed on a live
       #   pool). CI has to mirror it rather than assume two commands are two namespaces.
       #
@@ -99,12 +167,28 @@ jobs:
       #   them. Drop it and 20260810000002 fails with `type "ulid" does not exist` --
       #   which reads like a missing migration rather than a missing schema on the
       #   path. `state.rs` puts exactly this pair on the accounts pool, same note.
+      #
+      # ★ The schema is created as **`cortex_auth`**, and that is not a typo left over
+      #   from the rename. The pinned global migrations are fully qualified
+      #   `cortex_auth.…` and cannot be edited (their sha256 is pinned and they are
+      #   applied in production), so the migrator has to run against a schema by that
+      #   name. `Store::migrate_global` does exactly this -- it renames `cormex_auth`
+      #   to `cortex_auth`, migrates, and renames back -- and CI has to mirror it.
+      #
+      #   Creating `cormex_auth` here instead is what the runtime used to do, and it
+      #   worked only for as long as there was one global migration: the second one
+      #   failed with `schema "cortex_auth" does not exist` on every database that had
+      #   already been renamed. That is the upgrade path every existing deployment
+      #   takes, and CI is the only place it is exercised without a live server.
       - name: Apply migrations
         run: |
           psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations-global \
             --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth%2Cpublic"
+          # Rename afterwards, so the tests that query `cormex_auth.…` (the name the
+          # deployment uses) see the same shape a real server leaves behind
+          psql "$DATABASE_URL" -c 'ALTER SCHEMA cortex_auth RENAME TO cormex_auth'
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
           PGPASSWORD: postgres
@@ -114,10 +198,42 @@ jobs:
       #   **"ignored" and "ok" look equally green**. Without this flag the gate covers only
       #   the pure-logic half, leaving the retrieval / transaction / migration half (which
       #   is to say the core of this product) uncovered.
+      #
+      # ★ The Postgres **client** has to be installed, and at the server's own major
+      #   version. `ubuntu-latest` ships `pg_dump` 16, the service above is pg17, and
+      #   `pg_dump` refuses to dump a newer server:
+      #
+      #       pg_dump: error: aborting because of server version mismatch
+      #
+      #   That is the backup/restore drill (P6-3) failing in CI on every branch while
+      #   passing on a development machine -- where the host has no `pg_dump` at all, so
+      #   the test falls back to the binaries inside the Postgres container. The test now
+      #   skips when no capable client exists, which is right for a laptop and wrong here:
+      #   CI is the one place the drill has to actually run.
+      - name: Install the matching Postgres client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          pg_dump --version
+
       - name: cargo test
         run: cargo test --workspace --locked -- --include-ignored
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
+          # A throwaway master key, so the **encrypted** capture path is
+          # actually exercised. Without it those tests skip themselves, and a
+          # skip in CI's output is indistinguishable from a pass -- the same
+          # reason `--include-ignored` is above. It is a literal, not a secret:
+          # it protects nothing, and the database it encrypts into is thrown
+          # away at the end of the job
+          CORMEX_SECRET_KEY: 0000000000000000000000000000000000000000000000000000000000000001
 
     # pgvector rather than the official postgres image: the retrieval leg needs the
     # `vector` extension, and without it the very first migration blows up. The version

@@ -11,7 +11,7 @@ use crate::matcher::{Matcher, QuestionMatchers};
 use crate::metrics::{Aggregate, QuestionResult, Status, aggregate, score};
 use crate::report::{CorpusInfo, Report, RunInfo, SuiteInfo, kind_order, lang_order};
 use crate::suite::{Question, QuestionKind, Suite};
-use cortex_memory::retrieval::{DEFAULT_ABSTAIN_BELOW, RecencyMode};
+use cormex_memory::retrieval::{DEFAULT_ABSTAIN_BELOW, RecencyMode};
 
 /// Render the recency mode as the line of text that goes into the report.
 fn describe_recency(mode: RecencyMode) -> String {
@@ -139,7 +139,7 @@ async fn run_inner(db: &EvalDb, suite: &Suite, opts: &RunOptions) -> Result<Repo
         run: RunInfo {
             mode: opts.mode.to_string(),
             embedding_model: retriever.embedding_model(),
-            rrf_k: cortex_memory::fusion::RRF_K,
+            rrf_k: cormex_memory::fusion::RRF_K,
             width_bm25: cfg.width.bm25,
             width_vector: cfg.width.vector,
             width_graph: cfg.width.graph,

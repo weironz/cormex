@@ -4,8 +4,7 @@
 
 **v0.1.11。生产在跑，仓库已公开，两个镜像在发。**
 
-拆分这件事**做完了**：与 Cortex 之间零代码依赖，只有 HTTP。
-`cargo tree` 上没有一条边通向那边，两条版本线独立。
+对外只有 HTTP 契约，没有代码依赖 —— 任何 agent 走的都是同一组公开接口。
 
 ```
                         ┌─────────────────────────────┐
@@ -14,8 +13,8 @@
                                      │  同源 /api
                                      ▼
    Claude Code ──/mcp──▶ ┌───────────────────────────┐ ──▶ Postgres + pgvector
-   goose        ────────▶│  cormex（cortexd 二进制）  │ ──▶ S3 兼容对象存储
-   Cortex 的 agent ─────▶└───────────────────────────┘ ──▶ embedding 服务
+   goose        ────────▶│  cormex（cormexd 二进制）  │ ──▶ S3 兼容对象存储
+   Cormex 的 agent ─────▶└───────────────────────────┘ ──▶ embedding 服务
         /llm/stream · /episodes · /memory/search
 ```
 
@@ -23,7 +22,7 @@
 
 ## 已经做完的（别重做）
 
-- **MCP 门面**：`cortex://profile`（resource）+ `memory_search` / `remember`（tool）。
+- **MCP 门面**：`cormex://profile`（resource）+ `memory_search` / `remember`（tool）。
   两个原语的分工对应注入的两半，见 CLAUDE.md 约束 4
 - **委托凭据**：`POST/DELETE /delegated-tokens`，用调用者自己的 bearer 签发
 - **agent 循环已从这里删除**，且有测试钉着不许回来
@@ -45,7 +44,7 @@
 
 ```console
 $ cd deploy && docker compose up -d
-external volume "cortex_cortex-prod-postgres" not found
+external volume "cormex_cormex-prod-postgres" not found
 ```
 
 现在 `deploy/` 里是三份职责分明的东西：
@@ -57,9 +56,8 @@ external volume "cortex_cortex-prod-postgres" not found
 | `proxy.conf` | 自足那份缺的那一块 —— 见下 |
 
 `.env.example` 跟着拆成两份（`.env.example` / `.env.prod.example`）。
-根那份 dev compose 的 `name:` 从 `cortex` 改成 `cormex` —— **那才是所有
-`cortex_` 卷名前缀的来源**，也是 Cortex 那侧 roadmap 里「compose 项目重名」
-指的这一条。
+根那份 dev compose 的 `name:` 是 `cormex` —— **那才是所有 `cormex_` 卷名前缀
+的来源**。
 
 **自足那份必须自带一层薄反代，这不是可选项。** `cormex-web` 镜像刻意不反代
 API（部署事实不该编进镜像），生产上那一刀是 traefik 切的。没有它的话，浏览器
@@ -73,7 +71,19 @@ API（部署事实不该编进镜像），生产上那一刀是 traefik 切的�
 `.env.example`，于是新加的 `.env.prod.example` **会被静默忽略** ——
 本机好好的、`git status` 干净、提交也成功，而 clone 的人没有那个文件。
 
-### ❌ 撞出来的：**全新数据库上根本起不来**
+### ✅ 撞出来的：**全新数据库上根本起不来**（2026-10-29 修）
+
+修法取的是上面列的第 1 种：`Store::migrate_global` 在跑全局那套之前，**先用
+同一个 `boot` 连接对 `public` 跑一次租户那套**（`boot` 显式设
+`search_path=public`，否则登录用户同名的 schema 会截胡）。一处覆盖三个调用点，
+不存在「漏一处」；DOMAIN 仍然只有一份定义，没有抄第二遍。重复执行是幂等的
+—— sqlx 在 `public._sqlx_migrations` 里记着已应用的版本。
+
+`crates/cortex-store/tests/fresh_database.rs` 建一个真正空的库来钉这件事
+（`#[ignore]`，`just test-db` 会跑到）。改之前它报
+`type "ulid" does not exist`，改之后通过。
+
+### 原来的记录：**全新数据库上根本起不来**
 
 照着新 README 从零跑一遍（这是这一条一直缺的那次验证），服务端进了重启循环：
 
@@ -103,20 +113,21 @@ type "ulid" does not exist
    覆盖所有调用点，但把 DOMAIN 定义抄成了两份，正是这个仓库盯得最紧的
    「同一个定义两处」。要配一条比对两处文本的测试
 2. 把租户那套排到全局前面。SQL 层面**没有**反向依赖（核过：`migrations/`
-   里唯一提到 `cortex_auth` 的地方是一句注释），但调用点有三处，漏一处就是
+   里唯一提到 `cormex_auth` 的地方是一句注释），但调用点有三处，漏一处就是
    上面那个「账号这一轮废了」
 3. 新加一条编号更早的全局 migration —— 与 sqlx 的顺序检查冲突
 
 ### 还欠的
 
 - **在一台干净机器上完整走一遍**：能起、能开第一个账号、能搜到东西。
-  上面第 ❌ 条挡着，修完再验
-- README 的 quickstart 现在如实挂着那个「Known gap」。**修好之前不要摘掉它**
-  —— 一份声称能跑而跑不起来的 quickstart，比一份诚实说明卡在哪的更糟
+  空库那一条已经修了（见上），这一条现在只剩「真的走一遍」本身
+- README 的「Known gap」已经摘掉 —— 它挡着的那条修好了。摘掉是**跟着修复走
+  的**，不是单独的动作：一份声称能跑而跑不起来的 quickstart，比一份诚实说明
+  卡在哪的更糟，反过来也一样
 
 ## B. 第一次用的人卡在哪
 
-**开第一个账号的流程只散在注释里。** 实际是：`cortexd --generate-token` →
+**开第一个账号的流程只散在注释里。** 实际是：`cormexd --generate-token` →
 拿那串令牌连上 → 建账号 → 之后用账号密码。没有一处文档从头讲到尾，
 而这是每个自托管的人必经的第一步。
 
@@ -131,11 +142,10 @@ type "ulid" does not exist
 - **`app/` 与 `deploy/` 里的注释还是中文。** Rust crate 那一批翻完了，这两处没有。
   README 的 Status 已经如实写着这件事
 - **`injection-drift.py` 只是手工脚本。** 它守的是 CLAUDE.md 约束 4 —— 一条
-  漂了不报错的约束。要进 CI 得先解决「CI 上没有另一个仓库」：可行的做法是
-  在 Cortex 那侧的 CI 里跑（那边 checkout 两个仓库更自然），或者把渲染实现
-  连同测试一起做成一个可以被两边 vendor 的单文件并比对 sha256
+  漂了不报错的约束。要进 CI 得先解决「CI 上拿不到另一份实现」：可行的做法是
+  把渲染实现连同测试一起做成一个可以被两边 vendor 的单文件并比对 sha256
 - **evals 不在 CI 里。** 它是 workspace member，所以 `cargo test` 会编它，
-  但 `cargo run -p cortex-evals -- validate` 这条几秒就跑完的题集校验没有接上。
+  但 `cargo run -p cormex-evals -- validate` 这条几秒就跑完的题集校验没有接上。
   它的价值恰恰是「给每一次『优化』一个可对照的数字」—— 不跑就等于没有
 - **备份只写了没验过恢复。** `data/backup` 有东西，但没有一次「从备份起一个空库
   并对上记录数」的演练
@@ -153,9 +163,9 @@ type "ulid" does not exist
 
 ## E. 运维
 
-- **没有 CI 部署。** 现在是手工 ssh + `docker compose up -d`。Cortex 那边有一套
-  节点侧的部署策略脚本（CI 只能执行它、不能改它）—— 这边要不要照做，取决于
-  发布频率。**在有之前，别把手工步骤写进文档当成流程**，写清楚它就是手工的
+- **没有 CI 部署。** 现在是手工 ssh + `docker compose up -d`。节点侧的部署策略
+  脚本目前没有 —— 要不要做取决于发布频率。**在有之前，别把手工步骤写进文档
+  当成流程**，写清楚它就是手工的
 - **升级路径没有验证过。** 从 v0.1.9 升到 v0.1.11 走的是「pull + up」，
   中间没有 schema 变更所以顺利。第一次带 migration 的升级需要一份先 dump 的退路
 
@@ -175,7 +185,6 @@ type "ulid" does not exist
 
 ## 不做
 
-- **不为 Cortex 做任何事。** 它是另一个产品、另一个仓库。这边只保证 HTTP 契约
 - **不加第二个存储后端。** Postgres + pgvector 是唯一硬依赖，那是特性不是限制 ——
   双时间轴与四路召回都建在 SQL 上，抽象掉它等于把卖点抽象掉
 - **不做最小公倍数式的供应商抽象**（会丢 prompt caching 与 thinking 块）

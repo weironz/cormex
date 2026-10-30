@@ -15,7 +15,7 @@ class HealthStatus {
   final String status;
   final String version;
 
-  /// `"cortexd"`。留着是为了在连上一个**不是** Cormex 的东西时能说清楚：
+  /// `"cormexd"`。留着是为了在连上一个**不是** Cormex 的东西时能说清楚：
   /// 一个地址打通了、回的却是别的服务，比连不上更难排查。
   final String role;
 
@@ -36,8 +36,8 @@ class HealthStatus {
 
   /// 这个部署谁连上谁就是主人。
   ///
-  /// 界面上要**明说**而不是默默享受：cortexd 只有在有人特地写了
-  /// `CORTEX_AUTH=disabled` 时才会到这个状态，而它自己每次启动都会打一行
+  /// 界面上要**明说**而不是默默享受：cormexd 只有在有人特地写了
+  /// `CORMEX_AUTH=disabled` 时才会到这个状态，而它自己每次启动都会打一行
   /// 警告。客户端什么都不说，就成了整个系统里唯一装作没看见的那一环。
   bool get authDisabled => auth == 'disabled';
 
@@ -45,7 +45,7 @@ class HealthStatus {
 
   /// 存储层没接线时的一句短提示；接好了返回 null。
   ///
-  /// 刻意不把它并进 [isHealthy]：开发中的 cortexd 会诚实地报 `not_wired`，
+  /// 刻意不把它并进 [isHealthy]：开发中的 cormexd 会诚实地报 `not_wired`，
   /// 而那时 `/memory/search` 照样答得出来 —— 把整个界面涂红是过度反应。
   String? get databaseNote => switch (database) {
     'ok' => null,
@@ -56,7 +56,7 @@ class HealthStatus {
   factory HealthStatus.fromJson(Map<String, dynamic> json) => HealthStatus(
     status: asString(json['status'], 'unknown'),
     version: asString(json['version'], '?'),
-    role: asString(json['role'], 'cortexd'),
+    role: asString(json['role'], 'cormexd'),
     database: asString(json['database'], 'unknown'),
     auth: asString(json['auth'], authUnknown),
   );

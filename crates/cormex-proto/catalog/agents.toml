@@ -1,0 +1,411 @@
+# 来源目录：哪个 agent 的会话文件在哪、怎么从路径里认出会话 id。
+#
+# 这是**数据不是代码**（D8）。加一个 agent 只改这份文件加一个服务端解析器，
+# CLI 一行不动。`cormex-proto::catalog::Catalog::builtin()` 用 `include_str!`
+# 把它编进二进制，CLI 与服务端共用同一份；服务端可以用
+# `CORMEX_CAPTURE_CATALOG` 指向一份更新的文件。
+#
+# 规矩：
+# - 所有路径相对 agent 的 home，正斜杠分隔
+# - 解析 cwd 与 session_id **只看路径**，不读文件内容（D2）
+# - `glob` 用 globset 语法；`**` 匹配任意深度
+
+schema = 1
+version = "2026-11-01"
+
+[[agents]]
+id = "claude_code"
+name = "Claude Code"
+home = [
+  { env = "CLAUDE_CONFIG_DIR" },
+  { path = "~/.claude" },
+]
+
+  # 主 transcript。Claude Code 一个项目一个目录，目录名是 cwd 把 `/` 换成 `-`
+  [[agents.source]]
+  role = "transcript"
+  glob = "projects/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  cwd = { from = "parent_dir", decode = "claude_project_dir" }
+
+  # 子 agent 的 transcript：projects/<项目>/<父会话>/subagents/<子会话>.jsonl
+  [[agents.source]]
+  role = "subagent"
+  glob = "projects/*/*/subagents/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 2 }
+
+  # 溢出的工具输出。归属父会话；用正向下标，因为 `**` 的深度不定
+  [[agents.source]]
+  role = "sidecar"
+  glob = "projects/*/*/tool-results/**"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 2 }
+
+  # 每个项目一个 memory 伪会话。`prefix` 拼在前面，避免伪会话 id 与真实会话 id 撞车
+  [[agents.source]]
+  role = "memory"
+  glob = "projects/*/memory/**"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1, prefix = "memory:" }
+
+  [agents.hooks]
+  kind = "claude_code_settings"
+  events = ["Stop", "SubagentStop", "PreCompact", "SessionEnd"]
+
+  [agents.retention]
+  setting = "cleanupPeriodDays"
+  file = "settings.json"
+  default_days = 30
+
+[[agents]]
+id = "codex"
+name = "Codex CLI"
+home = [
+  { env = "CODEX_HOME" },
+  { path = "~/.codex" },
+]
+
+  # rollout 文件。`also_compressed` 说同名 `.jsonl.zst` 是**同一个逻辑文件**：
+  # 采集端只保留一个（明文优先），逻辑路径一律是明文名
+  [[agents.source]]
+  role = "transcript"
+  glob = "{sessions,archived_sessions}/**/rollout-*.jsonl"
+  framing = "append"
+  also_compressed = ".zst"
+  session_id = { from = "stem_regex", regex = "rollout-[0-9T-]+-(?P<id>[0-9a-f-]{36})" }
+
+  # 全局记忆。每台机器各一份，所以 `per_device`：不拼的话两台机器的记忆会被
+  # 合并成一个会话，而它们的内容并不相同
+  [[agents.source]]
+  role = "memory"
+  glob = "memories/{raw_memories.md,rollout_summaries/**}"
+  framing = "snapshot"
+  session_id = { from = "const", value = "memory", per_device = true }
+
+  [agents.hooks]
+  kind = "codex_hooks_json"
+  events = ["Stop", "PreCompact", "SessionEnd"]
+
+[[agents]]
+id = "gemini_cli"
+name = "Gemini CLI"
+home = [
+  { env = "GEMINI_CLI_HOME" },
+  { path = "~/.gemini" },
+]
+
+  # `~/.gemini/tmp/<project hash>/chats/session-<timestamp>-<short id>.jsonl`.
+  # 上游 `packages/core/src/services/chatRecordingService.ts`：文件名是
+  # `session-` + `YYYY-MM-DDTHH-MM` + `-` + 会话 id 前 8 位，撞名时插一个序号。
+  # 会话 id 只在前 8 位里，所以 `stem_regex` 取不到完整 id —— 用整个 stem 当
+  # 会话 id：它唯一、稳定，而且跨设备一致（同一台机器上同一个文件）
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/session-*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+
+  # 子 agent 的会话：`tmp/<project hash>/chats/<父会话 id>/<子会话 id>.jsonl`
+  # （上游注释：`subagents are nested under the complete parent session id`）
+  [[agents.source]]
+  role = "subagent"
+  glob = "tmp/*/chats/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 3 }
+
+  # 旧版本的 `.json` 是整个会话对象，走 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/session-*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+  [agents.hooks]
+  kind = "gemini_settings"
+  events = ["AfterAgent", "SessionEnd"]
+
+[[agents]]
+id = "cline"
+name = "Cline"
+# VS Code's global storage. The extension id is the directory name; Roo Code is a
+# fork with its own id and the same file layout, so it gets its own entry below
+home = [
+  { env = "CLINE_GLOBAL_STORAGE" },
+  { path = "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev" },
+  { path = "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" },
+  { path = "~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev" },
+]
+
+  # 上游 `apps/vscode/src/core/storage/disk.ts`：`tasks/<taskId>/<file>`，
+  # `api_conversation_history.json` 是发给模型的 `Anthropic.MessageParam[]`，
+  # 也就是对话本身。**整份重写**，所以是 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "tasks/*/api_conversation_history.json"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1 }
+
+  # UI 自己的事件日志。**不采**：它与上面那份是同一段对话的两种写法，两份都采
+  # 会让每条消息出现两次。留在这里是为了让下一个人知道它是故意漏掉的
+  # [[agents.source]]
+  # role = "sidecar"
+  # glob = "tasks/*/ui_messages.json"
+
+[[agents]]
+id = "roo_code"
+name = "Roo Code"
+home = [
+  { env = "ROO_GLOBAL_STORAGE" },
+  { path = "~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline" },
+  { path = "~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline" },
+  { path = "~/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "tasks/*/api_conversation_history.json"
+  framing = "snapshot"
+  session_id = { from = "path_segment", index = 1 }
+
+[[agents]]
+id = "opencode"
+name = "OpenCode"
+home = [
+  { env = "OPENCODE_DATA" },
+  { path = "~/.local/share/opencode" },
+  { path = "~/Library/Application Support/opencode" },
+]
+
+  # 上游 `sst/opencode`（MIT）`packages/core/src/session/sql.ts`：
+  # `session_message(id, session_id, type, seq, data)` 与
+  # `session_part(message_id, session_id, ordinal, type, call_id, data)`。
+  # assistant 消息的内容在 **另一张表** 里，所以查询把 parts 聚合成一个数组 ——
+  # 解析器拿不到数据库，只能拿到这一行的字节
+  [[agents.source]]
+  role = "row"
+  glob = "opencode.db"
+  framing = "snapshot"
+  session_id = { from = "const", value = "opencode", per_device = true }  # 仅当查询没有 session_column 时使用
+  [agents.source.sqlite]
+  key_column = "id"
+  session_column = "session_id"
+  text_column = "row_json"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT m.id AS id,
+           m.session_id AS session_id,
+           json_object(
+             'type', m.type,
+             'data', json(m.data),
+             'parts', (SELECT json_group_array(json_object('type', p.type, 'data', json(p.data)))
+                         FROM session_part p
+                        WHERE p.message_id = m.id
+                        ORDER BY p.ordinal)
+           ) AS row_json
+      FROM session_message m
+     ORDER BY m.session_id, m.seq
+  """
+
+[[agents]]
+id = "goose"
+name = "Goose"
+home = [
+  { env = "GOOSE_DATA" },
+  { path = "~/.local/share/goose/sessions" },
+  { path = "~/Library/Application Support/goose/sessions" },
+]
+
+  # 上游 `block/goose`（Apache-2.0）`crates/goose/src/session/session_manager.rs`：
+  # `messages(id, message_id, session_id, role, content_json, created_timestamp)`。
+  # 一行一条消息
+  [[agents.source]]
+  role = "row"
+  glob = "sessions.db"
+  framing = "snapshot"
+  session_id = { from = "const", value = "goose", per_device = true }
+  [agents.source.sqlite]
+  key_column = "id"
+  session_column = "session_id"
+  text_column = "row_json"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT id AS id,
+           session_id AS session_id,
+           json_object(
+             'role', role,
+             'content_json', content_json,
+             'created_timestamp', created_timestamp,
+             'session_id', session_id
+           ) AS row_json
+      FROM messages
+     ORDER BY session_id, created_timestamp, id
+  """
+
+# 导出文件（P4-7）。**不是**从某个 agent 的 home 里发现的：用户显式 `cormex import`
+# 一个导出，客户端把 `conversations.json` 拆成每个会话一个文件再上传。所以这里
+# 没有 `home`，也没有 glob 会让 `discover` 找到它们 —— 它们是导入器的产物
+[[agents]]
+id = "chatgpt_export"
+name = "ChatGPT export"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "claude_export"
+name = "Claude export"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "qwen_code"
+name = "Qwen Code"
+home = [
+  { env = "QWEN_HOME" },
+  { path = "~/.qwen" },
+]
+
+  # 上游 `QwenLM/qwen-code`（Apache-2.0）
+  # `packages/core/src/services/chatRecordingService.ts`：`~/.qwen/tmp/<project_id>/chats/<sessionId>.jsonl`，
+  # 一行一个 `ChatRecord`，append-only。记录是**树**（`parentUuid`），不是列表
+  [[agents.source]]
+  role = "transcript"
+  glob = "tmp/*/chats/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "copilot_chat"
+name = "VS Code Copilot Chat"
+# VS Code 的 workspaceStorage：每个工作区一个目录，里面是 chatSessions/
+home = [
+  { env = "VSCODE_WORKSPACE_STORAGE" },
+  { path = "~/.config/Code/User/workspaceStorage" },
+  { path = "~/Library/Application Support/Code/User/workspaceStorage" },
+  { path = "~/.vscode-server/data/User/workspaceStorage" },
+]
+
+  # 上游 `microsoft/vscode`（MIT）`chatSessionStore.ts`：1.109 起是
+  # `<sessionId>.jsonl` 的**对象变更日志**（`objectMutationLog.ts`）：
+  # kind 0 初始快照、1 设值、2 数组追加（`i` 表示先截断）、3 删除。
+  # 解析器要先重放成会话对象才能出事件
+  [[agents.source]]
+  role = "transcript"
+  glob = "*/chatSessions/*.jsonl"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+  # 1.109 之前的扁平 JSON。整份重写，同样 snapshot
+  [[agents.source]]
+  role = "transcript"
+  glob = "*/chatSessions/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "cursor"
+name = "Cursor"
+home = [
+  { env = "CURSOR_HOME" },
+  { path = "~/.cursor" },
+]
+
+  # CLI 的会话记录。**公开文档没有描述它的格式**，但 CLI 本身是打包的
+  # JavaScript，序列化代码就在里面（`agent-transcript/dist/index.js` 的 `U`/`W`），
+  # 解析器是照着那段代码写的，不是猜的。
+  #
+  # 路径：`~/.cursor/projects/<workspace 路径压成 - >/agent-transcripts/<id>.jsonl`
+  # （`utils/dist/workspace-paths.js` 里 `O2 = "agent-transcripts"`）。
+  [[agents.source]]
+  role = "transcript"
+  glob = "projects/*/agent-transcripts/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+
+  # 子 agent 的记录：同一目录下 `<parent>/<child>.jsonl`
+  [[agents.source]]
+  role = "subagent"
+  glob = "projects/*/agent-transcripts/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 3 }
+
+  # 历史数据：`state.vscdb` 的 `cursorDiskKV` 表。键前缀是设计里给的
+  # （`composerData:%` 是会话、`bubbleId:%` 是单条消息），**值的格式同样没有
+  # 公布**。所以按 P4-0 的行来源采，投影同样是一条「格式未知」的 Unknown
+  # 事件 —— 字节进 R 层，解析器以后再补
+  [[agents.source]]
+  role = "row"
+  glob = "state.vscdb"
+  framing = "snapshot"
+  session_id = { from = "const", value = "cursor", per_device = true }
+  [agents.source.sqlite]
+  key_column = "key"
+  session_column = "session_key"
+  text_column = "value"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT key AS key,
+           CASE
+             WHEN key LIKE 'bubbleId:%' THEN substr(key, 10, instr(substr(key, 10), ':') - 1)
+             WHEN key LIKE 'composerData:%' THEN substr(key, 14)
+             ELSE 'cursor'
+           END AS session_key,
+           value AS value
+      FROM cursorDiskKV
+     WHERE key LIKE 'composerData:%' OR key LIKE 'bubbleId:%'
+     ORDER BY key
+  """
+
+  [agents.hooks]
+  kind = "cursor_hooks"
+  events = ["stop", "sessionEnd", "preCompact"]
+
+# Aider（P4-6）。**没有 home、没有 source，`import_only` 也不对** —— 它的历史文件
+# `.aider.chat.history.md` 在**项目目录里**，D7 禁止默认读项目目录。所以它只能由
+# 用户 `cormex sources add aider <路径>` 显式指定，路径存在 `config.toml` 的
+# `extra_sources` 里（每台机器一份），而不是这份共享的 catalog 里。
+#
+# 这个条目存在的唯一理由是让 `capture_sessions.agent` 的 CHECK 有一个对应的 id，
+# 以及让 `every_catalogued_agent_has_a_parser` 知道 `aider` 有解析器。
+[[agents]]
+id = "aider"
+name = "Aider"
+manual_only = true
+
+# Copilot CLI（P4-6）。`github/copilot-cli` 是**闭源**的，但它的原生二进制里
+# 打包了一份 gzip 的 tar，里面是应用自己的 JavaScript（`package/cli-main.js`，
+# 8.3 MB）—— 事件类型与写入形状都是从那里读出来的，并用 `copilot sessions import`
+# 产出的真实 `events.jsonl` 验证过。
+#
+# 一行一个事件，append-only，`parentId` 把事件串成链：
+#   {"type":"session.start","data":{…},"id":"…","timestamp":"…","parentId":null}
+#   {"type":"user.message","data":{"content":"…"},…}
+#   {"type":"assistant.message","data":{"content":"…","toolRequests":[…]}…}
+[[agents]]
+id = "copilot_cli"
+name = "GitHub Copilot CLI"
+home = [
+  { env = "COPILOT_HOME" },
+  { path = "~/.copilot" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "session-state/*/events.jsonl"
+  framing = "append"
+  session_id = { from = "path_segment", index = 1 }
+
