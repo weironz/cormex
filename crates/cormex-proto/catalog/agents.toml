@@ -355,3 +355,22 @@ id = "aider"
 name = "Aider"
 manual_only = true
 
+# Copilot CLI（P4-6）。`github/copilot-cli` 是**闭源**的 —— 仓库里只有 README、
+# changelog 与安装脚本，没有代码，changelog 提到「transcript files」但从不描述格式。
+#
+# 与 Cursor 同样的处理：**采字节，投影如实标注**。Copilot 会清理自己的会话，
+# 没采到就永远没了；解析器写错了可以重投影。
+[[agents]]
+id = "copilot_cli"
+name = "GitHub Copilot CLI"
+home = [
+  { env = "COPILOT_HOME" },
+  { path = "~/.copilot" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "session-state/*/events.jsonl"
+  framing = "append"
+  session_id = { from = "path_segment", index = 1 }
+

@@ -1,6 +1,7 @@
-//! The Cursor transcript parser — **a placeholder that says so**.
+//! Parsers for hosts whose transcript format is **not documented** — Cursor
+//! and Copilot CLI.
 //!
-//! Design: plan P4-2.
+//! Design: plan P4-2 and P4-6.
 //!
 //! # Why this exists at all when the format is unknown
 //!
@@ -8,6 +9,11 @@
 //! conversation. **Upstream does not document its format**: the hook reference
 //! says only "Path to the main conversation transcript file", and nothing in
 //! Cursor's public material describes the bytes.
+//!
+//! Copilot CLI is the same: `github/copilot-cli` is a **closed-source
+//! repository** — its GitHub repo holds a README, a changelog and an install
+//! script, no code — and its changelog mentions "transcript files" without ever
+//! describing them.
 //!
 //! The choice is between two bad options and one good one:
 //!
@@ -33,34 +39,53 @@ use cormex_proto::transcript::{ContentBlock, TranscriptKind};
 
 use crate::parser::{ParsedEvent, Parser};
 
+/// Which undocumented host this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undocumented {
+    Cursor,
+    CopilotCli,
+}
+
+impl Undocumented {
+    /// The agent id, matching the catalog.
+    #[must_use]
+    pub const fn agent(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::CopilotCli => "copilot_cli",
+        }
+    }
+}
+
 /// The parser.
 ///
 /// Stateless: it emits one event for the whole file on the first feed and
 /// nothing afterwards, so a re-run of the projector produces the same result.
 pub struct CursorParser {
+    host: Undocumented,
     emitted: bool,
 }
 
 impl CursorParser {
     #[must_use]
-    pub fn new() -> Self {
-        Self { emitted: false }
-    }
-}
-
-impl Default for CursorParser {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(host: Undocumented) -> Self {
+        Self {
+            host,
+            emitted: false,
+        }
     }
 }
 
 impl Parser for CursorParser {
     fn version(&self) -> &'static str {
         // **The version names the situation, not a parser revision.** When a
-        // real parser lands it becomes `cursor@2`, and the projector then
-        // rewrites the projection from the stored bytes — which is exactly what
-        // `parser_version` exists for
-        "cursor@1-undocumented"
+        // real parser lands it becomes `cursor@2` / `copilot_cli@2`, and the
+        // projector then rewrites the projection from the stored bytes — which
+        // is exactly what `parser_version` exists for
+        match self.host {
+            Undocumented::Cursor => "cursor@1-undocumented",
+            Undocumented::CopilotCli => "copilot_cli@1-undocumented",
+        }
     }
 
     fn feed(&mut self, offset: u64, bytes: &[u8]) -> Result<Vec<ParsedEvent>, String> {
@@ -73,7 +98,7 @@ impl Parser for CursorParser {
             role: None,
             occurred_at: None,
             content: vec![ContentBlock::Unknown {
-                raw_type: "cursor:format-undocumented".to_owned(),
+                raw_type: format!("{}:format-undocumented", self.host.agent()),
             }],
             // No text: the file's bytes are not the conversation's text, and
             // putting them here would put a JSON blob into the conversation
@@ -96,8 +121,9 @@ impl CursorParser {
     ///
     /// # Errors
     /// The checkpoint is not one this parser wrote.
-    pub fn restore(state: &serde_json::Value) -> Result<Self, String> {
+    pub fn restore(host: Undocumented, state: &serde_json::Value) -> Result<Self, String> {
         Ok(Self {
+            host,
             emitted: state
                 .get("emitted")
                 .and_then(serde_json::Value::as_bool)
@@ -118,7 +144,7 @@ mod tests {
     /// somebody had said it.
     #[test]
     fn it_emits_one_event_that_says_the_format_is_unknown() {
-        let mut p = CursorParser::new();
+        let mut p = CursorParser::new(Undocumented::Cursor);
         let events = p.feed(0, br#"{"whatever":"cursor writes"}"#).expect("feed");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, TranscriptKind::Unknown);
@@ -141,13 +167,20 @@ mod tests {
     /// `parser_version` exists for.
     #[test]
     fn the_version_says_the_format_is_undocumented() {
-        assert_eq!(CursorParser::new().version(), "cursor@1-undocumented");
+        assert_eq!(
+            CursorParser::new(Undocumented::Cursor).version(),
+            "cursor@1-undocumented"
+        );
+        assert_eq!(
+            CursorParser::new(Undocumented::CopilotCli).version(),
+            "copilot_cli@1-undocumented"
+        );
     }
 
     /// Feeding twice does not duplicate.
     #[test]
     fn feeding_twice_does_not_duplicate() {
-        let mut p = CursorParser::new();
+        let mut p = CursorParser::new(Undocumented::Cursor);
         assert!(!p.feed(0, b"anything").expect("first").is_empty());
         assert!(p.feed(0, b"anything").expect("second").is_empty());
     }
@@ -155,10 +188,10 @@ mod tests {
     /// A checkpoint round-trips.
     #[test]
     fn the_checkpoint_round_trips() {
-        let mut p = CursorParser::new();
+        let mut p = CursorParser::new(Undocumented::Cursor);
         p.feed(0, b"anything").expect("feed");
         let state = p.checkpoint();
-        let mut restored = CursorParser::restore(&state).expect("restore");
+        let mut restored = CursorParser::restore(Undocumented::Cursor, &state).expect("restore");
         assert!(restored.feed(0, b"anything").expect("again").is_empty());
     }
 }
