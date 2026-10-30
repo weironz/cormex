@@ -71,15 +71,39 @@
 
 ### P1-13 发版
 
-- 状态：**待所有者执行**。
-- 原因：发版要打 tag 并推两个 registry，是对外动作。
-- 所有者验证步骤：
+- 环境：开发机，Docker
+- 步骤：`just release-check 0.1.11`、`just release-cli 0.1.11`、
+  镜像构建 + 烟测（`release-images` 的前半段）
+- 结果：**本地这一半通过**。
+  - preflight：版本与 Cargo.toml 一致、`Cargo.lock --locked` 自洽
+  - CLI：两个 Linux musl 目标构建成功，`--version` 报 `cormex 0.1.11`，
+    `file` 显示 `statically linked`；macOS / Windows 四个目标在本机跳过并打印原因
+  - `cormex:0.1.11` 镜像：`--version` 报 `cormexd 0.1.11`，镜像内两套
+    migration 目录都在
+- **未做**：打 tag、推两个 registry、npm 发布。这三步是对外动作，需要所有者执行：
+
   ```bash
-  just release-check 0.1.12   # 版本与 Cargo.lock 自洽
+  just release-check 0.1.12
   just release 0.1.12         # 构建 → 烟测 → 推送 → npm
   ```
+
   `just release` 在推送前完成全部构建与烟测；`NPM_TOKEN` 未设置时 npm 那步会跳过
   并说明。
+
+### P3-5 `cormex restore` 之后 `claude --resume` 能接着聊
+
+- 环境：开发机，真 `claude` CLI 2.1.314
+- 步骤：
+  ```bash
+  cormex sessions ls
+  cormex sessions restore 000000000075KJ4SJWYN85WWYZ --to /tmp/restored
+  diff <原文件> /tmp/restored/...          # 逐字节
+  HOME=/tmp/resumehome claude --resume aaaabbbb-... -p "继续"
+  ```
+- 结果：**通过**。
+  - 还原出的文件与原文件 **sha256 相同**（`d6c95550…`），`diff` 无输出
+  - `claude --resume` 读到了这个会话并正常继续对话，说明恢复出来的 JSONL
+    是 Claude Code 认得的格式，不只是字节相同
 
 ### P2-6 Web 会话视图
 
