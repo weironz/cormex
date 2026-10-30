@@ -386,11 +386,15 @@ id = "aider"
 name = "Aider"
 manual_only = true
 
-# Copilot CLI（P4-6）。`github/copilot-cli` 是**闭源**的 —— 仓库里只有 README、
-# changelog 与安装脚本，没有代码，changelog 提到「transcript files」但从不描述格式。
+# Copilot CLI（P4-6）。`github/copilot-cli` 是**闭源**的，但它的原生二进制里
+# 打包了一份 gzip 的 tar，里面是应用自己的 JavaScript（`package/cli-main.js`，
+# 8.3 MB）—— 事件类型与写入形状都是从那里读出来的，并用 `copilot sessions import`
+# 产出的真实 `events.jsonl` 验证过。
 #
-# 与 Cursor 同样的处理：**采字节，投影如实标注**。Copilot 会清理自己的会话，
-# 没采到就永远没了；解析器写错了可以重投影。
+# 一行一个事件，append-only，`parentId` 把事件串成链：
+#   {"type":"session.start","data":{…},"id":"…","timestamp":"…","parentId":null}
+#   {"type":"user.message","data":{"content":"…"},…}
+#   {"type":"assistant.message","data":{"content":"…","toolRequests":[…]}…}
 [[agents]]
 id = "copilot_cli"
 name = "GitHub Copilot CLI"
