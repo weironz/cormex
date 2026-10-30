@@ -142,9 +142,14 @@ enum Command {
     },
     /// Undo every change `init` made.
     Uninstall {
-        /// Keep the local upload state.
+        /// Also remove the local upload state.
+        ///
+        /// **Off by default**: `state.db` holds "how far each file was
+        /// uploaded", and deleting it means the next run re-uploads everything
+        /// from zero. The server deduplicates, so the result is correct — but on
+        /// a large history it is an hour of bandwidth.
         #[arg(long)]
-        keep_data: bool,
+        drop_data: bool,
     },
     /// Check why this machine is not capturing.
     Doctor {
@@ -462,8 +467,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::Ok)
         }
-        Command::Uninstall { keep_data } => {
-            let report = uninstall::run(&cfg, &dirs.data, keep_data)?;
+        Command::Uninstall { drop_data } => {
+            let report = uninstall::run(&cfg, &dirs.data, drop_data)?;
             print!("{}", uninstall::render(&report));
             Ok(ExitCode::Ok)
         }

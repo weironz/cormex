@@ -22,7 +22,24 @@ pub fn backup(path: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
+
+    // **One backup per file, not one per installer.** Two installers touch the
+    // same file — `claude_code` adds hooks to `settings.json` and `retention`
+    // raises `cleanupPeriodDays` in it — and each calls this. With a
+    // millisecond timestamp the two calls can land in the same millisecond, and
+    // the second `copy` then **silently overwrites the first**: both `installs`
+    // rows end up pointing at a backup of the file as it was *after* the first
+    // installer ran, so `uninstall` "restores" a state that still has our
+    // changes in it.
+    //
+    // Reusing the existing backup fixes both halves: the file is captured once,
+    // before anything touched it, and every installer that modifies it shares
+    // that one copy.
+    if let Some(existing) = existing_backup(path) {
+        return Ok(Some(existing));
+    }
+
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6f");
     let name = format!(
         "{}.cormex-backup-{stamp}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
@@ -31,6 +48,32 @@ pub fn backup(path: &Path) -> Result<Option<PathBuf>> {
     std::fs::copy(path, &dest)
         .with_context(|| format!("could not back up {} to {}", path.display(), dest.display()))?;
     Ok(Some(dest))
+}
+
+/// An existing backup of `path`, if one was made.
+///
+/// The newest one wins: `init` is meant to be re-runnable, and a second run
+/// over an already-initialised file has nothing new to preserve — the first
+/// run's copy is the original.
+fn existing_backup(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let stem = path.file_name()?.to_str()?;
+    let prefix = format!("{stem}.cormex-backup-");
+    let mut best: Option<(std::ffi::OsString, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with(&prefix) {
+            continue;
+        }
+        // The timestamp sorts lexicographically (fixed width, zero-padded)
+        if best.as_ref().is_none_or(|(b, _)| name > *b) {
+            best = Some((name.clone(), entry.path()));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Write a file atomically: temp file, then rename.
@@ -85,20 +128,54 @@ mod tests {
         );
     }
 
-    /// Two backups of the same file do not collide.
+    /// **A second backup of the same file reuses the first.**
+    ///
+    /// This is the opposite of what an earlier version asserted, and the earlier
+    /// version was the bug: two installers touch `settings.json` (hooks and
+    /// `cleanupPeriodDays`), each called `backup()`, and with a millisecond
+    /// timestamp the two could land in the same millisecond — the second `copy`
+    /// then silently overwrote the first, so both `installs` rows pointed at a
+    /// backup of the file *after* the first installer's changes. `uninstall`
+    /// then restored a file that still had our hooks in it.
+    ///
+    /// One backup per file, taken before anything touched it, is what makes the
+    /// restore exact.
     #[test]
-    fn two_backups_do_not_overwrite_each_other() {
+    fn a_second_backup_reuses_the_first() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("settings.json");
-        std::fs::write(&path, b"first").expect("write");
+        std::fs::write(&path, b"original").expect("write");
         let a = backup(&path).expect("backup").expect("path");
-        std::fs::write(&path, b"second").expect("write");
-        // A millisecond later, so the timestamp differs
-        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // The file changes, as it does between two installers
+        std::fs::write(&path, b"modified").expect("write");
         let b = backup(&path).expect("backup").expect("path");
-        assert_ne!(a, b, "the second backup overwrote the first");
-        assert_eq!(std::fs::read(&a).expect("read"), b"first");
-        assert_eq!(std::fs::read(&b).expect("read"), b"second");
+
+        assert_eq!(
+            a, b,
+            "a second backup made a second copy; two installers on one file then have two \
+             different 'originals', and only one of them is the real one"
+        );
+        assert_eq!(
+            std::fs::read(&a).expect("read"),
+            b"original",
+            "the shared backup does not hold the file as it was before anything touched it"
+        );
+    }
+
+    /// Backups of **different** files do not share.
+    #[test]
+    fn different_files_get_their_own_backups() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let one = dir.path().join("settings.json");
+        let two = dir.path().join("hooks.json");
+        std::fs::write(&one, b"one").expect("write");
+        std::fs::write(&two, b"two").expect("write");
+        let a = backup(&one).expect("backup").expect("path");
+        let b = backup(&two).expect("backup").expect("path");
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).expect("read"), b"one");
+        assert_eq!(std::fs::read(&b).expect("read"), b"two");
     }
 
     #[test]

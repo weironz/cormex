@@ -51,6 +51,12 @@ pub struct InitOptions {
     pub backfill: bool,
 }
 
+/// The installers for a set of agents, for the tests that drive them directly.
+#[cfg(test)]
+pub(crate) fn installers_for_test(cfg: &Config, agents: &[String]) -> Vec<Box<dyn Installer>> {
+    installers(cfg, agents)
+}
+
 /// Collect every installer that applies to this machine.
 fn installers(cfg: &Config, agents: &[String]) -> Vec<Box<dyn Installer>> {
     let wants = |id: &str| agents.is_empty() || agents.iter().any(|a| a == id);
