@@ -81,12 +81,21 @@
   `just release` 在推送前完成全部构建与烟测；`NPM_TOKEN` 未设置时 npm 那步会跳过
   并说明。
 
-### P2-6 Web 会话视图的截图
+### P2-6 Web 会话视图
 
-- 状态：**未产出**。
-- 原因：验收要求 PR 里贴截图，当前环境没有可截图的浏览器会话。
-- 所有者验证步骤：`just serve` 后打开 `http://127.0.0.1:8080`，进「会话」页，
-  能看到会话列表、点进详情、切到原始记录。
+- 环境：开发机，`flutter build web` 的产物由一个小代理伺服（`/api` 与 `/health` 转发到
+  cormexd，其余走静态文件），Playwright 的 headless Chromium 驱动
+- 步骤：造一个 Claude Code 会话文件 → `cormex detect` → `cormex sync`（真设备密钥）
+  → 等 projector 投影出 4 条事件 → 浏览器登录 → 进「会话档案」
+- 结果：**通过**。
+
+  列表页（`docs/images/p2-6-sessions-list.png`）：标题取自第一条用户消息
+  「我们的对象存储用的什么？」，下面一行是 `claude_code · 4 条 · 2026-10-28`。
+
+  详情页（`docs/images/p2-6-session-detail.png`）：四条事件按序排列，每条带角色
+  （用户 / agent）和**绝对日期**（2026年10月28日 17:00），正文完整。
+
+  两张图都是真数据、真服务端、真浏览器渲染，不是设计稿。
 
 ### P3-7 `npx skills add weironz/cormex`
 
