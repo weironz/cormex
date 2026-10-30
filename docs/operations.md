@@ -112,7 +112,19 @@ curl -X POST "https://<域名>/api/episodes/<episode_id>/redact?confirm=<episode
 
 ## 二、备份与恢复演练（P6-3）
 
-> **状态：步骤已写，尚未在真实部署上演练过。** 演练一次之后把日期和结果补在这里。
+> **状态：数据库那一半已经演练过，而且是自动化的。**
+>
+> ```bash
+> DATABASE_URL=… cargo test -p cormex-store --test backup_restore_drill -- --include-ignored
+> ```
+>
+> 它建一个临时库、迁移、塞进一条**已擦除**的 episode 与它的墓碑、`pg_dump`、
+> 恢复进另一个空库、逐表比对行数，并断言**被擦除的内容没有被恢复回来**。
+> 2026-10-30 在本机跑通（`pg_dump` / `pg_restore` 在 `cormex-postgres` 容器里）。
+>
+> **对象存储那一半仍然只有步骤，没有自动化**：RustFS 的卷是一个目录，复制它就是
+> `tar`，会出错的地方是路径而不是逻辑，而脚本无法复现生产卷的布局。下面那一步
+> 保持手工，附了能抓到它的检查。
 
 ### 备份
 
