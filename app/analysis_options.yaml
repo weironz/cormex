@@ -7,6 +7,19 @@
 
 # The following line activates a set of recommended lints for Flutter apps,
 # packages, and plugins designed to encourage good coding practices.
+#
+# `exclude` is written out rather than left to `flutter analyze` to add: 3.47
+# rewrites this file on every run to insert these three entries, which turns a
+# read-only check into a dirty working tree. Keeping them here makes `flutter
+# analyze` idempotent.
+#
+# None of the three holds Dart source. `web/` is the HTML shell and icons,
+# `windows/` is the generated runner, `build/` is output.
+analyzer:
+  exclude:
+    - build/**
+    - web/**
+    - windows/**
 include: package:flutter_lints/flutter.yaml
 
 linter:

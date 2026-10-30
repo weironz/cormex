@@ -3,7 +3,17 @@ name: Release
 # ══════════════════════════════════════════════════════════
 #  Release pipeline -- builds and pushes cormex's docker image.
 #
-#  Triggers: pushing a `v*` tag, or a manual workflow_dispatch (which requires a tag).
+#  Triggers: a manual workflow_dispatch, which requires a tag.
+#
+#  ★ **The `push: tags` trigger is commented out, not deleted.** GitHub Actions
+#    minutes are exhausted, and a tag push would spend a quarter of an hour of
+#    them without warning. Until the quota is restored, releases are cut with
+#    `just release <version>` (see the justfile), which runs the same preflight,
+#    the same builds and the same smoke tests locally and then pushes.
+#
+#    Restoring the trigger is deleting the two comment markers below. Do that
+#    only once `just release` has been run at least once, so the local path is
+#    known to work rather than assumed to.
 #
 #  ── Images only, no bare binaries ─────────────────────────
 #  This is a memory service: it needs Postgres + pgvector to run at all, and compose is
@@ -11,16 +21,16 @@ name: Release
 #  offer an installation path that does not work. Anyone who does not want docker goes
 #  through `cargo install --git`.
 #
-#  ── The version line is independent of Cormex ─────────────
-#  This is the whole point of the split: Cormex and Cormex release their own versions,
-#  sharing no tags and not aligning with each other. What is checked below is the
-#  `[workspace.package] version` in **this repository's** Cargo.toml, which has nothing
-#  to do with Cormex's version number.
+#  ── The version line is independent of Cormex's ───────────
+#  Cormex and its companion release their own versions, sharing no tags and not aligning
+#  with each other. What is checked below is the `[workspace.package] version` in **this
+#  repository's** Cargo.toml, which has nothing to do with any other project's version
+#  number.
 # ══════════════════════════════════════════════════════════
 
 on:
-  push:
-    tags: ["v*"]
+  # push:
+  #   tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:

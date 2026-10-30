@@ -1,9 +1,19 @@
 name: CI
 
+# ══════════════════════════════════════════════════════════
+#  **Manual only.** No `push`, no `pull_request`.
+#
+#  GitHub Actions minutes are exhausted, and an automatic trigger spends
+#  them on every push to every branch of a 50-branch stack. Until the quota
+#  is restored, the checks run locally through `just ci` / `just test-db`
+#  (see the justfile), which is the same set of commands this file runs —
+#  `just ci` is not an approximation of CI, it is the same steps.
+#
+#  Keeping the workflow dispatchable rather than deleting it: it is the
+#  record of what "green" means, and the moment the quota comes back the
+#  triggers are two lines to restore.
+# ══════════════════════════════════════════════════════════
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
