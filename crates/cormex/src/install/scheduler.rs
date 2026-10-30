@@ -21,7 +21,15 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 
-use crate::install::{Change, Installer, backup};
+use crate::install::{Change, Installer};
+
+// `backup` is used only by the `#[cfg(not(windows))]` branch below. Importing it
+// unconditionally compiles on Linux and macOS and warns on Windows, where the
+// module is genuinely unused -- and a warning that only appears on one of the
+// three release targets is one nobody sees until the Windows build is green in
+// every other respect.
+#[cfg(not(windows))]
+use crate::install::backup;
 
 /// The marker that identifies our crontab line.
 pub const CRON_MARKER: &str = "# cormex";
