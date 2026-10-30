@@ -35,6 +35,44 @@ pub struct Config {
     /// the agent's own directories. Turning it off costs the project filter and
     /// nothing else.
     pub git_metadata: bool,
+    /// Extra sources the user added by hand (`cormex sources add`).
+    ///
+    /// # Why this exists
+    ///
+    /// Some hosts keep their history somewhere the catalog deliberately does
+    /// not look. Aider's `.aider.chat.history.md` sits **in the project
+    /// directory**, which D7 forbids capturing by default — the client reads the
+    /// agent's own homes and nothing else. The design's answer is "only when the
+    /// user names it explicitly", and this is where that naming lives.
+    ///
+    /// It is a **local** list, not a catalog entry: the catalog is shared with
+    /// the server and describes what every deployment should capture, while
+    /// this describes what one person chose to add on one machine.
+    #[serde(default)]
+    pub extra_sources: Vec<ExtraSource>,
+}
+
+/// One source the user added by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtraSource {
+    /// The agent id this source is captured under. Must match
+    /// `capture_sessions.agent`'s shape.
+    pub agent: String,
+    /// An absolute path, or one starting with `~/`.
+    ///
+    /// Absolute because the whole point is "somewhere the catalog does not
+    /// look": a path relative to an agent home would be a catalog entry.
+    pub path: String,
+    /// `append` or `snapshot`.
+    pub framing: String,
+    /// How to derive the session id from the path. `stem` is the only rule a
+    /// hand-added source needs in practice.
+    #[serde(default = "default_session_rule")]
+    pub session_id: String,
+}
+
+fn default_session_rule() -> String {
+    "stem".to_owned()
 }
 
 impl Default for Config {
@@ -45,6 +83,7 @@ impl Default for Config {
             schedule_minutes: 20,
             exclusions: Vec::new(),
             git_metadata: true,
+            extra_sources: Vec::new(),
         }
     }
 }
@@ -179,6 +218,7 @@ mod tests {
                 },
             ],
             git_metadata: false,
+            extra_sources: Vec::new(),
         };
         cfg.save(dir.path()).expect("save");
         let back = Config::load(dir.path()).expect("load");

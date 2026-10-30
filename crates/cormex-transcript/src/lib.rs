@@ -17,6 +17,7 @@
 //! - [`parser`]: the [`parser::Parser`] trait and the shared event shape
 //! - [`claude_code`] and [`codex`]: the two parsers
 
+pub mod aider;
 pub mod anonymize;
 pub mod claude_code;
 pub mod cline;

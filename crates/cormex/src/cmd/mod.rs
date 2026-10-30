@@ -13,5 +13,6 @@ pub mod logout;
 pub mod mcp;
 pub mod restore;
 pub mod sessions;
+pub mod sources;
 pub mod status;
 pub mod uninstall;

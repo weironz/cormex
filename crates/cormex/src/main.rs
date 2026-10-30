@@ -29,6 +29,24 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SourcesAction {
+    /// Add one source.
+    Add {
+        /// The agent id to capture it under (`aider`, …).
+        agent: String,
+        /// An absolute path, or one starting with `~/`.
+        path: String,
+        /// `append` or `snapshot`.
+        #[arg(long, default_value = "append")]
+        framing: String,
+    },
+    /// Remove one source by its path.
+    Remove { path: String },
+    /// List the configured sources.
+    List,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Log in and store a device key on this machine.
     Login {
@@ -67,6 +85,16 @@ enum Command {
         /// Really upload.
         #[arg(long)]
         yes: bool,
+    },
+    /// Hand-added capture sources (P4-6).
+    ///
+    /// The catalog covers the agents whose history lives in their own home. A
+    /// host whose history lives **in the project directory** (Aider) is only
+    /// captured when named here — D7 forbids reading project directories by
+    /// default.
+    Sources {
+        #[command(subcommand)]
+        action: SourcesAction,
     },
     /// Revoke this machine's key and forget it.
     Logout {
@@ -303,6 +331,42 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("dry run: nothing was uploaded. Pass --yes to upload.");
             } else {
                 println!("uploaded {}", report.uploaded);
+            }
+            Ok(ExitCode::Ok)
+        }
+        Command::Sources { action } => {
+            match action {
+                SourcesAction::Add {
+                    agent,
+                    path,
+                    framing,
+                } => {
+                    let mut cfg = cfg;
+                    let source =
+                        cormex::cmd::sources::add(&mut cfg, &dirs.config, &agent, &path, &framing)?;
+                    println!(
+                        "added {} -> {} ({})",
+                        source.agent, source.path, source.framing
+                    );
+                }
+                SourcesAction::Remove { path } => {
+                    let mut cfg = cfg;
+                    if cormex::cmd::sources::remove(&mut cfg, &dirs.config, &path)? {
+                        println!("removed {path}");
+                    } else {
+                        println!("no such source: {path}");
+                    }
+                }
+                SourcesAction::List => {
+                    let sources = cormex::cmd::sources::list(&cfg);
+                    if sources.is_empty() {
+                        println!("no hand-added sources");
+                    } else {
+                        for s in sources {
+                            println!("{} -> {} ({})", s.agent, s.path, s.framing);
+                        }
+                    }
+                }
             }
             Ok(ExitCode::Ok)
         }

@@ -337,3 +337,15 @@ home = [
   kind = "cursor_hooks"
   events = ["stop", "sessionEnd", "preCompact"]
 
+# Aider（P4-6）。**没有 home、没有 source，`import_only` 也不对** —— 它的历史文件
+# `.aider.chat.history.md` 在**项目目录里**，D7 禁止默认读项目目录。所以它只能由
+# 用户 `cormex sources add aider <路径>` 显式指定，路径存在 `config.toml` 的
+# `extra_sources` 里（每台机器一份），而不是这份共享的 catalog 里。
+#
+# 这个条目存在的唯一理由是让 `capture_sessions.agent` 的 CHECK 有一个对应的 id，
+# 以及让 `every_catalogued_agent_has_a_parser` 知道 `aider` 有解析器。
+[[agents]]
+id = "aider"
+name = "Aider"
+manual_only = true
+

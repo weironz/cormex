@@ -106,6 +106,79 @@ pub fn discover(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<Vec<
             out.extend(discover_source(agent, source, &home, cfg, device_id)?);
         }
     }
+    // **Hand-added sources, after the catalog's.** They exist for hosts whose
+    // history is somewhere the catalog deliberately does not look (D7), so they
+    // are the user's own decision and are not subject to the "agent home"
+    // restriction the rest of this function enforces
+    out.extend(discover_extra_sources(cfg, device_id)?);
+    Ok(out)
+}
+
+/// Discover the sources the user added with `cormex sources add`.
+///
+/// # Why a plain path rather than a glob
+///
+/// A hand-added source is "this one file". A glob would make it a second
+/// catalog, with all the matching rules and precedence questions the real one
+/// has — and the case this exists for (Aider's per-project history file) is
+/// always one file per path.
+fn discover_extra_sources(cfg: &Config, device_id: &str) -> Result<Vec<DiscoveredFile>> {
+    let mut out = Vec::new();
+    for extra in &cfg.extra_sources {
+        let Some(path) = expand_tilde(&extra.path) else {
+            tracing::debug!(path = %extra.path, "an extra source's path does not resolve");
+            continue;
+        };
+        if !path.is_file() {
+            // A file that is not there yet is not an error: a project the user
+            // has not run Aider in has no history file, and failing the whole
+            // sync over it would make `cormex sync` red on a fresh checkout
+            continue;
+        }
+        let logical = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| extra.path.clone());
+        let native_session_id = match extra.session_id.as_str() {
+            "stem" => logical.split('.').next().unwrap_or(&logical).to_owned(),
+            other => {
+                tracing::warn!(
+                    rule = other,
+                    "an extra source names a session-id rule that does not exist; skipping"
+                );
+                continue;
+            }
+        };
+        let framing = match extra.framing.as_str() {
+            "append" => Framing::Append,
+            "snapshot" => Framing::Snapshot,
+            other => {
+                tracing::warn!(
+                    framing = other,
+                    "an extra source names a framing that does not exist; skipping"
+                );
+                continue;
+            }
+        };
+        let file = DiscoveredFile {
+            agent: extra.agent.clone(),
+            role: FileRole::Transcript,
+            framing,
+            logical_path: logical,
+            physical_path: path,
+            compressed: false,
+            native_session_id,
+            parent_native_session_id: None,
+            cwd: None,
+            cwd_guessed: false,
+            bytes: None,
+        };
+        if excluded(cfg, &file) {
+            continue;
+        }
+        out.push(file);
+    }
+    let _ = device_id;
     Ok(out)
 }
 
@@ -393,6 +466,7 @@ mod tests {
             name: "Claude Code".into(),
             home: Vec::new(),
             sources: Vec::new(),
+            manual_only: false,
             import_only: false,
             hooks: None,
             retention: None,
@@ -541,6 +615,7 @@ mod tests {
                     busy_timeout_ms: 1000,
                 }),
             }],
+            manual_only: false,
             import_only: false,
             hooks: None,
             retention: None,
@@ -596,6 +671,7 @@ mod tests {
                         busy_timeout_ms: 1000,
                     }),
                 }],
+                manual_only: false,
                 import_only: false,
                 hooks: None,
                 retention: None,
@@ -649,6 +725,7 @@ mod tests {
                     busy_timeout_ms: 1000,
                 }),
             }],
+            manual_only: false,
             import_only: false,
             hooks: None,
             retention: None,

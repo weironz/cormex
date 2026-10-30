@@ -85,6 +85,17 @@ pub struct AgentEntry {
     /// weakened to accept both.
     #[serde(default, skip_serializing_if = "is_false")]
     pub import_only: bool,
+    /// This agent's files are only captured when the user names them with
+    /// `cormex sources add` (P4-6).
+    ///
+    /// Distinct from [`Self::import_only`] because the reason is different:
+    /// Aider's history file lives **in the project directory**, and D7 forbids
+    /// reading project directories by default. The path therefore lives in each
+    /// machine's `config.toml`, not in this shared catalog — but the agent id
+    /// still has to exist here, because `capture_sessions.agent` has a CHECK
+    /// and the parser dispatch is keyed on the same id.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual_only: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -314,9 +325,9 @@ mod tests {
                 a.id
             );
             assert!(
-                a.import_only || !a.home.is_empty(),
+                a.import_only || a.manual_only || !a.home.is_empty(),
                 "agent {:?} has no home; discovery would find nothing. If it is fed by \
-                 `cormex import` rather than by reading the disk, set `import_only = true`",
+                 `cormex import` set `import_only`, or by `cormex sources add` set `manual_only`",
                 a.id
             );
             // An agent may legitimately have no sources yet: Cursor's hooks are
@@ -325,8 +336,9 @@ mod tests {
             // would capture files that never project. `hooks.is_some()` is the
             // other way an agent can be useful before it has a parser
             assert!(
-                !a.sources.is_empty() || a.hooks.is_some(),
-                "agent {:?} has neither sources nor hooks, so it does nothing at all",
+                !a.sources.is_empty() || a.hooks.is_some() || a.import_only || a.manual_only,
+                "agent {:?} has neither sources nor hooks and is not fed by `cormex import` or \
+                 `cormex sources add`, so it does nothing at all",
                 a.id
             );
         }
@@ -485,6 +497,7 @@ mod tests {
             "copilot_chat",
             "chatgpt_export",
             "claude_export",
+            "aider",
         ];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent
