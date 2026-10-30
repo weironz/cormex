@@ -90,7 +90,7 @@ separate containers because they are separate concerns — you can run the serve
 alone and talk to it over MCP, and never deploy the browser at all.
 
 ```bash
-docker run --rm willdockerhub/cormex:v0.1.11 --generate-token
+docker run --rm willdockerhub/cormex:v0.1.12 --generate-token
 
 cd deploy
 cp .env.example .env      # paste the hash it printed, set two passwords
