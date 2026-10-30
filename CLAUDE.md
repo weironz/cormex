@@ -176,21 +176,34 @@ just up            # 起 postgres + rustfs（**不含 cormexd**：开发时它�
                    #   改一行重启只要一秒。整栈容器化见 just serve）
 just db-migrate    # 两套 migration，顺序不能反
 just run           # 跑 cormexd
-just ci            # fmt-check + lint + test
-just test-db       # 要数据库的那些集成测试
+just ci            # fmt-check + lint + test（不需要数据库）
+just ci-full       # 上面这些 + test-db + flutter analyze/test —— **这才是全绿**
+just test-db       # 只跑要数据库的那些集成测试
+just release 0.1.12  # 发版：preflight → 六个 CLI 二进制 → 两个镜像 → 烟测 → 推送 → npm
 ```
 
-**`just ci` 不等于 CI 全绿。** 它跑的是 `cargo test --workspace`，而要数据库的
+**`just ci` 不等于全绿。** 它跑的是 `cargo test --workspace`，而要数据库的
 那批默认是 `#[ignore]` 的 —— 「跳过」在输出里和「通过」长得一模一样。
-真要验数据库那一层，跑 `just test-db`（它自带 `--include-ignored`）。
-Flutter 那一份 `just` 里也没有，得自己 `cd app && flutter analyze && flutter test`。
+要验全，跑 **`just ci-full`**：它带 `--include-ignored`，也跑 Flutter。
+
+⚠️ **GitHub Actions 额度已用光，两个 workflow 都改成只能手动触发**
+（`workflow_dispatch`）。原来的 `push` / `pull_request` / `push: tags` 触发器
+是**注释掉**的，不是删掉 —— 额度恢复后去掉注释符即可。在那之前：
+
+- 提交前跑 `just ci-full`，它是唯一的门
+- 发版跑 `just release <version>`，它做的是流水线同一套事
+  （`release-check` / `release-cli` / `release-images` / `release-push` / `release-npm`
+  可以单独跑）
+
+`just ci-full` 里的每一步都和 `.github/workflows/ci.yml` 的 job 对应。
+**改了一边记得改另一边** —— 一个只写在 YAML 里的检查，在额度用光期间等于没人跑。
 
 CI 三个 job：`lint`（fmt / clippy / rustdoc 死链）、`test`（带 pgvector 的
 Postgres + 两套 migration）、`app`（flutter analyze + test）。
 
-发版 = **打一个 `vX.Y.Z` tag**。流水线做 preflight（tag 与 Cargo.toml 版本
-一致、`Cargo.lock --locked` 自洽）然后并行构建两个镜像，各自烟测后推两个
-registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
+发版 = `just release <version>`（额度恢复后也可以打 `vX.Y.Z` tag）。preflight
+（版本与 Cargo.toml 一致、`Cargo.lock --locked` 自洽）→ 并行构建两个镜像 →
+各自烟测 → 推两个 registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
 
 **没有 CI 部署。** 部署是手工 ssh + `docker compose up -d`。节点侧的部署策略
 脚本目前没有 —— 要做的话见 roadmap。
