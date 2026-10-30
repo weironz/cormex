@@ -59,6 +59,47 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}_{}", std::process::id(), millis)
 }
 
+/// The major version of a `pg_dump`-style binary on `PATH`, if there is one.
+///
+/// The output is `pg_dump (PostgreSQL) 17.11 (Debian …)`, so the version is the
+/// first dotted number in the string. `None` means the binary is absent or its
+/// output does not look like a version, and both are treated the same way: do
+/// not use it.
+fn major_version(tool: &str) -> Option<u32> {
+    let out = Command::new(tool).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|w| w.split('.').next()?.parse::<u32>().ok())
+}
+
+/// The server's major version, from the database itself.
+///
+/// Asking the server rather than assuming: the CI service and a development
+/// container are not the same image, and the whole point of the check is to
+/// compare against what is actually running.
+async fn server_major(base_url: &str) -> u32 {
+    let Ok(pool) = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(base_url)
+        .await
+    else {
+        // Unreachable server: the drill will fail at its own connection step
+        // with a better message than this one could give
+        return 0;
+    };
+    let version: Option<String> = sqlx::query_scalar("SHOW server_version")
+        .fetch_one(&pool)
+        .await
+        .ok();
+    pool.close().await;
+    version
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Where `pg_dump` / `pg_restore` come from.
 ///
 /// # Why the container is tried as well as the host
@@ -71,29 +112,64 @@ fn unique(prefix: &str) -> String {
 ///
 /// `CORMEX_PG_CONTAINER` overrides the container name; the default matches
 /// `docker-compose.yml`.
+///
+/// # Why the host binaries are version-checked before being used
+///
+/// `pg_dump` **refuses to dump a server newer than itself**:
+///
+/// ```text
+/// pg_dump: error: aborting because of server version mismatch
+/// ```
+///
+/// A host that merely *has* `pg_dump` is therefore not enough. GitHub's
+/// `ubuntu-latest` ships one, the CI service is `pgvector/pgvector:pg17`, and
+/// this test failed in CI on every branch for that reason alone — while passing
+/// on a development machine, where the host has no `pg_dump` at all and the
+/// container path is taken.
+///
+/// So the host is used only when its major version is at least the server's.
+/// Otherwise the container is tried, and if that is unavailable too the drill
+/// **skips** rather than reporting a failure it cannot fix.
 enum PgTools {
     Host,
     Container(String),
 }
 
 impl PgTools {
-    fn detect() -> Option<Self> {
+    /// Pick a pair of binaries that can dump the server at `server_major`.
+    fn detect(server_major: u32) -> Option<Self> {
         let host_ok = ["pg_dump", "pg_restore"].iter().all(|tool| {
             Command::new(tool)
                 .arg("--version")
                 .output()
                 .is_ok_and(|o| o.status.success())
         });
-        if host_ok {
+        if host_ok
+            && let Some(v) = major_version("pg_dump")
+            && v >= server_major
+        {
             return Some(Self::Host);
         }
+
         let name =
             std::env::var("CORMEX_PG_CONTAINER").unwrap_or_else(|_| "cormex-postgres".into());
         let in_container = Command::new("docker")
             .args(["exec", &name, "pg_dump", "--version"])
             .output()
             .is_ok_and(|o| o.status.success());
-        in_container.then_some(Self::Container(name))
+        if in_container {
+            return Some(Self::Container(name));
+        }
+
+        // Neither side can dump this server. Say which side and why, so the
+        // skip is diagnosable rather than mysterious
+        let host = major_version("pg_dump");
+        eprintln!(
+            "skipped: no pg_dump can dump a {server_major} server \
+             (host: {host:?}, container `{name}`: unavailable). \
+             A pg_dump older than the server aborts with `server version mismatch`"
+        );
+        None
     }
 
     /// Run one tool, writing its stdout to `stdout_path` when given.
@@ -134,11 +210,7 @@ async fn the_backup_restores_and_the_erased_content_stays_erased() {
         eprintln!("skipped: DATABASE_URL is not set");
         return;
     };
-    let Some(tools) = PgTools::detect() else {
-        eprintln!(
-            "skipped: no pg_dump / pg_restore (neither on PATH nor in the \
-             CORMEX_PG_CONTAINER container)"
-        );
+    let Some(tools) = PgTools::detect(server_major(&base).await) else {
         return;
     };
 
