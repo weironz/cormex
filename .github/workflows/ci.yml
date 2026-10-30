@@ -157,12 +157,28 @@ jobs:
       #   them. Drop it and 20260810000002 fails with `type "ulid" does not exist` --
       #   which reads like a missing migration rather than a missing schema on the
       #   path. `state.rs` puts exactly this pair on the accounts pool, same note.
+      #
+      # ★ The schema is created as **`cortex_auth`**, and that is not a typo left over
+      #   from the rename. The pinned global migrations are fully qualified
+      #   `cortex_auth.…` and cannot be edited (their sha256 is pinned and they are
+      #   applied in production), so the migrator has to run against a schema by that
+      #   name. `Store::migrate_global` does exactly this -- it renames `cormex_auth`
+      #   to `cortex_auth`, migrates, and renames back -- and CI has to mirror it.
+      #
+      #   Creating `cormex_auth` here instead is what the runtime used to do, and it
+      #   worked only for as long as there was one global migration: the second one
+      #   failed with `schema "cortex_auth" does not exist` on every database that had
+      #   already been renamed. That is the upgrade path every existing deployment
+      #   takes, and CI is the only place it is exercised without a live server.
       - name: Apply migrations
         run: |
-          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cormex_auth'
+          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS cortex_auth'
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations-global \
-            --database-url "$DATABASE_URL?options=-csearch_path%3Dcormex_auth%2Cpublic"
+            --database-url "$DATABASE_URL?options=-csearch_path%3Dcortex_auth%2Cpublic"
+          # Rename afterwards, so the tests that query `cormex_auth.…` (the name the
+          # deployment uses) see the same shape a real server leaves behind
+          psql "$DATABASE_URL" -c 'ALTER SCHEMA cortex_auth RENAME TO cormex_auth'
         env:
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/cormex_test
           PGPASSWORD: postgres
