@@ -122,18 +122,27 @@ curl -X POST "https://<域名>/api/episodes/<episode_id>/redact?confirm=<episode
 > 恢复进另一个空库、逐表比对行数，并断言**被擦除的内容没有被恢复回来**。
 > 2026-10-30 在本机跑通（`pg_dump` / `pg_restore` 在 `cormex-postgres` 容器里）。
 >
-> **对象存储那一半也有测试**：
+> **对象存储那一半也演练过，而且是对着真的 RustFS 卷跑的**：
 >
 > ```bash
-> cargo test -p cormex-blob --test backup_restore_objects
+> scripts/rustfs-volume-drill.sh
 > ```
 >
-> 它写三个对象、按 `tar` 的方式复制整棵树、把**第二个** store 指向副本、逐字节
-> 比对。另一条测试钉住最常见的错误：**解包时多套了一层目录** —— 那种情况下
-> 数据库的行数完全对得上、会话列表也正常，而每个会话读出来都是空的。
+> 它写一个对象进正在跑的 store → `tar` 整个卷 → 解进**新卷** → 在新卷上起
+> **第二个 RustFS**（另一个端口）→ 从恢复后的 store 读回那个对象 → 逐字节比对。
+> 2026-10-30 在本机跑通。
 >
-> 它不覆盖 RustFS 本身（卷的内部布局是 RustFS 的事），覆盖的是我们这一半：key
-> 的布局，以及「树的副本就是一个能用的 store」。
+> 为什么不是只跑 Rust 测试：`cargo test -p cormex-blob --test backup_restore_objects`
+> 证明了「一棵目录树的副本是一个能用的 `LocalFsBlobStore`」，但它证明不了
+> 「一个 **RustFS 卷**的副本是一个能用的 RustFS」—— 卷的布局是 RustFS 自己的
+> （一个对象是一个装着 `xl.meta` 的目录，不是普通文件），恢复对了还得**由
+> RustFS 读回来**才算数。
+>
+> 用第二个容器而不是换卷：正在跑的容器占着那个卷，停掉它换卷会让演练对正在用
+> 这台机器的人有破坏性，而这个演练的价值就在于随时能跑。
+>
+> 凭据从**正在跑的容器自己的环境**里读，不是手输 —— 用另一套凭据跑的演练，演练
+> 的不是那个部署。
 
 ### 备份
 
