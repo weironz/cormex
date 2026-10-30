@@ -49,5 +49,9 @@ imagesize = "0.15"
 # touches JSON; serialization is done by cormexd in its own response layer)
 serde_json.workspace = true
 tempfile = "3"
+# The backup/restore drill walks a directory tree, the way `tar` would
+walkdir = "2"
+# `put_keyed` takes `bytes::Bytes`, which this crate does not re-export
+bytes = "1"
 dotenvy.workspace = true
 reqwest.workspace = true

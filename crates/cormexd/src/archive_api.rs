@@ -488,6 +488,7 @@ async fn redact_common(
         "facts_invalidated": report.facts_invalidated,
         "blob_transcripts_cleared": report.blob_transcripts_cleared,
         "summaries_deleted": report.summaries_deleted,
+        "sessions_rewound": report.sessions_rewound,
         "transcript_events_cleared": report.transcript_events_cleared,
         "archive_chunks_deleted": report.archive_chunks_deleted,
     })))

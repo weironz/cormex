@@ -65,7 +65,9 @@ pub struct RedactReport {
     pub facts_invalidated: usize,
     pub blob_transcripts_cleared: usize,
     pub summaries_deleted: usize,
-    pub summaries_regenerated: usize,
+    /// Sessions whose distiller progress was rewound, so the next round
+    /// rebuilds their summaries from what is left.
+    pub sessions_rewound: usize,
     pub transcript_events_cleared: usize,
     pub archive_chunks_deleted: usize,
     /// Blobs whose objects were deleted from storage. Purge only.
@@ -149,14 +151,25 @@ pub async fn redact_episode(
     // ── Summaries derived from it ──
     //
     // **Deleted, not blanked.** A summary is a paraphrase, and a paraphrase of a
-    // secret is the secret. The design's "delete and regenerate excluding the
-    // redacted episode" is what this does: the deletion is here, the
-    // regeneration is the distiller's next round, which reads
-    // `transcript_events` — and those are cleared below
+    // secret is the secret.
+    //
+    // The design says "delete and regenerate excluding the redacted episode".
+    // Deleting is here; **regenerating is the next step below**, and it has to
+    // be: a summary that covers only the innocent half of a conversation is
+    // still worth having, and leaving it deleted forever loses it.
     let summaries = store
         .summaries_derived_from(RedactionTarget::Episode, episode_id)
         .await?;
+    let mut affected_sessions: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for summary_id in &summaries {
+        // The session a summary belongs to is its `scope_key`; that is what the
+        // distiller will rebuild from
+        if let Some(summary) = store.summary(summary_id).await?
+            && summary.scope == cormex_store::SummaryScope::Session
+        {
+            affected_sessions.insert(summary.scope_key);
+        }
         report.summaries_deleted += store.delete_summary(summary_id).await?;
     }
 
@@ -172,6 +185,40 @@ pub async fn redact_episode(
         .context("clearing the archive's copies failed")?;
     report.transcript_events_cleared = cleared.events;
     report.archive_chunks_deleted = cleared.chunks;
+
+    // ── Regenerate what the deletion took ──
+    //
+    // **Rewind the distiller's progress**, so its next round re-reads this
+    // session from the start. That is the regeneration: the summaries are
+    // rebuilt from what is left of the events (the redacted one is now empty),
+    // and the innocent content in the same session comes back.
+    //
+    // Why rewinding rather than regenerating here: the distiller is the only
+    // thing that knows how to turn events into observations, and a second
+    // implementation inside the redact cascade would be a second thing to keep
+    // in step — with the failure being "the regenerated summary reads
+    // differently from the original", which nobody would notice.
+    //
+    // Rewinding is safe because a summary's id is derived from its sources: the
+    // ones that were **not** deleted come back with the same id and collide on
+    // the primary key, which `insert_summary`'s caller treats as a no-op.
+    for session_id in &affected_sessions {
+        // **Only a real capture session can be rewound.** The progress table
+        // has a foreign key onto `capture_sessions(id)`, and a summary's
+        // `scope_key` is usually — but not always — one of those
+        if !store.is_capture_session(session_id).await? {
+            tracing::debug!(
+                scope_key = %session_id,
+                "a summary's scope is not a capture session; nothing to rewind"
+            );
+            continue;
+        }
+        store
+            .archive_txn(async |t| t.insert_distill_progress(session_id, -1).await)
+            .await
+            .context("rewinding the distiller failed")?;
+        report.sessions_rewound += 1;
+    }
 
     // ── The tombstone, last ──
     let tombstone = cormex_store::NewRedaction {
@@ -283,10 +330,28 @@ mod tests {
 
     /// One episode, one fact from it, one summary derived from it, one
     /// transcript event.
+    ///
+    /// The session id is a real `capture_sessions` row: the distiller's
+    /// progress table has a foreign key onto it, and a made-up string would
+    /// make the rewind untestable.
     async fn seed(store: &Store) -> (String, String, String, String) {
+        let session_id = Id::new().to_string();
+        store
+            .archive_txn(async |t| {
+                t.upsert_capture_session(&cormex_store::NewCaptureSession {
+                    id: session_id.parse().expect("a ULID"),
+                    agent: "claude_code".into(),
+                    native_session_id: format!("native-{session_id}"),
+                    parent_session_id: None,
+                })
+                .await
+            })
+            .await
+            .expect("a capture session");
+
         let episode = NewEpisode {
             id: Id::new(),
-            session_id: "redact-test".into(),
+            session_id: session_id.clone(),
             role: Role::User,
             content: serde_json::json!({"role":"user","text":"my key is AKIAIOSFODNN7EXAMPLE"}),
             text: Some("my key is AKIAIOSFODNN7EXAMPLE".into()),
@@ -342,7 +407,7 @@ mod tests {
         let summary = NewSummary {
             id: Id::new(),
             scope: SummaryScope::Session,
-            scope_key: "redact-test".into(),
+            scope_key: session_id.clone(),
             text: "the user pasted a key".into(),
             tsv_source: Some("the user pasted a key".into()),
             embedding: None,
@@ -365,7 +430,7 @@ mod tests {
             episode_id.to_string(),
             fact_id.to_string(),
             summary_id.to_string(),
-            "redact-test".into(),
+            session_id,
         )
     }
 
@@ -528,6 +593,120 @@ mod tests {
         assert!(
             result.is_ok(),
             "the cascade aborted on the facts CHECK: {result:?}"
+        );
+
+        db.drop().await;
+    }
+
+    /// The summaries come back on the distiller's next round.
+    ///
+    /// The design says "delete and regenerate excluding the redacted episode".
+    /// Deleting alone loses the innocent half of a conversation forever; the
+    /// regeneration is a **rewind of the distiller's progress**, so its next
+    /// round rebuilds the session's summaries from what is left.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_summaries_are_regenerated_by_the_next_distill_round() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (episode_id, _, summary_id, scope_key) = seed(&store).await;
+
+        // The distiller's progress says "already done", so its next round would
+        // skip this session entirely without the rewind
+        store
+            .archive_txn(async |t| t.insert_distill_progress(&scope_key, 0).await)
+            .await
+            .expect("progress");
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        let report = redact_episode(
+            &st,
+            &tenant,
+            &episode_id,
+            RedactionMode::Redact,
+            "regenerate",
+        )
+        .await
+        .expect("redact");
+
+        assert_eq!(report.summaries_deleted, 1);
+        assert_eq!(
+            report.sessions_rewound, 1,
+            "the distiller's progress was not rewound, so the summary is gone for good"
+        );
+
+        // The progress now says "nothing done yet", which is what makes the
+        // next round rebuild
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        let through: i64 = sqlx::query_scalar(
+            "SELECT through_seq FROM distill_progress
+              WHERE session_id::text = $1
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&scope_key)
+        .fetch_one(&pool)
+        .await
+        .expect("progress row");
+        pool.close().await;
+        assert_eq!(
+            through, -1,
+            "the distiller would skip this session: its progress still says it is done"
+        );
+
+        // And the summary really is gone until then
+        let gone: bool = store.summary(&summary_id).await.expect("q").is_none();
+        assert!(gone, "the redacted summary survived");
+
+        db.drop().await;
+    }
+
+    /// A session with no derived summary is not rewound.
+    ///
+    /// Rewinding every session a redact touches would make the distiller
+    /// re-read conversations that lost nothing, which costs a model call per
+    /// session for no reason.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_session_with_no_summary_is_not_rewound() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt) = crate::test_support::live_state(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let (episode_id, _, _, _) = seed(&store).await;
+
+        // Remove the summary so nothing is derived from this episode
+        let pool = sqlx::PgPool::connect(&db.url).await.expect("connect");
+        sqlx::raw_sql("DELETE FROM derivations; DELETE FROM summaries;")
+            .execute(&pool)
+            .await
+            .expect("clear");
+        pool.close().await;
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        let report = redact_episode(
+            &st,
+            &tenant,
+            &episode_id,
+            RedactionMode::Redact,
+            "no summary",
+        )
+        .await
+        .expect("redact");
+        assert_eq!(
+            report.sessions_rewound, 0,
+            "a session that lost no summary was rewound"
         );
 
         db.drop().await;

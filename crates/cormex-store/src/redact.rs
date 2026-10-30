@@ -303,6 +303,24 @@ impl Store {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    /// Whether a string names a real capture session.
+    ///
+    /// The distiller's progress table has a foreign key onto
+    /// `capture_sessions(id)`, so rewinding a `scope_key` that is not one would
+    /// fail. A summary's `scope_key` is *usually* a capture session id, but not
+    /// always — a summary written from the memory side can name something else.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub async fn is_capture_session(&self, id: &str) -> Result<bool> {
+        let (exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM capture_sessions WHERE id::text = $1)")
+                .bind(id)
+                .fetch_one(self.pool())
+                .await?;
+        Ok(exists)
+    }
+
     /// Redacted-at timestamp for a target, when there is one.
     ///
     /// # Errors
