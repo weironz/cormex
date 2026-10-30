@@ -745,4 +745,50 @@ mod tests {
             "the second conversation was merged into the first"
         );
     }
+
+    /// A SQLite source's query is exercised against a table shaped like
+    /// Cursor's `cursorDiskKV`.
+    ///
+    /// The catalog's queries are **data**, so nothing type-checks them. A typo
+    /// in one surfaces on a user's machine as "the query does not prepare", and
+    /// that reads like a bug in the client rather than in the catalog. This
+    /// builds the table the query names and runs it.
+    #[test]
+    fn the_cursor_query_runs_against_its_table_shape() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let db = home.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+             INSERT INTO cursorDiskKV VALUES
+               ('composerData:abc', '{\"name\":\"a conversation\"}'),
+               ('bubbleId:abc:1', '{\"text\":\"hello\"}'),
+               ('bubbleId:abc:2', '{\"text\":\"world\"}'),
+               ('unrelated:key', 'ignored');",
+        )
+        .expect("seed");
+        drop(conn);
+
+        // The catalog's own query, verbatim
+        let agent = cormex_proto::catalog::Catalog::builtin()
+            .agent("cursor")
+            .expect("the cursor entry");
+        let source = agent
+            .sources
+            .iter()
+            .find(|s| s.sqlite.is_some())
+            .expect("a SQLite source");
+        let spec = source.sqlite.as_ref().expect("the spec");
+
+        let rows = crate::sqlite_source::read_rows(&db, "state.vscdb", spec)
+            .expect("the catalog's query should run against this table shape");
+        assert_eq!(rows.len(), 3, "the unrelated key should be filtered out");
+        // Both bubbles land in the conversation the composer names
+        let sessions: Vec<&str> = rows.iter().filter_map(|r| r.session.as_deref()).collect();
+        assert_eq!(
+            sessions,
+            vec!["abc", "abc", "abc"],
+            "the session column should be the composer id for both key kinds: {sessions:?}"
+        );
+    }
 }

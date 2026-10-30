@@ -147,7 +147,7 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         }
         // Cursor (P4-2). The format is undocumented; this captures the bytes
         // and labels the projection honestly rather than guessing
-        ("cursor", FileRole::Transcript | FileRole::Subagent) => Some(Box::new(
+        ("cursor", FileRole::Transcript | FileRole::Subagent | FileRole::Row) => Some(Box::new(
             crate::cursor::CursorParser::new(crate::cursor::Undocumented::Cursor),
         )),
         // Copilot CLI (P4-6). Closed source: its repository holds a README, a

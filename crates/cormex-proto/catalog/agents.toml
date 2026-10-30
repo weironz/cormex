@@ -339,6 +339,33 @@ home = [
   framing = "append"
   session_id = { from = "stem" }
 
+  # 历史数据：`state.vscdb` 的 `cursorDiskKV` 表。键前缀是设计里给的
+  # （`composerData:%` 是会话、`bubbleId:%` 是单条消息），**值的格式同样没有
+  # 公布**。所以按 P4-0 的行来源采，投影同样是一条「格式未知」的 Unknown
+  # 事件 —— 字节进 R 层，解析器以后再补
+  [[agents.source]]
+  role = "row"
+  glob = "state.vscdb"
+  framing = "snapshot"
+  session_id = { from = "const", value = "cursor", per_device = true }
+  [agents.source.sqlite]
+  key_column = "key"
+  session_column = "session_key"
+  text_column = "value"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT key AS key,
+           CASE
+             WHEN key LIKE 'bubbleId:%' THEN substr(key, 10, instr(substr(key, 10), ':') - 1)
+             WHEN key LIKE 'composerData:%' THEN substr(key, 14)
+             ELSE 'cursor'
+           END AS session_key,
+           value AS value
+      FROM cursorDiskKV
+     WHERE key LIKE 'composerData:%' OR key LIKE 'bubbleId:%'
+     ORDER BY key
+  """
+
   [agents.hooks]
   kind = "cursor_hooks"
   events = ["stop", "sessionEnd", "preCompact"]
