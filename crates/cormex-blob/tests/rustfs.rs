@@ -40,7 +40,7 @@ async fn store() -> Option<S3BlobStore> {
     let _ = dotenvy::dotenv();
 
     let opts = S3Options {
-        endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9010".into()),
+        endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into()),
         bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "cormex-blobs".into()),
         region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
         access_key: std::env::var("RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "cormexadmin".into()),

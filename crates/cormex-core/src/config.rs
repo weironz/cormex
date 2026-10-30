@@ -163,7 +163,13 @@ impl Config {
             database_url: required("DATABASE_URL")?,
             bind: optional("CORMEXD_BIND", "127.0.0.1:8080"),
             s3: S3Config {
-                endpoint: optional("S3_ENDPOINT", "http://localhost:9010"),
+                // 9000, matching what `docker-compose.yml` publishes RustFS on. It used
+                // to default to 9010, which no compose service has ever listened on: a
+                // `just run` on the host then fell back to the local filesystem with
+                // `CreateBucket failed … Connection refused`, and the consequence is
+                // quiet -- uploaded media lands in `.cormex/blobs` instead of the object
+                // store, so it is outside the RustFS volume and outside the backup.
+                endpoint: optional("S3_ENDPOINT", "http://localhost:9000"),
                 bucket: optional("S3_BUCKET", "cormex-blobs"),
                 region: optional("S3_REGION", "us-east-1"),
                 access_key: optional("RUSTFS_ACCESS_KEY", "cormexadmin"),
