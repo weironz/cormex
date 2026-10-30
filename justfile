@@ -146,12 +146,18 @@ release-check version:
     cargo metadata --locked --format-version 1 > /dev/null
     echo "Cargo.lock is consistent with the manifests"
 
-# Build the six CLI binaries into dist/.
+# Build the CLI binaries into dist/. Linux targets always; the rest only on their own OS.
 release-cli version:
     #!/usr/bin/env bash
     set -euo pipefail
     v="{{version}}"
     rm -rf dist && mkdir -p dist
+    # ★ **This produces the Linux binaries on any machine, and the other four only on
+    #   their own OS.** Cross-compiling to macOS needs the Apple SDK and to Windows needs
+    #   MSVC; neither is a thing you install by accident, and a recipe that silently
+    #   produced four of six artefacts would make a release look complete when it is not.
+    #   So the skips are printed, and `release` warns loudly if the set is incomplete.
+    built=0
     # The two Linux targets are musl: a glibc binary built here refuses to start on an
     # older distribution with `GLIBC_2.xx not found`, which the user meets on first run
     # with no way to tell it from a corrupt download
@@ -164,6 +170,7 @@ release-cli version:
       cp README.md LICENSE "dist/$name/" 2>/dev/null || true
       tar -czf "dist/$name.tar.gz" -C dist "$name"
       rm -rf "dist/$name"
+      built=$((built + 1))
     done
     # The native targets build with the host toolchain
     for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
@@ -185,7 +192,9 @@ release-cli version:
         *)         tar -czf "dist/$name.tar.gz" -C dist "$name" ;;
       esac
       rm -rf "dist/$name"
+      built=$((built + 1))
     done
+    echo "built $built of 6 targets"
     # The binary has to answer `--version` on the platform it was built for
     out=$(./target/x86_64-unknown-linux-musl/release/cormex --version)
     echo "$out"
@@ -272,12 +281,29 @@ release-npm version:
 
 # The whole release: preflight, CLI, images, smoke tests, push, npm.
 release version:
+    #!/usr/bin/env bash
     # Everything is built and smoke-tested **before anything is pushed**: a release that
     # fails halfway leaves the registry with an image nobody can withdraw.
+    set -euo pipefail
     just release-check {{version}}
     just release-cli {{version}}
+    # ★ A partial CLI set is a **warning, not a stop**, and the distinction is deliberate.
+    #   The images are the product; the CLI is how capture agents are installed. A Linux
+    #   machine can build two of the six binaries, and refusing to release the server
+    #   because a laptop cannot cross-compile to macOS would block the thing that matters
+    #   on the thing that does not. What must not happen is a *silent* partial set -- so
+    #   it says so, loudly, and names what is missing.
+    n=$(ls dist/*.tar.gz dist/*.zip 2>/dev/null | wc -l)
+    if [ "$n" -lt 6 ]; then
+      echo
+      echo "WARNING: only $n of 6 CLI binaries were built on this machine."
+      echo "  The release will publish a partial set. To get all six, either run"
+      echo "  \`just release-cli\` on macOS and Windows too, or restore the tag trigger in"
+      echo "  .github/workflows/release.yml and let CI build them."
+      echo
+    fi
     just release-images {{version}}
     just release-push {{version}}
     just release-npm {{version}}
-    @echo
-    @echo "released v{{version}}"
+    echo
+    echo "released v{{version}}"

@@ -118,27 +118,44 @@ services:
       # An existing database cannot have this switch flipped; use
       # `just pg-enable-checksums` to retrofit it offline (see docs/operations.md).
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---data-checksums}
-    # WAL archiving. archive_mode can only be set at startup, hence in command rather than in SQL.
-    #   archive_timeout=60  force a segment switch every 60s even with no writes -- this is what bounds the RPO
-    #   archive_command     the standard form from the docs: fail if the target already exists, never overwrite silently
-    #                       (two WAL segments with the same name and different contents are a disaster;
-    #                        better to stop and be seen)
-    #   summarize_wal=on    PG17's WAL summarizer, the precondition for pg_basebackup --incremental.
-    #                       Incremental is not in use yet, but turning it on is what keeps that upgrade road open
+    # WAL archiving is **off**, and that is a fix rather than an omission.
+    #
+    # It used to be `archive_mode=on` with `archive_command` writing to `/backup/wal`.
+    # `/backup` is a bind mount onto `./data/backup`, which Docker creates as **root** --
+    # and the archiver runs as `postgres` (uid 999). So every archive attempt failed:
+    #
+    #     archive command failed with exit code 1
+    #
+    # and a failed archive means the segment is never recycled. `archive_timeout=60` then
+    # forces a new segment every minute regardless of write volume, so the WAL grew by
+    # 16 MB per minute forever. Measured on this machine: **46 GB of pg_wal for a 132 MB
+    # database**, and the disk filled up.
+    #
+    # The archiving itself was never used: nothing here does point-in-time recovery, and
+    # the backup procedure in docs/operations.md is `pg_dump` plus a RustFS volume copy.
+    # Turning it off is the honest configuration, not a workaround.
+    #
+    # A deployment that does want PITR has to do three things together: make
+    # `CORMEX_BACKUP_DIR` writable by uid 999, keep `archive_mode=on`, and monitor
+    # `pg_stat_archiver.failed_count` -- a non-zero value there means WAL is accumulating
+    # and nothing else will say so.
+    #
+    # `summarize_wal=on` stays: PG17's WAL summarizer is the precondition for
+    # `pg_basebackup --incremental`, and it costs nothing when archiving is off.
     command:
       - postgres
       - -c
-      - archive_mode=on
-      - -c
-      - archive_command=mkdir -p /backup/wal && test ! -f /backup/wal/%f && cp %p /backup/wal/%f
-      - -c
-      - archive_timeout=60
+      - archive_mode=off
       - -c
       - wal_level=replica
       - -c
       - wal_compression=on
       - -c
       - summarize_wal=on
+      - -c
+      # Keep the WAL bounded. With archiving off this is the only thing standing between
+      # a long-running transaction and another disk-full incident
+      - max_wal_size=2GB
     ports:
       - "${CORMEX_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
