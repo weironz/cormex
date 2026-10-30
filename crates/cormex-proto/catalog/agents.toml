@@ -323,21 +323,25 @@ home = [
   { path = "~/.cursor" },
 ]
 
-  # hook 给的 `transcript_path` 指向一份追加型的会话记录。**上游没有公布它的
-  # 格式**（hook 文档只说「Path to the main conversation transcript file」）。
+  # CLI 的会话记录。**公开文档没有描述它的格式**，但 CLI 本身是打包的
+  # JavaScript，序列化代码就在里面（`agent-transcript/dist/index.js` 的 `U`/`W`），
+  # 解析器是照着那段代码写的，不是猜的。
   #
-  # 这里仍然登记 source，因为**字节比解析器重要**：Cursor 会删自己的历史，
-  # 而一份没被采到的文件事后无法补 —— 解析器写错了可以重投影，文件没采到就永远
-  # 没了。所以字节进 R 层，投影是一条明确写着「格式未知」的 `Unknown` 事件
-  # （`cursor@1-undocumented`），而不是编出来的对话。
-  #
-  # 拿到一份真实文件（`cormex hook cursor` 的 stdin 里就有 `transcript_path`）
-  # 之后写解析器，版本变成 `cursor@2`，投影器会从已存的字节重算。
+  # 路径：`~/.cursor/projects/<workspace 路径压成 - >/agent-transcripts/<id>.jsonl`
+  # （`utils/dist/workspace-paths.js` 里 `O2 = "agent-transcripts"`）。
   [[agents.source]]
   role = "transcript"
-  glob = "**/*.jsonl"
+  glob = "projects/*/agent-transcripts/*.jsonl"
   framing = "append"
   session_id = { from = "stem" }
+
+  # 子 agent 的记录：同一目录下 `<parent>/<child>.jsonl`
+  [[agents.source]]
+  role = "subagent"
+  glob = "projects/*/agent-transcripts/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+  parent_session_id = { from = "path_segment", index = 3 }
 
   # 历史数据：`state.vscdb` 的 `cursorDiskKV` 表。键前缀是设计里给的
   # （`composerData:%` 是会话、`bubbleId:%` 是单条消息），**值的格式同样没有

@@ -145,17 +145,17 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("copilot_chat", FileRole::Transcript) => {
             Some(Box::new(crate::copilot_chat::CopilotChatParser::new()))
         }
-        // Cursor (P4-2). The format is undocumented; this captures the bytes
-        // and labels the projection honestly rather than guessing
-        ("cursor", FileRole::Transcript | FileRole::Subagent | FileRole::Row) => Some(Box::new(
-            crate::cursor::CursorParser::new(crate::cursor::Undocumented::Cursor),
-        )),
-        // Copilot CLI (P4-6). Closed source: its repository holds a README, a
-        // changelog and an install script, no code, and the changelog mentions
-        // "transcript files" without describing them
-        ("copilot_cli", FileRole::Transcript) => Some(Box::new(crate::cursor::CursorParser::new(
-            crate::cursor::Undocumented::CopilotCli,
-        ))),
+        // Cursor (P4-2). The format came from the CLI's own bundled
+        // JavaScript (`agent-transcript/dist/index.js`), not from a guess
+        ("cursor", FileRole::Transcript | FileRole::Subagent) => {
+            Some(Box::new(crate::cursor::CursorParser::new()))
+        }
+        // Copilot CLI (P4-6). Closed source and shipped as a stripped native
+        // binary, so there is nothing to read the format out of; the bytes are
+        // captured and the projection says so
+        ("copilot_cli", FileRole::Transcript) => {
+            Some(Box::new(crate::copilot_cli::CopilotCliParser::new()))
+        }
         // Aider (P4-6). Only reached through a source the user added by hand:
         // its history file lives in the project directory, which D7 forbids
         // capturing by default
