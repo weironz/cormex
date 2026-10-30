@@ -118,8 +118,8 @@ impl Store {
     /// changed on an existing pool.
     ///
     /// # Errors
-    /// Cannot connect, cannot create `cormex_auth`, or some migration fails to
-    /// run.
+    /// Cannot connect, cannot create or rename the accounts schema, or some
+    /// migration fails to run.
     pub async fn migrate_global(database_url: &str) -> Result<()> {
         use std::str::FromStr as _;
 
@@ -150,59 +150,59 @@ impl Store {
         // sqlx records every applied migration in `public._sqlx_migrations`.
         MIGRATOR.run(&boot).await?;
 
-        // ── The schema rename, done **here** rather than in a migration ──
+        // ── The schema name, normalised around the migrator ──
         //
-        // The accounts schema used to be called `cortex_auth`. Renaming it in a
-        // migration cannot work: sqlx keeps its version table **inside the
-        // schema**, so `ALTER SCHEMA … RENAME` carries `_sqlx_migrations` along
-        // with it — and the next run finds no version table in the new schema,
-        // concludes the global set has never been applied, and replays it from
-        // the top, stopping at `relation "users" already exists`. The failure
-        // lands halfway through, with the schema renamed and the account tables
+        // Two names are in play, and they cannot be reconciled in SQL:
+        //
+        // - The **deployment** calls the accounts schema `cormex_auth`. Every
+        //   query in cormexd says so.
+        // - The **pinned migrations** hard-code `cortex_auth`, fully qualified.
+        //   Their sha256 is pinned and they are applied in production, so they
+        //   cannot be edited into agreement.
+        //
+        // So the migrator runs against a schema literally named `cortex_auth`,
+        // and the name is normalised back to `cormex_auth` afterwards.
+        //
+        // # Why a rename rather than a migration
+        //
+        // sqlx keeps its version table **inside** the schema, so
+        // `ALTER SCHEMA … RENAME` carries `_sqlx_migrations` along with it. A
+        // rename written *as* a migration would therefore move its own version
+        // table out from under the migrator: the next run finds no version
+        // table in the new schema, concludes the set has never been applied,
+        // and replays it from the top, stopping at `relation "users" already
+        // exists` — halfway through, with the schema renamed and the tables
         // intact but the deployment unable to start.
         //
-        // So the rename happens around the migrator instead, and both sides are
-        // idempotent.
+        // # Why it runs on **both** sides, every time
         //
-        // # Why it has to happen on **both** sides
+        // The pre-rename is what makes an **already-migrated** database work:
+        // it is `cormex_auth` on disk, and the migrator would otherwise run
+        // `CREATE TABLE cortex_auth.device_keys` against a schema that does not
+        // exist. The post-rename is what leaves the deployment with the name it
+        // queries. Both are idempotent, and the version table travels with the
+        // schema, so a database that is already up to date is renamed twice and
+        // migrated zero times.
         //
-        // - **Before**: an existing database already has `cortex_auth` with its
-        //   version table. Renaming first means the migrator finds the table it
-        //   recorded and does nothing.
-        // - **After**: a fresh database has no `cortex_auth` at all, and the
-        //   pinned migration creates `cortex_auth.users` by that name (it cannot
-        //   be edited — its sha256 is pinned and it is applied in production).
-        //   So on a fresh database the migration *builds* `cortex_auth` and the
-        //   rename has to run afterwards, or every new deployment would be left
-        //   with the old name.
+        // A run that fails between the two renames leaves `cortex_auth` behind;
+        // the next start renames it forward again before retrying, so the
+        // intermediate state is not a trap.
         //
-        // The two branches cannot both fire: whichever schema exists at the time
-        // is the one the migrator uses, and the other is absent.
-        rename_auth_schema(&boot).await?;
-
-        // Whichever one is present is where the version table lives.
-        //
-        // Only when **neither** exists — a genuinely fresh database — is
-        // `cortex_auth` created, because that is the name the pinned migration
-        // hard-codes. Creating it unconditionally would leave an empty
-        // `cortex_auth` behind on every database that has already been renamed,
-        // and the next `pg_dump` would carry a schema with nothing in it.
-        let auth_schema: Option<String> = sqlx::query_scalar(
-            "SELECT nspname FROM pg_namespace
-              WHERE nspname IN ('cormex_auth', 'cortex_auth')
-              ORDER BY nspname LIMIT 1",
+        // The one case that is not a rename: a genuinely fresh database has
+        // neither schema, and `cortex_auth` is created because that is the name
+        // the pinned migration hard-codes.
+        let had_auth_schema: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_namespace
+                             WHERE nspname IN ('cormex_auth', 'cortex_auth'))",
         )
-        .fetch_optional(&boot)
+        .fetch_one(&boot)
         .await?;
-        let auth_schema = match auth_schema {
-            Some(name) => name,
-            None => {
-                sqlx::query("CREATE SCHEMA cortex_auth")
-                    .execute(&boot)
-                    .await?;
-                "cortex_auth".to_owned()
-            }
-        };
+        rename_schema(&boot, "cormex_auth", "cortex_auth").await?;
+        if !had_auth_schema {
+            sqlx::query("CREATE SCHEMA cortex_auth")
+                .execute(&boot)
+                .await?;
+        }
         boot.close().await;
 
         let options = sqlx::postgres::PgConnectOptions::from_str(database_url)
@@ -211,25 +211,25 @@ impl Store {
             })?
             // public stays at the tail: the `ulid` and `sha256` DOMAINs live
             // there
-            .options([("search_path", format!("{auth_schema},public"))]);
+            .options([("search_path", "cortex_auth,public")]);
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await?;
         let result = GLOBAL_MIGRATOR.run(&pool).await;
         pool.close().await;
-        result?;
 
-        // A fresh database: the migration just built `cortex_auth`, version
-        // table and all. Move it now. The version table travels with the
-        // schema, so the next call's pre-rename sees `cormex_auth` and finds
-        // everything already applied.
+        // Rename back **even when the migrator failed**: the deployment queries
+        // `cormex_auth`, and leaving the schema under the migrator's name after
+        // a failed run would turn one startup failure into every subsequent
+        // query failing too. The migration error is still the one reported.
         let boot = PgPoolOptions::new()
             .max_connections(1)
             .connect(database_url)
             .await?;
-        let renamed = rename_auth_schema(&boot).await;
+        let renamed = rename_schema(&boot, "cortex_auth", "cormex_auth").await;
         boot.close().await;
+        result?;
         renamed?;
         Ok(())
     }
@@ -315,9 +315,9 @@ impl Store {
     }
 }
 
-/// Rename `cortex_auth` to `cormex_auth`, if that is what is there.
+/// Rename a schema, if `from` is there and `to` is not.
 ///
-/// Idempotent in both directions of "already done": if `cormex_auth` exists the
+/// Idempotent in both directions of "already done": if `to` already exists the
 /// call does nothing, and if neither exists it does nothing either (the caller
 /// creates the schema it needs next).
 ///
@@ -328,18 +328,33 @@ impl Store {
 /// between the five account tables stay intact. Moving them one at a time would
 /// have to respect the FK order, and getting it wrong fails **halfway through**
 /// — leaving a database with some tables in each schema.
-async fn rename_auth_schema(pool: &PgPool) -> Result<()> {
-    sqlx::query(
+///
+/// # Why both names are arguments
+///
+/// The rename runs in both directions: `cormex_auth → cortex_auth` before the
+/// global migrator (whose pinned SQL hard-codes the old name) and
+/// `cortex_auth → cormex_auth` after it. Two constants would work too, but then
+/// the direction would have to be inferred from which one exists — and that
+/// inference reads wrong at the call site, where the direction is the whole
+/// point.
+///
+/// The two names never coexist: every path renames forward, including the path
+/// where the migrator failed, so `cortex_auth` is only ever present for the
+/// duration of one `GLOBAL_MIGRATOR::run`.
+async fn rename_schema(pool: &PgPool, from: &str, to: &str) -> Result<()> {
+    // Identifiers cannot be bound as parameters, and these are two constants
+    // from this module rather than anything a caller supplies
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DO $$
          BEGIN
-             IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cortex_auth')
-                AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cormex_auth')
+             IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '{from}')
+                AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '{to}')
              THEN
-                 ALTER SCHEMA cortex_auth RENAME TO cormex_auth;
+                 ALTER SCHEMA \"{from}\" RENAME TO \"{to}\";
              END IF;
          END
-         $$",
-    )
+         $$"
+    )))
     .execute(pool)
     .await?;
     Ok(())

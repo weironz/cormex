@@ -143,3 +143,129 @@ async fn migrate_global_works_on_an_empty_database() {
         "cormex_auth.users is missing after migrate_global: the global set did not run"
     );
 }
+
+/// The **upgrade** path: an already-migrated database that gains a new global
+/// migration.
+///
+/// This is the shape every existing deployment is in, and it is the one that
+/// broke: the accounts schema is `cormex_auth` on disk, the new migration's SQL
+/// is fully qualified `cortex_auth.…`, and the migrator was pointed at
+/// `cormex_auth`. The result was
+///
+/// ```text
+/// schema "cortex_auth" does not exist
+/// ```
+///
+/// on a database that had been running for months — while the fresh-database
+/// test above passed, because a genuinely empty database creates `cortex_auth`
+/// first and only renames it afterwards.
+///
+/// The state is produced the way a real upgrade produces it: migrate once, then
+/// un-apply the newest global migration by hand (drop its table, remove its
+/// version row). Nothing else about the database changes.
+#[tokio::test]
+#[ignore = "creates a database; run with just test-db"]
+async fn a_new_global_migration_applies_to_an_already_migrated_database() {
+    let Some(url) = database_url() else {
+        return;
+    };
+
+    let admin = match PgPoolOptions::new().max_connections(1).connect(&url).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipped: cannot reach the database ({err})");
+            return;
+        }
+    };
+
+    let name = fresh_database_name();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+        .execute(&admin)
+        .await
+        .expect("the test role should be allowed to create a database");
+    let fresh_url = with_database(&url, &name);
+
+    // Run everything, then roll the newest global migration back by hand.
+    let first = Store::migrate_global(&fresh_url).await;
+    let rolled_back = async {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&fresh_url)
+            .await?;
+        sqlx::query("DROP TABLE IF EXISTS cormex_auth.device_keys")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM cormex_auth._sqlx_migrations WHERE version = 20261101000001")
+            .execute(&pool)
+            .await?;
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM cormex_auth._sqlx_migrations")
+            .fetch_one(&pool)
+            .await?;
+        pool.close().await;
+        Ok::<i64, sqlx::Error>(left)
+    }
+    .await;
+
+    // The second run is the upgrade.
+    let second = Store::migrate_global(&fresh_url).await;
+
+    let (schema, device_keys) = if second.is_ok() {
+        let probe = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&fresh_url)
+            .await
+            .expect("the database should be reachable after the upgrade");
+        let schema: Option<String> = sqlx::query_scalar(
+            "SELECT nspname FROM pg_namespace WHERE nspname IN ('cormex_auth', 'cortex_auth')",
+        )
+        .fetch_one(&probe)
+        .await
+        .expect("querying the database should succeed");
+        let device_keys: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('cormex_auth.device_keys')::text")
+                .fetch_one(&probe)
+                .await
+                .expect("querying the database should succeed");
+        probe.close().await;
+        (schema, device_keys)
+    } else {
+        (None, None)
+    };
+
+    let dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
+    admin.close().await;
+    if let Err(err) = dropped {
+        eprintln!("cleaning up the fresh database {name} failed: {err}");
+    }
+
+    first.expect("the first migrate_global should succeed on an empty database");
+    let left = rolled_back.expect("rolling the newest global migration back should succeed");
+    assert_eq!(
+        left, 1,
+        "the rollback should leave exactly the first global migration applied"
+    );
+    second.unwrap_or_else(|err| {
+        panic!(
+            "migrate_global failed on an already-migrated database gaining a new global \
+             migration: {err}\n\
+             This is the upgrade path every existing deployment takes. The pinned global SQL \
+             hard-codes `cortex_auth`, so the migrator has to run against a schema by that \
+             name -- see Store::migrate_global's docs."
+        )
+    });
+    assert_eq!(
+        schema.as_deref(),
+        Some("cormex_auth"),
+        "after the upgrade the accounts schema must be back under the name the deployment \
+         queries, not the one the migrations hard-code"
+    );
+    assert!(
+        device_keys.is_some(),
+        "cormex_auth.device_keys is missing after the upgrade: the new global migration did \
+         not run"
+    );
+}
