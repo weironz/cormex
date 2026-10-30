@@ -498,6 +498,7 @@ mod tests {
             "chatgpt_export",
             "claude_export",
             "aider",
+            "cursor",
         ];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent

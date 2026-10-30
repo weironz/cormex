@@ -323,16 +323,22 @@ home = [
   { path = "~/.cursor" },
 ]
 
-  # ⚠️ **没有 source 条目，这是有意的。**
+  # hook 给的 `transcript_path` 指向一份追加型的会话记录。**上游没有公布它的
+  # 格式**（hook 文档只说「Path to the main conversation transcript file」）。
   #
-  # hook 给的 `transcript_path` 指向一份追加型的会话记录，但上游文档只说明它是
-  # 「conversation transcript」，**没有公布格式**。没有解析器就登记 source，会让
-  # 文件被采集、存储、然后**永远投影不出来** —— 归档越积越多，每个会话读出来都是
-  # 空的，而且没有任何报错。`every_catalogued_agent_has_a_parser` 会拦住这种写法，
-  # 它拦得对。
+  # 这里仍然登记 source，因为**字节比解析器重要**：Cursor 会删自己的历史，
+  # 而一份没被采到的文件事后无法补 —— 解析器写错了可以重投影，文件没采到就永远
+  # 没了。所以字节进 R 层，投影是一条明确写着「格式未知」的 `Unknown` 事件
+  # （`cursor@1-undocumented`），而不是编出来的对话。
   #
-  # 拿到一份真实文件（`hook stop` 的 stdin 里就有 `transcript_path`）之后再补
-  # source 与解析器。hooks 本身可以先装：它已经把路径放进队列了。
+  # 拿到一份真实文件（`cormex hook cursor` 的 stdin 里就有 `transcript_path`）
+  # 之后写解析器，版本变成 `cursor@2`，投影器会从已存的字节重算。
+  [[agents.source]]
+  role = "transcript"
+  glob = "**/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem" }
+
   [agents.hooks]
   kind = "cursor_hooks"
   events = ["stop", "sessionEnd", "preCompact"]
