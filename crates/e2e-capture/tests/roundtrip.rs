@@ -185,9 +185,19 @@ impl Harness {
     /// two different accounts live in two different schemas, so querying
     /// `public` would only ever see the first account's files.
     async fn generation_of(&self, device_id: &str, path: &str) -> String {
+        self.generation_of_agent(device_id, "claude_code", path)
+            .await
+    }
+
+    /// The same, for any agent.
+    ///
+    /// `capture_file` is keyed on `(device, agent, logical_path)`, so a test
+    /// that covers several agents has to pass the agent — the default above
+    /// exists because most tests are about one.
+    async fn generation_of_agent(&self, device_id: &str, agent: &str, path: &str) -> String {
         let store = self.store_for_device(device_id).await;
         let file = store
-            .capture_file(device_id, "claude_code", path)
+            .capture_file(device_id, agent, path)
             .await
             .expect("query")
             .unwrap_or_else(|| panic!("no capture file for {path} on {device_id}"));
@@ -524,6 +534,164 @@ async fn a_device_cannot_write_into_another_devices_generation() {
          handler's ownership check; 404 is the tenant lookup not finding the generation at all. \
          Either is correct -- what must not happen is a 200"
     );
+
+    h.db.drop().await;
+}
+
+/// **Every catalogued agent's real layout round-trips.**
+///
+/// Phase 4's fixed contents say "端到端测试（P1-12）增加该 agent 的往返用例",
+/// and this is that for all of them at once. The property under test is the same
+/// for each: bytes written into the layout the agent really uses come back out
+/// of the server byte for byte.
+///
+/// What it catches that a parser unit test cannot: a catalog glob that does not
+/// match the layout. The parser would be perfect and never see a file.
+#[tokio::test]
+#[ignore = "needs a database; run with just test-db"]
+async fn every_agent_layout_round_trips() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let key = h.device_key("layouts").await;
+
+    // One file per agent, at the path its catalog entry expects, with content
+    // that differs per agent so a mix-up would show
+    let layouts: &[(&str, &str, &[u8])] = &[
+        (
+            "claude_code",
+            "claude/projects/-home-u-proj/s1.jsonl",
+            b"{\"type\":\"user\",\"text\":\"claude\"}\n",
+        ),
+        // **A real 36-character UUID**: codex's `session_id` rule is
+        // `rollout-<timestamp>-<uuid>`, and a short placeholder yields no id,
+        // so the file is skipped with only a debug log
+        (
+            "codex",
+            "codex/sessions/2026/10/30/rollout-2026-10-30T00-00-00-0f8e2c1a-4b3d-4e5f-9a8b-7c6d5e4f3a2b.jsonl",
+            b"{\"type\":\"response_item\"}\n",
+        ),
+        (
+            "gemini_cli",
+            "gemini/tmp/abc123/chats/session-2026-10-30T00-00-abc.jsonl",
+            b"{\"type\":\"user\"}\n",
+        ),
+        (
+            "cursor",
+            "cursor/projects/-home-u-proj/agent-transcripts/c1.jsonl",
+            b"{\"role\":\"user\"}\n",
+        ),
+        // The home is the `workspaceStorage` directory itself, so the relative
+        // path is `<workspace hash>/chatSessions/<id>.jsonl`
+        (
+            "copilot_chat",
+            "vscode/h1/chatSessions/s1.jsonl",
+            b"{\"kind\":0}\n",
+        ),
+        // **Non-empty**: a snapshot source with zero bytes is skipped by the
+        // sync engine (there is nothing to send), so `[]` would test the
+        // engine's empty-file rule rather than the layout
+        (
+            "cline",
+            "cline/tasks/t1/api_conversation_history.json",
+            b"[{\"role\":\"user\"}]",
+        ),
+        (
+            "roo_code",
+            "roo/tasks/t2/api_conversation_history.json",
+            b"[{\"role\":\"user\"}]",
+        ),
+        (
+            "qwen_code",
+            "qwen/tmp/proj/chats/q1.jsonl",
+            b"{\"type\":\"user\"}\n",
+        ),
+        (
+            "copilot_cli",
+            "copilot/session-state/s1/events.jsonl",
+            b"{\"type\":\"session.start\"}\n",
+        ),
+    ];
+
+    let home = tempfile::tempdir().expect("home");
+    let data = tempfile::tempdir().expect("data");
+    for (_, rel, body) in layouts {
+        let path = home.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&path, body).expect("write");
+    }
+
+    // The built-in catalog, with every home pointed at this one temp tree
+    let mut catalog = Catalog::builtin().clone();
+    for agent in &mut catalog.agents {
+        let sub = match agent.id.as_str() {
+            "claude_code" => "claude",
+            "codex" => "codex",
+            "gemini_cli" => "gemini",
+            "cursor" => "cursor",
+            "copilot_chat" => "vscode",
+            "cline" => "cline",
+            "roo_code" => "roo",
+            "qwen_code" => "qwen",
+            "copilot_cli" => "copilot",
+            _ => continue,
+        };
+        agent.home = vec![HomeRoot::Path {
+            path: home.path().join(sub).display().to_string(),
+        }];
+    }
+
+    let client = cormex::ApiClient::new(&h.base_url, &key).expect("client");
+    let api = HttpCaptureApi::new(client);
+    let db = StateDb::open(data.path()).expect("db");
+    let report = run(
+        &api,
+        &db,
+        data.path(),
+        &catalog,
+        &Config::default(),
+        "test-device",
+        &SyncOptions {
+            trigger: Trigger::Manual,
+            only: None,
+            budget: Budget::unlimited(),
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("the run itself should not fail");
+
+    assert_eq!(
+        report.errors, 0,
+        "a layout failed to sync: {:?}",
+        report.last_error
+    );
+    assert_eq!(
+        report.files_uploaded,
+        layouts.len(),
+        "{} of {} layouts were uploaded; last error: {:?}",
+        report.files_uploaded,
+        layouts.len(),
+        report.last_error
+    );
+
+    // Each file's bytes come back. **The logical path is relative to the
+    // agent's home**, not to the temp root the test laid out
+    let device = h.device_id(&key).await;
+    for (agent, rel, body) in layouts {
+        let sub = rel.split('/').next().expect("a first segment");
+        let logical = rel
+            .strip_prefix(&format!("{sub}/"))
+            .unwrap_or(rel)
+            .to_owned();
+        let generation = h.generation_of_agent(&device, agent, &logical).await;
+        let got = h.reassemble(&generation).await;
+        assert_eq!(
+            &got[..],
+            *body,
+            "{agent}'s bytes did not round-trip through {rel}"
+        );
+    }
 
     h.db.drop().await;
 }

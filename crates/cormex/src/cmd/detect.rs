@@ -486,4 +486,98 @@ mod no_open_tests {
         #[link_name = "geteuid"]
         fn libc_geteuid() -> u32;
     }
+
+    /// **Every agent the built-in catalog knows about** is detected from a
+    /// fake home laid out the way that agent really writes.
+    ///
+    /// Phase 4's fixed contents say "`cormex detect` 的夹具 home 增加该 agent",
+    /// and this is that, for all of them at once. It is one test rather than
+    /// eight because the thing that can go wrong is the same for each: a
+    /// catalog glob that does not match the layout the agent actually uses.
+    ///
+    /// The layouts are the ones the parsers were written against — Gemini's
+    /// `tmp/<hash>/chats/`, Cursor's `projects/<enc>/agent-transcripts/`,
+    /// Copilot CLI's `session-state/<id>/`, and so on.
+    #[test]
+    fn every_catalogued_agent_is_detected_from_its_own_layout() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let p = home.path();
+        let write = |rel: &str, body: &[u8]| {
+            let path = p.join(rel);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, body).expect("write");
+        };
+
+        // Claude Code
+        write("claude/projects/-home-u-proj/s1.jsonl", b"{}\n");
+        // Codex
+        write(
+            "codex/sessions/2026/10/30/rollout-2026-10-30T00-00-00-abc.jsonl",
+            b"{}\n",
+        );
+        // Gemini CLI
+        write(
+            "gemini/tmp/abc123/chats/session-2026-10-30T00-00-abc.jsonl",
+            b"{}\n",
+        );
+        // Cursor
+        write(
+            "cursor/projects/-home-u-proj/agent-transcripts/c1.jsonl",
+            b"{}\n",
+        );
+        // VS Code Copilot Chat
+        write("vscode/workspaceStorage/h1/chatSessions/s1.jsonl", b"{}\n");
+        // Cline
+        write("cline/tasks/t1/api_conversation_history.json", b"[]");
+        // Roo Code
+        write("roo/tasks/t2/api_conversation_history.json", b"[]");
+        // Qwen Code
+        write("qwen/tmp/proj/chats/q1.jsonl", b"{}\n");
+        // Copilot CLI
+        write("copilot/session-state/s1/events.jsonl", b"{}\n");
+
+        // A catalog whose every agent's home points at the directory this test
+        // laid out, so one temp dir serves all of them
+        let mut catalog = Catalog::builtin().clone();
+        for agent in &mut catalog.agents {
+            agent.home = vec![HomeRoot::Path {
+                path: match agent.id.as_str() {
+                    "claude_code" => p.join("claude"),
+                    "codex" => p.join("codex"),
+                    "gemini_cli" => p.join("gemini"),
+                    "cursor" => p.join("cursor"),
+                    "copilot_chat" => p.join("vscode"),
+                    "cline" => p.join("cline"),
+                    "roo_code" => p.join("roo"),
+                    "qwen_code" => p.join("qwen"),
+                    "copilot_cli" => p.join("copilot"),
+                    _ => p.join(&agent.id),
+                }
+                .display()
+                .to_string(),
+            }];
+        }
+
+        let report = run(&catalog, &Config::default(), "dev").expect("detect");
+        let found: Vec<&str> = report.agents.iter().map(|a| a.agent.as_str()).collect();
+
+        for expected in [
+            "claude_code",
+            "codex",
+            "gemini_cli",
+            "cursor",
+            "copilot_chat",
+            "cline",
+            "roo_code",
+            "qwen_code",
+            "copilot_cli",
+        ] {
+            assert!(
+                found.contains(&expected),
+                "{expected} was not detected from its own layout; found {found:?}. A catalog \
+                 glob that does not match the layout the agent really uses means its sessions \
+                 are never captured, and nothing reports it"
+            );
+        }
+    }
 }
