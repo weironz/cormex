@@ -250,7 +250,19 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-cormex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-cormex}
       # 服务端自己访问对象存储走内网一跳，不绕 traefik。
       # 浏览器那侧用的是 https://${S3_DOMAIN}，两者指向同一个桶
-      S3_ENDPOINT: http://rustfs:9000
+      #
+      # ★ **用容器名，不用服务名。** 这台机器上跑着不止一个 RustFS（另一个
+      #   项目也有一个，接在同一张 traefik 网上），于是 `rustfs` 这个名字解析
+      #   出**两个 IP**，Docker 的 DNS 轮流返回。连错了那一个的症状是
+      #
+      #       CreateBucket failed [InvalidAccessKeyId]:
+      #       The Access Key Id you provided does not exist in our records
+      #
+      #   —— 看起来像凭据错了，实际上是连到了别人的对象存储。容器名是唯一的，
+      #   解析不出歧义。2026-10-31 升级 v0.1.12 时实测撞到过，当时 cormexd
+      #   静默回落到本地文件系统（`blob_backend: local_fs`），媒体文件因此
+      #   落在容器里、不在备份范围内。
+      S3_ENDPOINT: http://cortex-rustfs:9000
       S3_PUBLIC_ENDPOINT: https://${S3_DOMAIN}
       S3_BUCKET: ${S3_BUCKET:-cormex-blobs}
       S3_REGION: ${S3_REGION:-us-east-1}
