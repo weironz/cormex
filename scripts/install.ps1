@@ -32,37 +32,60 @@ $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     'ARM64' { 'aarch64' }
     default { Fail "unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
 }
-$Target = "$Arch-pc-windows-msvc"
+$Targets = switch ($Arch) {
+    'x86_64' { @('x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu') }
+    'aarch64' { @('aarch64-pc-windows-msvc', 'aarch64-pc-windows-gnullvm') }
+}
 
 # ── Version ───────────────────────────────────────────────
 $Version = $env:CORMEX_VERSION
 if (-not $Version) {
-    # The redirect's final path segment is the tag
+    # Follow the redirect; the final URL contains the release tag. Windows
+    # PowerShell 5.1 and PowerShell 7 expose the response URL differently.
     $resp = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" `
-        -MaximumRedirection 0 -ErrorAction SilentlyContinue -SkipHttpErrorCheck
-    $location = $resp.Headers.Location
-    if (-not $location) { Fail 'could not work out the latest version; set $env:CORMEX_VERSION' }
-    $Version = ($location -split '/')[-1]
+        -UseBasicParsing
+    $finalUri = if ($PSVersionTable.PSEdition -eq 'Core') {
+        $resp.BaseResponse.RequestMessage.RequestUri
+    } else {
+        $resp.BaseResponse.ResponseUri
+    }
+    if (-not $finalUri -or $finalUri.AbsolutePath -notmatch '/releases/tag/([^/]+)$') {
+        Fail 'could not work out the latest version; set $env:CORMEX_VERSION'
+    }
+    $Version = [uri]::UnescapeDataString($Matches[1])
 }
 if (-not $Version) { Fail 'could not work out the latest version; set $env:CORMEX_VERSION' }
 
-Write-Host "installing $Bin $Version for $Target"
+Write-Host "selecting $Bin $Version for $Arch"
 
 # ── Download ──────────────────────────────────────────────
 $Tmp = Join-Path $env:TEMP ("cormex-install-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
     $Base = "https://github.com/$Repo/releases/download/$Version"
-    $Archive = "$Bin-$($Version.TrimStart('v'))-$Target.zip"
-    $ArchivePath = Join-Path $Tmp $Archive
     $SumsPath = Join-Path $Tmp 'SHA256SUMS'
 
-    Invoke-WebRequest -Uri "$Base/$Archive" -OutFile $ArchivePath
-    Invoke-WebRequest -Uri "$Base/SHA256SUMS" -OutFile $SumsPath
+    Invoke-WebRequest -Uri "$Base/SHA256SUMS" -OutFile $SumsPath -UseBasicParsing
+
+    # Prefer the current release target, while supporting older releases that
+    # shipped GNU / GNU LLVM binaries instead of MSVC.
+    $sums = Get-Content $SumsPath
+    $Archive = $null
+    foreach ($candidate in $Targets) {
+        $name = "$Bin-$($Version.TrimStart('v'))-$candidate.zip"
+        $line = $sums | Where-Object { $_ -match "^[a-fA-F0-9]{64}\s+\*?$([regex]::Escape($name))$" } | Select-Object -First 1
+        if ($line) {
+            $Target = $candidate
+            $Archive = $name
+            break
+        }
+    }
+    if (-not $Archive) { Fail "no Windows archive for $Arch is listed in $Version SHA256SUMS" }
+    $ArchivePath = Join-Path $Tmp $Archive
+    Write-Host "installing $Bin $Version for $Target"
+    Invoke-WebRequest -Uri "$Base/$Archive" -OutFile $ArchivePath -UseBasicParsing
 
     # ── Verify ────────────────────────────────────────────
-    $line = Get-Content $SumsPath | Where-Object { $_ -match " $([regex]::Escape($Archive))$" }
-    if (-not $line) { Fail "SHA256SUMS does not list $Archive" }
     $expected = ($line -split '\s+')[0]
     $actual = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLower()
     if ($expected -ne $actual) {
