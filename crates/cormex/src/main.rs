@@ -258,7 +258,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             username,
         } => {
             if let Some(server) = server {
-                cfg.server_url = server;
+                cfg.server_url = login::resolve_server_url(&server).await?;
             }
             if let Some(label) = label {
                 cfg.device_label = label;

@@ -137,16 +137,31 @@ npm install -g cormex
 Then:
 
 ```bash
-cormex login --server https://memory.example.com   # asks for your account password
+cormex login --server https://memory.example.com/api   # asks for your account password
 cormex init                                        # hooks, scheduler, backfill
 ```
+
+The example uses the API base for the standard same-origin deployment. Newer
+CLI builds can also accept the website origin and discover `/api` before asking
+for a password; older deployments are detected using unauthenticated health
+checks. For example, with a CLI build that supports discovery:
+
+```bash
+cormex login --server https://memory.example.com
+```
+
+For a standalone server exposed at the origin, use `https://memory.example.com`;
+for a custom proxy prefix, include that path explicitly. If login returns 405
+or an HTML response, check the API base and proxy routing. Discovery and health
+checks never send your password or device key. See [CLI connection and
+authentication](docs/cli-connection.md) for the discovery contract and setup.
 
 On a machine with no browser (a server, a container), use the device-code flow
 instead — it prints a short code, you type it into a browser you are already
 logged into, and the machine polls until a key appears:
 
 ```bash
-cormex login --server https://memory.example.com --device-code
+cormex login --server https://memory.example.com/api --device-code
 ```
 
 `cormex init` shows every change before making it: hooks in the agent's own

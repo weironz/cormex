@@ -31,6 +31,74 @@ use crate::credentials;
 /// they have to be asked for explicitly.
 pub const DEFAULT_SCOPES: &[&str] = &["capture:write", "session:read", "memory:read"];
 
+/// Resolve a website URL before collecting credentials. Explicit paths are API
+/// bases and are never rewritten; discovery is restricted to the same origin.
+///
+/// # Errors
+/// The URL is not an HTTP(S) server URL or contains credentials, a query or fragment.
+pub async fn resolve_server_url(input: &str) -> Result<String> {
+    let url = reqwest::Url::parse(input.trim()).context("invalid server URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("server URL must be an HTTP(S) URL without credentials, query or fragment");
+    }
+    let base = url.as_str().trim_end_matches('/').to_owned();
+    if url.path() != "/" {
+        return Ok(base);
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    if let Ok(resp) = http.get(format!("{base}/.well-known/cormex")).send().await
+        && resp.status().is_success()
+        && let Ok(value) = resp.json::<serde_json::Value>().await
+        && let Some(path) = value.get("api_base").and_then(serde_json::Value::as_str)
+        && valid_discovery_path(path)
+    {
+        return Ok(format!("{base}{}", path.trim_end_matches('/')));
+    }
+
+    // Compatibility with existing deployments without a discovery endpoint.
+    // Health responses identify cormexd; HTML SPA fallbacks do not qualify.
+    for suffix in ["", "/api"] {
+        if let Ok(resp) = http.get(format!("{base}{suffix}/health")).send().await
+            && resp.status().is_success()
+            && let Ok(value) = resp.json::<serde_json::Value>().await
+            && value.get("role").and_then(serde_json::Value::as_str) == Some("cormexd")
+            && value
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            && value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        {
+            return Ok(format!("{base}{suffix}"));
+        }
+    }
+    // Preserve direct servers that predate role-bearing health responses.
+    eprintln!(
+        "cormex: could not discover the API; using {base}. If login returns 405 or HTML, specify the API base explicitly (for example, {base}/api)."
+    );
+    Ok(base)
+}
+
+fn valid_discovery_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains(['?', '#', '\\', '%'])
+        && path.split('/').all(|part| part != "." && part != "..")
+        && !path.chars().any(char::is_control)
+}
+
 /// What `login` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginOutcome {
@@ -96,7 +164,13 @@ pub async fn login_with_password(
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| {
+            if e.message.contains("405 Method Not Allowed") || e.message.contains("does not parse") {
+                anyhow::anyhow!("{e}; check that --server is the API base URL (the web deployment commonly uses /api)")
+            } else {
+                anyhow::anyhow!("{e}")
+            }
+        })
         .context("could not log in")?;
 
     // From here on the access token is the credential
@@ -240,6 +314,93 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn discovers_advertised_same_origin_api() {
+        let base = serve(axum::Router::new().route(
+            "/.well-known/cormex",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"api_base":"/custom/api"}))
+            }),
+        ))
+        .await;
+        assert_eq!(
+            resolve_server_url(&base).await.unwrap(),
+            format!("{base}/custom/api")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_legacy_api_without_sending_credentials() {
+        let base = serve(
+            axum::Router::new()
+                .route(
+                    "/.well-known/cormex",
+                    axum::routing::get(|| async { "<html>SPA</html>" }),
+                )
+                .route(
+                    "/health",
+                    axum::routing::get(|| async { "<html>SPA</html>" }),
+                )
+                .route(
+                    "/api/health",
+                    axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                        assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
+                        axum::Json(
+                            serde_json::json!({"role":"cormexd","version":"1","status":"ok"}),
+                        )
+                    }),
+                ),
+        )
+        .await;
+        assert_eq!(
+            resolve_server_url(&base).await.unwrap(),
+            format!("{base}/api")
+        );
+        assert_eq!(
+            resolve_server_url(&format!("{base}/custom")).await.unwrap(),
+            format!("{base}/custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_discovery_and_preserves_direct_servers() {
+        let base = serve(
+            axum::Router::new()
+                .route(
+                    "/.well-known/cormex",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"api_base":"//evil.example/api"}))
+                    }),
+                )
+                .route(
+                    "/health",
+                    axum::routing::get(|| async {
+                        axum::Json(
+                            serde_json::json!({"role":"cormexd","version":"1","status":"ok"}),
+                        )
+                    }),
+                ),
+        )
+        .await;
+        assert_eq!(resolve_server_url(&base).await.unwrap(), base);
+        for invalid in [
+            "//evil.example",
+            "/../api",
+            "/%2f%2fevil",
+            "/api?x=1",
+            "/api\\evil",
+        ] {
+            assert!(!valid_discovery_path(invalid), "{invalid}");
+        }
+    }
 
     #[test]
     fn a_key_without_a_server_url_is_refused() {
