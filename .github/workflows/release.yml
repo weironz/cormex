@@ -340,7 +340,7 @@ jobs:
   # ══════════════════════════════════════════════════════════
   cli-release:
     name: Publish the CLI
-    needs: [preflight, cli, image, web]
+    needs: [preflight, cli, image, web-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
