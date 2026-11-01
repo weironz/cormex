@@ -165,11 +165,23 @@ impl DeviceCodes {
             .lock()
             .expect("the device-code lock is not poisoned");
         match map.get_mut(&normalized) {
-            Some(p) if p.created_at.elapsed() < CODE_TTL => {
+            Some(p) if p.created_at.elapsed() < CODE_TTL && p.approved_by.is_none() => {
                 p.approved_by = Some(user_id.to_owned());
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Release a claim if key issuance failed, allowing the user to retry.
+    pub fn release_approval(&self, user_code: &str, user_id: &str) {
+        let normalized = normalize_user_code(user_code);
+        if let Ok(mut map) = self.pending.lock()
+            && let Some(p) = map.get_mut(&normalized)
+            && p.approved_by.as_deref() == Some(user_id)
+            && p.issued.is_none()
+        {
+            p.approved_by = None;
         }
     }
 
@@ -284,6 +296,18 @@ mod tests {
 
     fn codes() -> DeviceCodes {
         DeviceCodes::default()
+    }
+
+    #[test]
+    fn authorization_cannot_be_claimed_twice_and_failed_issue_can_retry() {
+        let codes = DeviceCodes::default();
+        let started = codes.start("test".into(), vec!["capture:write".into()], None);
+        assert!(codes.approve(&started.user_code, "user"));
+        assert!(!codes.approve(&started.user_code, "other"));
+        codes.release_approval(&started.user_code, "other");
+        assert!(!codes.approve(&started.user_code, "other"));
+        codes.release_approval(&started.user_code, "user");
+        assert!(codes.approve(&started.user_code, "user"));
     }
 
     /// A started authorization polls as pending until approved.
@@ -482,6 +506,27 @@ mod flow_tests {
             StatusCode::UNAUTHORIZED,
             "an anonymous caller confirmed a device login"
         );
+
+        let (status, _) = post(
+            &app,
+            "/devices/inspect",
+            None,
+            serde_json::json!({"user_code": started.user_code}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = post(
+            &app,
+            "/devices/inspect",
+            Some(&token),
+            serde_json::json!({"user_code": started.user_code}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview["label"], "headless-box");
+        assert_eq!(preview["scopes"][0], "capture:write");
+        assert!(preview.get("device_code").is_none());
 
         // ── The person confirms in the browser ──
         let (status, body) = post(

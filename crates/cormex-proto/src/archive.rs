@@ -23,6 +23,14 @@ pub struct ArchiveSessionDto {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_position: Option<i32>,
+    /// At least one transcript was collected from the host's archived area.
+    /// Provenance only; this is not the chat's current archive status.
+    #[serde(default)]
+    pub source_archived: bool,
     /// Every device that has contributed a file to this session.
     #[serde(default)]
     pub devices: Vec<String>,
@@ -31,6 +39,9 @@ pub struct ArchiveSessionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_at: Option<String>,
     pub event_count: i64,
+    /// Default conversation-view messages; absent while statistics are pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<i64>,
     /// One line, once phase 5's summaries exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -50,6 +61,19 @@ pub struct ArchiveSessionsResponse {
     /// The cursor for the next page. `None` = this is the last one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// Project facets are independent of chat pagination. A null key is unassigned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveProjectDto {
+    pub key: Option<String>,
+    pub name: Option<String>,
+    pub chat_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveProjectsResponse {
+    pub projects: Vec<ArchiveProjectDto>,
 }
 
 /// One file of a session, with its generations.
@@ -144,6 +168,10 @@ mod tests {
             agent: "claude_code".into(),
             title: None,
             project_key: None,
+            project_name: None,
+            pinned_position: None,
+            source_archived: false,
+            message_count: None,
             devices: vec![],
             first_at: None,
             last_at: None,

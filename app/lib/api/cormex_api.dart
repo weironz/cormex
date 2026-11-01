@@ -11,7 +11,10 @@ import '../models/auth_tokens.dart';
 import '../models/episode.dart';
 import '../models/health_status.dart';
 import '../models/json.dart';
+import '../models/memory_artifact.dart';
 import '../models/memory_search_result.dart';
+import '../models/memory_context.dart';
+import '../models/memory_extraction_status.dart';
 import '../models/transcript_event.dart';
 import 'api_exception.dart';
 import 'http_client_factory.dart';
@@ -203,6 +206,34 @@ class CormexApi {
     }
   }
 
+  /// Look up a device request without authorizing it.
+  Future<Map<String, dynamic>> inspectDevice(String code) =>
+      _postDevice('/devices/inspect', code);
+
+  /// Approve the request only after the user has reviewed its details.
+  Future<Map<String, dynamic>> confirmDevice(String code) =>
+      _postDevice('/devices/confirm', code);
+
+  Future<Map<String, dynamic>> _postDevice(String path, String code) async {
+    final http.Response response;
+    try {
+      response = await _client.post(
+        _uri(path),
+        headers: _headers(const {
+          'content-type': 'application/json',
+          'accept': 'application/json',
+        }),
+        body: jsonEncode({'user_code': code}),
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+    return _decodeObject(path, utf8.decode(response.bodyBytes));
+  }
+
   // ─────────────────────────────── 记忆 ───────────────────────────────
 
   /// `GET /memory/search?q=&limit=&as_of=`
@@ -227,6 +258,19 @@ class CormexApi {
     return MemorySearchResult.fromJson(json);
   }
 
+  /// 按需分页读取会话摘要；记忆仍由 searchMemory 返回。
+  Future<MemoryArtifactsPage> memoryArtifacts({
+    required MemoryArtifactKind kind,
+    int limit = 30,
+    String? cursor,
+  }) async => MemoryArtifactsPage.fromJson(
+    await _getJson('/memory/artifacts', {
+      'kind': kind.name,
+      'limit': '$limit',
+      if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+    }),
+  );
+
   /// `GET /episodes/{id}` —— 一条事实的出处。
   Future<Episode> episode(String id) async =>
       Episode.fromJson(await _getJson('/episodes/${Uri.encodeComponent(id)}'));
@@ -244,6 +288,8 @@ class CormexApi {
     DateTime? until,
     String? cursor,
     int limit = 50,
+    bool unassigned = false,
+    String? query,
   }) async {
     final json = await _getJson('/archive/sessions', {
       if (agent != null && agent.isNotEmpty) 'agent': agent,
@@ -252,8 +298,24 @@ class CormexApi {
       if (until != null) 'until': until.toUtc().toIso8601String(),
       if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
       'limit': '$limit',
+      if (unassigned) 'unassigned': 'true',
+      if (query != null && query.isNotEmpty) 'q': query,
     });
     return ArchiveSessionsPage.fromJson(json);
+  }
+
+  Future<List<ArchiveProject>> archiveProjects({
+    String? agent,
+    String? query,
+  }) async {
+    final json = await _getJson('/archive/projects', {
+      'agent': ?agent,
+      if (query != null && query.isNotEmpty) 'q': query,
+    });
+    return (json['projects'] as List<dynamic>? ?? [])
+        .whereType<Map<String, dynamic>>()
+        .map(ArchiveProject.fromJson)
+        .toList();
   }
 
   /// `GET /archive/sessions/{id}` —— 会话详情：元数据、文件与代。
@@ -272,14 +334,12 @@ class CormexApi {
     String? cursor,
     int limit = 100,
   }) async {
-    final json = await _getJson(
-      '/archive/sessions/${Uri.encodeComponent(id)}/events',
-      {
-        'view': view,
-        if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
-        'limit': '$limit',
-      },
-    );
+    final json =
+        await _getJson('/archive/sessions/${Uri.encodeComponent(id)}/events', {
+          'view': view,
+          if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+          'limit': '$limit',
+        });
     return TranscriptEventsPage.fromJson(json);
   }
 
@@ -378,6 +438,93 @@ class CormexApi {
   }
 
   // ─────────────────────────────── 管道 ───────────────────────────────
+
+  Future<List<MemoryContext>> memoryContexts(List<String> ids) async {
+    final j = await _getJson('/memory/context', {'ids': ids.join(',')});
+    return (j['contexts'] as List? ?? [])
+        .whereType<Map>()
+        .map((m) => MemoryContext.fromJson(m.cast<String, dynamic>()))
+        .toList();
+  }
+
+  Future<List<Map<String, dynamic>>> memoryTrialCandidates() async {
+    final j = await _getJson('/settings/memory-extraction/trial/candidates');
+    return (j['chats'] as List? ?? [])
+        .whereType<Map>()
+        .map((m) => m.cast<String, dynamic>())
+        .toList();
+  }
+
+  Future<Map<String, dynamic>> memoryExtractionDependencies() =>
+      _getJson('/settings/memory-extraction/dependencies');
+
+  Future<void> startMemoryTrial(List<String> sessionIds) async {
+    await _memoryTrialPost('/settings/memory-extraction/trial', {
+      'session_ids': sessionIds,
+    });
+  }
+
+  Future<void> cancelMemoryTrial() async {
+    await _memoryTrialPost('/settings/memory-extraction/trial/cancel', {});
+  }
+
+  Future<void> _memoryTrialPost(String path, Map<String, Object?> data) async {
+    final http.Response response;
+    try {
+      response = await _client.post(
+        _uri(path),
+        headers: _headers(const {'content-type': 'application/json'}),
+        body: jsonEncode(data),
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+  }
+
+  Future<MemoryExtractionStatus> memoryExtractionStatus() async =>
+      MemoryExtractionStatus.fromJson(
+        await _getJson('/settings/memory-extraction'),
+      );
+
+  Future<MemoryExtractionStatus> saveMemoryExtraction(
+    Map<String, Object?> settings,
+  ) async {
+    final http.Response response;
+    try {
+      response = await _client.put(
+        _uri('/settings/memory-extraction'),
+        headers: _headers(const {'content-type': 'application/json'}),
+        body: jsonEncode(settings),
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+    return MemoryExtractionStatus.fromJson(
+      _decodeObject('memory extraction', utf8.decode(response.bodyBytes)),
+    );
+  }
+
+  Future<void> testMemoryExtractionModel() async {
+    final http.Response response;
+    try {
+      response = await _client.post(
+        _uri('/settings/memory-extraction/test'),
+        headers: _headers(const {'content-type': 'application/json'}),
+        body: '{}',
+      );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+  }
 
   Future<Map<String, dynamic>> _getJson(
     String path, [

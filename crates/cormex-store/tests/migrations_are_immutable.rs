@@ -149,6 +149,34 @@ const PINNED: &[(&str, &str)] = &[
         "migrations/20261125000007_redaction_capture_targets.sql",
         "8a401a04439d705826abfe366f79b92d9e73071b0597a24fa83df809935c2aaa",
     ),
+    (
+        "migrations/20261125000008_capture_session_ui_metadata.sql",
+        "9a24363b95a27de40051866e8e82cf4763902f6d4a933361fa7968e0880d05da",
+    ),
+    (
+        "migrations/20261125000009_archive_message_counts.sql",
+        "b7be56cc1e19286e41bfbd2ae0206fce8514331b81b25169aa8a901af2a80d39",
+    ),
+    (
+        "migrations/20261125000010_memory_extraction_settings.sql",
+        "c592b34f69827387d443b62463b813911eaed7997d6f10bde9b3c905ff4c28e5",
+    ),
+    (
+        "migrations/20261125000011_memory_extraction_trials.sql",
+        "45707ebc7061c0b29c911162a15b37e7a921b90aad1eb699ec7dafa0ad47f0fa",
+    ),
+    (
+        "migrations/20261125000012_memory_qa_analysis.sql",
+        "648f92b026e0706e27f3a9b5250a8018492d6b50f4e3908819817803bbfd58a8",
+    ),
+    (
+        "migrations/20261125000013_automatic_memory.sql",
+        "53e16c841675b23cc2b468cce6ea3af66a21abd7c377d6a01274fa7d671e470d",
+    ),
+    (
+        "migrations/20261125000014_memory_semantic_validation.sql",
+        "d15f8b671145a6ca44be03b62196d6d3f0eeb9f3fd1da358ff08edc387e09e59",
+    ),
 ];
 
 fn sha256_hex(bytes: &[u8]) -> String {

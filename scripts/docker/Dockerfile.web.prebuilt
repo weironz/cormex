@@ -1,0 +1,29 @@
+# Optional production runtime for an existing Flutter release bundle.
+# Dockerfile.web remains the complete, pinned-SDK source build.
+#
+# First run from app/ (use PowerShell on Windows to preserve /api):
+#   flutter build web --release --dart-define=CORMEX_BASE_URL=/api
+#
+# Then run from the repository root, explicitly admitting only the release
+# bundle through a named context:
+#   docker build --build-context web-build=./app/build/web -f scripts/docker/Dockerfile.web.prebuilt -t cormex/cormex-web .
+# The root .dockerignore still excludes all host build output from the main
+# source context. nginx.conf comes from that source context as usual.
+
+FROM nginx:1.29-alpine AS runtime
+
+RUN rm -f /etc/nginx/conf.d/default.conf
+COPY scripts/docker/nginx.conf /etc/nginx/conf.d/cormex.conf
+COPY --from=web-build / /usr/share/nginx/html
+
+# Reject an empty bundle or one built without the production API prefix.
+RUN set -eux; \
+    test -s /usr/share/nginx/html/index.html; \
+    f=/usr/share/nginx/html/main.dart.js; \
+    test -s "$f"; \
+    grep -qF '"/api"' "$f" || grep -qF "'/api'" "$f"
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://127.0.0.1/healthz || exit 1

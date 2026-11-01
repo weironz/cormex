@@ -10,11 +10,8 @@
 //! installs, but the default is to show the list and ask — a tool that silently
 //! rewrites your editor config is a tool you stop trusting.
 //!
-//! # The backfill is a separate, explicit step
-//!
-//! The estimate comes before it, and it is not part of the confirmed changes:
-//! "capture everything from now on" and "upload three years of history right
-//! now" are different decisions, and the second one can take an hour.
+//! The estimate is shown before changes are applied. By default the CLI then
+//! runs the initial sync; `--no-backfill` skips it.
 
 use anyhow::Result;
 
@@ -35,7 +32,8 @@ pub struct InitReport {
     /// Files and bytes the backfill would send.
     pub estimate_files: usize,
     pub estimate_bytes: u64,
-    pub backfill_ran: bool,
+    pub backfill: Option<crate::sync::SyncReport>,
+    pub warnings: Vec<String>,
 }
 
 /// The options `init` takes.
@@ -137,10 +135,13 @@ pub async fn run(
     let detected = detect::run(&catalog, cfg, &cfg.device_label)?;
     report.estimate_files = detected.total_files();
     report.estimate_bytes = detected.total_bytes();
+    report.warnings = detected.warnings;
 
     if opts.dry_run {
         return Ok(report);
     }
+
+    eprintln!("{}", render_plan(&report));
 
     for installer in &plan {
         for change in installer.plan()? {
@@ -158,10 +159,27 @@ pub async fn run(
     }
 
     if opts.backfill {
-        // The backfill is the same engine with the budget lifted: a user who
-        // just said "capture everything" is not well served by a client that
-        // stops after a minute
-        report.backfill_ran = true;
+        let (key, _) = crate::credentials::load(config_dir, &cfg.server_url)?;
+        let client = ApiClient::new(&cfg.server_url, &key)?;
+        let api = crate::sync::api::HttpCaptureApi::new(client);
+        eprintln!("starting initial history sync; it may take a while");
+        report.backfill = Some(
+            crate::sync::run(
+                &api,
+                &db,
+                data_dir,
+                &catalog,
+                cfg,
+                &cfg.device_label,
+                &crate::sync::SyncOptions {
+                    trigger: crate::sync::Trigger::Manual,
+                    only: None,
+                    budget: crate::sync::upload::Budget::unlimited(),
+                    dry_run: false,
+                },
+            )
+            .await?,
+        );
     }
 
     Ok(report)
@@ -184,6 +202,9 @@ pub fn render_plan(report: &InitReport) -> String {
         report.estimate_files,
         human_bytes(report.estimate_bytes)
     ));
+    for warning in &report.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
     out
 }
 

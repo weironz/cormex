@@ -148,8 +148,20 @@ fn parse_opencode(row: &Value, offset: u64, len: u64) -> Vec<ParsedEvent> {
             let text = data
                 .get("text")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    row.get("parts")
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                                .filter_map(|p| p.get("data")?.get("text")?.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default()
+                });
             out.push(text_event(
                 TranscriptKind::UserMessage,
                 "user",
@@ -162,7 +174,11 @@ fn parse_opencode(row: &Value, offset: u64, len: u64) -> Vec<ParsedEvent> {
         "assistant" => {
             // The parts are the content; `data.content` is absent on a
             // `session_message` row because the parts live in their own table
-            let parts = row.get("parts").and_then(Value::as_array);
+            let parts = row
+                .get("parts")
+                .and_then(Value::as_array)
+                .filter(|p| !p.is_empty())
+                .or_else(|| data.get("content").and_then(Value::as_array));
             match parts {
                 Some(parts) if !parts.is_empty() => {
                     for part in parts {
@@ -216,7 +232,7 @@ fn opencode_part(
     len: u64,
 ) -> Vec<ParsedEvent> {
     let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
-    let data = part.get("data").cloned().unwrap_or(Value::Null);
+    let data = part.get("data").cloned().unwrap_or_else(|| part.clone());
     match part_type {
         "text" => vec![text_event(
             TranscriptKind::AgentMessage,
@@ -254,12 +270,15 @@ fn opencode_part(
             // The tool's state is a tagged union: `streaming` has no result,
             // `completed` carries `content`, `error` carries `error`
             let id = data
-                .get("id")
+                .get("callID")
+                .or_else(|| data.get("call_id"))
+                .or_else(|| data.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
             let name = data
-                .get("name")
+                .get("tool")
+                .or_else(|| data.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
@@ -289,7 +308,7 @@ fn opencode_part(
                         .map(|e| e.to_string())
                         .unwrap_or_default()
                 } else {
-                    flatten_content(state.get("content"))
+                    flatten_content(state.get("content").or_else(|| state.get("output")))
                 };
                 out.push(ParsedEvent {
                     kind: TranscriptKind::ToolResult,
@@ -621,6 +640,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, TranscriptKind::UserMessage);
         assert_eq!(events[0].text, "hello");
+    }
+
+    #[test]
+    fn legacy_user_parts_and_tool_outputs_are_preserved() {
+        let user = serde_json::json!({"type":"user", "data":{}, "parts":[{"type":"text", "data":{"text":"hello from v1"}}]});
+        assert_eq!(parse(RowFormat::OpenCode, &user)[0].text, "hello from v1");
+        let assistant = serde_json::json!({"type":"assistant", "data":{}, "parts":[{"type":"tool", "data":{"callID":"call1", "tool":"bash", "state":{"status":"completed", "input":{}, "output":"done"}}}]});
+        let events = parse(RowFormat::OpenCode, &assistant);
+        assert_eq!(events[0].tool_name.as_deref(), Some("bash"));
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("call1"));
+        assert_eq!(events[1].text, "done");
     }
 
     /// An assistant row with no parts joined in is `Unknown`, not silence.

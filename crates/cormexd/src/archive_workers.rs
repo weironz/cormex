@@ -32,14 +32,18 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use base64::Engine as _;
 use cormex_core::Id;
 use cormex_memory::distill::{DistillEvent, Observation, Observer};
 use cormex_proto::transcript::ContentBlock;
+#[cfg(test)]
+use cormex_store::NewEpisode;
 use cormex_store::{
-    CaptureChunk, ChunkEncoding, NewCaptureMask, NewEpisode, NewMaskProgress, NewProjection,
-    NewSummary, NewTranscriptEvent, Projection, ProjectionStatus, ProvenanceRef, SourceKind, Store,
+    CaptureChunk, ChunkEncoding, NewCaptureMask, NewMaskProgress, NewProjection, NewSummary,
+    NewTranscriptEvent, Projection, ProjectionStatus, ProvenanceRef, SourceKind, Store,
     SummaryScope, TranscriptEvent, TranscriptEventKind,
 };
+use futures::StreamExt as _;
 
 use crate::request_tenant::Tenant;
 use crate::state::AppState;
@@ -121,7 +125,13 @@ pub fn spawn(st: AppState) {
 
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_SCAN_DELAY).await;
-        let mut tick = tokio::time::interval(SCAN_INTERVAL);
+        let interval = std::env::var("CORMEX_ARCHIVE_SCAN_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(SCAN_INTERVAL);
+        let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
 
@@ -178,6 +188,11 @@ pub fn spawn(st: AppState) {
                         schema = schema.as_str(),
                         "the indexer round failed; the next one retries"
                     ),
+                }
+                if let Ok(store) = tenant.store()
+                    && let Err(error) = crate::archive_api::update_message_counts(&st, store).await
+                {
+                    tracing::warn!(error = ?error, "conversation message statistics round failed");
                 }
                 // **Last, and only over what the projector has already
                 // written.** The distiller's input is P-layer events; running
@@ -350,6 +365,12 @@ pub(crate) async fn index_tick(tenant: &Tenant) -> Result<usize> {
 /// for one session is logged and the round continues: a provider outage must
 /// not stop masking and projecting, which do not need a model at all.
 pub(crate) async fn distill_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
+    // Local archive previews must not send imported conversations to an LLM.
+    if std::env::var("CORMEX_ARCHIVE_DISTILL_ENABLED")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("false") || v == "0")
+    {
+        return Ok(0);
+    }
     // The observer is built once per round rather than per session: it holds
     // the provider client, and constructing one per session would re-read the
     // provider definition every time
@@ -693,27 +714,66 @@ impl FactSink for LiveFactSink<'_> {
 /// the progress row only advances past what actually succeeded.
 pub(crate) async fn promote_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
     let cfg = st.distill_config();
-    if !cfg.promote || cfg.promote_per_round <= 0 {
+    let store = tenant.store()?;
+    let settings = store.memory_extraction_settings().await?;
+    let enabled = settings.as_ref().map_or(cfg.promote, |s| s.enabled);
+    if !enabled || cfg.promote_per_round <= 0 {
+        return Ok(0);
+    }
+    if store.memory_extraction_work().await?.is_some_and(|w| {
+        w.last_error.is_some() && w.updated_at > chrono::Utc::now() - chrono::Duration::seconds(60)
+    }) {
         return Ok(0);
     }
     let Some(live) = st.live() else {
         return Ok(0);
     };
-    let (extractor, gate) = live.extractor();
-    promote_round(st, tenant, &LiveFactSink::new(extractor, gate)).await
+    let settings_value = settings
+        .clone()
+        .unwrap_or_else(|| crate::memory_settings::defaults(st));
+    let llm = match crate::memory_settings::client(st, &settings_value) {
+        Ok(llm) => llm,
+        Err(_) => {
+            store
+                .set_memory_extraction_work(false, Some("模型配置不可用，请检查配置后保存重试"))
+                .await?;
+            return Ok(0);
+        }
+    };
+    // Share the deployment's concurrency gate even with a custom tenant model.
+    let (default_extractor, gate) = live.extractor();
+    let extractor = default_extractor.clone().with_llm(llm.clone());
+    let analyzer = cormex_memory::dialogue::ModelDialogueAnalyzer(llm);
+    store.set_memory_extraction_work(true, None).await?;
+    let result =
+        crate::memory_qa::normal_round(st, store, &settings_value, &analyzer, &extractor, gate)
+            .await;
+    let error = match &result {
+        Err(_) => Some("模型提取失败，处理位置已保留；请检查模型配置后重试"),
+        _ => None,
+    };
+    store.set_memory_extraction_work(false, error).await?;
+    match result {
+        Err(_) => Err(anyhow::anyhow!(
+            "memory extraction failed; see account status"
+        )),
+        Ok(n) => Ok(n),
+    }
 }
 
 /// The round itself, with the fact sink supplied.
+#[cfg(test)]
 pub(crate) async fn promote_round(
     st: &AppState,
     tenant: &Tenant,
     sink: &dyn FactSink,
 ) -> Result<usize> {
     let cfg = st.distill_config();
-    if !cfg.promote || cfg.promote_per_round <= 0 {
+    let store = tenant.store()?;
+    let settings = store.memory_extraction_settings().await?;
+    if !settings.as_ref().map_or(cfg.promote, |s| s.enabled) || cfg.promote_per_round <= 0 {
         return Ok(0);
     }
-    let store = tenant.store()?;
     let todo = store.sessions_needing_promotion(BATCH).await?;
     if todo.is_empty() {
         return Ok(0);
@@ -757,70 +817,18 @@ pub(crate) async fn promote_round(
                 continue;
             }
 
-            let episode = NewEpisode {
-                // **Derived from the event id.** A re-run over the same events
-                // produces the same id, so the PK rejects the duplicate and
-                // "promote this event twice" is impossible by construction —
-                // which is what makes the progress row safe to lose
-                id: Id::derived(
-                    event.occurred_at.unwrap_or(event.created_at),
-                    &format!("promote|{}", event.id),
-                ),
-                session_id: session_id.clone(),
-                role: match event.kind {
-                    TranscriptEventKind::UserMessage => cormex_store::Role::User,
-                    _ => cormex_store::Role::Assistant,
-                },
-                // The event id travels inside `content`, which is how a fact
-                // extracted from this episode can be traced back to the
-                // transcript line it came from
-                content: serde_json::json!({
-                    "transcript_event_id": event.id,
-                    "text": text,
-                }),
-                text: Some(text.to_owned()),
-                tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(text)),
-                domain: None,
-                device_id: SERVER_DEVICE.to_owned(),
-                occurred_at: event.occurred_at.unwrap_or(event.created_at),
-            };
-            let episode_id = episode.id;
-
-            let written = store
-                .write_txn(async |t| t.insert_episode(&episode).await)
-                .await;
-            match written {
-                Ok(_) => promoted += 1,
-                Err(cormex_store::StoreError::Sql(sqlx::Error::Database(e)))
-                    if e.code().as_deref() == Some("23505") =>
-                {
-                    // Already promoted. Not an error: the progress row was
-                    // lost or the round overlapped
-                    tracing::debug!(session = %session_id, event = %event.id, "already promoted");
-                }
+            match extract_memory_event(store, event, sink).await {
+                Ok(created) => promoted += usize::from(created),
                 Err(e) => {
-                    // **Stop this session here** rather than skipping ahead:
-                    // advancing past an episode that failed to write would
-                    // leave it unextracted forever
-                    tracing::warn!(session = %session_id, error = %e, "could not promote this event");
-                    break;
+                    if last_ok > through_seq {
+                        store
+                            .archive_txn(async |t| {
+                                t.insert_promote_progress(&session_id, last_ok).await
+                            })
+                            .await?;
+                    }
+                    return Err(e);
                 }
-            }
-
-            // ── The extraction, through the same gate as `POST /episodes` ──
-            let ctx = cormex_memory::extract::ExtractContext::new(
-                episode_id,
-                event.occurred_at.unwrap_or(event.created_at),
-            );
-            // The episode is written; only the facts are missing if this
-            // fails. Advancing is right: re-running extraction would need the
-            // episode to be re-promoted, and its id makes that a no-op
-            if let Err(e) = sink.extract(store, text, &ctx).await {
-                tracing::warn!(
-                    session = %session_id,
-                    error = %e,
-                    "the promoted episode could not be extracted; the episode itself is kept"
-                );
             }
 
             last_ok = event.seq;
@@ -833,6 +841,63 @@ pub(crate) async fn promote_round(
         }
     }
     Ok(promoted)
+}
+
+/// The shared archive-event → episode → facts path, used by normal and bounded jobs.
+#[cfg(test)]
+pub(crate) async fn extract_memory_event(
+    store: &Store,
+    event: &TranscriptEvent,
+    sink: &dyn FactSink,
+) -> Result<bool> {
+    let Some(text) = event
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return Ok(false);
+    };
+    if cormex_memory::redaction::scan(text).is_some() {
+        anyhow::bail!("credential-shaped input was blocked")
+    }
+    let episode = NewEpisode {
+        id: Id::derived(
+            event.occurred_at.unwrap_or(event.created_at),
+            &format!("promote|{}", event.id),
+        ),
+        session_id: event.session_id.clone(),
+        role: if event.kind == TranscriptEventKind::UserMessage {
+            cormex_store::Role::User
+        } else {
+            cormex_store::Role::Assistant
+        },
+        content: serde_json::json!({"transcript_event_id":event.id,"text":text}),
+        text: Some(text.to_owned()),
+        tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(text)),
+        domain: None,
+        device_id: SERVER_DEVICE.into(),
+        occurred_at: event.occurred_at.unwrap_or(event.created_at),
+    };
+    let episode_id = episode.id;
+    let created = match store
+        .write_txn(async |t| t.insert_episode(&episode).await)
+        .await
+    {
+        Ok(_) => true,
+        Err(cormex_store::StoreError::Sql(sqlx::Error::Database(e)))
+            if e.code().as_deref() == Some("23505") =>
+        {
+            false
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let ctx = cormex_memory::extract::ExtractContext::new(
+        episode_id,
+        event.occurred_at.unwrap_or(event.created_at),
+    );
+    sink.extract(store, text, &ctx).await?;
+    Ok(created)
 }
 
 /// One vector round (P5-6). Returns how many vectors were written.
@@ -924,19 +989,63 @@ fn split_chunks(text: &str) -> Vec<String> {
 /// The todo query failed, or the store could not be reached.
 pub(crate) async fn project_tick(st: &AppState, tenant: &Tenant) -> Result<usize> {
     let store = tenant.store()?;
+    let mut versions = serde_json::Map::new();
+    for agent in &cormex_proto::catalog::Catalog::builtin().agents {
+        let mut roles = serde_json::Map::new();
+        for role in [
+            cormex_proto::capture::FileRole::Transcript,
+            cormex_proto::capture::FileRole::Subagent,
+            cormex_proto::capture::FileRole::Row,
+        ] {
+            if let Some(parser) = cormex_transcript::parser_for(&agent.id, role) {
+                let name = serde_json::to_value(role)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                roles.insert(name, parser.version().into());
+            }
+        }
+        if !roles.is_empty() {
+            versions.insert(agent.id.clone(), roles.into());
+        }
+    }
+    let retry_failed_secs = std::env::var("CORMEX_ARCHIVE_RETRY_FAILED_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3600);
     let todo = store
-        .sessions_needing_projection("claude_code@1", BATCH)
+        .sessions_needing_projection(&versions.into(), BATCH, retry_failed_secs)
         .await?;
-    let mut written = 0;
-
-    for (session_id, agent) in todo {
+    let concurrency = std::env::var("CORMEX_ARCHIVE_PROJECTION_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let results = futures::stream::iter(todo).map(|(session_id, agent)| async move {
         match project_session(st, store, &session_id, &agent).await {
-            Ok(n) => written += n,
+            Ok(n) => n,
             Err(e) => {
                 // **Recorded, then skipped.** A parser that fails on this input
                 // fails on it every time; retrying every round turns one bad
                 // session into a log flood
                 tracing::warn!(session = %session_id, error = %e, "could not project this session");
+                let version = cormex_transcript::parser_for(
+                    &agent,
+                    cormex_proto::capture::FileRole::Transcript,
+                )
+                .or_else(|| {
+                    cormex_transcript::parser_for(&agent, cormex_proto::capture::FileRole::Row)
+                })
+                .map(|p| p.version())
+                .unwrap_or("unknown");
+                // A failure can occur after earlier batches committed. Preserve
+                // their checkpoint so a retry does not restart at sequence zero.
+                let previous = store
+                    .latest_projection(&session_id, version)
+                    .await
+                    .ok()
+                    .flatten();
                 let _ = store
                     .archive_txn(async |t| {
                         t.insert_transcript_events(
@@ -946,9 +1055,11 @@ pub(crate) async fn project_tick(st: &AppState, tenant: &Tenant) -> Result<usize
                                 session_id: session_id.parse().map_err(|_| {
                                     cormex_store::StoreError::Invalid("bad session id".into())
                                 })?,
-                                parser_version: "claude_code@1".into(),
-                                through: serde_json::json!({}),
-                                next_seq: 0,
+                                parser_version: version.into(),
+                                through: previous
+                                    .as_ref()
+                                    .map_or_else(|| serde_json::json!({}), |p| p.through.clone()),
+                                next_seq: previous.as_ref().map_or(0, |p| p.next_seq),
                                 status: ProjectionStatus::Failed,
                                 error: Some(e.to_string()),
                             },
@@ -956,10 +1067,11 @@ pub(crate) async fn project_tick(st: &AppState, tenant: &Tenant) -> Result<usize
                         .await
                     })
                     .await;
+                0
             }
         }
-    }
-    Ok(written)
+    }).buffer_unordered(concurrency).collect::<Vec<_>>().await;
+    Ok(results.into_iter().sum())
 }
 
 /// Project one session's files.
@@ -996,15 +1108,19 @@ async fn project_session(
         let latest = store
             .latest_projection(session_id, parser.version())
             .await?;
+        let mut through_map = latest
+            .as_ref()
+            .map(|p| p.through.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
         let slot = latest.as_ref().and_then(|p| p.through.get(&generation.id));
 
         let (through, mut parser) = match slot {
-            Some(v) if v.get("parser").is_some() => {
+            Some(v) if v.get("parser").is_some() || v.get("parser_b64").is_some() => {
                 let offset = v
                     .get("offset")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
-                let state = v.get("parser").cloned().unwrap_or(serde_json::Value::Null);
+                let state = checkpoint_parser_state(v)?;
                 // The parser type is known from the agent, so the restore is
                 // dispatched the same way `parser_for` dispatches
                 let restored = restore_parser(agent, file.role, &state)?;
@@ -1044,8 +1160,10 @@ async fn project_session(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             for e in events {
-                let masked_text = cormex_memory::redaction::mask_text(&e.text).into_owned();
+                let masked_text = cormex_memory::redaction::mask_text(&e.text).replace('\0', "�");
                 let content = mask_blocks(&e.content);
+                let mut content = serde_json::to_value(&content)?;
+                sanitize_json_nuls(&mut content);
                 let occurred_at = e.occurred_at.unwrap_or(chunk.created_at);
                 pending.push(NewTranscriptEvent {
                     id: Id::derived(
@@ -1062,11 +1180,11 @@ async fn project_session(
                     seq: next_seq,
                     kind: kind_of(e.kind),
                     occurred_at: Some(occurred_at),
-                    content: serde_json::to_value(&content)?,
+                    content,
                     text: Some(masked_text.clone()),
-                    tsv_source: Some(cormex_memory::tokenize::to_tsvector_input(&masked_text)),
-                    tool_name: e.tool_name,
-                    tool_call_id: e.tool_call_id,
+                    tsv_source: Some(projection_tsv_source(&masked_text)),
+                    tool_name: e.tool_name.map(|s| s.replace('\0', "�")),
+                    tool_call_id: e.tool_call_id.map(|s| s.replace('\0', "�")),
                     src_generation_id: generation.id.parse()?,
                     src_offset: i64::try_from(e.src_offset).unwrap_or(0),
                     src_length: i64::try_from(e.src_length).unwrap_or(0),
@@ -1077,7 +1195,13 @@ async fn project_session(
 
             if pending.len() >= EVENTS_PER_TXN {
                 let batch = std::mem::take(&mut pending);
-                let checkpoint = checkpoint_of(&generation.id, projected_to, parser.checkpoint());
+                merge_checkpoint(
+                    &mut through_map,
+                    &generation.id,
+                    projected_to,
+                    parser.checkpoint(),
+                );
+                let checkpoint = through_map.clone();
                 store
                     .archive_txn(async |t| {
                         t.insert_transcript_events(
@@ -1102,6 +1226,7 @@ async fn project_session(
         }
 
         // The final batch, with `ok` status and the generation marked complete
+        merge_checkpoint(&mut through_map, &generation.id, end, parser.checkpoint());
         store
             .archive_txn(async |t| {
                 t.insert_transcript_events(
@@ -1112,7 +1237,7 @@ async fn project_session(
                             cormex_store::StoreError::Invalid("bad session id".into())
                         })?,
                         parser_version: parser.version().to_owned(),
-                        through: checkpoint_of(&generation.id, end, parser.checkpoint()),
+                        through: through_map.clone(),
                         next_seq,
                         status: ProjectionStatus::Ok,
                         error: None,
@@ -1206,17 +1331,62 @@ fn mask_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
 /// failure is an `Err`, which the caller records as a `failed` projection, so
 /// the symptom would be "the session stopped projecting after the first
 /// append".
-fn checkpoint_of(
+// The conversation text remains intact; archive search separately indexes it
+// in chunks. Bound the per-event vector to avoid PostgreSQL's 1 MiB limit.
+fn projection_tsv_source(text: &str) -> String {
+    let mut end = text.len().min(64 * 1024);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    cormex_memory::tokenize::to_tsvector_input(&text[..end])
+}
+
+fn sanitize_json_nuls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = s.replace('\0', "�"),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(sanitize_json_nuls),
+        serde_json::Value::Object(values) => {
+            let old = std::mem::take(values);
+            for (key, mut value) in old {
+                sanitize_json_nuls(&mut value);
+                values.insert(key.replace('\0', "�"), value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn checkpoint_parser_state(slot: &serde_json::Value) -> Result<serde_json::Value> {
+    if let Some(encoded) = slot.get("parser_b64").and_then(serde_json::Value::as_str) {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    } else {
+        Ok(slot
+            .get("parser")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+}
+
+fn merge_checkpoint(
+    through: &mut serde_json::Value,
     generation_id: &str,
     offset: i64,
     parser_state: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        generation_id: {
-            "offset": offset,
-            "parser": parser_state,
-        }
-    })
+) {
+    if !through.is_object() {
+        *through = serde_json::json!({});
+    }
+    let bytes = serde_json::to_vec(&parser_state).expect("JSON value serializes");
+    let slot = if bytes.windows(6).any(|w| w == b"\\u0000") {
+        serde_json::json!({"offset": offset, "parser_b64": base64::engine::general_purpose::STANDARD.encode(bytes)})
+    } else {
+        serde_json::json!({"offset": offset, "parser": parser_state})
+    };
+    through
+        .as_object_mut()
+        .expect("object")
+        .insert(generation_id.to_owned(), slot);
 }
 
 /// Restore a parser from a stored checkpoint.
@@ -1235,6 +1405,56 @@ fn restore_parser(
             cormex_transcript::codex::CodexParser::restore(state)
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         )),
+        ("gemini_cli", W::Transcript | W::Subagent) => Ok(Box::new(
+            cormex_transcript::gemini::GeminiParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("cursor", W::Transcript | W::Subagent) => Ok(Box::new(
+            cormex_transcript::cursor::CursorParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("cline" | "roo_code", W::Transcript) => Ok(Box::new(
+            cormex_transcript::cline::ClineParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("copilot_chat", W::Transcript) => Ok(Box::new(
+            cormex_transcript::copilot_chat::CopilotChatParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("copilot_cli", W::Transcript) => Ok(Box::new(
+            cormex_transcript::copilot_cli::CopilotCliParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("aider", W::Transcript) => Ok(Box::new(
+            cormex_transcript::aider::AiderParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("qwen_code", W::Transcript) => Ok(Box::new(
+            cormex_transcript::qwen::QwenParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("opencode" | "goose", W::Row) => {
+            let format = if agent == "opencode" {
+                cormex_transcript::rows::RowFormat::OpenCode
+            } else {
+                cormex_transcript::rows::RowFormat::Goose
+            };
+            Ok(Box::new(
+                cormex_transcript::rows::RowParser::restore(format, state)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ))
+        }
+        ("chatgpt_export" | "claude_export", W::Transcript) => {
+            let platform = if agent == "chatgpt_export" {
+                cormex_transcript::export::ExportPlatform::ChatGpt
+            } else {
+                cormex_transcript::export::ExportPlatform::Claude
+            };
+            Ok(Box::new(
+                cormex_transcript::export::ExportParser::restore(platform, state)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ))
+        }
         _ => anyhow::bail!("no parser for {agent}"),
     }
 }
@@ -1274,7 +1494,7 @@ pub fn failed_recently(p: &Projection) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! The masker and the projector, driven directly against a real database.
     //!
     //! The tick functions are `pub(crate)` so a test can call one round without
@@ -1283,6 +1503,114 @@ mod tests {
 
     use super::*;
     use cormex_store::{FileRole, Framing, NewCaptureChunk, NewCaptureFile};
+
+    #[test]
+    fn checkpoints_preserve_progress_of_other_generations() {
+        let mut progress = serde_json::json!({});
+        merge_checkpoint(&mut progress, "first", 10, serde_json::json!({"state": 1}));
+        merge_checkpoint(&mut progress, "second", 20, serde_json::json!({"state": 2}));
+        assert_eq!(progress["first"]["offset"], 10);
+        assert_eq!(progress["second"]["offset"], 20);
+        merge_checkpoint(&mut progress, "first", 15, serde_json::json!({"state": 3}));
+        assert_eq!(progress["first"]["offset"], 15);
+        assert_eq!(progress["second"]["offset"], 20);
+    }
+
+    #[test]
+    fn nul_in_checkpoint_round_trips_and_display_content_is_postgres_safe() {
+        let original = serde_json::json!({"buffer": "a\u{0000}b"});
+        let mut progress = serde_json::json!({});
+        merge_checkpoint(&mut progress, "first", 10, original.clone());
+        assert!(progress["first"].get("parser_b64").is_some());
+        assert_eq!(
+            checkpoint_parser_state(&progress["first"]).unwrap(),
+            original
+        );
+        let mut content = serde_json::json!({"nested": ["a\u{0000}b"]});
+        sanitize_json_nuls(&mut content);
+        assert_eq!(content["nested"][0], "a�b");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_projector_accepts_a_nul_in_a_message() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let body = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"before\\u0000after\"}}\n";
+        let store = st.public_store().unwrap();
+        let (session, _) = seed(&store, "claude_code", body).await;
+        store_object(&st, body).await;
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        assert_eq!(project_tick(&st, &tenant).await.unwrap(), 1);
+        let events = store
+            .transcript_page(&session, "claude_code@1", -1, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.as_deref().unwrap().contains("before�after"));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_projector_keeps_long_message_text_without_overflowing_tsvector() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let content = (0..120_000)
+            .map(|n| format!("word{n:06} "))
+            .collect::<String>();
+        let body = format!(
+            "{}\n",
+            serde_json::json!({"type":"user", "message":{"role":"user", "content":content}})
+        );
+        let store = st.public_store().unwrap();
+        let (session, _) = seed(&store, "claude_code", body.as_bytes()).await;
+        store_object(&st, body.as_bytes()).await;
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        assert_eq!(project_tick(&st, &tenant).await.unwrap(), 1);
+        let events = store
+            .transcript_page(&session, "claude_code@1", -1, 10)
+            .await
+            .unwrap();
+        assert_eq!(events[0].text.as_deref(), Some(content.as_str()));
+        db.drop().await;
+    }
+
+    #[test]
+    fn all_catalogued_parsers_can_restore_their_checkpoint() {
+        use cormex_proto::capture::FileRole as W;
+        use cormex_store::FileRole as S;
+        for agent in &cormex_proto::catalog::Catalog::builtin().agents {
+            for (role, stored) in [
+                (W::Transcript, S::Transcript),
+                (W::Subagent, S::Subagent),
+                (W::Row, S::Row),
+            ] {
+                if let Some(parser) = cormex_transcript::parser_for(&agent.id, role) {
+                    let restored = restore_parser(&agent.id, stored, &parser.checkpoint());
+                    assert!(
+                        restored.is_ok(),
+                        "{} {:?}: {:?}",
+                        agent.id,
+                        role,
+                        restored.err()
+                    );
+                }
+            }
+        }
+    }
 
     /// Register a file with one chunk of `body`, returning
     /// `(session_id, generation_id)`.
@@ -1326,6 +1654,36 @@ mod tests {
             .await
             .expect("append");
         (session_id, generation_id)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn projection_queue_uses_each_agents_version() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let (codex, generation) = seed(&store, "codex", b"12345").await;
+        let (claude, _) = seed(&store, "claude_code", b"12345").await;
+        store
+            .archive_txn(async |t| {
+                t.insert_transcript_events(&[], &NewProjection {
+            id: Id::new(), session_id: codex.parse().unwrap(), parser_version: "codex@1".into(),
+            through: serde_json::json!({(generation.clone()): {"offset": 5, "parser": {}}}),
+            next_seq: 0, status: ProjectionStatus::Ok, error: None,
+        }).await
+            })
+            .await
+            .unwrap();
+        let versions = serde_json::json!({"codex": {"transcript": "codex@1"}, "claude_code": {"transcript": "claude_code@1"}});
+        let todo = store
+            .sessions_needing_projection(&versions, 20, 3600)
+            .await
+            .unwrap();
+        assert_eq!(todo, vec![(claude, "claude_code".into())]);
+        db.drop().await;
     }
 
     /// Register a file **without** appending a chunk, returning
@@ -1854,6 +2212,129 @@ mod tests {
     }
 
     /// The same event is never promoted twice.
+    #[tokio::test]
+    #[ignore = "needs a database"]
+    async fn memory_context_batches_subject_and_source_without_source_body() {
+        let base = crate::test_support::database_url().unwrap();
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let body=br#"{"type":"user","message":{"role":"user","content":"opaque source body for context test"}}
+"#;
+        let (session, tenant) = seed_projected_session(&st, &store, body).await;
+        promote_round(&st, &tenant, &FakeFactSink::new())
+            .await
+            .unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM facts")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+        let rows = store.memory_contexts(&ids).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "RustFS");
+        assert_eq!(rows[0].session_id, session);
+        assert_eq!(rows[0].source_role, "user");
+        assert_eq!(rows[0].extraction_unit, "single_message");
+        assert!(
+            !serde_json::to_string(&rows)
+                .unwrap()
+                .contains("opaque source body")
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database"]
+    async fn browser_snapshots_do_not_drop_rows_at_agent_score_threshold() {
+        let base = crate::test_support::database_url().unwrap();
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let body=(0..40).map(|i|format!("{}\n",serde_json::json!({"type":"user","message":{"role":"user","content":format!("durable preference {i}")}}))).collect::<String>();
+        let (_id, tenant) = seed_projected_session(&st, &store, body.as_bytes()).await;
+        let sink = FakeFactSink::new();
+        for _ in 0..20 {
+            if store
+                .sessions_needing_promotion(1)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            promote_round(&st, &tenant, &sink).await.unwrap();
+        }
+        assert_eq!(sink.calls(), 40);
+        let result = st
+            .memory_search(
+                &tenant,
+                crate::dto::MemorySearchQuery {
+                    q: String::new(),
+                    limit: 100,
+                    as_of: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.facts.len(),
+            40,
+            "browser snapshots must not apply the agent's 1/rank cutoff or token budget"
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn extraction_failure_preserves_progress_and_can_retry() {
+        let base = crate::test_support::database_url().expect("database URL");
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let body =
+            br#"{"type":"user","message":{"role":"user","content":"first durable preference"}}
+{"type":"user","message":{"role":"user","content":"second durable preference"}}
+"#;
+        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+        struct FailSecond {
+            inner: FakeFactSink,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl FactSink for FailSecond {
+            async fn extract(
+                &self,
+                s: &Store,
+                text: &str,
+                ctx: &cormex_memory::extract::ExtractContext,
+            ) -> anyhow::Result<()> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    anyhow::bail!("temporary model failure")
+                }
+                self.inner.extract(s, text, ctx).await
+            }
+        }
+        let sink = FailSecond {
+            inner: FakeFactSink::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(promote_round(&st, &tenant, &sink).await.is_err());
+        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 0, 1));
+        assert_eq!(store.sessions_needing_promotion(10).await.unwrap()[0].1, 0);
+        let retry = FakeFactSink::new();
+        promote_round(&st, &tenant, &retry).await.unwrap();
+        assert_eq!(retry.calls(), 1);
+        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 1, 2));
+        let mut settings = crate::memory_settings::defaults(&st);
+        settings.enabled = false;
+        store
+            .save_memory_extraction_settings(&settings)
+            .await
+            .unwrap();
+        assert_eq!(promote_round(&st, &tenant, &retry).await.unwrap(), 0);
+        db.drop().await;
+    }
+
     #[tokio::test]
     #[ignore = "needs a database; run with just test-db"]
     async fn promotion_is_idempotent() {
@@ -2457,7 +2938,11 @@ mod tests {
         pool.close().await;
     }
 
-    async fn seed_projected_session(st: &AppState, store: &Store, body: &[u8]) -> (String, Tenant) {
+    pub(crate) async fn seed_projected_session(
+        st: &AppState,
+        store: &Store,
+        body: &[u8],
+    ) -> (String, Tenant) {
         let (session, _generation) = seed(store, "claude_code", body).await;
         store_object(st, body).await;
         let tenant = Tenant::Live {

@@ -16,6 +16,70 @@ use crate::error::Result;
 use crate::store::Store;
 
 impl Store {
+    pub async fn archive_projects(
+        &self,
+        agent: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<Vec<crate::ArchiveProjectRow>> {
+        Ok(sqlx::query_as(
+            "WITH candidates AS (
+               SELECT s.id,
+                 CASE WHEN m.session_id IS NOT NULL THEN m.project_id ELSE f.project_key END AS project_key,
+                 m.project_name,
+                 coalesce(nullif(m.title,''), CASE WHEN $2::text IS NOT NULL THEN
+                   (SELECT e.text FROM transcript_events e WHERE e.session_id=s.id AND e.kind='user_message'
+                     AND e.text IS NOT NULL AND e.text<>''
+                     AND (s.agent<>'codex' OR (e.text NOT LIKE '# AGENTS.md instructions%'
+                       AND e.text NOT LIKE '<environment_context>%' AND e.text NOT LIKE '<recommended_plugins>%'
+                       AND e.text NOT LIKE '<permissions instructions>%' AND e.text NOT LIKE '<external_codex_apps_open_page>%'
+                       AND e.text NOT LIKE '<user_instructions>%')) ORDER BY e.seq LIMIT 1) END,'') AS title
+               FROM capture_sessions s
+               LEFT JOIN LATERAL (SELECT session_id,project_id,project_name,title FROM capture_session_ui_metadata
+                 WHERE session_id=s.id ORDER BY updated_at DESC LIMIT 1) m ON true
+               LEFT JOIN LATERAL (SELECT min(project_key) AS project_key FROM capture_files
+                 WHERE session_id=s.id AND project_key IS NOT NULL) f ON m.session_id IS NULL
+               WHERE ($1::text IS NULL OR s.agent=$1) AND EXISTS(SELECT 1 FROM transcript_events e WHERE e.session_id=s.id)
+             ) SELECT project_key AS key,max(project_name) AS name,count(*) AS chat_count FROM candidates
+               WHERE $2::text IS NULL OR strpos(lower(title),lower($2))>0
+                 OR strpos(lower(coalesce(project_name,project_key,'')),lower($2))>0
+               GROUP BY project_key ORDER BY project_key IS NULL,coalesce(max(project_name),project_key)")
+            .bind(agent).bind(query).fetch_all(self.pool()).await?)
+    }
+
+    pub async fn message_counts_pending(
+        &self,
+        versions: &serde_json::Value,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT s.id,s.agent,p.parser_version,p.id,(SELECT count(*) FROM transcript_events e WHERE e.session_id=s.id) FROM capture_sessions s
+             JOIN LATERAL (SELECT id,parser_version,next_seq,status,created_at FROM transcript_projections
+                WHERE session_id=s.id AND parser_version=($1::jsonb ->> s.agent)
+                ORDER BY created_at DESC,id DESC LIMIT 1) p ON true
+             WHERE p.status='ok' AND NOT EXISTS (SELECT 1 FROM archive_message_counts c
+                WHERE c.session_id=s.id AND c.projection_id=p.id AND c.rule_version='conversation@1'
+                  AND (c.message_count IS NOT NULL OR c.updated_at > now() - interval '10 minutes'))
+             ORDER BY p.created_at DESC LIMIT $2")
+            .bind(versions).bind(limit.clamp(1, 100)).fetch_all(self.pool()).await?)
+    }
+
+    pub async fn conversation_candidates(
+        &self,
+        session: &str,
+        version: &str,
+        after: i64,
+    ) -> Result<Vec<TranscriptEvent>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM transcript_events WHERE session_id=$1 AND parser_version=$2
+            AND kind IN ('user_message','agent_message') AND seq>$3 ORDER BY seq LIMIT 200",
+        )
+        .bind(session)
+        .bind(version)
+        .bind(after)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// One logical file, by the key that identifies it.
     pub async fn capture_file(
         &self,
@@ -76,11 +140,13 @@ impl Store {
     /// Returns `(session_id, agent)` — the agent picks the parser.
     pub async fn sessions_needing_projection(
         &self,
-        parser_version_filter: &str,
+        parser_versions: &serde_json::Value,
         limit: i64,
+        retry_failed_secs: i32,
     ) -> Result<Vec<(String, String)>> {
-        // A session is done when every one of its generations is fully
-        // projected. `through` is a JSON map from generation id to a **record**
+        // The projector reads the latest generation of each file; earlier
+        // generations remain archived but must not keep re-entering its queue.
+        // `through` is a JSON map from generation id to a **record**
         // — `{offset, parser}` — not a bare number: the offset alone cannot
         // resume a parser, because the parser holds a line buffer and feeding
         // it a chunk that starts mid-file fails its contiguity check.
@@ -91,15 +157,21 @@ impl Store {
             "SELECT DISTINCT s.id, s.agent
                FROM capture_sessions s
                JOIN capture_files f ON f.session_id = s.id
-               JOIN capture_generations g ON g.file_id = f.id
+               JOIN LATERAL (
+                    SELECT g0.id FROM capture_generations g0
+                     WHERE g0.file_id = f.id
+                     ORDER BY g0.ordinal DESC LIMIT 1
+               ) g ON true
                JOIN capture_chunks c ON c.generation_id = g.id
                LEFT JOIN LATERAL (
-                    SELECT p.through
+                    SELECT p.through, p.status, p.created_at
                       FROM transcript_projections p
-                     WHERE p.session_id = s.id AND p.parser_version = $1
+                     WHERE p.session_id = s.id AND p.parser_version = ($1::jsonb -> s.agent ->> f.role::text)
                      ORDER BY p.created_at DESC, p.id DESC
                      LIMIT 1
                ) prog ON true
+              WHERE ($1::jsonb -> s.agent ->> f.role::text) IS NOT NULL
+                AND (prog.status IS NULL OR prog.status <> 'failed' OR prog.created_at < now() - make_interval(secs => $3))
               GROUP BY s.id, s.agent, g.id, prog.through
              HAVING coalesce(max(c.byte_offset + c.byte_length), 0)
                     > coalesce(
@@ -109,8 +181,9 @@ impl Store {
               ORDER BY s.id
               LIMIT $2",
         )
-        .bind(parser_version_filter)
+        .bind(parser_versions)
         .bind(limit.clamp(1, 1000))
+        .bind(retry_failed_secs.max(1))
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
@@ -167,6 +240,35 @@ impl Store {
         after: Option<(&DateTime<Utc>, &str)>,
         limit: i64,
     ) -> Result<Vec<ArchiveSessionRow>> {
+        self.archive_sessions_filtered_at(
+            agent,
+            project_key,
+            since,
+            until,
+            at,
+            as_of,
+            after,
+            limit,
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn archive_sessions_filtered_at(
+        &self,
+        agent: Option<&str>,
+        project_key: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        at: Option<DateTime<Utc>>,
+        as_of: Option<DateTime<Utc>>,
+        after: Option<(&DateTime<Utc>, &str)>,
+        limit: i64,
+        query: Option<&str>,
+        unassigned: bool,
+    ) -> Result<Vec<ArchiveSessionRow>> {
         let rows = sqlx::query_as::<_, ArchiveSessionRow>(
             "WITH agg AS (
                  SELECT s.id, s.agent,
@@ -178,25 +280,37 @@ impl Store {
                   WHERE ($8::timestamptz IS NULL OR e.occurred_at <= $8)
                     AND ($9::timestamptz IS NULL OR e.created_at <= $9)
                   GROUP BY s.id, s.agent
-             )
+             ), candidates AS (
              SELECT a.id, a.agent, a.first_at, a.last_at, a.event_count,
+                    (SELECT c.message_count FROM archive_message_counts c WHERE c.session_id=a.id AND $8::timestamptz IS NULL AND $9::timestamptz IS NULL AND c.rule_version='conversation@1' AND c.projection_id=(SELECT p.id FROM transcript_projections p WHERE p.session_id=a.id AND p.parser_version=c.parser_version ORDER BY p.created_at DESC,p.id DESC LIMIT 1)) AS message_count,
                     (SELECT e.text FROM transcript_events e
                       WHERE e.session_id = a.id AND e.kind = 'user_message'
                         AND e.text IS NOT NULL AND e.text <> ''
+                        AND (a.agent <> 'codex' OR (e.text NOT LIKE '# AGENTS.md instructions%'
+                          AND e.text NOT LIKE '<environment_context>%'
+                          AND e.text NOT LIKE '<recommended_plugins>%'
+                          AND e.text NOT LIKE '<permissions instructions>%'
+                          AND e.text NOT LIKE '<external_codex_apps_open_page>%'
+                          AND e.text NOT LIKE '<user_instructions>%'))
                       ORDER BY e.seq ASC LIMIT 1) AS title_source,
-                    (SELECT min(f.project_key) FROM capture_files f
-                      WHERE f.session_id = a.id AND f.project_key IS NOT NULL) AS project_key,
+                    (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
+                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=a.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=a.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_files f WHERE f.session_id=a.id AND f.project_key IS NOT NULL) END AS project_key,
+                    (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
+                    (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
+                    (a.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = a.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
                     (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f
                       WHERE f.session_id = a.id) AS devices
                FROM agg a
               WHERE ($1::text IS NULL OR a.agent = $1)
-                AND ($2::text IS NULL OR EXISTS (
-                        SELECT 1 FROM capture_files f
-                         WHERE f.session_id = a.id AND f.project_key = $2))
                 AND ($3::timestamptz IS NULL OR a.last_at >= $3)
                 AND ($4::timestamptz IS NULL OR a.first_at <= $4)
                 AND ($5::timestamptz IS NULL OR (a.last_at, a.id) < ($5, $6))
-              ORDER BY a.last_at DESC, a.id DESC
+             ) SELECT * FROM candidates
+              WHERE ($2::text IS NULL OR project_key=$2)
+                AND (NOT $11 OR project_key IS NULL)
+                AND ($10::text IS NULL OR strpos(lower(coalesce(nullif(original_title,''),title_source,'')),lower($10))>0
+                     OR strpos(lower(coalesce(project_name,project_key,'')),lower($10))>0)
+              ORDER BY last_at DESC, id DESC
               LIMIT $7",
         )
         .bind(agent)
@@ -208,6 +322,8 @@ impl Store {
         .bind(limit.clamp(1, 200))
         .bind(at)
         .bind(as_of)
+        .bind(query)
+        .bind(unassigned)
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
@@ -220,12 +336,22 @@ impl Store {
                     min(e.occurred_at) AS first_at,
                     max(e.occurred_at) AS last_at,
                     count(*)           AS event_count,
+                    (SELECT c.message_count FROM archive_message_counts c WHERE c.session_id=s.id AND c.rule_version='conversation@1' AND c.projection_id=(SELECT p.id FROM transcript_projections p WHERE p.session_id=s.id AND p.parser_version=c.parser_version ORDER BY p.created_at DESC,p.id DESC LIMIT 1)) AS message_count,
                     (SELECT e.text FROM transcript_events e
                       WHERE e.session_id = s.id AND e.kind = 'user_message'
                         AND e.text IS NOT NULL AND e.text <> ''
+                        AND (s.agent <> 'codex' OR (e.text NOT LIKE '# AGENTS.md instructions%'
+                          AND e.text NOT LIKE '<environment_context>%'
+                          AND e.text NOT LIKE '<recommended_plugins>%'
+                          AND e.text NOT LIKE '<permissions instructions>%'
+                          AND e.text NOT LIKE '<external_codex_apps_open_page>%'
+                          AND e.text NOT LIKE '<user_instructions>%'))
                       ORDER BY e.seq ASC LIMIT 1) AS title_source,
-                    (SELECT min(f.project_key) FROM capture_files f
-                      WHERE f.session_id = s.id AND f.project_key IS NOT NULL) AS project_key,
+                    (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
+                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=s.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_files f WHERE f.session_id=s.id AND f.project_key IS NOT NULL) END AS project_key,
+                    (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
+                    (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
+                    (s.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = s.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
                     (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f
                       WHERE f.session_id = s.id) AS devices
                FROM capture_sessions s

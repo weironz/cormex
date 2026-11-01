@@ -176,11 +176,11 @@ impl Installer for Scheduler {
                 .context("could not run schtasks")?;
             anyhow::ensure!(status.success(), "schtasks exited with {status}");
             db.record_install("scheduler", &self.target.display().to_string(), None)?;
-            return Ok(vec![Change {
+            Ok(vec![Change {
                 kind: "scheduler".into(),
                 target: self.target.clone(),
                 description: "registered the cormex-sync scheduled task".into(),
-            }]);
+            }])
         }
 
         #[cfg(not(windows))]
@@ -228,7 +228,7 @@ impl Installer for Scheduler {
                 .args(["/Delete", "/TN", "cormex-sync", "/F"])
                 .status();
             db.forget_install("scheduler", &self.target.display().to_string())?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(windows))]

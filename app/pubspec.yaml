@@ -4,7 +4,7 @@ publish_to: 'none'
 
 # 与根 Cargo.toml 的 [workspace.package] version 保持一致（`+N` 是 Flutter 的
 # build number，不参与比较）。
-version: 0.1.11+4
+version: 0.1.13+5
 
 environment:
   sdk: ^3.12.1
@@ -26,6 +26,7 @@ dependencies:
   # 声明的传递依赖，等哪天别的包不再依赖它就当场断。
   web: ^1.1.0
   flutter_secure_storage: ^10.3.1
+  flutter_markdown_plus: ^1.0.12
 
 dev_dependencies:
   flutter_test:

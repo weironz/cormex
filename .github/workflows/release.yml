@@ -1,25 +1,13 @@
 name: Release
 
 # ══════════════════════════════════════════════════════════
-#  Release pipeline -- builds and pushes cormex's docker image.
+#  Release pipeline -- server/Web images and capture CLI archives.
 #
 #  Triggers: a manual workflow_dispatch, which requires a tag.
 #
-#  ★ **The `push: tags` trigger is commented out, not deleted.** GitHub Actions
-#    minutes are exhausted, and a tag push would spend a quarter of an hour of
-#    them without warning. Until the quota is restored, releases are cut with
-#    `just release <version>` (see the justfile), which runs the same preflight,
-#    the same builds and the same smoke tests locally and then pushes.
-#
-#    Restoring the trigger is deleting the two comment markers below. Do that
-#    only once `just release` has been run at least once, so the local path is
-#    known to work rather than assumed to.
-#
-#  ── Images only, no bare binaries ─────────────────────────
-#  This is a memory service: it needs Postgres + pgvector to run at all, and compose is
-#  the only shape it is actually deployed in. Shipping a "download and go" binary would
-#  offer an installation path that does not work. Anyone who does not want docker goes
-#  through `cargo install --git`.
+#  The `push: tags` trigger remains commented out. Publishing is explicitly
+#  requested through workflow_dispatch against an existing release tag.
+#  The CLI platform matrix below is independent of the two Linux images.
 #
 #  ── The version line is independent of Cormex's ───────────
 #  Cormex and its companion release their own versions, sharing no tags and not aligning
@@ -37,8 +25,7 @@ on:
         description: The tag to use for a manual release (of the form v0.1.0)
         required: true
 
-# Read-only. This pipeline creates no release and changes nothing in the repository; its
-# only write operations happen on two registries (through secrets, not GITHUB_TOKEN)
+# Default to read-only; only cli-release can write GitHub Release assets.
 permissions:
   contents: read
 
@@ -57,26 +44,37 @@ jobs:
     name: Preflight checks
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.source.outputs.commit }}
     steps:
-      - uses: actions/checkout@v5
-
       # The tag is resolved once, here. `github.ref_name || inputs.tag` is deliberately not
       # used: on a workflow_dispatch, ref_name is the **branch name** and therefore always
       # truthy, so the right-hand side of `||` can never be reached, and a manual release
       # would push things like `cormex:vmain`
       - name: Resolve the tag
         id: resolve
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
             tag="${GITHUB_REF_NAME}"
           else
-            tag="${{ inputs.tag }}"
+            tag="$REQUESTED_TAG"
           fi
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "::error::tag '$tag' is not valid, it must be vX.Y.Z"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ steps.resolve.outputs.tag }}
+
+      - name: Pin the release source
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Parsed with tomllib rather than grep: `version = ` appears a dozen times in
       # Cargo.toml (once per workspace dependency), which line grep catches depends on the
@@ -97,21 +95,8 @@ jobs:
 
       # ── The lock-file gate ────────────────────────────────
       #
-      # The `cargo build --release` inside the Dockerfile has **no `--locked`**, and this
-      # pipeline is only allowed to change files under .github/workflows/ -- which means
-      # "use the lock file when building" cannot be passed in from the build-push-action
-      # side (the Dockerfile takes no ARG, and cargo has no equivalent environment variable).
-      #
-      # So the guarantee is moved forward to here: `--locked` makes cargo fail outright when
-      # "what resolution produces" disagrees with Cargo.lock, without resolving and without
-      # touching the file. What this guards against is precisely the pgvector landmine --
-      # its sqlx dependency range spans a semver group, and allowing re-resolution pulls
-      # sqlx back to 0.8 and leaves two copies of sqlx-core coexisting (see CLAUDE.md).
-      # Once the lock file has been confirmed self-consistent here, the flagless build
-      # inside the image can only follow it.
-      #
-      # The real fix is to add `--locked` to the Dockerfile's cargo build; this gate is
-      # only its stand-in.
+      # Fail before compiling if Cargo.lock disagrees with the manifests.
+      # The Dockerfile and CLI builds also use --locked to preserve this resolution.
       - uses: dtolnay/rust-toolchain@stable
       - name: Cargo.lock is consistent with the manifests
         run: cargo metadata --locked --format-version 1 > /dev/null
@@ -135,6 +120,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -265,6 +252,8 @@ jobs:
             zigbuild: false
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -290,15 +279,17 @@ jobs:
             cargo build --release --locked -p cormex --target ${{ matrix.target }}
           fi
 
-      # The binary has to answer `--version` **on the platform it was built
-      # for**. For the two cross-compiled targets that cannot be checked here
-      # (no emulator), so the check runs on the four native ones and the cross
-      # ones are covered by the installers' smoke test on a real machine.
+      # Execute only a native binary; cross targets require a matching host.
       - name: Smoke test
         if: ${{ !matrix.zigbuild }}
         shell: bash
         run: |
           set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "${{ matrix.target }}" != "$host" ]; then
+            echo "Skipping execution of ${{ matrix.target }} on $host"
+            exit 0
+          fi
           v="${{ needs.preflight.outputs.version }}"
           bin="target/${{ matrix.target }}/release/cormex"
           [ -f "$bin.exe" ] && bin="$bin.exe"
@@ -331,7 +322,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.target }}
-          path: dist/*
+          path: dist/cormex-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
   # ══════════════════════════════════════════════════════════
@@ -345,6 +336,8 @@ jobs:
     name: Publish the CLI
     needs: [preflight, cli]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       # Job-level, not step-level: a step's own `env` is not visible to its own
       # `if`, so `if: env.NPM_TOKEN != ''` with `env:` on the same step is
@@ -354,6 +347,8 @@ jobs:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -364,15 +359,17 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload to the Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
-          # The tag already exists (it is what triggered this run); this only
-          # attaches the files to it
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
 
       # npm is **optional**: without `NPM_TOKEN` the step is skipped and the
@@ -412,6 +409,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3

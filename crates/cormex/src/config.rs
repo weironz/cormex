@@ -182,8 +182,12 @@ impl Dirs {
             )
         })?;
         Ok(Self {
-            config: base.config_dir().to_path_buf(),
-            data: base.data_dir().to_path_buf(),
+            config: std::env::var_os("CORMEX_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .map_or_else(|| base.config_dir().to_path_buf(), PathBuf::from),
+            data: std::env::var_os("CORMEX_DATA_DIR")
+                .filter(|v| !v.is_empty())
+                .map_or_else(|| base.data_dir().to_path_buf(), PathBuf::from),
         })
     }
 }

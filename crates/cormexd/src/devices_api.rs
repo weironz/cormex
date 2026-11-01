@@ -205,6 +205,28 @@ pub async fn token(
 /// # Errors
 /// The caller is a device key or a delegated token (403), the code is unknown
 /// or expired (404), or minting the key failed.
+pub async fn inspect_authorization(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Json(req): Json<ConfirmRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !matches!(principal, Principal::User { .. } | Principal::LegacyOwner) {
+        return Err(ApiError::forbidden(
+            "only a user may approve a device login",
+        ));
+    }
+    let pending = st
+        .device_codes()
+        .by_user_code(&req.user_code)
+        .filter(|p| p.approved_by.is_none())
+        .ok_or_else(|| {
+            ApiError::not_found("no pending login with that code; it may have expired")
+        })?;
+    Ok(Json(
+        serde_json::json!({"label": pending.label, "scopes": pending.scopes, "platform": pending.platform}),
+    ))
+}
+
 pub async fn confirm(
     State(st): State<AppState>,
     axum::Extension(principal): axum::Extension<Principal>,
@@ -251,7 +273,7 @@ pub async fn confirm(
     // Mint now rather than on the poll: the person has just confirmed, and a
     // key that is created here is a key whose creation time is the moment of
     // consent
-    let issued = st
+    let issued = match st
         .device_keys()
         .issue(
             &user_id,
@@ -259,7 +281,14 @@ pub async fn confirm(
             &pending.scopes,
             pending.platform.as_deref(),
         )
-        .await?;
+        .await
+    {
+        Ok(issued) => issued,
+        Err(error) => {
+            st.device_codes().release_approval(&req.user_code, &user_id);
+            return Err(error);
+        }
+    };
     st.device_codes()
         .set_issued(&pending.user_code, issued.clone());
 

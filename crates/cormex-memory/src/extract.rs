@@ -923,9 +923,18 @@ pub struct Extractor {
     trace_rules: TraceRules,
     device_id: String,
     entity_match_threshold: f32,
+    revalidated_predicates: BTreeSet<String>,
+    memory_evidence: HashMap<String, u8>,
 }
 
 impl Extractor {
+    /// Use an account's model while preserving entity resolution and rules.
+    #[must_use]
+    pub fn with_llm(mut self, llm: LlmClient) -> Self {
+        self.llm = llm;
+        self
+    }
+
     pub fn new(llm: LlmClient, embedder: SharedEmbedder, device_id: impl Into<String>) -> Self {
         Self {
             llm,
@@ -935,12 +944,33 @@ impl Extractor {
             trace_rules: TraceRules::default(),
             device_id: device_id.into(),
             entity_match_threshold: DEFAULT_ENTITY_MATCH_THRESHOLD,
+            revalidated_predicates: BTreeSet::new(),
+            memory_evidence: HashMap::new(),
         }
     }
 
     #[must_use]
     pub fn with_rules(mut self, rules: PredicateRules) -> Self {
         self.rules = rules;
+        self
+    }
+    #[must_use]
+    pub fn with_functional_predicates(mut self, predicates: Vec<String>) -> Self {
+        self.rules = self.rules.with_functional(predicates);
+        self
+    }
+    /// Refresh equal-value provenance only after stronger source validation.
+    #[must_use]
+    pub fn with_revalidated_predicates(mut self, predicates: Vec<String>) -> Self {
+        self.revalidated_predicates = predicates.iter().map(|p| normalize_predicate(p)).collect();
+        self
+    }
+    #[must_use]
+    pub fn with_memory_evidence(mut self, evidence: Vec<(String, u8)>) -> Self {
+        self.memory_evidence = evidence
+            .into_iter()
+            .map(|(p, r)| (normalize_predicate(&p), r))
+            .collect();
         self
     }
 
@@ -1175,6 +1205,17 @@ impl Extractor {
 
         for ((candidate, source), vector) in candidates.into_iter().zip(vectors) {
             let subject_id = resolver.require(&candidate.subject)?;
+            if let Some(rank) = self
+                .memory_evidence
+                .get(&normalize_predicate(&candidate.predicate))
+                && store
+                    .strongest_memory_rank(subject_id, &candidate.predicate)
+                    .await?
+                    > i32::from(*rank)
+            {
+                report.duplicates += 1;
+                continue;
+            }
             let object_entity_id = match &candidate.object {
                 ObjectRef::Entity(e) => Some(resolver.require(e)?),
                 ObjectRef::Literal(_) => None,
@@ -1198,7 +1239,25 @@ impl Extractor {
             rivals.extend(pending.get(&slot).cloned().unwrap_or_default());
 
             let functional = self.rules.is_functional(&candidate.predicate);
-            let verdict = decide(&key, effective_at, functional, &rivals);
+            let verdict = if self
+                .revalidated_predicates
+                .contains(&normalize_predicate(&candidate.predicate))
+                && rivals
+                    .iter()
+                    .any(|r| r.object_key == key && effective_at >= r.effective_at)
+            {
+                Verdict::Write {
+                    supersede: rivals
+                        .iter()
+                        .filter(|r| effective_at >= r.effective_at)
+                        .map(|r| r.fact_id)
+                        .collect(),
+                    flag: Vec::new(),
+                    invalid_at: effective_at,
+                }
+            } else {
+                decide(&key, effective_at, functional, &rivals)
+            };
 
             let (supersede, flag, invalid_at) = match verdict {
                 Verdict::Duplicate => {

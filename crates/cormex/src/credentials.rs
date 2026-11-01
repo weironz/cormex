@@ -144,17 +144,36 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 }
 
 fn keyring_get(server_url: &str) -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, server_url).ok()?;
-    entry.get_password().ok().filter(|k| !k.trim().is_empty())
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    {
+        let _ = server_url;
+        return None;
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+    {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, server_url).ok()?;
+        entry.get_password().ok().filter(|k| !k.trim().is_empty())
+    }
 }
 
 fn keyring_set(server_url: &str, key: &str) -> bool {
-    keyring::Entry::new(KEYRING_SERVICE, server_url)
-        .and_then(|e| e.set_password(key))
-        .is_ok()
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    {
+        let _ = (server_url, key);
+        return false;
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+    {
+        keyring::Entry::new(KEYRING_SERVICE, server_url)
+            .and_then(|e| e.set_password(key))
+            .is_ok()
+    }
 }
 
 fn keyring_delete(server_url: &str) {
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    let _ = server_url;
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, server_url) {
         let _ = entry.delete_credential();
     }

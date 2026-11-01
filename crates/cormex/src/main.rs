@@ -50,6 +50,9 @@ enum SourcesAction {
 enum Command {
     /// Log in and store a device key on this machine.
     Login {
+        /// Replace the current device login even if it is still valid.
+        #[arg(long)]
+        force: bool,
         /// The server's base URL. Required the first time.
         #[arg(long)]
         server: Option<String>,
@@ -110,6 +113,12 @@ enum Command {
     },
     /// Upload the session files that changed since the last run.
     Sync {
+        /// Only scan and upload this agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Also upload Codex's local titles, project assignments and pins.
+        #[arg(long)]
+        codex_metadata: bool,
         /// Only this logical path.
         #[arg(long)]
         source: Option<String>,
@@ -119,6 +128,12 @@ enum Command {
         /// Seconds this run may spend.
         #[arg(long, default_value_t = 60)]
         budget_secs: u64,
+        /// Run a scheduled scan.
+        #[arg(long, conflicts_with = "queue")]
+        once: bool,
+        /// Process changes recorded by hooks.
+        #[arg(long, conflicts_with = "once")]
+        queue: bool,
     },
     /// Called by the host's hooks. Reads stdin, queues, exits 0 -- always.
     Hook {
@@ -139,6 +154,9 @@ enum Command {
         /// Run the backfill after applying the changes.
         #[arg(long)]
         backfill: bool,
+        /// Skip the initial history upload.
+        #[arg(long, conflicts_with = "backfill")]
+        no_backfill: bool,
     },
     /// Undo every change `init` made.
     Uninstall {
@@ -175,6 +193,28 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_and_hook_sync_arguments_are_accepted() {
+        assert!(matches!(
+            Cli::try_parse_from(["cormex", "sync", "--once"])
+                .unwrap()
+                .command,
+            Command::Sync { once: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cormex", "sync", "--queue"])
+                .unwrap()
+                .command,
+            Command::Sync { queue: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["cormex", "sync", "--queue", "--once"]).is_err());
+    }
 }
 
 #[derive(Subcommand)]
@@ -250,6 +290,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
     match cli.command {
         Command::Login {
+            force,
             server,
             label,
             scopes,
@@ -257,6 +298,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             device_code,
             username,
         } => {
+            if !force
+                && server.is_none()
+                && label.is_none()
+                && scopes.is_empty()
+                && key.is_none()
+                && !device_code
+                && username.is_none()
+                && let Ok((existing, _)) = cormex::credentials::load(&dirs.config, &cfg.server_url)
+                && let Ok(client) = cormex::ApiClient::new(&cfg.server_url, &existing)
+            {
+                match client
+                    .get_json::<cormex_proto::auth::WhoAmI>("/auth/me")
+                    .await
+                {
+                    Ok(me) => {
+                        println!(
+                            "already logged in as {}. Use `cormex login --force` to log in again.",
+                            me.username
+                        );
+                        return Ok(ExitCode::Ok);
+                    }
+                    Err(error) if error.code == ExitCode::Unreachable => {
+                        return Err(anyhow::anyhow!("cannot verify the existing login: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
             if let Some(server) = server {
                 cfg.server_url = login::resolve_server_url(&server).await?;
             }
@@ -393,31 +461,87 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::Ok)
         }
         Command::Sync {
+            agent,
+            codex_metadata,
             source,
             dry_run,
             budget_secs,
+            once,
+            queue,
         } => {
             let (key, _source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
             let client = cormex::ApiClient::new(&cfg.server_url, &key)?;
-            let api = cormex::sync::api::HttpCaptureApi::new(client);
+            let api = cormex::sync::api::HttpCaptureApi::new(client.clone());
             let db = cormex::StateDb::open(&dirs.data)?;
-            let catalog = cormex_proto::catalog::Catalog::builtin().clone();
+            let mut catalog = cormex_proto::catalog::Catalog::builtin().clone();
+            if let Some(ref selected) = agent {
+                catalog.agents.retain(|a| &a.id == selected);
+                anyhow::ensure!(!catalog.agents.is_empty(), "unknown agent: {selected}");
+            }
+            let mut sync_cfg = cfg.clone();
+            if let Some(ref selected) = agent {
+                sync_cfg.extra_sources.retain(|s| &s.agent == selected);
+            }
             let opts = cormex::sync::SyncOptions {
-                trigger: cormex::sync::Trigger::Manual,
+                trigger: if queue {
+                    cormex::sync::Trigger::Queue
+                } else if once {
+                    cormex::sync::Trigger::Scheduled
+                } else {
+                    cormex::sync::Trigger::Manual
+                },
                 only: source,
                 budget: cormex::sync::upload::Budget::new(budget_secs, 512 << 20),
                 dry_run,
             };
-            let report = cormex::sync::run(
+            let mut report = cormex::sync::run(
                 &api,
                 &db,
                 &dirs.data,
                 &catalog,
-                &cfg,
+                &sync_cfg,
                 &cfg.device_label,
                 &opts,
             )
             .await?;
+            if codex_metadata && !dry_run {
+                let home = cormex::codex_metadata::home()
+                    .ok_or_else(|| anyhow::anyhow!("Codex home unavailable"))?;
+                let metadata = cormex::codex_metadata::read(&home)?;
+                let (files, _) = cormex::catalog::discover_with_warnings(
+                    &catalog,
+                    &sync_cfg,
+                    &cfg.device_label,
+                )?;
+                let mut sent = 0usize;
+                for file in files.iter().filter(|f| f.agent == "codex") {
+                    let Some(item) = metadata.get(&file.native_session_id) else {
+                        continue;
+                    };
+                    let Some(file_id) = db
+                        .file(&format!("{}|{}", file.agent, file.logical_path))?
+                        .and_then(|s| s.file_id)
+                    else {
+                        continue;
+                    };
+                    match client
+                        .post_json::<_, serde_json::Value>(
+                            &format!("/capture/files/{file_id}/metadata"),
+                            item,
+                        )
+                        .await
+                    {
+                        Ok(_) => sent += 1,
+                        Err(e) => {
+                            report.errors += 1;
+                            if report.last_error.is_none() {
+                                report.last_error = Some(format!("Codex metadata: {e}"));
+                            }
+                        }
+                    }
+                }
+                println!("{sent} Codex session metadata records updated");
+            }
             println!(
                 "{} seen, {} uploaded, {} bytes, {} errors, {} deferred, {} locked",
                 report.files_seen,
@@ -441,12 +565,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
             agents,
             backfill,
+            no_backfill,
         } => {
             let opts = init::InitOptions {
                 yes,
                 dry_run,
                 agents,
-                backfill,
+                backfill: backfill || !no_backfill,
             };
             let report = init::run(&cfg, &dirs.config, &dirs.data, &opts, |change| {
                 // Without `--yes`, ask. The prompt goes to stderr so that a
@@ -459,11 +584,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     && line.trim().eq_ignore_ascii_case("y")
             })
             .await?;
-            print!("{}", init::render_plan(&report));
             if dry_run {
+                print!("{}", init::render_plan(&report));
                 println!("\n(dry run: nothing was changed)");
             } else if !report.applied.is_empty() {
                 println!("\napplied {} change(s)", report.applied.len());
+            }
+            if let Some(sync) = &report.backfill {
+                println!(
+                    "history: {} seen, {} uploaded, {} bytes, {} errors, {} deferred, {} locked",
+                    sync.files_seen,
+                    sync.files_uploaded,
+                    sync.bytes,
+                    sync.errors,
+                    sync.deferred,
+                    sync.locked
+                );
+                if let Some(error) = &sync.last_error {
+                    eprintln!("first error: {error}");
+                }
+                if sync.errors > 0 || sync.deferred > 0 || sync.locked > 0 {
+                    return Ok(ExitCode::PartialFailure);
+                }
             }
             Ok(ExitCode::Ok)
         }

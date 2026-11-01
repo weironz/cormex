@@ -156,6 +156,7 @@ impl DeviceScope {
                 // request, so an exact-string table cannot express them
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "generations"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "events"]))
+                || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "metadata"]))
                 // A batch of small snapshots (P4-0): SQLite rows
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "snapshots"]))
                 || (is(Method::PUT)
@@ -179,12 +180,20 @@ impl DeviceScope {
                 // **not** here: it needs `raw:read`, and the handler checks
                 // that per call
                 || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions"]))
+                || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "projects"]))
                 || (is(Method::GET) && matches!(segs.as_slice(), ["archive", "sessions", _, "events"]));
             if session {
                 return true;
             }
         }
 
+        if self.has(Scope::MemoryRead)
+            && self.has(Scope::SessionRead)
+            && is(Method::GET)
+            && matches!(path, "/memory/context" | "/memory/artifacts")
+        {
+            return true;
+        }
         if self.has(Scope::MemoryRead)
             && ((is(Method::GET) && path == "/memory/search")
                 || ((is(Method::POST) || is(Method::GET) || is(Method::DELETE)) && path == "/mcp"))
@@ -487,6 +496,17 @@ mod tests {
     /// the second.
     #[test]
     fn the_allowlist_is_exactly_what_the_client_actually_calls() {
+        assert!(!scope(&[Scope::MemoryRead]).allows(&Method::GET, "/memory/context"));
+        assert!(!scope(&[Scope::MemoryRead]).allows(&Method::GET, "/memory/artifacts"));
+        assert!(!scope(&[Scope::SessionRead]).allows(&Method::GET, "/memory/artifacts"));
+        assert!(
+            scope(&[Scope::MemoryRead, Scope::SessionRead])
+                .allows(&Method::GET, "/memory/artifacts")
+        );
+        assert!(!scope(&[Scope::SessionRead]).allows(&Method::GET, "/memory/context"));
+        assert!(
+            scope(&[Scope::MemoryRead, Scope::SessionRead]).allows(&Method::GET, "/memory/context")
+        );
         let capture = scope(&[Scope::CaptureWrite]);
         for (method, path) in [
             (Method::GET, "/capture/catalog"),
@@ -494,6 +514,7 @@ mod tests {
             (Method::POST, "/capture/files/01ABC/generations"),
             (Method::PUT, "/capture/generations/01ABC/chunks/4096"),
             (Method::POST, "/capture/files/01ABC/events"),
+            (Method::POST, "/capture/files/01ABC/metadata"),
             (Method::POST, "/capture/snapshots"),
         ] {
             assert!(
@@ -503,6 +524,7 @@ mod tests {
         }
         for (method, path) in [
             (Method::GET, "/memory/search"),
+            (Method::GET, "/archive/projects"),
             (Method::GET, "/archive/sessions"),
             (Method::GET, "/archive/raw/01ABC"),
             (Method::GET, "/sync"),
@@ -517,6 +539,7 @@ mod tests {
 
         let session = scope(&[Scope::SessionRead]);
         for (method, path) in [
+            (Method::GET, "/archive/projects"),
             (Method::GET, "/archive/sessions"),
             (Method::GET, "/archive/sessions/01ABC"),
             (Method::GET, "/archive/sessions/01ABC/events"),

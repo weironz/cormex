@@ -40,9 +40,7 @@ class ConnectPage extends ConsumerStatefulWidget {
 }
 
 class _ConnectPageState extends ConsumerState<ConnectPage> {
-  late final TextEditingController _baseUrl = TextEditingController(
-    text: ref.read(connectionProvider).baseUrl,
-  );
+  late final TextEditingController _baseUrl;
   final _token = TextEditingController();
   final _username = TextEditingController();
   final _password = TextEditingController();
@@ -55,6 +53,16 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
   /// 桌面端没有同源，藏起来等于让人对着一个连不上的按钮点，而错误信息会是
   /// 「连接被拒绝 127.0.0.1:8080」—— 读起来像服务没起来，不像少填了一项。
   late bool _showAddress = !CormexApi.canUseSameOrigin;
+
+  @override
+  void initState() {
+    super.initState();
+    // The address field can stay hidden for the entire page lifetime.
+    // Initialize before dispose rather than reading ref during lazy teardown.
+    _baseUrl = TextEditingController(
+      text: ref.read(connectionProvider).baseUrl,
+    );
+  }
 
   @override
   void dispose() {

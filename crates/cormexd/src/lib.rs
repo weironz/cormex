@@ -36,8 +36,13 @@ pub mod import;
 pub mod live;
 /// Memory's outward-facing MCP frontage. See that module's header comment.
 pub mod mcp;
+pub mod memory_context;
+pub mod memory_qa;
+pub mod memory_settings;
+pub mod memory_trial;
 pub mod principal;
 pub mod purge;
+mod qa_evidence;
 pub mod quota;
 pub mod redact;
 pub mod reembed;

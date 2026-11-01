@@ -129,6 +129,15 @@ pub struct RegisterFileResponse {
     pub generation: GenerationDto,
 }
 
+/// Display metadata from the host, independent from transcript bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionUiMetadata {
+    pub title: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub pinned_position: Option<i32>,
+}
+
 /// `POST /capture/files/{id}/generations`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewGenerationRequest {

@@ -110,7 +110,11 @@ class MemoryController extends Notifier<MemoryState> {
     try {
       final result = await ref
           .read(apiProvider)
-          .searchMemory(query, limit: 30, asOf: state.asOf);
+          .searchMemory(
+            query,
+            limit: query.isEmpty ? 100 : 30,
+            asOf: state.asOf,
+          );
       if (seq != _requestSeq || !ref.mounted) return; // 已被取代
       state = state.copyWith(result: result, loading: false);
     } on CormexApiException catch (e) {

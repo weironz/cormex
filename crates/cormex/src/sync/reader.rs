@@ -40,9 +40,7 @@ pub struct LogicalReader {
     /// The logical length, in uncompressed bytes.
     ///
     /// For a plaintext file this is the file's size. For a compressed one it is
-    /// the frame's declared content size — which is why a zstd frame written
-    /// without a content size is refused: without it, "how long is this file"
-    /// can only be answered by decompressing all of it.
+    /// the frame's declared content size, or a streaming count when omitted.
     len: u64,
 }
 
@@ -50,27 +48,25 @@ impl LogicalReader {
     /// Open a file.
     ///
     /// # Errors
-    /// The file cannot be opened, or a compressed one does not carry its
-    /// content size.
+    /// The file cannot be opened or decompressed.
     pub fn open(path: &Path, compressed: bool) -> Result<Self> {
         let len = if compressed {
-            // The frame header carries the content size, so reading it is a few
-            // bytes rather than a full decompression. A frame without one
-            // cannot answer "how long is this" at all, and decompressing to
-            // find out would read the whole file on every hook invocation.
+            // Streaming writers may omit content size. Count their decoded
+            // bytes without retaining the decompressed file in memory.
             let head = std::fs::read(path)
                 .with_context(|| format!("could not read {}", path.display()))?;
-            zstd::zstd_safe::get_frame_content_size(&head)
-                .map_err(|e| {
-                    anyhow::anyhow!("{} is not a readable zstd frame: {e}", path.display())
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{} is a zstd frame without a content size, so its logical length is \
-                         unknown without decompressing all of it",
-                        path.display()
-                    )
-                })?
+            match zstd::zstd_safe::get_frame_content_size(&head).map_err(|e| {
+                anyhow::anyhow!("{} is not a readable zstd frame: {e}", path.display())
+            })? {
+                Some(size) => size,
+                None => {
+                    let file = std::fs::File::open(path)?;
+                    let mut decoder = zstd::Decoder::new(file)?;
+                    std::io::copy(&mut decoder, &mut std::io::sink()).with_context(|| {
+                        format!("could not count decoded bytes of {}", path.display())
+                    })?
+                }
+            }
         } else {
             std::fs::metadata(path)
                 .with_context(|| format!("could not stat {}", path.display()))?
@@ -288,8 +284,8 @@ mod tests {
         let path = dir.path().join("s.jsonl.zst");
         let body = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
         // **With a content size**, which is what a host that writes a `.zst`
-        // for a finished file produces. `encode_all` omits it, and a frame
-        // without one cannot report its logical length -- see the test below.
+        // for some finished files produces. The test below covers streaming
+        // frames that require a decoding pass to determine logical length.
         // `include_contentsize` only takes effect when the size is pledged
         let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
         encoder
@@ -321,12 +317,12 @@ mod tests {
         );
     }
 
-    /// A frame without a content size is refused.
+    /// A frame without a content size is counted and read as logical bytes.
     ///
     /// Without it, "how long is this file" can only be answered by decompressing
     /// all of it — on every hook invocation.
     #[test]
-    fn a_frame_without_a_content_size_is_refused() {
+    fn a_frame_without_a_content_size_is_readable() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("s.jsonl.zst");
         // Streaming compression omits the content size
@@ -338,11 +334,8 @@ mod tests {
         let frame = encoder.finish().expect("finish");
         std::fs::write(&path, &frame).expect("write");
 
-        let err = LogicalReader::open(&path, true)
-            .expect_err("a frame without a content size cannot report its length");
-        assert!(
-            err.to_string().contains("content size"),
-            "the error should say why: {err}"
-        );
+        let reader = LogicalReader::open(&path, true).expect("streamed frame");
+        assert_eq!(reader.len(), 5);
+        assert_eq!(reader.read_all().unwrap(), b"hello");
     }
 }

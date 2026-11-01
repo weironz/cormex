@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'package:cormex_app/api/cormex_api.dart';
 import 'package:cormex_app/features/sessions/sessions_page.dart';
 import 'package:cormex_app/models/archive_session.dart';
 import 'package:cormex_app/state/connection_controller.dart';
@@ -5,126 +7,157 @@ import 'package:cormex_app/state/sessions_controller.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 
-/// 一个只返回固定页的控制器，不碰网络。
-///
-/// 继承真的 `SessionsController` 并覆盖两个方法，而不是另写一个接口：
-/// 被测的是**页面**，它调用的正是这两个方法，接口一致就够了。
-class _FakeSessions extends SessionsController {
-  _FakeSessions(this.pages);
-
-  final List<ArchiveSessionsPage> pages;
-  int _call = 0;
-
-  @override
-  SessionsState build() => const SessionsState();
-
-  @override
-  Future<void> load({String? agent, String? project}) async {
-    _call = 0;
-    final page = pages.first;
-    state = SessionsState(
-      sessions: page.sessions,
-      nextCursor: page.nextCursor,
-      agent: agent,
-    );
-  }
-
-  @override
-  Future<void> loadMore() async {
-    _call += 1;
-    if (_call >= pages.length) return;
-    final page = pages[_call];
-    state = state.copyWith(
-      sessions: [...state.sessions, ...page.sessions],
-      nextCursor: page.nextCursor,
-    );
-  }
-}
-
-Widget _wrap(List<ArchiveSessionsPage> pages) => ProviderScope(
-  overrides: [
-    sessionsControllerProvider.overrideWith(() => _FakeSessions(pages)),
-    // 页面读 apiProvider 只是为了刷新，这里给一个不会用到的覆盖
-    apiProvider.overrideWith((ref) => throw UnimplementedError()),
-  ],
+http.Response response(Object value) => http.Response(
+  jsonEncode(value),
+  200,
+  headers: {'content-type': 'application/json; charset=utf-8'},
+);
+Widget wrap(ProviderContainer c) => UncontrolledProviderScope(
+  container: c,
   child: const MaterialApp(home: SessionsPage()),
+);
+ProviderContainer apiContainer(
+  Future<http.Response> Function(http.Request) f,
+) => ProviderContainer(
+  overrides: [
+    apiProvider.overrideWithValue(
+      CormexApi(baseUrl: 'http://localhost', client: MockClient(f)),
+    ),
+  ],
 );
 
 void main() {
-  testWidgets('列表显示会话，并标出唯一副本', (tester) async {
-    await tester.pumpWidget(
-      _wrap([
-        const ArchiveSessionsPage(
-          sessions: [
-            ArchiveSession(
-              id: '01S',
-              agent: 'claude_code',
-              title: '对象存储用什么',
-              eventCount: 12,
-            ),
-            ArchiveSession(
-              id: '02S',
-              agent: 'codex',
-              title: '宿主已删的那段',
-              eventCount: 3,
-              soleCopy: true,
-            ),
-          ],
-        ),
-      ]),
-    );
-    await tester.pumpAndSettle();
-
-    expect(find.text('对象存储用什么'), findsOneWidget);
-    expect(find.text('宿主已删的那段'), findsOneWidget);
-    expect(
-      find.byIcon(Icons.warning_amber_rounded),
-      findsOneWidget,
-      reason: '唯一副本必须标出来 —— 在这里删除就是删掉最后一份',
-    );
+  test('older responses do not invent source tags or message counts', () {
+    final s = ArchiveSession.fromJson({'id': 'one', 'agent': 'codex'});
+    expect(s.sourceArchived, isFalse);
+    expect(s.messageCount, isNull);
   });
-
-  testWidgets('空列表给出下一步', (tester) async {
-    await tester.pumpWidget(
-      _wrap([const ArchiveSessionsPage()]),
-    );
+  testWidgets(
+    'project directory does not fetch chats; expanded pages show provenance and message counts',
+    (tester) async {
+      var calls = 0;
+      final c = apiContainer((r) async {
+        if (r.url.path.endsWith('/projects')) {
+          return response({
+            'projects': [
+              {'key': null, 'chat_count': 896},
+            ],
+          });
+        }
+        calls++;
+        return response({
+          'sessions': [
+            {
+              'id': 'one',
+              'agent': 'codex',
+              'title': '旧聊天',
+              'source_archived': true,
+              'message_count': 2,
+              'event_count': 947,
+              'sole_copy': true,
+            },
+          ],
+        });
+      });
+      addTearDown(c.dispose);
+      await tester.pumpWidget(wrap(c));
+      await tester.pumpAndSettle();
+      expect(calls, 0);
+      expect(find.text('896 个聊天'), findsOneWidget);
+      expect(find.text('旧聊天'), findsNothing);
+      await tester.tap(find.text('未分类'));
+      await tester.pumpAndSettle();
+      expect(calls, 1);
+      expect(find.text('旧聊天'), findsOneWidget);
+      expect(find.textContaining('2 条消息'), findsOneWidget);
+      expect(find.textContaining('947'), findsNothing);
+      expect(find.text('来自已归档聊天'), findsOneWidget);
+      expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+      await tester.tap(find.text('未分类'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('未分类'));
+      await tester.pumpAndSettle();
+      expect(calls, 1);
+    },
+  );
+  testWidgets('a large project fetches thirty chats per explicit page', (
+    tester,
+  ) async {
+    var calls = 0;
+    final c = apiContainer((r) async {
+      if (r.url.path.endsWith('/projects')) {
+        return response({
+          'projects': [
+            {'key': 'p', 'name': '大型项目', 'chat_count': 896},
+          ],
+        });
+      }
+      calls++;
+      final start = r.url.queryParameters['cursor'] == null ? 0 : 30;
+      return response({
+        'sessions': [
+          for (var i = start; i < start + 30; i++)
+            {'id': '$i', 'agent': 'claude_code', 'title': '聊天 $i'},
+        ],
+        'next_cursor': start == 0 ? 'next' : null,
+      });
+    });
+    addTearDown(c.dispose);
+    await tester.pumpWidget(wrap(c));
     await tester.pumpAndSettle();
-    expect(find.text('还没有采集到会话'), findsOneWidget);
-    expect(
-      find.textContaining('cormex init'),
-      findsOneWidget,
-      reason: '空状态要说下一步做什么，而不是只说「没有」',
-    );
+    await tester.tap(find.text('大型项目'));
+    await tester.pumpAndSettle();
+    expect(calls, 1);
+    expect(c.read(sessionsControllerProvider).groups['p']!.sessions.length, 30);
+    await tester.ensureVisible(find.text('加载更多聊天'));
+    await tester.pumpAndSettle();
+    expect(calls, 1);
+    await tester.tap(find.text('加载更多聊天'));
+    await tester.pumpAndSettle();
+    expect(calls, 2);
+    expect(c.read(sessionsControllerProvider).groups['p']!.sessions.length, 60);
   });
-
-  testWidgets('滚到底追加下一页', (tester) async {
-    await tester.pumpWidget(
-      _wrap([
-        ArchiveSessionsPage(
-          sessions: [
-            for (var i = 0; i < 30; i++)
-              ArchiveSession(id: '0$i', agent: 'claude_code', title: '会话 $i'),
-          ],
-          nextCursor: 'cursor-1',
-        ),
-        const ArchiveSessionsPage(
-          sessions: [
-            ArchiveSession(id: '99', agent: 'codex', title: '第二页的会话'),
-          ],
-        ),
-      ]),
-    );
+  testWidgets('search is debounced and sent to the server', (tester) async {
+    final queries = <String?>[];
+    final c = apiContainer((r) async {
+      queries.add(r.url.queryParameters['q']);
+      return response({
+        'projects': [
+          {'key': 'p', 'name': '远处项目', 'chat_count': 1},
+        ],
+      });
+    });
+    addTearDown(c.dispose);
+    await tester.pumpWidget(wrap(c));
     await tester.pumpAndSettle();
-    expect(find.text('第二页的会话'), findsNothing);
-
-    await tester.drag(find.byType(ListView), const Offset(0, -4000));
+    await tester.enterText(find.byType(TextField), 'needle');
+    await tester.pump(const Duration(milliseconds: 301));
     await tester.pumpAndSettle();
-
-    expect(
-      find.text('第二页的会话'),
-      findsOneWidget,
-      reason: '滚到底要按游标取下一页；没有游标时再请求一次会拿回同一页，列表就重复了',
+    expect(queries, [null, 'needle']);
+    expect(find.text('远处项目'), findsOneWidget);
+  });
+  testWidgets('narrow screens keep the project directory inside the viewport', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final c = apiContainer(
+      (r) async => response({
+        'projects': [
+          {'key': 'p', 'name': '项目', 'chat_count': 50},
+        ],
+      }),
     );
+    addTearDown(c.dispose);
+    await tester.pumpWidget(wrap(c));
+    await tester.pumpAndSettle();
+    expect(find.text('项目'), findsOneWidget);
+    expect(find.text('选择聊天'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 }

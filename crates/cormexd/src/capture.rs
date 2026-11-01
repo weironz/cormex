@@ -138,6 +138,49 @@ pub async fn register_file(
     }))
 }
 
+/// Store the owning device's presentation metadata for a previously registered file.
+pub async fn update_session_ui_metadata(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<cormex_proto::capture::SessionUiMetadata>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let (tenant, device_id) = capture_caller(&st, &principal).await?;
+    id.parse::<Id>()
+        .map_err(|_| ApiError::bad_request("invalid capture file id"))?;
+    let store = tenant
+        .store()
+        .map_err(|e| ApiError::unsupported(e.to_string()))?;
+    if req.title.as_ref().is_some_and(|v| v.chars().count() > 4096)
+        || req
+            .project_id
+            .as_ref()
+            .is_some_and(|v| v.chars().count() > 512)
+        || req
+            .project_name
+            .as_ref()
+            .is_some_and(|v| v.chars().count() > 512)
+        || req.pinned_position.is_some_and(|v| v < 0)
+    {
+        return Err(ApiError::bad_request("invalid session display metadata"));
+    }
+    let title = req
+        .title
+        .as_deref()
+        .map(|v| cormex_memory::redaction::mask_text(v).into_owned());
+    let project_name = req
+        .project_name
+        .as_deref()
+        .map(|v| cormex_memory::redaction::mask_text(v).into_owned());
+    let result = sqlx::query("INSERT INTO capture_session_ui_metadata (session_id,device_id,title,project_id,project_name,pinned_position) SELECT session_id,device_id,$3,$4,$5,$6 FROM capture_files WHERE id=$1 AND device_id=$2 ON CONFLICT (session_id,device_id) DO UPDATE SET title=EXCLUDED.title,project_id=EXCLUDED.project_id,project_name=EXCLUDED.project_name,pinned_position=EXCLUDED.pinned_position,updated_at=clock_timestamp()")
+        .bind(&id).bind(&device_id).bind(title).bind(req.project_id).bind(project_name).bind(req.pinned_position)
+        .execute(store.pool()).await.map_err(|e| ApiError::internal(format!("could not update session metadata: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("no such file for this device"));
+    }
+    Ok(axum::Json(serde_json::json!({"updated": true})))
+}
+
 /// `POST /capture/snapshots` — store a batch of small snapshots (P4-0).
 ///
 /// # What this is for
@@ -825,6 +868,44 @@ mod tests {
             .as_str()
             .expect("a generation id")
             .to_owned();
+        let metadata_path = format!("/capture/files/{file_id}/metadata");
+        let metadata = serde_json::json!({"title":"Original title","project_id":"p1","project_name":"Project one","pinned_position":0});
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &metadata_path,
+            None,
+            Some(metadata.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &metadata_path,
+            Some(&device_key),
+            Some(metadata.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, other) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/devices",
+            Some(&token),
+            Some(serde_json::json!({"label":"other","scopes":["capture:write"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &metadata_path,
+            other["key"].as_str(),
+            Some(metadata),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             registered["generation"]["end_offset"], 0,
             "a freshly registered file ends at 0"

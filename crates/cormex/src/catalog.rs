@@ -2,13 +2,14 @@
 //!
 //! Design: docs/design/session-archive-architecture.md §5.2 (D2, D7, D8).
 //!
-//! # Discovery reads paths and metadata, never contents
+//! # Discovery reads paths and metadata for file sources
 //!
 //! Every rule here works from the path: which agent's home, which glob matched,
 //! which segment is the session id. That is not an optimisation — discovery
 //! runs on every hook, and a hook has a 1.5-second budget on `SessionEnd`. It
 //! also keeps the promise the privacy section makes: the client does not open a
-//! transcript until it is about to upload it.
+//! transcript until it is about to upload it. SQLite sources are different:
+//! their individual message rows must be read to identify logical files.
 //!
 //! # The one lossy decode
 //!
@@ -112,6 +113,30 @@ pub fn discover(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<Vec<
     // restriction the rest of this function enforces
     out.extend(discover_extra_sources(cfg, device_id)?);
     Ok(out)
+}
+
+/// Discovery for interactive inspection: keep independent sources available
+/// while returning failures for display to the user.
+pub fn discover_with_warnings(
+    catalog: &Catalog,
+    cfg: &Config,
+    device_id: &str,
+) -> Result<(Vec<DiscoveredFile>, Vec<String>)> {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    for agent in &catalog.agents {
+        let Some(home) = resolve_home(agent) else {
+            continue;
+        };
+        for source in &agent.sources {
+            match discover_source(agent, source, &home, cfg, device_id) {
+                Ok(found) => files.extend(found),
+                Err(error) => warnings.push(format!("{}: {error:#}", agent.id)),
+            }
+        }
+    }
+    files.extend(discover_extra_sources(cfg, device_id)?);
+    Ok((files, warnings))
 }
 
 /// Discover the sources the user added with `cormex sources add`.
@@ -322,8 +347,12 @@ fn discover_sqlite(
         return Ok(Vec::new());
     }
     let db_rel = crate::sqlite_source::db_rel_path(home, &db);
-    let rows = crate::sqlite_source::read_rows(&db, &db_rel, spec)
-        .with_context(|| format!("agent {}: reading {}", agent.id, db.display()))?;
+    let rows = if agent.id == "opencode" {
+        crate::sqlite_source::read_opencode(&db, &db_rel, spec)
+    } else {
+        crate::sqlite_source::read_rows(&db, &db_rel, spec)
+    }
+    .with_context(|| format!("agent {}: reading {}", agent.id, db.display()))?;
 
     // The session id comes from the source's rule applied to the **logical
     // path**, so a catalog can use the database's name or the row key

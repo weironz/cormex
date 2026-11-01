@@ -60,6 +60,14 @@ pub fn read_rows(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<
     conn.busy_timeout(std::time::Duration::from_millis(spec.busy_timeout_ms))
         .context("cannot set busy_timeout")?;
 
+    read_rows_conn(&conn, db_rel, spec)
+}
+
+fn read_rows_conn(
+    conn: &rusqlite::Connection,
+    db_rel: &str,
+    spec: &SqliteSpec,
+) -> Result<Vec<RowFile>> {
     let mut stmt = conn
         .prepare(&spec.query)
         .with_context(|| format!("the catalog's query does not prepare: {}", spec.query))?;
@@ -119,6 +127,55 @@ pub fn read_rows(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<
         });
     }
     Ok(out)
+}
+
+/// Read both OpenCode generations. A database can contain legacy messages
+/// alongside a partially populated newer projection.
+pub fn read_opencode(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<RowFile>> {
+    let uri = format!("file:{}?mode=ro", db_path.display());
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("cannot open {} read-only", db_path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(spec.busy_timeout_ms))?;
+    let has = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?)
+    };
+    let legacy = has("message")? && has("part")?;
+    let modern = has("session_message")?;
+    if !legacy && !modern {
+        anyhow::bail!("unsupported OpenCode database schema: no recognizable message tables");
+    }
+    let mut result = Vec::new();
+    let mut selected = spec.clone();
+    if modern {
+        selected.query = if has("session_part")? {
+            spec.query.clone()
+        } else {
+            "SELECT id, session_id, json_object('type', type, 'data', json(data), 'parts', json('[]')) AS row_json FROM session_message ORDER BY session_id, seq".into()
+        };
+        result.extend(read_rows_conn(&conn, db_rel, &selected)?);
+    }
+    if legacy {
+        selected.query = r#"SELECT m.id AS id, m.session_id AS session_id,
+            json_object('type', json_extract(m.data, '$.role'), 'data', json(m.data),
+                'parts', json((SELECT json_group_array(json_object('type', json_extract(p.data, '$.type'), 'data', json(p.data)))
+                    FROM (SELECT data FROM part WHERE message_id=m.id ORDER BY id) p))) AS row_json
+            FROM message m ORDER BY m.session_id, m.time_created, m.id"#.into();
+        let existing: std::collections::HashSet<String> =
+            result.iter().map(|r| r.logical_path.clone()).collect();
+        result.extend(
+            read_rows_conn(&conn, db_rel, &selected)?
+                .into_iter()
+                .filter(|r| !existing.contains(&r.logical_path)),
+        );
+    }
+    Ok(result)
 }
 
 /// A column as a string, for the key and text columns.
@@ -191,6 +248,49 @@ pub fn db_path(home: &Path, glob: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_reads_legacy_and_modern_and_deduplicates_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(r#"
+          CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+          CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+          INSERT INTO message VALUES('old','s',1,'{"role":"user"}'),('same','s',2,'{"role":"user"}');
+          INSERT INTO part VALUES('p','old','{"type":"text","text":"legacy"}');
+          CREATE TABLE session_message(id TEXT, session_id TEXT, type TEXT, seq INTEGER, data TEXT);
+          INSERT INTO session_message VALUES('same','s','user',1,'{"text":"modern"}');
+        "#).unwrap();
+        let catalog = cormex_proto::catalog::Catalog::builtin();
+        let spec = catalog
+            .agents
+            .iter()
+            .find(|a| a.id == "opencode")
+            .unwrap()
+            .sources[0]
+            .sqlite
+            .as_ref()
+            .unwrap();
+        let rows = read_opencode(&path, "opencode.db", spec).unwrap();
+        assert_eq!(rows.len(), 2);
+        let old = rows
+            .iter()
+            .find(|r| r.logical_path.ends_with("#old"))
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&old.bytes).unwrap();
+        assert_eq!(data["parts"][0]["data"]["text"], "legacy");
+        conn.execute_batch(r#"CREATE TABLE session_part(message_id TEXT, ordinal INTEGER, type TEXT, data TEXT);
+          INSERT INTO session_part VALUES('same',2,'text','{"text":"second"}'),('same',1,'text','{"text":"first"}');"#).unwrap();
+        let rows = read_opencode(&path, "opencode.db", spec).unwrap();
+        let modern = rows
+            .iter()
+            .find(|r| r.logical_path.ends_with("#same"))
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&modern.bytes).unwrap();
+        assert_eq!(data["parts"][0]["data"]["text"], "first");
+        assert_eq!(data["parts"][1]["data"]["text"], "second");
+    }
 
     /// Build a small database with two rows.
     fn fixture() -> (tempfile::TempDir, PathBuf) {

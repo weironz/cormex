@@ -161,6 +161,7 @@ class TranscriptEvent {
     required this.kind,
     this.occurredAt,
     this.role,
+    this.phase,
     this.content = const [],
     this.text,
     this.toolName,
@@ -175,6 +176,7 @@ class TranscriptEvent {
   final TranscriptKind kind;
   final DateTime? occurredAt;
   final String? role;
+  final String? phase;
   final List<ContentBlock> content;
   final String? text;
   final String? toolName;
@@ -189,10 +191,7 @@ class TranscriptEvent {
   String get plainText {
     final t = text;
     if (t != null && t.isNotEmpty) return t;
-    return content
-        .whereType<TextBlock>()
-        .map((b) => b.text)
-        .join('\n');
+    return content.whereType<TextBlock>().map((b) => b.text).join('\n');
   }
 
   factory TranscriptEvent.fromJson(Map<String, dynamic> json) {
@@ -208,11 +207,13 @@ class TranscriptEvent {
         final s => s == null ? null : DateTime.tryParse(s)?.toLocal(),
       },
       role: asStringOrNull(json['role']),
+      phase: asStringOrNull(json['phase']),
       content: switch (json['content']) {
-        final List<dynamic> l => l
-            .whereType<Map<String, dynamic>>()
-            .map(ContentBlock.fromJson)
-            .toList(),
+        final List<dynamic> l =>
+          l
+              .whereType<Map<String, dynamic>>()
+              .map(ContentBlock.fromJson)
+              .toList(),
         _ => const [],
       },
       text: asStringOrNull(json['text']),
@@ -235,10 +236,11 @@ class TranscriptEventsPage {
   factory TranscriptEventsPage.fromJson(Map<String, dynamic> json) =>
       TranscriptEventsPage(
         events: switch (json['events']) {
-          final List<dynamic> l => l
-              .whereType<Map<String, dynamic>>()
-              .map(TranscriptEvent.fromJson)
-              .toList(),
+          final List<dynamic> l =>
+            l
+                .whereType<Map<String, dynamic>>()
+                .map(TranscriptEvent.fromJson)
+                .toList(),
           _ => const [],
         },
         nextCursor: asStringOrNull(json['next_cursor']),

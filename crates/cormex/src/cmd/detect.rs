@@ -1,19 +1,14 @@
-//! `cormex detect` — what this machine has, without reading any of it.
+//! `cormex detect` — discover this machine's capture sources.
 //!
 //! Design: docs/design/session-archive-architecture.md §5.1.
 //!
-//! # Only `metadata` is called
-//!
-//! The card's acceptance criterion is "detect does not open any session file".
-//! That is enforced structurally rather than by discipline: this module calls
-//! `discover`, which walks with `walkdir` and reads `DirEntry::metadata`, and
-//! nothing here has a `File::open`. `detect_never_opens_a_session_file` pins it
-//! by counting `open` calls through a wrapper — see the test.
+//! File sources are inspected by path and metadata. SQLite sources must be
+//! opened read-only and queried to discover their logical message rows.
 
 use anyhow::Result;
 use cormex_proto::catalog::Catalog;
 
-use crate::catalog::{DiscoveredFile, discover};
+use crate::catalog::{DiscoveredFile, discover_with_warnings};
 use crate::config::Config;
 
 /// One agent's summary.
@@ -32,6 +27,7 @@ pub struct AgentSummary {
 pub struct DetectReport {
     pub agents: Vec<AgentSummary>,
     pub files: Vec<DiscoveredFile>,
+    pub warnings: Vec<String>,
 }
 
 impl DetectReport {
@@ -53,7 +49,7 @@ impl DetectReport {
 /// # Errors
 /// A catalog glob does not compile, or a file's metadata cannot be read.
 pub fn run(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<DetectReport> {
-    let files = discover(catalog, cfg, device_id)?;
+    let (files, warnings) = discover_with_warnings(catalog, cfg, device_id)?;
 
     let mut agents: Vec<AgentSummary> = Vec::new();
     for agent in &catalog.agents {
@@ -71,9 +67,11 @@ pub fn run(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<DetectRep
         let bytes = mine
             .iter()
             .map(|f| {
-                std::fs::metadata(&f.physical_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
+                f.bytes.as_ref().map(|b| b.len() as u64).unwrap_or_else(|| {
+                    std::fs::metadata(&f.physical_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                })
             })
             .sum();
         agents.push(AgentSummary {
@@ -85,14 +83,22 @@ pub fn run(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<DetectRep
         });
     }
 
-    Ok(DetectReport { agents, files })
+    Ok(DetectReport {
+        agents,
+        files,
+        warnings,
+    })
 }
 
 /// Render as a table.
 #[must_use]
 pub fn render(r: &DetectReport) -> String {
     if r.agents.is_empty() {
-        return "no supported agents found on this machine\n".to_owned();
+        let mut out = "no supported agents found on this machine\n".to_owned();
+        for warning in &r.warnings {
+            out.push_str(&format!("warning: {warning}\n"));
+        }
+        return out;
     }
     let mut out = String::new();
     out.push_str(&format!(
@@ -114,6 +120,9 @@ pub fn render(r: &DetectReport) -> String {
         r.total_files(),
         human_bytes(r.total_bytes())
     ));
+    for warning in &r.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
     out
 }
 
@@ -132,6 +141,7 @@ pub fn render_json(r: &DetectReport) -> Result<String> {
         })).collect::<Vec<_>>(),
         "total_files": r.total_files(),
         "total_bytes": r.total_bytes(),
+        "warnings": r.warnings,
     }))?)
 }
 
@@ -229,6 +239,29 @@ mod tests {
         assert_eq!(report.agents[0].sessions, 2);
         assert_eq!(report.agents[0].files, 2);
         assert_eq!(report.agents[0].bytes, 11, "5 + 6 bytes");
+    }
+
+    #[test]
+    fn broken_agent_does_not_block_other_agents() {
+        let home = fake_home();
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("opencode.db"), b"not a database").unwrap();
+        let mut catalog = catalog_for(home.path());
+        let mut opencode = cormex_proto::catalog::Catalog::builtin()
+            .agents
+            .iter()
+            .find(|a| a.id == "opencode")
+            .unwrap()
+            .clone();
+        opencode.home = vec![HomeRoot::Path {
+            path: broken.path().display().to_string(),
+        }];
+        catalog.agents.insert(0, opencode);
+        let report = run(&catalog, &Config::default(), "dev").unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("opencode"));
+        assert!(render(&report).contains("warning:"));
     }
 
     /// A `.jsonl.zst` beside a `.jsonl` is one logical file, and plaintext wins.
@@ -416,12 +449,13 @@ mod no_open_tests {
     //! defeats it (root ignores the mode bits), so the test skips there.
 
     use super::*;
-    use cormex_proto::capture::{FileRole, Framing};
-    use cormex_proto::catalog::{AgentEntry, HomeRoot, SessionIdRule, SourceSpec};
+    use cormex_proto::catalog::HomeRoot;
 
     #[cfg(unix)]
     #[test]
     fn detect_reads_metadata_and_never_opens_a_file() {
+        use cormex_proto::capture::{FileRole, Framing};
+        use cormex_proto::catalog::{AgentEntry, SessionIdRule, SourceSpec};
         use std::os::unix::fs::PermissionsExt as _;
 
         if unsafe { libc_geteuid() } == 0 {

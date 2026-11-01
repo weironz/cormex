@@ -59,6 +59,7 @@ desktop.ini
 # 日志
 *.log
 logs/
+.playwright-mcp/
 
 # 编辑器私有配置（Flutter 工程自动生成）
 app/.idea/

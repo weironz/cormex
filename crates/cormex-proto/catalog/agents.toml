@@ -201,10 +201,8 @@ home = [
            json_object(
              'type', m.type,
              'data', json(m.data),
-             'parts', (SELECT json_group_array(json_object('type', p.type, 'data', json(p.data)))
-                         FROM session_part p
-                        WHERE p.message_id = m.id
-                        ORDER BY p.ordinal)
+             'parts', json((SELECT json_group_array(json_object('type', p.type, 'data', json(p.data)))
+                         FROM (SELECT type, data FROM session_part WHERE message_id = m.id ORDER BY ordinal) p))
            ) AS row_json
       FROM session_message m
      ORDER BY m.session_id, m.seq

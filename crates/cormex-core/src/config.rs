@@ -39,11 +39,11 @@ pub struct DistillConfig {
     /// of history must not spend everyone else's allowance.
     pub daily_tokens: i64,
     /// Whether captured sessions are promoted into `episodes` for fact
-    /// extraction (D14). `CORMEX_PROMOTE_ENABLED`, default on.
+    /// extraction (D14). `CORMEX_PROMOTE_ENABLED`, default off.
     ///
-    /// Off is a legitimate choice: promotion spends an extraction call per
-    /// promoted message, and somebody archiving sessions purely for the raw
-    /// record is paying for facts they never asked for.
+    /// Promotion spends model calls, so it requires an explicit environment
+    /// or account setting. Capturing and backfilling the raw archive remain
+    /// available without enabling paid memory extraction.
     pub promote: bool,
     /// How many events one promotion round takes.
     ///
@@ -189,7 +189,7 @@ impl Config {
             distill: DistillConfig {
                 model: non_empty("CORMEX_DISTILL_MODEL"),
                 daily_tokens: parse_distill_daily()?,
-                promote: parse_bool("CORMEX_PROMOTE_ENABLED", true),
+                promote: parse_bool("CORMEX_PROMOTE_ENABLED", false),
                 promote_per_round: parse_promote_per_round()?,
                 session_embeddings: parse_bool("CORMEX_SESSION_EMBEDDINGS", false),
             },

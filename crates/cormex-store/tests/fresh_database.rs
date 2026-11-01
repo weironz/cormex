@@ -25,17 +25,36 @@
 //! unrelated to the code under test is worse than one that is skipped on
 //! demand. `just test-db` runs it with `--include-ignored`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use cormex_store::Store;
 use sqlx::postgres::PgPoolOptions;
 
-/// A database name that cannot collide with anything: the process id and the
-/// wall clock, both in the `cormex_fresh_` namespace this test owns.
+/// Names remain unique when tests in this process start in the same millisecond.
 fn fresh_database_name() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the system clock should not predate 1970")
         .as_millis();
-    format!("cormex_fresh_{}_{}", std::process::id(), millis)
+    fresh_database_name_at(millis)
+}
+
+fn fresh_database_name_at(millis: u128) -> String {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("cormex_fresh_{}_{millis}_{seq}", std::process::id())
+}
+
+#[test]
+fn database_names_are_unique_within_one_millisecond() {
+    let names: std::collections::BTreeSet<_> = (0..128)
+        .map(|_| fresh_database_name_at(1_700_000_000_000))
+        .collect();
+    assert_eq!(
+        names.len(),
+        128,
+        "parallel tests must not share a database name when their timestamps match"
+    );
 }
 
 fn database_url() -> Option<String> {

@@ -449,6 +449,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Current browser snapshot, using the database's active view rather than
+    /// comparing creation times against a possibly skewed application clock.
+    pub async fn current_memory_facts(&self, limit: i64) -> Result<Vec<Fact>> {
+        Ok(sqlx::query_as(concat!(
+            "SELECT ",
+            fact_columns!(),
+            " FROM active_facts ORDER BY created_at DESC,id DESC LIMIT $1"
+        ))
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// BM25 ranking on top of the replay snapshot.
     ///
     /// # Why not "fetch the whole picture and sort it in memory"

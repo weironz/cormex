@@ -86,6 +86,32 @@ pub async fn redact_episode(
     mode: RedactionMode,
     reason: &str,
 ) -> Result<RedactReport> {
+    let peers = tenant.store()?.qa_related_episodes(episode_id).await?;
+    let mut ids = vec![episode_id.to_owned()];
+    ids.extend(peers.into_iter().filter(|id| id != episode_id));
+    let mut total = RedactReport::default();
+    for id in ids {
+        let r = redact_one_episode(st, tenant, &id, mode, reason).await?;
+        total.episodes_cleared += r.episodes_cleared;
+        total.facts_cleared += r.facts_cleared;
+        total.facts_invalidated += r.facts_invalidated;
+        total.blob_transcripts_cleared += r.blob_transcripts_cleared;
+        total.summaries_deleted += r.summaries_deleted;
+        total.sessions_rewound += r.sessions_rewound;
+        total.transcript_events_cleared += r.transcript_events_cleared;
+        total.archive_chunks_deleted += r.archive_chunks_deleted;
+        total.blobs_deleted += r.blobs_deleted;
+    }
+    Ok(total)
+}
+
+async fn redact_one_episode(
+    st: &AppState,
+    tenant: &Tenant,
+    episode_id: &str,
+    mode: RedactionMode,
+    reason: &str,
+) -> Result<RedactReport> {
     let store = tenant.store()?;
     // Validated before anything is written: a malformed id would otherwise
     // fail halfway through the cascade, leaving the episode partly cleared

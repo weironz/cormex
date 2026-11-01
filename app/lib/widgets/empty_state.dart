@@ -25,7 +25,7 @@ class EmptyState extends StatelessWidget {
       EmptyStateTone.error => scheme.error,
     };
 
-    return Center(
+    final content = Center(
       child: Padding(
         padding: const EdgeInsets.all(28),
         child: ConstrainedBox(
@@ -59,6 +59,16 @@ class EmptyState extends StatelessWidget {
               if (action != null) ...[const SizedBox(height: 18), action!],
             ],
           ),
+        ),
+      ),
+    );
+    return LayoutBuilder(
+      builder: (context, box) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            minHeight: box.maxHeight.isFinite ? box.maxHeight : 0,
+          ),
+          child: content,
         ),
       ),
     );

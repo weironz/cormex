@@ -1,136 +1,357 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-
 import '../../core/formatting.dart';
 import '../../models/archive_session.dart';
 import '../../state/sessions_controller.dart';
 import '../../widgets/empty_state.dart';
+import '../settings/settings_page.dart';
 import 'session_detail_page.dart';
+import 'widgets/archive_source_label.dart';
 
-/// 采集进来的会话列表。
-///
-/// # 与记忆浏览器并列，不是它的子页
-///
-/// 「我的记忆里有什么」和「我的 agent 到底说了什么」是两个问题。前者是
-/// 抽取之后的事实，后者是原始对话 —— 而「凭什么这么认为」的答案在后者里。
-/// 把它们做成父子页会让第二个问题永远藏在第一个后面。
 class SessionsPage extends ConsumerStatefulWidget {
   const SessionsPage({super.key});
-
   @override
   ConsumerState<SessionsPage> createState() => _SessionsPageState();
 }
 
 class _SessionsPageState extends ConsumerState<SessionsPage> {
-  final ScrollController _scroll = ScrollController();
-
+  final TextEditingController _search = TextEditingController();
+  Timer? _debounce;
+  String? _selectedId;
   @override
   void initState() {
     super.initState();
-    _scroll.addListener(_maybeLoadMore);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(sessionsControllerProvider.notifier).load();
+      if (mounted) ref.read(sessionsControllerProvider.notifier).load();
     });
   }
 
   @override
   void dispose() {
-    _scroll.dispose();
+    _debounce?.cancel();
+    _search.dispose();
     super.dispose();
   }
 
-  void _maybeLoadMore() {
-    if (!_scroll.hasClients) return;
-    // 提前一屏开始加载，滚动才不会在底部停一下
-    final remaining = _scroll.position.maxScrollExtent - _scroll.position.pixels;
-    if (remaining < 400) {
-      ref.read(sessionsControllerProvider.notifier).loadMore();
-    }
+  void _searchChanged(String value) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+      ref
+          .read(sessionsControllerProvider.notifier)
+          .load(
+            agent: ref.read(sessionsControllerProvider).agent,
+            query: value,
+          );
+    });
+    setState(() {});
+  }
+
+  void _changeAgent(String? agent) {
+    _debounce?.cancel();
+    setState(() => _selectedId = null);
+    ref
+        .read(sessionsControllerProvider.notifier)
+        .load(agent: agent, query: _search.text);
   }
 
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(sessionsControllerProvider);
     final notifier = ref.read(sessionsControllerProvider.notifier);
-
+    final wide = MediaQuery.sizeOf(context).width >= 1000;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('会话档案'),
+        title: const Text('聊天档案'),
         actions: [
-          PopupMenuButton<String?>(
-            tooltip: '按 agent 筛选',
-            icon: const Icon(Icons.filter_list),
-            onSelected: (agent) => notifier.load(agent: agent),
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: null, child: Text('全部 agent')),
-              for (final agent in _agentsIn(state.sessions))
-                PopupMenuItem(value: agent, child: Text(agent)),
-            ],
+          IconButton(
+            tooltip: '设置',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
+            ),
           ),
           IconButton(
             tooltip: '刷新',
             icon: const Icon(Icons.refresh),
-            onPressed: () => notifier.load(agent: state.agent),
+            onPressed: () {
+              _debounce?.cancel();
+              notifier.load(agent: state.agent, query: _search.text);
+            },
           ),
         ],
       ),
-      body: switch (state) {
-        SessionsState(loading: true) => const Center(
-          child: CircularProgressIndicator(),
-        ),
-        SessionsState(error: final e?) => EmptyState(
-          icon: Icons.error_outline,
-          title: '读不到会话',
-          description: e,
-          action: FilledButton(
-            onPressed: () => notifier.load(agent: state.agent),
-            child: const Text('重试'),
+      body: Row(
+        children: [
+          SizedBox(
+            width: wide ? 360 : MediaQuery.sizeOf(context).width,
+            child: ClipRect(
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: DropdownButtonFormField<String>(
+                      key: ValueKey(state.agent),
+                      initialValue: state.agent ?? '',
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: '来源',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                      items: [
+                        const DropdownMenuItem(value: '', child: Text('全部来源')),
+                        for (final agent in _agents)
+                          DropdownMenuItem(
+                            value: agent,
+                            child: Text(_agentLabel(agent)),
+                          ),
+                      ],
+                      onChanged: (value) =>
+                          _changeAgent(value == '' ? null : value),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: TextField(
+                      controller: _search,
+                      onChanged: _searchChanged,
+                      decoration: InputDecoration(
+                        hintText: '搜索聊天或项目',
+                        prefixIcon: const Icon(Icons.search),
+                        border: const OutlineInputBorder(),
+                        isDense: true,
+                        suffixIcon: _search.text.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: '清除搜索',
+                                icon: const Icon(Icons.close),
+                                onPressed: () {
+                                  _search.clear();
+                                  _searchChanged('');
+                                },
+                              ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: state.loading
+                        ? const Center(child: CircularProgressIndicator())
+                        : state.error != null
+                        ? EmptyState(
+                            icon: Icons.error_outline,
+                            title: '读不到项目',
+                            description: state.error!,
+                            action: FilledButton(
+                              onPressed: () => notifier.load(
+                                agent: state.agent,
+                                query: state.query,
+                              ),
+                              child: const Text('重试'),
+                            ),
+                          )
+                        : state.projects.isEmpty
+                        ? EmptyState(
+                            icon: Icons.inbox_outlined,
+                            title: state.query.isEmpty
+                                ? '此来源暂无聊天'
+                                : '没有找到匹配的聊天',
+                            description: '项目只显示已有聊天的项目。',
+                          )
+                        : ListView.builder(
+                            key: const ValueKey('project-list'),
+                            padding: const EdgeInsets.fromLTRB(12, 0, 12, 24),
+                            itemCount: state.projects.length,
+                            itemBuilder: (context, i) {
+                              final project = state.projects[i];
+                              return _ProjectGroup(
+                                key: ObjectKey(project),
+                                project: project,
+                                group:
+                                    state.groups[project.key] ??
+                                    const ProjectChats(),
+                                selectedId: _selectedId,
+                                onOpen: _openSession,
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
           ),
-        ),
-        SessionsState(sessions: final s) when s.isEmpty => const EmptyState(
-          icon: Icons.inbox_outlined,
-          title: '还没有采集到会话',
-          description:
-              '在装了 agent 的机器上运行 `cormex login` 和 `cormex init`，'
-              '会话就会出现在这里。',
-        ),
-        _ => ListView.separated(
-          controller: _scroll,
-          itemCount: state.sessions.length + (state.loadingMore ? 1 : 0),
-          separatorBuilder: (_, _) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            if (i >= state.sessions.length) {
-              return const Padding(
-                padding: EdgeInsets.all(16),
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            return _SessionTile(session: state.sessions[i]);
-          },
-        ),
-      },
+          if (wide)
+            Expanded(
+              child: Container(
+                decoration: BoxDecoration(
+                  border: Border(
+                    left: BorderSide(
+                      color: Theme.of(context).colorScheme.outlineVariant,
+                    ),
+                  ),
+                ),
+                child: _selectedId == null
+                    ? const EmptyState(
+                        icon: Icons.forum_outlined,
+                        title: '选择聊天',
+                        description: '展开左侧项目，选择聊天后查看完整对话。',
+                      )
+                    : SessionDetailPage(
+                        key: ValueKey(_selectedId),
+                        sessionId: _selectedId!,
+                      ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
-  /// 列表里出现过的 agent，用来填筛选菜单。
-  ///
-  /// 从**当前结果**里取而不是从 catalog 取：一个菜单项点了之后没有任何结果，
-  /// 比菜单里少一项更让人困惑。
-  List<String> _agentsIn(List<ArchiveSession> sessions) {
-    final set = <String>{for (final s in sessions) s.agent};
-    return set.toList()..sort();
+  void _openSession(ArchiveSession session) {
+    if (MediaQuery.sizeOf(context).width >= 1000) {
+      setState(() => _selectedId = session.id);
+    } else {
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => SessionDetailPage(sessionId: session.id),
+        ),
+      );
+    }
+  }
+
+  static const _agents = [
+    'codex',
+    'chatgpt_export',
+    'claude_code',
+    'gemini_cli',
+    'opencode',
+    'cursor',
+    'copilot_cli',
+    'qwen_code',
+    'copilot_chat',
+    'cline',
+    'roo_code',
+    'aider',
+    'goose',
+    'claude_export',
+  ];
+  String _agentLabel(String agent) => switch (agent) {
+    'codex' => 'Codex 编程',
+    'chatgpt_export' => 'ChatGPT 聊天',
+    'claude_code' => 'Claude Code',
+    'gemini_cli' => 'Gemini CLI',
+    'opencode' => 'OpenCode',
+    'cursor' => 'Cursor',
+    _ => agent,
+  };
+}
+
+class _ProjectGroup extends ConsumerWidget {
+  const _ProjectGroup({
+    super.key,
+    required this.project,
+    required this.group,
+    required this.onOpen,
+    this.selectedId,
+  });
+  final ArchiveProject project;
+  final ProjectChats group;
+  final ValueChanged<ArchiveSession> onOpen;
+  final String? selectedId;
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final notifier = ref.read(sessionsControllerProvider.notifier);
+    return Card(
+      elevation: 0,
+      margin: const EdgeInsets.only(bottom: 8),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        shape: const Border(),
+        collapsedShape: const Border(),
+        leading: Icon(
+          project.key == null ? Icons.inbox_outlined : Icons.folder_outlined,
+          size: 20,
+        ),
+        title: Text(
+          project.key == null ? '未分类' : (project.name ?? project.key!),
+        ),
+        subtitle: Text('${project.chatCount} 个聊天'),
+        onExpansionChanged: (expanded) {
+          if (expanded) notifier.loadProject(project.key);
+        },
+        children: [
+          for (final session in group.sessions)
+            _SessionTile(
+              key: ValueKey(session.id),
+              session: session,
+              onOpen: onOpen,
+              selected: session.id == selectedId,
+            ),
+          if (group.loading)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: LinearProgressIndicator(),
+            ),
+          if (group.error != null)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  Text(group.error!),
+                  TextButton(
+                    onPressed: () =>
+                        notifier.loadProject(project.key, more: group.loaded),
+                    child: const Text('重试'),
+                  ),
+                ],
+              ),
+            ),
+          if (group.loaded &&
+              !group.loading &&
+              group.error == null &&
+              group.cursor != null)
+            TextButton(
+              onPressed: () => notifier.loadProject(project.key, more: true),
+              child: const Text('加载更多聊天'),
+            ),
+          if (group.loaded && group.sessions.isEmpty && group.error == null)
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('没有匹配的聊天，刷新目录后重试。'),
+            ),
+        ],
+      ),
+    );
   }
 }
 
 class _SessionTile extends StatelessWidget {
-  const _SessionTile({required this.session});
+  const _SessionTile({
+    super.key,
+    required this.session,
+    required this.onOpen,
+    required this.selected,
+  });
 
   final ArchiveSession session;
+  final ValueChanged<ArchiveSession> onOpen;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return ListTile(
+      selected: selected,
+      selectedTileColor: theme.colorScheme.primaryContainer.withValues(
+        alpha: 0.35,
+      ),
+      contentPadding: const EdgeInsets.fromLTRB(56, 0, 16, 4),
+      leading: Icon(
+        Icons.chat_bubble_outline_rounded,
+        size: 18,
+        color: theme.colorScheme.onSurfaceVariant,
+      ),
       title: Row(
         children: [
           Expanded(
@@ -157,22 +378,29 @@ class _SessionTile extends StatelessWidget {
             ),
         ],
       ),
-      subtitle: Text(
-        [
-          session.agent,
-          if (session.projectKey != null) session.projectKey!,
-          '${session.eventCount} 条',
-          if (session.lastAt != null) formatDate(session.lastAt),
-        ].join(' · '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            [
+              switch (session.agent) {
+                'codex' => 'Codex 编程',
+                'chatgpt_export' => 'ChatGPT 聊天',
+                _ => session.agent,
+              },
+              session.messageCount == null
+                  ? '消息数统计中'
+                  : '${session.messageCount} 条消息',
+              if (session.lastAt != null) formatDate(session.lastAt),
+            ].join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          if (session.sourceArchived) const ArchiveSourceLabel(),
+        ],
       ),
       trailing: const Icon(Icons.chevron_right),
-      onTap: () => Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => SessionDetailPage(sessionId: session.id),
-        ),
-      ),
+      onTap: () => onOpen(session),
     );
   }
 }

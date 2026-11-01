@@ -139,6 +139,9 @@ pub struct TranscriptEventDto {
     pub occurred_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Host-provided message phase, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub content: Vec<ContentBlock>,
     /// Plain text for display and search. The masked form: suspected secrets
     /// have already been replaced (D5).
@@ -263,6 +266,7 @@ mod tests {
             kind: TranscriptKind::Meta,
             occurred_at: None,
             role: None,
+            phase: None,
             content: vec![],
             text: None,
             tool_name: None,

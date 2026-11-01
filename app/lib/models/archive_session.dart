@@ -1,5 +1,17 @@
 import 'json.dart';
 
+class ArchiveProject {
+  const ArchiveProject({this.key, this.name, required this.chatCount});
+  final String? key;
+  final String? name;
+  final int chatCount;
+  factory ArchiveProject.fromJson(Map<String, dynamic> json) => ArchiveProject(
+    key: asStringOrNull(json['key']),
+    name: asStringOrNull(json['name']),
+    chatCount: asInt(json['chat_count']),
+  );
+}
+
 /// 档案里的一段会话。
 ///
 /// 与服务端 `cormex_proto::archive::ArchiveSessionDto` 一一对应。
@@ -9,10 +21,14 @@ class ArchiveSession {
     required this.agent,
     this.title,
     this.projectKey,
+    this.projectName,
+    this.pinnedPosition,
+    this.sourceArchived = false,
     this.devices = const [],
     this.firstAt,
     this.lastAt,
     this.eventCount = 0,
+    this.messageCount,
     this.summary,
     this.soleCopy = false,
   });
@@ -24,6 +40,9 @@ class ArchiveSession {
   final String? title;
 
   final String? projectKey;
+  final String? projectName;
+  final int? pinnedPosition;
+  final bool sourceArchived;
 
   /// 给这段会话贡献过文件的设备。
   final List<String> devices;
@@ -31,6 +50,7 @@ class ArchiveSession {
   final DateTime? firstAt;
   final DateTime? lastAt;
   final int eventCount;
+  final int? messageCount;
 
   /// 一行摘要。阶段 5 之前为 null。
   final String? summary;
@@ -53,13 +73,22 @@ class ArchiveSession {
     agent: asString(json['agent'], 'unknown'),
     title: asStringOrNull(json['title']),
     projectKey: asStringOrNull(json['project_key']),
+    projectName: asStringOrNull(json['project_name']),
+    pinnedPosition: json['pinned_position'] is int
+        ? json['pinned_position'] as int
+        : null,
+    sourceArchived: json['source_archived'] == true,
     devices: switch (json['devices']) {
-      final List<dynamic> l => l.map(asString).where((s) => s.isNotEmpty).toList(),
+      final List<dynamic> l =>
+        l.map(asString).where((s) => s.isNotEmpty).toList(),
       _ => const [],
     },
     firstAt: _time(json['first_at']),
     lastAt: _time(json['last_at']),
     eventCount: asInt(json['event_count']),
+    messageCount: json['message_count'] is num
+        ? (json['message_count'] as num).toInt()
+        : null,
     summary: asStringOrNull(json['summary']),
     soleCopy: json['sole_copy'] == true,
   );
@@ -82,10 +111,11 @@ class ArchiveSessionsPage {
   factory ArchiveSessionsPage.fromJson(Map<String, dynamic> json) =>
       ArchiveSessionsPage(
         sessions: switch (json['sessions']) {
-          final List<dynamic> l => l
-              .whereType<Map<String, dynamic>>()
-              .map(ArchiveSession.fromJson)
-              .toList(),
+          final List<dynamic> l =>
+            l
+                .whereType<Map<String, dynamic>>()
+                .map(ArchiveSession.fromJson)
+                .toList(),
           _ => const [],
         },
         nextCursor: asStringOrNull(json['next_cursor']),
@@ -117,10 +147,11 @@ class ArchiveFile {
     deviceId: asString(json['device_id']),
     logicalPath: asString(json['logical_path']),
     generations: switch (json['generations']) {
-      final List<dynamic> l => l
-          .whereType<Map<String, dynamic>>()
-          .map(ArchiveGeneration.fromJson)
-          .toList(),
+      final List<dynamic> l =>
+        l
+            .whereType<Map<String, dynamic>>()
+            .map(ArchiveGeneration.fromJson)
+            .toList(),
       _ => const [],
     },
   );
@@ -183,10 +214,11 @@ class ArchiveSessionDetail {
           _ => const ArchiveSession(id: '', agent: 'unknown'),
         },
         files: switch (json['files']) {
-          final List<dynamic> l => l
-              .whereType<Map<String, dynamic>>()
-              .map(ArchiveFile.fromJson)
-              .toList(),
+          final List<dynamic> l =>
+            l
+                .whereType<Map<String, dynamic>>()
+                .map(ArchiveFile.fromJson)
+                .toList(),
           _ => const [],
         },
         parserVersion: asStringOrNull(json['parser_version']),

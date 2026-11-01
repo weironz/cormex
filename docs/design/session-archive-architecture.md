@@ -1,5 +1,7 @@
 # 会话档案（Session Archive）—— 技术选型与架构设计
 
+> 当前 Codex 会话读取、存储、展示和 ChatGPT 导入的实现状态及限制，见 [Codex 会话数据流](codex-session-data-flow.md)。本文保留设计决策；实际可用行为以代码和该实现说明为准。
+
 > 日期：2026-10-29 · 状态：**定稿，待实施**
 >
 > 上游：[调研报告与需求评审](../research/2026-10-agent-memory-survey.md)（所有者的决定见其 §9）、

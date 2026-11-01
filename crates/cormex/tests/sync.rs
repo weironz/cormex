@@ -298,6 +298,77 @@ async fn a_budget_exhausted_run_leaves_work_for_next_time() {
 }
 
 #[tokio::test]
+async fn queued_work_survives_budget_exhaustion_and_drains_after_upload() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let path = f.home.path().join("projects/-home-u-proj/s1.jsonl");
+    f.db.enqueue("claude_code", path.to_str().unwrap(), None, None, "now")
+        .unwrap();
+    f.sync_with(SyncOptions {
+        trigger: Trigger::Queue,
+        budget: Budget::new(60, 0),
+        ..SyncOptions::default()
+    })
+    .await;
+    assert_eq!(f.db.queue_len().unwrap(), 1);
+    let report = f
+        .sync_with(SyncOptions {
+            trigger: Trigger::Queue,
+            ..SyncOptions::default()
+        })
+        .await;
+    assert_eq!(report.files_uploaded, 1);
+    assert_eq!(f.db.queue_len().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn spool_is_only_removed_after_its_source_was_synced() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let spool = f.data.path().join("spool");
+    std::fs::create_dir(&spool).unwrap();
+    let source = f.home.path().join("projects/-home-u-proj/s1.jsonl");
+    std::fs::write(
+        spool.join("handled.json"),
+        serde_json::json!({"path": source}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        spool.join("unknown.json"),
+        serde_json::json!({"path": "unknown"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(spool.join("other.txt"), "keep").unwrap();
+    f.sync().await;
+    assert!(!spool.join("handled.json").exists());
+    assert!(spool.join("unknown.json").exists());
+    assert!(spool.join("other.txt").exists());
+}
+
+#[tokio::test]
+async fn broken_source_is_reported_without_blocking_other_uploads() {
+    use cormex_proto::catalog::HomeRoot;
+    let mut f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::write(broken.path().join("opencode.db"), b"not sqlite").unwrap();
+    let mut agent = cormex_proto::catalog::Catalog::builtin()
+        .agents
+        .iter()
+        .find(|a| a.id == "opencode")
+        .unwrap()
+        .clone();
+    agent.home = vec![HomeRoot::Path {
+        path: broken.path().display().to_string(),
+    }];
+    f.catalog.agents.insert(0, agent);
+    let report = f.sync().await;
+    assert_eq!(report.files_uploaded, 1);
+    assert_eq!(report.errors, 1);
+    assert!(report.last_error.unwrap().contains("opencode"));
+}
+
+#[tokio::test]
 async fn a_dry_run_uploads_nothing_and_records_no_run() {
     let f = Fixture::new();
     f.write("s1.jsonl", b"0123456789");

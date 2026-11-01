@@ -31,7 +31,12 @@
 #
 # 构建与运行底座**必须同一个 debian 代号**：二进制动态链 glibc，
 # 新 glibc 编的东西放进老底座会在启动时报 `GLIBC_2.xx not found`。
+# Bound compiler concurrency on memory-limited Docker hosts; override with --build-arg.
+ARG CARGO_BUILD_JOBS=2
 FROM rust:1.97.1-trixie AS builder
+
+ARG CARGO_BUILD_JOBS
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 WORKDIR /build
 
@@ -47,16 +52,27 @@ COPY crates/cormex-blob/Cargo.toml   crates/cormex-blob/
 COPY crates/cormex-proto/Cargo.toml  crates/cormex-proto/
 COPY crates/cormex-import/Cargo.toml crates/cormex-import/
 COPY crates/cormexd/Cargo.toml       crates/cormexd/
+COPY crates/cormex/Cargo.toml        crates/cormex/
+COPY crates/e2e-capture/Cargo.toml   crates/e2e-capture/
+COPY crates/cormex-transcript/Cargo.toml crates/cormex-transcript/
 COPY evals/Cargo.toml                evals/
 
-# 造出空的 lib/main，让 cargo 能解析并预编译依赖
+# Stub every manifest-declared target, including disabled examples/tests:
+# cargo build validates their paths before selecting cormexd.
 RUN set -eux; \
     for d in crates/*/ evals/; do \
         mkdir -p "$d/src"; \
         echo '' > "$d/src/lib.rs"; \
         echo 'fn main() {}' > "$d/src/main.rs"; \
     done; \
-    cargo build --release --locked -p cormexd 2>/dev/null || true
+    for f in \
+        crates/cormex-memory/examples/embed_bench.rs \
+        crates/cormex-memory/tests/fastembed.rs \
+        crates/cormex-memory/tests/embed_env_empty.rs; do \
+        mkdir -p "$(dirname "$f")"; \
+        echo 'fn main() {}' > "$f"; \
+    done; \
+    cargo build --release --locked -p cormexd
 
 # 真正的源码。上面那层的产物在依赖没变时命中缓存
 COPY crates/ crates/
@@ -89,6 +105,9 @@ RUN set -eux; \
 # 部署机上不该为了跑一次 migration 去装 Rust 工具链，
 # 所以把 sqlx 一起塞进镜像，`just prod-migrate` 直接用。
 FROM rust:1.97.1-trixie AS sqlx
+ARG CARGO_BUILD_JOBS
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 # 版本必须钉在 0.9：Cargo.lock 把 sqlx 钉在 0.9（pgvector 的依赖范围会把它
 # 拉回 0.8 并造成两份 sqlx-core 共存，见 CLAUDE.md）。migration 记录表的
 # 格式跟 sqlx 大版本走，CLI 与库对不上会在应用 migration 时出怪问题。

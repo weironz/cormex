@@ -725,6 +725,10 @@ impl AppState {
         &self.inner.config.distill
     }
 
+    pub(crate) fn llm_config(&self) -> &cormex_core::config::LlmConfig {
+        &self.inner.config.llm
+    }
+
     /// The query's vector, when this deployment has conversation vectors on
     /// (P5-6).
     ///

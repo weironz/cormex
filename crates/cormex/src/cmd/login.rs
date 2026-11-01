@@ -251,10 +251,15 @@ pub async fn login_with_device_code(
         .context("could not start a device-code login")?;
 
     println!();
-    println!(
-        "  Open {} in a browser and enter:",
-        started.verification_uri
+    let base = reqwest::Url::parse(&cfg.server_url).context("invalid server URL")?;
+    let verification = base
+        .join(&started.verification_uri)
+        .context("invalid verification URL")?;
+    anyhow::ensure!(
+        verification.origin() == base.origin(),
+        "device authorization URL is on a different origin"
     );
+    println!("  Open {verification} in a browser and enter:");
     println!();
     println!("      {}", started.user_code);
     println!();

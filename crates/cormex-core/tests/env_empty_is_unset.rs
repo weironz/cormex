@@ -50,6 +50,7 @@ fn empty_env_falls_back_to_default() {
     unsafe {
         std::env::set_var("DATABASE_URL", "postgres://u:p@127.0.0.1:5432/x");
         std::env::set_var("CORMEX_LLM_PROVIDER", "deepseek");
+        std::env::remove_var("CORMEX_PROMOTE_ENABLED");
         for (key, _, _) in CASES {
             std::env::set_var(key, "");
         }
@@ -69,6 +70,26 @@ fn empty_env_falls_back_to_default() {
              {want}, but got {:?} — env::var returns Ok(\"\") for an empty \
              string, and the default got knocked out",
             get(&cfg)
+        );
+    }
+
+    assert!(
+        !cfg.distill.promote,
+        "paid memory extraction must stay off until explicitly enabled"
+    );
+    for (value, want) in [
+        ("", false),
+        ("   ", false),
+        ("true", true),
+        ("false", false),
+    ] {
+        // SAFETY: this is the only test in this binary, with no concurrent
+        // environment readers or writers.
+        unsafe { std::env::set_var("CORMEX_PROMOTE_ENABLED", value) };
+        let cfg = Config::from_env().expect("the promotion flag should parse");
+        assert_eq!(
+            cfg.distill.promote, want,
+            "CORMEX_PROMOTE_ENABLED={value:?} should produce promote={want}"
         );
     }
 

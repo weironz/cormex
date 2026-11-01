@@ -183,7 +183,13 @@ impl CorsPolicy {
             // Enumerated one by one rather than `Any`: `Any` saves no effort
             // here, it only hides the question "what happens once DELETE is
             // added"
-            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::OPTIONS,
+            ])
             .allow_headers([
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
@@ -284,6 +290,67 @@ fn validate_origin(item: &str) -> cormex_core::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn allowed_origin_can_preflight_settings_put() {
+        use axum::{Router, body::Body, http::Request, routing::put};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/settings/memory-extraction", put(|| async { "ok" }))
+            .layer(super::CorsPolicy::parse("loopback").unwrap().layer());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/settings/memory-extraction")
+                    .header("origin", "http://127.0.0.1:18091")
+                    .header("access-control-request-method", "PUT")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "http://127.0.0.1:18091"
+        );
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|m| m.trim() == "PUT")
+        );
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/settings/memory-extraction")
+                    .header("origin", "https://example.invalid")
+                    .header("access-control-request-method", "PUT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            denied
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
     use super::*;
 
     fn policy(raw: &str) -> CorsPolicy {

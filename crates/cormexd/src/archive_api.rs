@@ -44,17 +44,37 @@ use crate::state::AppState;
 
 /// The parser version the browsing API reads.
 ///
-/// One constant rather than a query parameter: two projections can coexist, and
-/// letting the client pick one would mean the UI has to know which parser
-/// version produced what it is looking at. When a parser is upgraded, the
-/// projector writes the new version and this moves with it.
+/// Fixture version for tests that seed Claude projections.
+#[cfg(test)]
 const PARSER_VERSION: &str = "claude_code@1";
+
+pub(crate) fn parser_version_for_agent(agent: &str) -> Option<&'static str> {
+    use cormex_proto::capture::FileRole;
+    [FileRole::Transcript, FileRole::Row, FileRole::Subagent]
+        .into_iter()
+        .find_map(|role| cormex_transcript::parser_for(agent, role).map(|p| p.version()))
+}
+
+#[cfg(test)]
+#[test]
+fn archive_details_use_each_agents_parser_version() {
+    assert_eq!(
+        parser_version_for_agent("claude_code"),
+        Some("claude_code@1")
+    );
+    assert_eq!(parser_version_for_agent("codex"), Some("codex@1"));
+    assert_eq!(parser_version_for_agent("opencode"), Some("opencode@1"));
+    assert_eq!(parser_version_for_agent("unrecognized"), None);
+}
 
 /// `GET /archive/sessions`.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     pub agent: Option<String>,
     pub project: Option<String>,
+    #[serde(default)]
+    pub unassigned: bool,
+    pub q: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
     pub cursor: Option<String>,
@@ -624,7 +644,7 @@ pub async fn list_sessions(
     let limit = q.limit.unwrap_or(50);
 
     let rows = store
-        .archive_sessions_at(
+        .archive_sessions_filtered_at(
             q.agent.as_deref(),
             q.project.as_deref(),
             since,
@@ -633,6 +653,8 @@ pub async fn list_sessions(
             as_of,
             after.as_ref().map(|(t, id)| (t, id.as_str())),
             limit,
+            q.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+            q.unassigned,
         )
         .await
         .map_err(store_err)?;
@@ -641,13 +663,47 @@ pub async fn list_sessions(
     for r in &rows {
         sessions.push(to_dto(&store, r).await?);
     }
-    let next_cursor = rows
-        .last()
-        .and_then(|r| r.last_at.map(|t| format!("{}|{}", t.to_rfc3339(), r.id)));
+    let next_cursor = if rows.len() < limit.clamp(1, 200) as usize {
+        None
+    } else {
+        rows.last()
+            .and_then(|r| r.last_at.map(|t| format!("{}|{}", t.to_rfc3339(), r.id)))
+    };
 
     Ok(Json(ArchiveSessionsResponse {
         sessions,
         next_cursor,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectsQuery {
+    pub agent: Option<String>,
+    pub q: Option<String>,
+}
+
+pub async fn list_projects(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Query(q): Query<ProjectsQuery>,
+) -> Result<Json<cormex_proto::archive::ArchiveProjectsResponse>, ApiError> {
+    let store = archive_store(&st, &principal).await?;
+    let rows = store
+        .archive_projects(
+            q.agent.as_deref(),
+            q.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+        )
+        .await
+        .map_err(store_err)?;
+    Ok(Json(cormex_proto::archive::ArchiveProjectsResponse {
+        projects: rows
+            .into_iter()
+            .map(|r| cormex_proto::archive::ArchiveProjectDto {
+                key: r.key,
+                name: r.name,
+                chat_count: r.chat_count,
+            })
+            .collect(),
     }))
 }
 
@@ -666,6 +722,7 @@ pub async fn get_session(
         .map_err(store_err)?
         .ok_or_else(|| ApiError::not_found("no such session, or it has no events yet"))?;
     let session = to_dto(&store, &row).await?;
+    let parser_version = parser_version_for_agent(&row.agent);
 
     let files = store.archive_files(&id).await.map_err(store_err)?;
     let files: Vec<ArchiveFileDto> = files
@@ -691,15 +748,19 @@ pub async fn get_session(
         })
         .collect();
 
-    let projection = store
-        .latest_projection(&id, PARSER_VERSION)
-        .await
-        .map_err(store_err)?;
+    let projection = if let Some(version) = parser_version {
+        store
+            .latest_projection(&id, version)
+            .await
+            .map_err(store_err)?
+    } else {
+        None
+    };
 
     Ok(Json(ArchiveSessionDetail {
         session,
         files,
-        parser_version: Some(PARSER_VERSION.to_owned()),
+        parser_version: parser_version.map(str::to_owned),
         projection_status: projection.as_ref().map(|p| p.status.to_string()),
         projection_error: projection.and_then(|p| p.error),
     }))
@@ -714,6 +775,13 @@ pub async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<ArchiveEventsResponse>, ApiError> {
     let store = archive_store(&st, &principal).await?;
+    let row = store
+        .archive_session(&id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::not_found("no such session, or it has no events yet"))?;
+    let parser_version = parser_version_for_agent(&row.agent)
+        .ok_or_else(|| ApiError::not_found("no parser available for this agent"))?;
     let after_seq = q
         .cursor
         .as_deref()
@@ -728,7 +796,7 @@ pub async fn get_events(
     let events = store
         .transcript_page_at(
             &id,
-            PARSER_VERSION,
+            parser_version,
             after_seq.unwrap_or(-1),
             parse_time(q.at.as_deref())?,
             parse_time(q.as_of.as_deref())?,
@@ -738,15 +806,284 @@ pub async fn get_events(
         .map_err(store_err)?;
 
     let next_cursor = events.last().map(|e| e.seq.to_string());
-    let events: Vec<TranscriptEventDto> = events
+    let mut events: Vec<TranscriptEventDto> = events
         .into_iter()
         .map(|e| to_event_dto(e, digest))
         .collect();
+    if row.agent == "codex" {
+        restore_codex_message_metadata(&st, &store, &mut events).await;
+    }
 
     Ok(Json(ArchiveEventsResponse {
         events,
         next_cursor,
     }))
+}
+
+/// Recover only non-sensitive classification fields from archived source spans.
+/// Group adjacent records into bounded reads so a page does not fetch each
+/// object separately. A missing source leaves the previous unknown behavior.
+async fn restore_codex_message_metadata(
+    st: &AppState,
+    store: &Store,
+    events: &mut [TranscriptEventDto],
+) -> bool {
+    const MAX_RECORD: i64 = 1024 * 1024;
+    const MAX_WINDOW: i64 = 8 * 1024 * 1024;
+    let mut indices: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e.kind,
+                TranscriptKind::UserMessage | TranscriptKind::AgentMessage
+            ) && e.source.offset >= 0
+                && e.source.length > 0
+                && e.source.length <= MAX_RECORD
+                && e.source.offset.checked_add(e.source.length).is_some()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    indices.sort_by(|&a, &b| {
+        events[a]
+            .source
+            .generation_id
+            .cmp(&events[b].source.generation_id)
+            .then(events[a].source.offset.cmp(&events[b].source.offset))
+    });
+    let mut pos = 0;
+    let mut readable = true;
+    while pos < indices.len() {
+        let first = indices[pos];
+        let generation = events[first].source.generation_id.clone();
+        let start = events[first].source.offset;
+        let mut end = start + events[first].source.length;
+        let mut stop = pos + 1;
+        while stop < indices.len() {
+            let source = &events[indices[stop]].source;
+            let next_end = source.offset + source.length;
+            if source.generation_id != generation || next_end - start > MAX_WINDOW {
+                break;
+            }
+            end = end.max(next_end);
+            stop += 1;
+        }
+        if let Ok(bytes) = read_range(st, store, &generation, start, end - start).await {
+            for &index in &indices[pos..stop] {
+                let source = &events[index].source;
+                let from = (source.offset - start) as usize;
+                let to = from + source.length as usize;
+                if let Some(record) = bytes.get(from..to) {
+                    let (role, phase) = codex_message_metadata(record);
+                    events[index].role = role;
+                    events[index].phase = phase;
+                } else {
+                    readable = false;
+                }
+            }
+        } else {
+            readable = false;
+        }
+        pos = stop;
+    }
+    readable
+}
+
+/// Keep this predicate aligned with the client's default conversation view.
+fn is_conversation_message(event: &TranscriptEventDto, agent: &str) -> bool {
+    if !matches!(
+        event.kind,
+        TranscriptKind::UserMessage | TranscriptKind::AgentMessage
+    ) {
+        return false;
+    }
+    if matches!(event.role.as_deref(), Some("developer" | "system")) {
+        return false;
+    }
+    if event.role.as_deref() == Some("assistant")
+        && matches!(event.phase.as_deref(), Some("commentary" | "analysis"))
+    {
+        return false;
+    }
+    let text = event
+        .text
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            event
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    const PREFIXES: &[&str] = &[
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<recommended_plugins>",
+        "<permissions instructions>",
+        "<external_codex_apps_open_page>",
+        "<user_instructions>",
+        "<subagent_notification>",
+        "<app-context>",
+        "<codex_apps_open_page_instructions>",
+        "<codex_apps_client_time_context>",
+        "<skills_instructions>",
+        "<tools>",
+        "You are Codex, an agent based on ",
+    ];
+    if PREFIXES.iter().any(|p| text.starts_with(p)) {
+        return false;
+    }
+    !(agent == "codex" && event.role.is_none() && text == "Not a git repo, skipping")
+}
+
+/// Prepare a whole short conversation using the same classification as the UI.
+/// No partial/truncated conversations are silently submitted to a model.
+pub(crate) async fn memory_trial_events(
+    st: &AppState,
+    store: &Store,
+    id: &str,
+) -> Result<(cormex_store::ArchiveSessionRow, Vec<TranscriptEvent>, i64), ApiError> {
+    let row = store
+        .archive_session(id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::bad_request("聊天不存在或尚未解析"))?;
+    let version = parser_version_for_agent(&row.agent)
+        .ok_or_else(|| ApiError::bad_request("暂不支持该来源的小样本提取"))?;
+    let events = store
+        .transcript_page_at(id, version, -1, None, None, 201)
+        .await
+        .map_err(store_err)?;
+    if events.len() > 200 {
+        return Err(ApiError::bad_request(
+            "请选择更短的聊天：小样本每个聊天最多 200 个事件",
+        ));
+    }
+    let through = events.last().map_or(-1, |e| e.seq);
+    let selected = memory_conversation_events(st, store, &row.agent, events).await?;
+    Ok((row, selected, through))
+}
+
+pub(crate) async fn memory_conversation_events(
+    st: &AppState,
+    store: &Store,
+    agent: &str,
+    events: Vec<TranscriptEvent>,
+) -> Result<Vec<TranscriptEvent>, ApiError> {
+    let mut display = events
+        .iter()
+        .cloned()
+        .map(|e| to_event_dto(e, false))
+        .collect::<Vec<_>>();
+    if agent == "codex" && !restore_codex_message_metadata(st, store, &mut display).await {
+        return Err(ApiError::bad_request("聊天来源暂时不可读，未提交给模型"));
+    }
+    let selected = events
+        .into_iter()
+        .zip(display)
+        .filter_map(|(mut e, d)| {
+            if !is_conversation_message(&d, agent) {
+                return None;
+            }
+            e.kind = match d.role.as_deref() {
+                Some("user") => cormex_store::TranscriptEventKind::UserMessage,
+                Some("assistant") => cormex_store::TranscriptEventKind::AgentMessage,
+                _ if d.kind == TranscriptKind::UserMessage => {
+                    cormex_store::TranscriptEventKind::UserMessage
+                }
+                _ => cormex_store::TranscriptEventKind::AgentMessage,
+            };
+            e.text = d.text.or(e.text);
+            Some(e)
+        })
+        .collect();
+    Ok(selected)
+}
+
+pub(crate) async fn update_message_counts(st: &AppState, store: &Store) -> Result<(), ApiError> {
+    let mut versions = serde_json::Map::new();
+    for agent in &cormex_proto::catalog::Catalog::builtin().agents {
+        if let Some(version) = parser_version_for_agent(&agent.id) {
+            versions.insert(agent.id.clone(), version.into());
+        }
+    }
+    for (session, agent, version, projection, event_count) in store
+        .message_counts_pending(&versions.into(), 20)
+        .await
+        .map_err(store_err)?
+    {
+        let mut after = -1;
+        let mut count = 0;
+        let mut readable = true;
+        loop {
+            let candidates = store
+                .conversation_candidates(&session, &version, after)
+                .await
+                .map_err(store_err)?;
+            if candidates.is_empty() {
+                break;
+            }
+            after = candidates.last().expect("nonempty").seq;
+            let mut events = candidates
+                .into_iter()
+                .map(|e| to_event_dto(e, false))
+                .collect::<Vec<_>>();
+            if agent == "codex" && !restore_codex_message_metadata(st, store, &mut events).await {
+                readable = false;
+                break;
+            }
+            count += events
+                .iter()
+                .filter(|e| is_conversation_message(e, &agent))
+                .count() as i64;
+        }
+        store
+            .archive_txn(async |t| {
+                t.cache_message_count(
+                    &session,
+                    &projection,
+                    &version,
+                    event_count,
+                    readable.then_some(count),
+                )
+                .await
+            })
+            .await
+            .map_err(store_err)?;
+    }
+    Ok(())
+}
+
+fn codex_message_metadata(record: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
+        return (None, None);
+    };
+    if value.get("type").and_then(|v| v.as_str()) != Some("response_item")
+        || value.pointer("/payload/type").and_then(|v| v.as_str()) != Some("message")
+    {
+        return (None, None);
+    }
+    let role = value
+        .pointer("/payload/role")
+        .and_then(|v| v.as_str())
+        .filter(|v| matches!(*v, "user" | "assistant" | "developer" | "system"))
+        .map(str::to_owned);
+    let phase = value
+        .pointer("/payload/phase")
+        .and_then(|v| v.as_str())
+        .filter(|v| matches!(*v, "commentary" | "final_answer" | "analysis"))
+        .map(str::to_owned);
+    (role, phase)
 }
 
 /// `GET /archive/raw/{generation_id}` — the original bytes.
@@ -855,15 +1192,20 @@ async fn to_dto(
     Ok(ArchiveSessionDto {
         id: row.id.clone(),
         agent: row.agent.clone(),
-        title: row
-            .title_source
-            .as_deref()
-            .map(|t| t.chars().take(TITLE_CHARS).collect::<String>()),
+        title: row.original_title.clone().or_else(|| {
+            row.title_source
+                .as_deref()
+                .map(|t| t.chars().take(TITLE_CHARS).collect::<String>())
+        }),
         project_key: row.project_key.clone(),
+        project_name: row.project_name.clone(),
+        pinned_position: row.pinned_position,
+        source_archived: row.source_archived,
         devices: row.devices.clone().unwrap_or_default(),
         first_at: row.first_at.map(|t| t.to_rfc3339()),
         last_at: row.last_at.map(|t| t.to_rfc3339()),
         event_count: row.event_count,
+        message_count: row.message_count,
         summary: None,
         sole_copy: store
             .session_is_sole_copy(&row.id)
@@ -911,6 +1253,7 @@ fn to_event_dto(e: TranscriptEvent, digest: bool) -> TranscriptEventDto {
         kind: wire_kind(e.kind),
         occurred_at: e.occurred_at.map(|t| t.to_rfc3339()),
         role: None,
+        phase: None,
         content: serde_json::from_value(content).unwrap_or_default(),
         text,
         tool_name: e.tool_name,
@@ -1052,6 +1395,412 @@ mod tests {
         FileRole, Framing, NewCaptureChunk, NewCaptureFile, NewCaptureMask, NewMaskProgress,
         NewProjection, NewTranscriptEvent, ProjectionStatus, TranscriptEventKind,
     };
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn project_facets_and_scoped_pages_are_complete_and_disjoint() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        for i in 0..65 {
+            let (id, _, _) = seed(&st).await;
+            let project = if i < 35 {
+                Some("a")
+            } else if i < 63 {
+                Some("b")
+            } else {
+                None
+            };
+            let title = if i == 34 {
+                "needle".to_owned()
+            } else {
+                format!("chat-{i}")
+            };
+            sqlx::query("INSERT INTO capture_session_ui_metadata(session_id,device_id,title,project_id,project_name) VALUES($1,$2,$3,$4,$4)")
+                .bind(&id).bind(Id::new().to_string()).bind(title).bind(project).execute(store.pool()).await.unwrap();
+        }
+        // Equal timestamps exercise the ID half of the keyset cursor.
+        sqlx::query("UPDATE transcript_events SET occurred_at='2026-10-01T00:00:00Z'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let facets = store
+            .archive_projects(Some("claude_code"), None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 3);
+        assert_eq!(facets.iter().map(|p| p.chat_count).sum::<i64>(), 65);
+        assert_eq!(
+            facets.iter().find(|p| p.key.is_none()).unwrap().chat_count,
+            2
+        );
+        assert!(
+            store
+                .archive_projects(Some("codex"), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let first = store
+            .archive_sessions_filtered_at(
+                Some("claude_code"),
+                Some("a"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                30,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 30);
+        let last = first.last().unwrap();
+        let stamp = last.last_at.unwrap();
+        let second = store
+            .archive_sessions_filtered_at(
+                Some("claude_code"),
+                Some("a"),
+                None,
+                None,
+                None,
+                None,
+                Some((&stamp, &last.id)),
+                30,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 5);
+        let unique = first
+            .iter()
+            .chain(&second)
+            .map(|r| r.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 35);
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|r| r.project_key.as_deref() == Some("a"))
+        );
+        let unassigned = store
+            .archive_sessions_filtered_at(None, None, None, None, None, None, None, 30, None, true)
+            .await
+            .unwrap();
+        assert_eq!(unassigned.len(), 2);
+        assert!(unassigned.iter().all(|r| r.project_key.is_none()));
+        let searched = store.archive_projects(None, Some("needle")).await.unwrap();
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].chat_count, 1);
+        let page = store
+            .archive_sessions_filtered_at(
+                None,
+                Some("a"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                Some("needle"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].original_title.as_deref(), Some("needle"));
+        assert!(
+            store
+                .archive_projects(None, Some("%_"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.drop().await;
+    }
+
+    #[test]
+    fn message_statistics_follow_the_conversation_view() {
+        let mut event = TranscriptEventDto {
+            id: "one".into(),
+            seq: 0,
+            kind: TranscriptKind::AgentMessage,
+            occurred_at: None,
+            role: Some("assistant".into()),
+            phase: Some("final_answer".into()),
+            content: vec![],
+            text: Some("done".into()),
+            tool_name: None,
+            tool_call_id: None,
+            source: cormex_proto::transcript::SourceSpan {
+                generation_id: "g".into(),
+                offset: 0,
+                length: 0,
+            },
+        };
+        assert!(is_conversation_message(&event, "codex"));
+        event.phase = Some("commentary".into());
+        assert!(!is_conversation_message(&event, "codex"));
+        event.phase = None;
+        assert!(is_conversation_message(&event, "codex"));
+        event.role = Some("developer".into());
+        assert!(!is_conversation_message(&event, "codex"));
+        event.role = None;
+        event.kind = TranscriptKind::UserMessage;
+        event.text = Some("<environment_context>internal</environment_context>".into());
+        assert!(!is_conversation_message(&event, "codex"));
+        event.text = Some("question".into());
+        assert!(is_conversation_message(&event, "codex"));
+        event.kind = TranscriptKind::ToolResult;
+        assert!(!is_conversation_message(&event, "codex"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn message_count_cache_invalidates_on_projection_change() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let (id, _, _) = seed(&st).await;
+        let store = st.public_store().unwrap();
+        assert!(
+            store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count
+                .is_none()
+        );
+        update_message_counts(&st, &store).await.unwrap();
+        assert_eq!(
+            store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count,
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .archive_sessions(None, None, None, None, None, 50)
+                .await
+                .unwrap()[0]
+                .message_count,
+            Some(1)
+        );
+        let previous = store
+            .latest_projection(&id, PARSER_VERSION)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .archive_txn(async |t| {
+                t.insert_transcript_events(
+                    &[],
+                    &NewProjection {
+                        id: Id::new(),
+                        session_id: id.parse().unwrap(),
+                        parser_version: PARSER_VERSION.into(),
+                        through: previous.through.clone(),
+                        next_seq: previous.next_seq + 10,
+                        status: ProjectionStatus::Ok,
+                        error: None,
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count
+                .is_none()
+        );
+        update_message_counts(&st, &store).await.unwrap();
+        assert_eq!(
+            store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count,
+            Some(1)
+        );
+        db.drop().await;
+    }
+
+    #[test]
+    fn codex_metadata_only_extracts_recognized_message_roles_and_phases() {
+        let developer = br#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"secret"}]}}"#;
+        assert_eq!(
+            codex_message_metadata(developer),
+            (Some("developer".into()), None)
+        );
+        let answer = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer"}}"#;
+        assert_eq!(
+            codex_message_metadata(answer),
+            (Some("assistant".into()), Some("final_answer".into()))
+        );
+        let commentary = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary"}}"#;
+        assert_eq!(
+            codex_message_metadata(commentary).1.as_deref(),
+            Some("commentary")
+        );
+        assert_eq!(
+            codex_message_metadata(
+                br#"{"type":"event_msg","payload":{"type":"message","role":"user"}}"#
+            ),
+            (None, None)
+        );
+        assert_eq!(codex_message_metadata(b"broken"), (None, None));
+        assert_eq!(codex_message_metadata(br#"{"type":"response_item","payload":{"type":"message","role":"unknown","phase":"unknown"}}"#), (None, None));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn archived_source_is_provenance_on_both_list_and_detail() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let (id, _, _) = seed(&st).await;
+        let store = st.public_store().unwrap();
+        assert!(
+            !store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_archived
+        );
+        sqlx::query("UPDATE capture_sessions SET agent='codex' WHERE id=$1")
+            .bind(&id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE capture_files SET logical_path='archived_sessions/rollout-test.jsonl' WHERE session_id=$1").bind(&id).execute(store.pool()).await.unwrap();
+        let detail = store.archive_session(&id).await.unwrap().unwrap();
+        assert!(detail.source_archived);
+        assert!(to_dto(&store, &detail).await.unwrap().source_archived);
+        let list = store
+            .archive_sessions(Some("codex"), None, None, None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].source_archived);
+        sqlx::query("UPDATE capture_files SET logical_path='archivedXsessions/rollout-test.jsonl' WHERE session_id=$1").bind(&id).execute(store.pool()).await.unwrap();
+        assert!(
+            !store
+                .archive_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_archived
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn codex_metadata_recovers_from_archived_source_spans() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let first = br#"{"type":"response_item","payload":{"type":"message","role":"developer"}}"#;
+        let second = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer"}}"#;
+        let mut body = first.to_vec();
+        body.push(b'\n');
+        body.extend_from_slice(second);
+        body.push(b'\n');
+        let registered = store
+            .archive_txn(async |t| {
+                t.register_capture_file(&NewCaptureFile {
+                    id: Id::new(),
+                    native_session_id: format!("native-{}", Id::new()),
+                    parent_native_session_id: None,
+                    device_id: Id::new().to_string(),
+                    agent: "codex".into(),
+                    logical_path: "session.jsonl".into(),
+                    role: FileRole::Transcript,
+                    framing: Framing::Append,
+                    cwd: None,
+                    project_key: None,
+                })
+                .await
+            })
+            .await
+            .unwrap();
+        use sha2::Digest as _;
+        let sha = format!("{:x}", sha2::Sha256::digest(&body));
+        let key = format!("public/capture/{}/{}/{sha}.zst", &sha[0..2], &sha[2..4]);
+        st.put_capture_object(
+            &key,
+            axum::body::Bytes::from(zstd::encode_all(body.as_slice(), 3).unwrap()),
+        )
+        .await
+        .unwrap();
+        store
+            .archive_txn(async |t| {
+                t.append_chunk(&NewCaptureChunk {
+                    id: Id::new(),
+                    generation_id: registered.generation.id.parse().unwrap(),
+                    byte_offset: 0,
+                    byte_length: body.len() as i64,
+                    content_sha256: sha.clone(),
+                    storage_key: key.clone(),
+                    encoding: ChunkEncoding::Zstd,
+                    observed_at: Utc::now(),
+                })
+                .await
+            })
+            .await
+            .unwrap();
+        let event = |offset, length| TranscriptEventDto {
+            id: Id::new().to_string(),
+            seq: 0,
+            kind: TranscriptKind::AgentMessage,
+            occurred_at: None,
+            role: None,
+            phase: None,
+            content: vec![],
+            text: None,
+            tool_name: None,
+            tool_call_id: None,
+            source: cormex_proto::transcript::SourceSpan {
+                generation_id: registered.generation.id.clone(),
+                offset,
+                length,
+            },
+        };
+        let mut events = vec![
+            event(0, first.len() as i64),
+            event((first.len() + 1) as i64, second.len() as i64),
+        ];
+        restore_codex_message_metadata(&st, &store, &mut events).await;
+        assert_eq!(events[0].role.as_deref(), Some("developer"));
+        assert_eq!(events[1].role.as_deref(), Some("assistant"));
+        assert_eq!(events[1].phase.as_deref(), Some("final_answer"));
+        db.drop().await;
+    }
 
     /// Seed a session with one event and one mask, returning
     /// `(session_id, generation_id, body)`.

@@ -88,6 +88,7 @@ tempfile = { version = "3", optional = true }
 
 serde.workspace = true
 serde_json.workspace = true
+url = "2"
 chrono.workspace = true
 anyhow.workspace = true
 

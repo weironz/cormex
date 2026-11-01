@@ -729,6 +729,29 @@ impl<E: Embedder> Retriever<E> {
         Ok(self.finish(chronological(facts), context_window))
     }
 
+    /// Browser snapshots honor their explicit row limit, without the agent's
+    /// score threshold or injection token budget. Agent retrieval is unchanged.
+    pub async fn browse_as_of(
+        &self,
+        store: &Store,
+        as_of: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Retrieved> {
+        let facts = store
+            .facts_as_of(as_of, limit.clamp(1, 100))
+            .await
+            .map_err(|e| CormexError::Store(e.to_string()))?;
+        Ok(display_snapshot(facts))
+    }
+
+    pub async fn browse_current(&self, store: &Store, limit: i64) -> Result<Retrieved> {
+        let facts = store
+            .current_memory_facts(limit)
+            .await
+            .map_err(|e| CormexError::Store(e.to_string()))?;
+        Ok(display_snapshot(facts))
+    }
+
     /// Replay + retrieval: relevance ranking **on top of** the snapshot as it stood
     /// at `as_of`.
     ///
@@ -959,26 +982,7 @@ impl<E: Embedder> Retriever<E> {
             })
             .collect();
 
-        let items: Vec<MemoryItem> = fused
-            .into_iter()
-            .map(|f| MemoryItem {
-                id: f.item.id,
-                statement: f.item.statement,
-                valid_at: f.item.valid_at.map(|t| t.to_rfc3339()),
-                known_since: f.item.created_at.to_rfc3339(),
-                source_episode_id: Some(f.item.source_episode_id),
-                domain: f.item.domain,
-                // The four below **do not enter the injection block**; they are for
-                // the client's memory drawer (see the MemoryItem docs). They used
-                // to be dropped right here, which is why every memory in the drawer
-                // displayed "100%" — that number was a constant hard-coded in
-                // cormexd, not this fact's score
-                predicate: Some(f.item.predicate),
-                confidence: Some(f.item.confidence),
-                source_channel: Some(f.item.source_channel.as_str().to_string()),
-                trust_tier: f.item.trust_tier,
-            })
-            .collect();
+        let items: Vec<MemoryItem> = fused.into_iter().map(|f| display_item(f.item)).collect();
 
         let kept = crate::injection::fit_to_budget(items, max_tokens);
         // The attribution table has to line up with the truncated items, otherwise
@@ -989,6 +993,43 @@ impl<E: Embedder> Retriever<E> {
             items: kept,
             attribution,
         }
+    }
+}
+
+fn display_snapshot(facts: Vec<Fact>) -> Retrieved {
+    let attribution = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Attribution {
+            fact_id: f.id.clone(),
+            score: 1.0 / (i as f64 + 1.0),
+            channels: vec!["recency"],
+        })
+        .collect();
+    Retrieved {
+        items: facts.into_iter().map(display_item).collect(),
+        attribution,
+    }
+}
+
+/// Preserve all requested snapshot rows for the human-facing browser.
+fn display_item(fact: Fact) -> MemoryItem {
+    MemoryItem {
+        id: fact.id,
+        statement: fact.statement,
+        valid_at: fact.valid_at.map(|t| t.to_rfc3339()),
+        known_since: fact.created_at.to_rfc3339(),
+        source_episode_id: Some(fact.source_episode_id),
+        domain: fact.domain,
+        // The four below **do not enter the injection block**; they are for
+        // the client's memory drawer (see the MemoryItem docs). They used
+        // to be dropped right here, which is why every memory in the drawer
+        // displayed "100%" — that number was a constant hard-coded in
+        // cormexd, not this fact's score
+        predicate: Some(fact.predicate),
+        confidence: Some(fact.confidence),
+        source_channel: Some(fact.source_channel.as_str().to_string()),
+        trust_tier: fact.trust_tier,
     }
 }
 

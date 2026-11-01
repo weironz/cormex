@@ -26,6 +26,7 @@
 pub mod catalog;
 pub mod client;
 pub mod cmd;
+pub mod codex_metadata;
 pub mod config;
 pub mod credentials;
 pub mod git_meta;

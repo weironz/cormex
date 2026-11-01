@@ -28,6 +28,7 @@ pub use cormex_core::injection;
 
 pub mod brief;
 pub mod crosslink;
+pub mod dialogue;
 pub mod distill;
 pub mod embed;
 pub mod embed_api;

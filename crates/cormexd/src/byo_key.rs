@@ -59,7 +59,7 @@ fn kek() -> Result<LessSafeKey, ApiError> {
 }
 
 /// Encrypt: `nonce(12) || ciphertext`.
-fn seal(plain: &str) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn seal(plain: &str) -> Result<Vec<u8>, ApiError> {
     seal_with(&kek()?, plain)
 }
 
@@ -90,7 +90,7 @@ fn seal_with(key: &LessSafeKey, plain: &str) -> Result<Vec<u8>, ApiError> {
 }
 
 /// Decrypt.
-fn open(blob: &[u8]) -> Result<String, ApiError> {
+pub(crate) fn open(blob: &[u8]) -> Result<String, ApiError> {
     open_with(&kek()?, blob)
 }
 

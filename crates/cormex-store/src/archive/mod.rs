@@ -50,12 +50,12 @@ use crate::model::table;
 use crate::store::Store;
 
 pub use model::{
-    AppendOutcome, ArchiveHit, ArchiveSessionRow, CaptureChunk, CaptureFile, CaptureMask,
-    CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing, Generation,
-    GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent, NewCaptureChunk,
-    NewCaptureFile, NewCaptureFileEvent, NewCaptureKey, NewCaptureMask, NewCaptureSession,
-    NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent, Projection,
-    ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
+    AppendOutcome, ArchiveHit, ArchiveProjectRow, ArchiveSessionRow, CaptureChunk, CaptureFile,
+    CaptureMask, CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing,
+    Generation, GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent,
+    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureKey, NewCaptureMask,
+    NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent,
+    Projection, ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
 };
 
 /// How far a conversation neighbour may be before the vector leg drops it.
@@ -477,32 +477,32 @@ impl ArchiveTxn {
         events: &[NewTranscriptEvent],
         progress: &NewProjection,
     ) -> Result<()> {
-        for e in events {
-            sqlx::query(
-                "INSERT INTO transcript_events
-                     (id, session_id, parser_version, seq, kind, occurred_at, content,
-                      text, tsv, tool_name, tool_call_id,
-                      src_generation_id, src_offset, src_length)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                         to_tsvector('simple', $9), $10, $11, $12, $13, $14)
-                 ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(e.id.to_string())
-            .bind(e.session_id.to_string())
-            .bind(&e.parser_version)
-            .bind(e.seq)
-            .bind(e.kind)
-            .bind(e.occurred_at)
-            .bind(sqlx::types::Json(&e.content))
-            .bind(&e.text)
-            .bind(&e.tsv_source)
-            .bind(&e.tool_name)
-            .bind(&e.tool_call_id)
-            .bind(e.src_generation_id.to_string())
-            .bind(e.src_offset)
-            .bind(e.src_length)
-            .execute(&mut *self.inner.tx)
-            .await?;
+        // Use bounded batches to avoid one database round trip per event.
+        // The enclosing transaction still commits events and checkpoint together.
+        for batch in events.chunks(500) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "INSERT INTO transcript_events (id, session_id, parser_version, seq, kind, occurred_at, content, text, tsv, tool_name, tool_call_id, src_generation_id, src_offset, src_length) ",
+            );
+            query.push_values(batch, |mut row, e| {
+                row.push_bind(e.id.to_string())
+                    .push_bind(e.session_id.to_string())
+                    .push_bind(&e.parser_version)
+                    .push_bind(e.seq)
+                    .push_bind(e.kind)
+                    .push_bind(e.occurred_at)
+                    .push_bind(sqlx::types::Json(&e.content))
+                    .push_bind(&e.text)
+                    .push("to_tsvector('simple', ")
+                    .push_bind_unseparated(&e.tsv_source)
+                    .push_unseparated(")")
+                    .push_bind(&e.tool_name)
+                    .push_bind(&e.tool_call_id)
+                    .push_bind(e.src_generation_id.to_string())
+                    .push_bind(e.src_offset)
+                    .push_bind(e.src_length);
+            });
+            query.push(" ON CONFLICT (id) DO NOTHING");
+            query.build().execute(&mut *self.inner.tx).await?;
         }
         sqlx::query(
             "INSERT INTO transcript_projections
@@ -518,6 +518,23 @@ impl ArchiveTxn {
         .bind(&progress.error)
         .execute(&mut *self.inner.tx)
         .await?;
+        Ok(())
+    }
+
+    pub async fn cache_message_count(
+        &mut self,
+        session: &str,
+        projection: &str,
+        version: &str,
+        event_count: i64,
+        message_count: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO archive_message_counts (session_id,projection_id,parser_version,rule_version,event_count,message_count)
+            VALUES ($1,$2,$3,'conversation@1',$4,$5) ON CONFLICT(session_id) DO UPDATE SET
+            projection_id=excluded.projection_id,parser_version=excluded.parser_version,rule_version=excluded.rule_version,
+            event_count=excluded.event_count,message_count=excluded.message_count,updated_at=clock_timestamp()")
+            .bind(session).bind(projection).bind(version).bind(event_count).bind(message_count)
+            .execute(&mut *self.inner.tx).await?;
         Ok(())
     }
 

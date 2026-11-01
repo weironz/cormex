@@ -1255,7 +1255,31 @@ impl Live {
     }
 
     async fn memory_search(&self, q: MemorySearchQuery) -> Result<MemorySearchResponse> {
-        let r = self.retrieve(&q.q, q.as_of.as_deref(), q.limit).await?;
+        let at = q
+            .as_of
+            .as_deref()
+            .map(|t| DateTime::parse_from_rfc3339(t).map(|v| v.with_timezone(&Utc)))
+            .transpose()
+            .map_err(|_| CormexError::Invalid("as_of is not valid RFC3339".into()))?;
+        let mut r = if q.q.trim().is_empty() && q.as_of.is_none() {
+            self.retriever.browse_current(&self.store, q.limit).await?
+        } else {
+            match retrieval_plan(&q.q, at) {
+                RetrievalPlan::Snapshot(at) => {
+                    self.retriever
+                        .browse_as_of(&self.store, at, q.limit)
+                        .await?
+                }
+                _ => self.retrieve(&q.q, q.as_of.as_deref(), q.limit).await?,
+            }
+        };
+        r.items.truncate(q.limit.clamp(1, 100) as usize);
+        let shown = r
+            .items
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        r.attribution.retain(|a| shown.contains(a.fact_id.as_str()));
         let invalidated = self.invalidation_flags(&r.items, q.as_of.is_some()).await;
 
         Ok(MemorySearchResponse {

@@ -389,10 +389,22 @@ pub struct ArchiveSessionRow {
     pub first_at: Option<DateTime<Utc>>,
     pub last_at: Option<DateTime<Utc>>,
     pub event_count: i64,
+    pub message_count: Option<i64>,
     /// The first user message's text, for deriving a title.
     pub title_source: Option<String>,
+    pub original_title: Option<String>,
     pub project_key: Option<String>,
+    pub project_name: Option<String>,
+    pub pinned_position: Option<i32>,
+    pub source_archived: bool,
     pub devices: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ArchiveProjectRow {
+    pub key: Option<String>,
+    pub name: Option<String>,
+    pub chat_count: i64,
 }
 
 /// One hit from the conversation search.

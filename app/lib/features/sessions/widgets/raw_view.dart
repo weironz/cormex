@@ -129,9 +129,7 @@ class _RawViewState extends ConsumerState<RawView> {
                 child: SelectableText(
                   // 解码失败时给出字节数而不是一句「解码失败」：至少让人知道
                   // 内容有多大，以及它不是文本
-                  _bytes == null
-                      ? ''
-                      : _tryDecode(_bytes!),
+                  _bytes == null ? '' : _tryDecode(_bytes!),
                   style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
                 ),
               ),

@@ -126,6 +126,7 @@ protected_routes! {
     // that decides whose account the machine lands on; the other two are on the
     // public side -- see `public_routes()`
     "/devices/confirm" [POST] => post(crate::devices_api::confirm),
+    "/devices/inspect" [POST] => post(crate::devices_api::inspect_authorization),
     // ── Capture (D2 / D3 / D16 / D23) ──────────────────────
     //
     // What the `cormex` CLI sends. Every one of these requires a **device key**
@@ -139,6 +140,7 @@ protected_routes! {
     // could say why.
     "/capture/catalog" [GET] => get(crate::capture::get_catalog),
     "/capture/files" [POST] => post(crate::capture::register_file),
+    "/capture/files/{id}/metadata" [POST] => post(crate::capture::update_session_ui_metadata),
     "/capture/files/{id}/generations" [POST] => post(crate::capture::open_generation),
     "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
     // A batch of small snapshots (P4-0): SQLite rows, which have no file to
@@ -155,6 +157,7 @@ protected_routes! {
     // "may this credential reach this path" and this answers "may it see
     // unmasked bytes", and the two differ per call.
     "/archive/sessions" [GET] => get(crate::archive_api::list_sessions),
+    "/archive/projects" [GET] => get(crate::archive_api::list_projects),
     "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),
@@ -178,6 +181,15 @@ protected_routes! {
     "/settings/llm-key" [GET, PUT, DELETE] => get(crate::byo_key::get)
         .put(crate::byo_key::put)
         .delete(crate::byo_key::delete),
+    "/settings/memory-extraction" [GET, PUT] => get(crate::memory_settings::get)
+        .put(crate::memory_settings::put),
+    "/settings/memory-extraction/test" [POST] => post(crate::memory_settings::test),
+    "/settings/memory-extraction/trial" [POST] => post(crate::memory_trial::start),
+    "/settings/memory-extraction/trial/cancel" [POST] => post(crate::memory_trial::cancel),
+    "/settings/memory-extraction/trial/candidates" [GET] => get(crate::memory_trial::candidates),
+    "/settings/memory-extraction/dependencies" [GET] => get(crate::memory_trial::dependencies),
+    "/memory/context" [GET] => get(crate::memory_context::get),
+    "/memory/artifacts" [GET] => get(crate::memory_qa::artifacts),
     // There is **no** `/chat` here, and no `/sandbox/*`. Those belong to
     // `cormex-agentd` — that process has docker, this one does not. The routing
     // split happens at the edge (nginx in dev, traefik in prod) and inside no

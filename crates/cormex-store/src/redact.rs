@@ -48,6 +48,7 @@ impl Store {
     /// # Errors
     /// The statement failed.
     pub async fn redact_episode_content(&self, episode_id: &str) -> Result<usize> {
+        self.clear_qa_for_episode(episode_id).await?;
         let done = sqlx::query(
             "UPDATE episodes
                 SET content = '{\"redacted\":true}'::jsonb,
@@ -293,7 +294,7 @@ impl Store {
     pub async fn promoted_episodes_of(&self, session_ids: &[String]) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT id::text FROM episodes
-              WHERE content ? 'transcript_event_id'
+              WHERE (content ? 'transcript_event_id' OR content->>'extraction_unit'='qa_turn')
                 AND session_id = ANY($1)
               ORDER BY id",
         )

@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../memory/memory_browser.dart';
 import '../sessions/sessions_page.dart';
 
-/// 连上之后的两个页面：记忆与会话档案。
+/// 连上之后的两个页面：记忆与聊天档案。
 ///
 /// # 为什么用底部导航而不是抽屉
 ///
@@ -22,23 +22,27 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final activeIndex = _index.clamp(0, 1);
     return Scaffold(
       body: IndexedStack(
-        index: _index,
+        index: activeIndex,
         // `IndexedStack` 而不是按需构建：切回来时滚动位置与检索结果还在，
         // 而重建会把它们都丢掉 —— 在记忆浏览器里那意味着刚调好的回放点
         // 没了
-        children: const [MemoryBrowser(), SessionsPage()],
+        children: [
+          TickerMode(enabled: activeIndex == 0, child: const MemoryBrowser()),
+          const SessionsPage(),
+        ],
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
+        selectedIndex: activeIndex,
         onDestinationSelected: (i) => setState(() => _index = i),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.search), label: '记忆'),
           NavigationDestination(
             icon: Icon(Icons.forum_outlined),
             selectedIcon: Icon(Icons.forum),
-            label: '会话档案',
+            label: '聊天档案',
           ),
         ],
       ),

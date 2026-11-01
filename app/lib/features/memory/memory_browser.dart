@@ -2,10 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/formatting.dart';
+import '../../models/memory_artifact.dart';
+import '../../models/memory_extraction_status.dart';
 import '../../state/connection_controller.dart';
+import '../../state/memory_artifacts.dart';
 import '../../state/memory_controller.dart';
+import '../../state/memory_extraction.dart';
+import '../../state/memory_context.dart';
 import '../../widgets/empty_state.dart';
+import '../settings/settings_page.dart';
 import 'widgets/fact_card.dart';
+import 'memory_extraction_panel.dart';
+import 'memory_artifacts_list.dart';
 
 /// 整页的记忆浏览器 —— 这个应用的全部。
 ///
@@ -25,6 +33,9 @@ class MemoryBrowser extends ConsumerStatefulWidget {
 }
 
 class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
+  MemoryArtifactKind? _kind;
+  MemoryExtractionStatus? _lastExtraction;
+  bool _factsStale = false;
   late final TextEditingController _query = TextEditingController(
     text: ref.read(memoryControllerProvider).query,
   );
@@ -44,6 +55,8 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref.read(memoryArtifactsProvider.notifier).select(null);
       if (!ref.read(memoryControllerProvider).hasSearched) {
         ref.read(memoryControllerProvider.notifier).search();
       }
@@ -71,12 +84,74 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
     }
   }
 
+  void _selectKind(MemoryArtifactKind? kind) {
+    if (_kind == kind) return;
+    ref.read(memoryArtifactsProvider.notifier).select(kind);
+    setState(() => _kind = kind);
+    if (kind == null &&
+        (_factsStale || !ref.read(memoryControllerProvider).hasSearched)) {
+      _factsStale = false;
+      ref.read(memoryControllerProvider.notifier).search();
+    }
+  }
+
+  void _refresh() {
+    final kind = _kind;
+    if (kind == null) {
+      ref.read(memoryControllerProvider.notifier).search();
+    } else {
+      ref.read(memoryArtifactsProvider.notifier).load(kind, refresh: true);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final state = ref.watch(memoryControllerProvider);
     final notifier = ref.read(memoryControllerProvider.notifier);
+    final artifacts = ref.watch(memoryArtifactsProvider)[_kind];
+    final loading = _kind == null ? state.loading : artifacts?.loading == true;
+    final loaded = _kind == null
+        ? state.hasSearched
+        : artifacts?.hasLoaded == true;
+    final count = _kind == null
+        ? state.result.facts.length
+        : artifacts?.items.length ?? 0;
+    ref.listen(memoryExtractionProvider, (previous, next) {
+      final before = _lastExtraction;
+      final after = next.asData?.value;
+      if (after == null) return;
+      _lastExtraction = after;
+      if (before == null) return;
+      if ((
+            before.memoryCount,
+            before.summaryCount,
+            before.factsCreated,
+            before.processedChats,
+            before.trial?['status'],
+            before.trial?['processed_messages'],
+            before.trial?['memory_count'],
+            before.trial?['summary_count'],
+          ) !=
+          (
+            after.memoryCount,
+            after.summaryCount,
+            after.factsCreated,
+            after.processedChats,
+            after.trial?['status'],
+            after.trial?['processed_messages'],
+            after.trial?['memory_count'],
+            after.trial?['summary_count'],
+          )) {
+        ref.read(memoryArtifactsProvider.notifier).invalidate();
+        if (_kind == null) {
+          notifier.search();
+        } else {
+          _factsStale = true;
+        }
+      }
+    });
     _widen(state);
 
     return Scaffold(
@@ -86,18 +161,27 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
           children: [
             Icon(Icons.psychology_rounded, size: 20, color: scheme.secondary),
             const SizedBox(width: 9),
-            const Text('Cormex 记忆'),
+            const Flexible(
+              child: Text('Cormex 记忆', overflow: TextOverflow.ellipsis),
+            ),
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: '设置',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
+            ),
+          ),
           // 检索到几条是这一页最要紧的一个数字：它同时回答「有没有」与
           // 「回放到那一刻少了多少」
-          if (state.hasSearched && !state.loading)
+          if (loaded && !loading)
             Padding(
               padding: const EdgeInsets.only(right: 4),
               child: Center(
                 child: Text(
-                  '${state.result.facts.length} 条',
+                  '$count 条',
                   style: theme.textTheme.labelMedium?.copyWith(
                     color: scheme.onSurfaceVariant,
                   ),
@@ -105,62 +189,131 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
               ),
             ),
           IconButton(
-            onPressed: state.loading ? null : notifier.search,
+            onPressed: loading ? null : _refresh,
             iconSize: 18,
-            tooltip: '重新检索',
+            tooltip: _kind == null ? '重新检索' : '刷新当前类别',
             icon: const Icon(Icons.refresh_rounded),
           ),
           const _ConnectionMenu(),
           const SizedBox(width: 8),
         ],
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 900),
-                child: TextField(
-                  controller: _query,
-                  autofocus: true,
-                  onChanged: notifier.setQuery,
-                  onSubmitted: (_) => notifier.search(),
-                  textInputAction: TextInputAction.search,
-                  decoration: InputDecoration(
-                    hintText: '检索事实、实体、领域…　留空则是此刻的全貌',
-                    prefixIcon: const Icon(Icons.search_rounded, size: 20),
-                    suffixIcon: state.query.isEmpty
-                        ? null
-                        : IconButton(
-                            icon: const Icon(Icons.close_rounded, size: 17),
-                            onPressed: () {
-                              _query.clear();
-                              notifier.setQuery('');
-                              notifier.search();
-                            },
+      body: CustomScrollView(
+        slivers: [
+          SliverToBoxAdapter(
+            child: Column(
+              children: [
+                const MemoryExtractionPanel(),
+                _MemoryCategories(kind: _kind, onSelected: _selectKind),
+                if (_kind == null) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 900),
+                        child: TextField(
+                          controller: _query,
+                          autofocus: true,
+                          onChanged: notifier.setQuery,
+                          onSubmitted: (_) => notifier.search(),
+                          textInputAction: TextInputAction.search,
+                          decoration: InputDecoration(
+                            hintText: '检索记忆，留空浏览最近记录',
+                            prefixIcon: const Icon(
+                              Icons.search_rounded,
+                              size: 20,
+                            ),
+                            suffixIcon: state.query.isEmpty
+                                ? null
+                                : IconButton(
+                                    icon: const Icon(
+                                      Icons.close_rounded,
+                                      size: 17,
+                                    ),
+                                    onPressed: () {
+                                      _query.clear();
+                                      notifier.setQuery('');
+                                      notifier.search();
+                                    },
+                                  ),
                           ),
+                        ),
+                      ),
+                    ),
                   ),
-                ),
-              ),
+                  if (_earliest != null || state.isTimeTravelling)
+                    _Timeline(
+                      earliest: _earliest,
+                      state: state,
+                      dragging: _dragging,
+                      onDrag: (v) => setState(() => _dragging = v),
+                      onSettled: (at) {
+                        setState(() => _dragging = null);
+                        notifier.setAsOf(at);
+                      },
+                    ),
+                ],
+                const Divider(height: 1),
+              ],
             ),
           ),
-          _Timeline(
-            earliest: _earliest,
-            state: state,
-            dragging: _dragging,
-            onDrag: (v) => setState(() => _dragging = v),
-            onSettled: (at) {
-              setState(() => _dragging = null);
-              notifier.setAsOf(at);
-            },
+          SliverFillRemaining(
+            child: _kind == null
+                ? _Grid(state: state)
+                : MemoryArtifactsList(kind: _kind!),
           ),
-          const Divider(height: 1),
-          Expanded(child: _Grid(state: state)),
         ],
       ),
     );
   }
+}
+
+class _MemoryCategories extends StatelessWidget {
+  const _MemoryCategories({required this.kind, required this.onSelected});
+  final MemoryArtifactKind? kind;
+  final ValueChanged<MemoryArtifactKind?> onSelected;
+
+  @override
+  Widget build(BuildContext context) => Center(
+    child: ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 1100),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  ChoiceChip(
+                    key: const ValueKey('memory-category-memory'),
+                    label: const Text('记忆'),
+                    selected: kind == null,
+                    onSelected: (_) => onSelected(null),
+                  ),
+                  for (final item in MemoryArtifactKind.values) ...[
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      key: ValueKey('memory-category-${item.name}'),
+                      label: Text(item.label),
+                      selected: kind == item,
+                      onSelected: (_) => onSelected(item),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              kind?.description ?? '从完整问答中自动提取、校验和更新可复用信息，可随时查看保留依据与来源。',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
 }
 
 /// 能拖的时间轴 —— 这个产品对标 mem0 / zep / Letta 时唯一的差异点。
@@ -307,13 +460,13 @@ class _Timeline extends StatelessWidget {
 }
 
 /// 宽屏下多列铺开。
-class _Grid extends StatelessWidget {
+class _Grid extends ConsumerWidget {
   const _Grid({required this.state});
 
   final MemoryState state;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (state.loading && state.result.isEmpty) {
       return const Center(
         child: SizedBox(
@@ -332,19 +485,34 @@ class _Grid extends StatelessWidget {
       );
     }
     if (state.result.isEmpty) {
+      final extraction = ref.watch(memoryExtractionProvider).asData?.value;
+      final explanation = extraction?.hasAnalyzedChats == true
+          ? '已分析聊天，当前没有可用记忆。可以查看会话摘要和来源了解分析内容。'
+          : switch (extraction?.phase) {
+              'trial_running' => '正在分析选定样本，自动保留的可复用信息会显示在这里；全量提取未开启。',
+              'paused' => '聊天已采集保存，但记忆提取尚未开启。可在设置中先选择小样本分析。',
+              'needs_configuration' => '请在设置中完善模型配置，再选择小样本分析。',
+              'error' => '提取遇到问题，处理位置已保留。请检查上方状态并重试。',
+              'processing' || 'queued' => '正在分批分析聊天，自动保留可复用信息并更新会话摘要。',
+              'caught_up' => '聊天分析已完成，当前没有可用记忆。可以查看会话摘要。',
+              _ => '记忆来自聊天中的可复用信息，可在设置中查看模型配置与小样本分析。',
+            };
       return EmptyState(
         icon: Icons.psychology_outlined,
-        title: state.query.isEmpty ? '还没有记忆' : '没有相关的记忆',
+        title: state.query.isEmpty ? '暂无记忆' : '没有相关的记忆',
         description: state.isTimeTravelling
             ? '在 ${formatDate(state.asOf)} 这个时点，Cormex 还不知道相关的事。'
             : state.query.isEmpty
-            ? '有对话写进来之后，抽取出的事实会出现在这里，每条都能追溯到原始记录。'
-            : '检索器判定与已存记忆无关时会主动弃权，返回空是正常结果。'
-                  '换个说法可能会命中 —— 检索同时走 BM25 与向量两路。',
+            ? explanation
+            : '没有匹配的记忆。可以调整关键词，或查看会话摘要。',
       );
     }
 
     final facts = state.result.facts;
+    final contexts = ref
+        .watch(memoryContextsProvider(facts.map((f) => f.id).join(',')))
+        .asData
+        ?.value;
     return LayoutBuilder(
       builder: (context, box) {
         // 一列 420px 上下。再宽就让列变宽而不是加列 —— 一条事实是一句话，
@@ -354,6 +522,7 @@ class _Grid extends StatelessWidget {
           child: ConstrainedBox(
             constraints: BoxConstraints(maxWidth: columns * 460),
             child: GridView.builder(
+              primary: false,
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 28),
               gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: columns,
@@ -361,12 +530,13 @@ class _Grid extends StatelessWidget {
                 mainAxisSpacing: 12,
                 // 卡片高度不定（陈述长短不一），给一个偏矮的固定高度让内容
                 // 自己滚 —— 定得太高会在短句上留大片空白，定死又会把长句截掉。
-                mainAxisExtent: 152,
+                mainAxisExtent: 270,
               ),
               itemCount: facts.length,
               itemBuilder: (context, i) => SingleChildScrollView(
                 child: FactCard(
                   fact: facts[i],
+                  contextInfo: contexts?[facts[i].id],
                   channels: state.result.channels[facts[i].id],
                 ),
               ),

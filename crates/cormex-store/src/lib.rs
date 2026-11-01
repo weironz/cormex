@@ -59,6 +59,9 @@
 pub mod archive;
 mod bootstrap;
 mod error;
+pub mod memory_context;
+pub mod memory_control;
+pub mod memory_qa;
 mod model;
 mod query;
 mod recall;
@@ -69,13 +72,13 @@ mod tenant;
 mod txn;
 
 pub use archive::{
-    AppendOutcome, ArchiveHit, ArchiveSessionRow, ArchiveTxn, CaptureChunk, CaptureFile,
-    CaptureMask, CaptureSession, ChunkEncoding, ConversationHit, FileEventOp, FileRole, Framing,
-    Generation, GenerationReason, NewAccessLog, NewArchiveChunk, NewArchiveIndexEvent,
-    NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureKey, NewCaptureMask,
-    NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEmbedding, NewTranscriptEvent,
-    Projection, ProjectionStatus, RegisteredFile, TranscriptEvent, TranscriptEventKind,
-    session_id_for,
+    AppendOutcome, ArchiveHit, ArchiveProjectRow, ArchiveSessionRow, ArchiveTxn, CaptureChunk,
+    CaptureFile, CaptureMask, CaptureSession, ChunkEncoding, ConversationHit, FileEventOp,
+    FileRole, Framing, Generation, GenerationReason, NewAccessLog, NewArchiveChunk,
+    NewArchiveIndexEvent, NewCaptureChunk, NewCaptureFile, NewCaptureFileEvent, NewCaptureKey,
+    NewCaptureMask, NewCaptureSession, NewMaskProgress, NewProjection, NewTranscriptEmbedding,
+    NewTranscriptEvent, Projection, ProjectionStatus, RegisteredFile, TranscriptEvent,
+    TranscriptEventKind, session_id_for,
 };
 pub use bootstrap::{TenantMigration, migrate_all, provision};
 pub use error::{Result, StoreError};

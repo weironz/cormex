@@ -29,7 +29,7 @@ pub mod upload;
 use anyhow::Result;
 use cormex_proto::capture::{FileEventOp, FileEventRequest, RegisterFileRequest};
 
-use crate::catalog::{DiscoveredFile, discover};
+use crate::catalog::{DiscoveredFile, discover_with_warnings};
 use crate::config::Config;
 use crate::state::{FileState, StateDb};
 use crate::sync::api::CaptureApi;
@@ -118,11 +118,48 @@ pub async fn run(
     // as the design allows.
     let mut budget = opts.budget.clone();
 
-    let mut files = discover(catalog, cfg, device_id)?;
+    // Take a snapshot first, so events arriving during the scan are retained.
+    let queued = if !opts.dry_run && opts.only.is_none() {
+        db.queue()?
+    } else {
+        Vec::new()
+    };
+    let spool = if !opts.dry_run && opts.only.is_none() {
+        std::fs::read_dir(crate::hook::spool_dir(data_dir))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_type().is_ok_and(|t| t.is_file())
+                    && e.path().extension().is_some_and(|ext| ext == "json")
+            })
+            .filter_map(|e| {
+                let path = e.path();
+                let content: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+                Some((
+                    path,
+                    std::path::PathBuf::from(content.get("path")?.as_str()?),
+                ))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let (mut files, warnings) = discover_with_warnings(catalog, cfg, device_id)?;
+    for warning in warnings {
+        report.errors += 1;
+        if report.last_error.is_none() {
+            report.last_error = Some(warning.clone());
+        }
+        tracing::warn!("source discovery failed: {warning}");
+    }
     if let Some(only) = &opts.only {
         files.retain(|f| &f.logical_path == only);
     }
     report.files_seen = files.len();
+    let mut handled_paths = std::collections::HashSet::new();
 
     for file in &files {
         if budget.exhausted() {
@@ -142,8 +179,15 @@ pub async fn run(
                     report.files_uploaded += 1;
                     report.bytes += uploaded;
                 }
+                if !budget.exhausted() {
+                    handled_paths.insert(file.physical_path.clone());
+                }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if !budget.exhausted() {
+                    handled_paths.insert(file.physical_path.clone());
+                }
+            }
             Err(e) => {
                 report.errors += 1;
                 if report.last_error.is_none() {
@@ -155,6 +199,26 @@ pub async fn run(
                     error = %e,
                     "could not sync this file; the rest of the run continues"
                 );
+            }
+        }
+    }
+
+    if !opts.dry_run
+        && report.errors == 0
+        && report.deferred == 0
+        && report.locked == 0
+        && !budget.exhausted()
+    {
+        for entry in queued {
+            if handled_paths.contains(std::path::Path::new(&entry.path)) {
+                db.dequeue(entry.id)?;
+            }
+        }
+        for (path, source) in spool {
+            if handled_paths.contains(&source)
+                && let Err(error) = std::fs::remove_file(&path)
+            {
+                tracing::warn!(?path, %error, "could not remove processed spool file");
             }
         }
     }
