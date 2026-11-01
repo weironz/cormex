@@ -259,6 +259,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The repository toolchain file pins a version independently of the
+      # action's bootstrap toolchain. Add std for the active pinned toolchain.
+      - name: Install the pinned toolchain target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: cli-${{ matrix.target }}
@@ -334,7 +340,7 @@ jobs:
   # ══════════════════════════════════════════════════════════
   cli-release:
     name: Publish the CLI
-    needs: [preflight, cli]
+    needs: [preflight, cli, image, web]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -2290,12 +2290,13 @@ pub(crate) mod tests {
         let base = crate::test_support::database_url().expect("database URL");
         let db = crate::test_support::FreshDb::create(&base).await;
         let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let st = st.with_promotion(true);
         let store = st.public_store().unwrap();
         let body =
             br#"{"type":"user","message":{"role":"user","content":"first durable preference"}}
 {"type":"user","message":{"role":"user","content":"second durable preference"}}
 "#;
-        let (_session, tenant) = seed_projected_session(&st, &store, body).await;
+        let (session, tenant) = seed_projected_session(&st, &store, body).await;
         struct FailSecond {
             inner: FakeFactSink,
             calls: std::sync::atomic::AtomicUsize,
@@ -2320,11 +2321,39 @@ pub(crate) mod tests {
         };
         assert!(promote_round(&st, &tenant, &sink).await.is_err());
         assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 0, 1));
-        assert_eq!(store.sessions_needing_promotion(10).await.unwrap()[0].1, 0);
+        assert_eq!(
+            store.sessions_needing_promotion(10).await.unwrap(),
+            vec![(session.clone(), 0)],
+            "legacy promotion must stop before the failed event"
+        );
         let retry = FakeFactSink::new();
         promote_round(&st, &tenant, &retry).await.unwrap();
-        assert_eq!(retry.calls(), 1);
-        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 1, 2));
+        assert_eq!(retry.calls(), 1, "only the failed extraction should retry");
+        assert!(
+            store
+                .sessions_needing_promotion(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "retrying must finish the legacy promotion cursor"
+        );
+        // This test-only path advances promote_progress, not the QA cursor
+        // that memory_extraction_totals uses for completed chats.
+        assert_eq!(
+            store
+                .qa_pending(cormex_memory::dialogue::RULE_VERSION, 10)
+                .await
+                .unwrap(),
+            vec![(session, -1)],
+            "legacy promotion must not mark QA analysis as complete"
+        );
+        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 0, 2));
+        assert_eq!(promote_round(&st, &tenant, &retry).await.unwrap(), 0);
+        assert_eq!(
+            retry.calls(),
+            1,
+            "completed events must not be extracted again"
+        );
         let mut settings = crate::memory_settings::defaults(&st);
         settings.enabled = false;
         store

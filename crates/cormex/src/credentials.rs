@@ -26,6 +26,7 @@ pub const DEVICE_KEY_ENV: &str = "CORMEX_DEVICE_KEY";
 
 /// The keyring service name. Matches the product name, so a user looking in
 /// their keychain finds it under the name they installed.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
 const KEYRING_SERVICE: &str = "cormex";
 
 /// Which of the three sources answered.
@@ -147,7 +148,7 @@ fn keyring_get(server_url: &str) -> Option<String> {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
     {
         let _ = server_url;
-        return None;
+        None
     }
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
     {
@@ -160,7 +161,7 @@ fn keyring_set(server_url: &str, key: &str) -> bool {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
     {
         let _ = (server_url, key);
-        return false;
+        false
     }
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
     {
