@@ -16,3 +16,4 @@ pub mod sessions;
 pub mod sources;
 pub mod status;
 pub mod uninstall;
+pub mod update;

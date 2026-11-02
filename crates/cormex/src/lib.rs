@@ -35,6 +35,7 @@ pub mod install;
 pub mod sqlite_source;
 pub mod state;
 pub mod sync;
+pub mod update;
 
 pub use client::{ApiClient, ExitCode};
 pub use config::{Config, Dirs};

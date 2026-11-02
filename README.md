@@ -173,6 +173,32 @@ deletes old sessions, and a capture client cannot recover what is already gone).
 `cormex uninstall` restores each file from a backup — byte for byte, not
 "removes what it thinks it added".
 
+### Updating
+
+```bash
+cormex update --check    # what is the newest release, and is it newer than this binary
+cormex update            # download it, verify it, run it, then replace this binary
+```
+
+`cormex update` fetches the archive for this platform from the GitHub release,
+compares it against the release's `SHA256SUMS`, unpacks it, runs the new binary
+with `--version`, and only then writes it over the current file — atomically, at
+the same path. Every check happens before the first write, so a corrupt
+download, a truncated mirror or a release built for the wrong libc leaves the
+working binary exactly as it was. Nothing needs re-running afterwards: `init`
+recorded the absolute path of this file in every hook and in the scheduler, and
+an update replaces the file at that path.
+
+`--version v0.1.14` installs a specific release (a downgrade needs `--force`).
+Two installations are refused without `--force`: a binary under `node_modules`
+(update it with `npm install -g cormex@latest` instead, or npm and the file
+disagree about which version is installed) and a `target/debug` development
+build.
+
+Builds older than the one that introduced `update` do not have the command; run
+the installer once by hand (`install.sh`, `install.ps1`, or `npm install -g
+cormex`) and self-updates work from then on.
+
 ### What it reads, and what it does not
 
 | | |

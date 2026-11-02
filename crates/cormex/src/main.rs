@@ -11,7 +11,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use cormex::client::ExitCode;
-use cormex::cmd::{detect, doctor, init, login, logout, mcp, restore, sessions, status, uninstall};
+use cormex::cmd::{
+    detect, doctor, init, login, logout, mcp, restore, sessions, status, uninstall, update,
+};
 use cormex::config::{Config, Dirs};
 
 #[derive(Parser)]
@@ -169,6 +171,27 @@ enum Command {
         #[arg(long)]
         drop_data: bool,
     },
+    /// Replace this binary with a published release.
+    ///
+    /// Downloads the archive for this platform, checks it against the release's
+    /// `SHA256SUMS`, runs it, and only then writes it over this binary. A failed
+    /// download or a bad checksum leaves the installed binary untouched.
+    ///
+    /// Nothing needs re-running afterwards: `init` recorded the absolute path of
+    /// this file in every hook and in the scheduler, and an update replaces the
+    /// file at that path.
+    Update {
+        /// Report what would be installed, download nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install this release instead of the newest one (`v0.1.14`).
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+        /// Install even when it is older or the same version, and past the two
+        /// refusals (`node_modules`, a development build).
+        #[arg(long)]
+        force: bool,
+    },
     /// Check why this machine is not capturing.
     Doctor {
         /// Machine-readable output.
@@ -214,6 +237,39 @@ mod cli_tests {
             Command::Sync { queue: true, .. }
         ));
         assert!(Cli::try_parse_from(["cormex", "sync", "--queue", "--once"]).is_err());
+    }
+
+    /// `update`'s three flags, and the tag being optional.
+    ///
+    /// Pinned because `--version` on a subcommand is easy to lose to clap's
+    /// own `--version`: the command would then print the crate version and exit
+    /// successfully, which looks like a very fast update.
+    #[test]
+    fn update_takes_a_check_a_tag_and_a_force() {
+        assert!(matches!(
+            Cli::try_parse_from(["cormex", "update"]).unwrap().command,
+            Command::Update {
+                check: false,
+                version: None,
+                force: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cormex", "update", "--check"])
+                .unwrap()
+                .command,
+            Command::Update { check: true, .. }
+        ));
+        match Cli::try_parse_from(["cormex", "update", "--version", "v0.1.14", "--force"])
+            .unwrap()
+            .command
+        {
+            Command::Update { version, force, .. } => {
+                assert_eq!(version.as_deref(), Some("v0.1.14"));
+                assert!(force);
+            }
+            _ => panic!("`cormex update --version v0.1.14` must parse as the update's own flag"),
+        }
     }
 }
 
@@ -613,6 +669,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let report = uninstall::run(&cfg, &dirs.data, drop_data)?;
             print!("{}", uninstall::render(&report));
             Ok(ExitCode::Ok)
+        }
+        Command::Update {
+            check,
+            version,
+            force,
+        } => {
+            let opts = cormex::update::Options {
+                check,
+                tag: version,
+                force,
+                ..cormex::update::Options::default()
+            };
+            update::run(opts).await
         }
         Command::Doctor { json } => {
             let report = doctor::run(&cfg, &dirs.config, &dirs.data).await?;

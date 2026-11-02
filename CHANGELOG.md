@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Capture CLI
+
+- `cormex update` self-updates the binary: it fetches the release archive for this platform, checks it against the release's `SHA256SUMS`, unpacks it, runs the new binary once, and only then replaces the current file in place. A failed download or a bad checksum leaves the installed binary untouched. `--check` reports without downloading, `--version` pins a release, `--force` reinstalls or downgrades.
+- The replacement happens at the same path, so the absolute paths `init` recorded in hooks and in the scheduler keep working; nothing has to be re-run.
+- Binaries installed by npm and `target/debug` development builds are refused unless `--force` is given.
+
 ## 0.1.13 — 2026-11-01
 
 ### Capture and authentication

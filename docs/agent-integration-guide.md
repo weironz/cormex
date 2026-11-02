@@ -64,6 +64,17 @@ cargo build --release --locked -p cormex
 
 Windows 可执行文件为 `target/release/cormex.exe`，Linux/macOS 为 `target/release/cormex`。安装替换时同时检查 MCP、hook 和计划任务引用的绝对路径，避免手工终端使用新版、后台仍执行旧版。
 
+已安装的 CLI 可以自更新，前提是该二进制包含 `update` 子命令：
+
+```bash
+cormex update --check   # 只比较版本，不下载
+cormex update           # 下载、校验、试运行，然后原地替换
+```
+
+它按平台取本 release 的归档，用同一 release 的 `SHA256SUMS` 校验，解包后先执行一次 `--version`，全部通过才原子替换当前文件——任一步失败都不碰现有二进制。替换的是同一个路径，所以 `init` 写进 hook 与计划任务里的绝对路径继续有效，不需要重跑 `init`；只有把新二进制装到**另一个**路径时，才需要重新指向。
+
+`--version v0.1.14` 装指定版本（降级需加 `--force`）。npm 安装的二进制与 `target/debug` 开发构建默认拒绝替换：前者用 `npm install -g cormex@latest`，否则 npm 记录的版本与磁盘上的实际文件会长期不一致。更早的版本没有该子命令，先手工跑一次安装脚本或 npm 安装。
+
 ### 2.2 登录
 
 ```bash
