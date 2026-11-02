@@ -85,6 +85,9 @@ Postgres with pgvector. That is the only hard dependency.
 
 ## Running it
 
+Detailed guides: [deployment and operations](docs/deployment-guide.md) and
+[AI agent integration and usage](docs/agent-integration-guide.md) (Chinese).
+
 Two images: `cormex` (the server) and `cormex-web` (the browser). They are
 separate containers because they are separate concerns — you can run the server
 alone and talk to it over MCP, and never deploy the browser at all.
