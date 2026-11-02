@@ -113,6 +113,7 @@ pub mod table {
     // `archive_chunks` here.
     pub const ARCHIVE: &[&str] = &[
         "capture_sessions",
+        "capture_session_ui_metadata",
         "capture_files",
         "capture_generations",
         "capture_chunks",

@@ -222,6 +222,10 @@ impl Installer for Scheduler {
     }
 
     fn uninstall(&self, db: &crate::state::StateDb) -> Result<()> {
+        // An unrelated state directory must not disable the user's global timer.
+        if !db.installs()?.contains(&self.target.display().to_string()) {
+            return Ok(());
+        }
         #[cfg(windows)]
         {
             let _ = std::process::Command::new("schtasks")

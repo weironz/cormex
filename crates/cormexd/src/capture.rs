@@ -172,10 +172,20 @@ pub async fn update_session_ui_metadata(
         .project_name
         .as_deref()
         .map(|v| cormex_memory::redaction::mask_text(v).into_owned());
-    let result = sqlx::query("INSERT INTO capture_session_ui_metadata (session_id,device_id,title,project_id,project_name,pinned_position) SELECT session_id,device_id,$3,$4,$5,$6 FROM capture_files WHERE id=$1 AND device_id=$2 ON CONFLICT (session_id,device_id) DO UPDATE SET title=EXCLUDED.title,project_id=EXCLUDED.project_id,project_name=EXCLUDED.project_name,pinned_position=EXCLUDED.pinned_position,updated_at=clock_timestamp()")
-        .bind(&id).bind(&device_id).bind(title).bind(req.project_id).bind(project_name).bind(req.pinned_position)
-        .execute(store.pool()).await.map_err(|e| ApiError::internal(format!("could not update session metadata: {e}")))?;
-    if result.rows_affected() == 0 {
+    let metadata = cormex_store::archive::SessionUiMetadata {
+        title: title.as_deref(),
+        project_id: req.project_id.as_deref(),
+        project_name: project_name.as_deref(),
+        pinned_position: req.pinned_position,
+    };
+    let updated = store
+        .archive_txn(async |tx| {
+            tx.update_session_ui_metadata(&id, &device_id, &metadata)
+                .await
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("could not update session metadata: {e}")))?;
+    if !updated {
         return Err(ApiError::not_found("no such file for this device"));
     }
     Ok(axum::Json(serde_json::json!({"updated": true})))

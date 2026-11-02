@@ -178,7 +178,43 @@ pub struct ArchiveTxn {
     inner: guarded::Guarded,
 }
 
+/// Device-owned display hints, kept separate from the immutable transcript.
+pub struct SessionUiMetadata<'a> {
+    pub title: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub project_name: Option<&'a str>,
+    pub pinned_position: Option<i32>,
+}
+
 impl ArchiveTxn {
+    /// Replace display hints only when the file belongs to this device.
+    pub async fn update_session_ui_metadata(
+        &mut self,
+        file_id: &str,
+        device_id: &str,
+        metadata: &SessionUiMetadata<'_>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT INTO capture_session_ui_metadata
+                (session_id,device_id,title,project_id,project_name,pinned_position)
+             SELECT session_id,device_id,$3,$4,$5,$6 FROM capture_files
+             WHERE id=$1 AND device_id=$2
+             ON CONFLICT (session_id,device_id) DO UPDATE SET
+                title=EXCLUDED.title,project_id=EXCLUDED.project_id,
+                project_name=EXCLUDED.project_name,pinned_position=EXCLUDED.pinned_position,
+                updated_at=clock_timestamp()",
+        )
+        .bind(file_id)
+        .bind(device_id)
+        .bind(metadata.title)
+        .bind(metadata.project_id)
+        .bind(metadata.project_name)
+        .bind(metadata.pinned_position)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
     pub(crate) async fn begin(pool: &PgPool) -> Result<Self> {
         Ok(Self {
             inner: guarded::Guarded::begin(pool).await?,

@@ -53,6 +53,15 @@ pub struct InitOptions {
 #[cfg(test)]
 pub(crate) fn installers_for_test(cfg: &Config, agents: &[String]) -> Vec<Box<dyn Installer>> {
     installers(cfg, agents)
+        .into_iter()
+        .filter(|installer| {
+            installer
+                .plan()
+                .expect("test installer plan")
+                .iter()
+                .all(|change| change.kind != "scheduler")
+        })
+        .collect()
 }
 
 /// Collect every installer that applies to this machine.

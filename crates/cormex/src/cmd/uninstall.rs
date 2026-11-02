@@ -68,14 +68,20 @@ pub fn run(cfg: &Config, data_dir: &std::path::Path, drop_data: bool) -> Result<
     }
 
     if drop_data {
+        // Windows will not unlink the SQLite file while its connection is open.
+        drop(db);
         // The state database is the only thing under `data_dir` the client
         // writes. Removing it means the next run re-uploads from zero, which
         // the server deduplicates -- correct, but an hour of bandwidth on a
         // large history, which is why **the default keeps it** and the flag is
         // named for the thing it does rather than the thing it stops
-        let _ = std::fs::remove_file(data_dir.join("state.db"));
-        let _ = std::fs::remove_file(data_dir.join("state.db-wal"));
-        let _ = std::fs::remove_file(data_dir.join("state.db-shm"));
+        for name in ["state.db", "state.db-wal", "state.db-shm"] {
+            if let Err(error) = std::fs::remove_file(data_dir.join(name))
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error.into());
+            }
+        }
         report.data_removed = true;
     }
 

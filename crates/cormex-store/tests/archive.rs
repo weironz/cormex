@@ -366,6 +366,127 @@ async fn archive_rows_never_enter_sync_log() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs Postgres; run with just test-db"]
+async fn ui_metadata_migration_preserves_existing_capture_files() {
+    let Some(db) = common::setup_upto(Some(20261125000007)).await else {
+        return;
+    };
+    let owner = device();
+    let (file, _) = register(&db.store, &owner, "before-metadata.jsonl").await;
+    db.store
+        .migrate()
+        .await
+        .expect("upgrading the populated archive should succeed");
+    db.store
+        .migrate()
+        .await
+        .expect("reapplying migrations should be a no-op");
+    let files = db.query_raw("SELECT id::text FROM capture_files").await;
+    assert_eq!(
+        files,
+        vec![file.clone()],
+        "migration must preserve existing file IDs"
+    );
+    let metadata = cormex_store::archive::SessionUiMetadata {
+        title: Some("Existing chat"),
+        project_id: None,
+        project_name: None,
+        pinned_position: None,
+    };
+    assert!(
+        db.store
+            .archive_txn(async |tx| {
+                tx.update_session_ui_metadata(&file, &owner, &metadata)
+                    .await
+            })
+            .await
+            .expect("metadata should be writable after the upgrade"),
+        "a file captured before the migration should accept metadata"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Postgres; run with just test-db"]
+async fn session_ui_metadata_is_device_owned_and_rolls_back() {
+    use cormex_store::archive::SessionUiMetadata;
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let owner = device();
+    let (file, _) = register(&db.store, &owner, "metadata.jsonl").await;
+    let metadata = SessionUiMetadata {
+        title: Some("Original title"),
+        project_id: Some("project-1"),
+        project_name: Some("Project one"),
+        pinned_position: Some(0),
+    };
+    let stranger = device();
+    assert!(
+        !db.store
+            .archive_txn(async |tx| {
+                tx.update_session_ui_metadata(&file, &stranger, &metadata)
+                    .await
+            })
+            .await
+            .unwrap(),
+        "a different device must not set this file's display hints"
+    );
+    let rolled_back: cormex_store::Result<()> = db
+        .store
+        .archive_txn(async |tx| {
+            assert!(
+                tx.update_session_ui_metadata(&file, &owner, &metadata)
+                    .await?
+            );
+            Err(cormex_store::StoreError::Invalid(
+                "abort metadata write".into(),
+            ))
+        })
+        .await;
+    assert!(
+        rolled_back.is_err(),
+        "the injected error should abort the transaction"
+    );
+    assert_eq!(
+        db.query_raw("SELECT count(*)::text FROM capture_session_ui_metadata")
+            .await,
+        vec!["0"],
+        "an aborted archive transaction must leave no display hints"
+    );
+    assert!(
+        db.store
+            .archive_txn(async |tx| {
+                tx.update_session_ui_metadata(&file, &owner, &metadata)
+                    .await
+            })
+            .await
+            .unwrap(),
+        "the owning device should be able to set display hints"
+    );
+    assert_eq!(db.query_raw("SELECT title || ':' || project_id || ':' || project_name || ':' || pinned_position::text FROM capture_session_ui_metadata").await,
+        vec!["Original title:project-1:Project one:0"], "all display hints should commit together");
+    let cleared = SessionUiMetadata {
+        title: None,
+        project_id: None,
+        project_name: None,
+        pinned_position: None,
+    };
+    db.store
+        .archive_txn(async |tx| tx.update_session_ui_metadata(&file, &owner, &cleared).await)
+        .await
+        .unwrap();
+    assert_eq!(db.query_raw("SELECT count(*)::text FROM capture_session_ui_metadata WHERE title IS NULL AND project_id IS NULL AND project_name IS NULL AND pinned_position IS NULL").await,
+        vec!["1"], "replacing hints with nulls should clear the same row");
+    assert_eq!(
+        db.query_raw("SELECT count(*)::text FROM sync_log").await,
+        vec!["0"],
+        "display hints must stay out of device sync"
+    );
+    db.cleanup().await;
+}
+
 /// `table::ALL` is defined as "every table name that can appear in
 /// `sync_log.table_name`", and the archive tables never do.
 ///

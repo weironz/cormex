@@ -238,6 +238,9 @@ mod tests {
     fn the_aider_source_is_the_project_history_file() {
         let (agent, path) = aider_source(std::path::Path::new("/home/u/proj"));
         assert_eq!(agent, "aider");
-        assert_eq!(path, "/home/u/proj/.aider.chat.history.md");
+        assert_eq!(
+            std::path::Path::new(&path),
+            std::path::Path::new("/home/u/proj").join(".aider.chat.history.md")
+        );
     }
 }

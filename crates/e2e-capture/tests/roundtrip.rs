@@ -623,6 +623,10 @@ async fn every_agent_layout_round_trips() {
 
     // The built-in catalog, with every home pointed at this one temp tree
     let mut catalog = Catalog::builtin().clone();
+    // Entries without fixtures must never fall back to the developer's real home.
+    catalog
+        .agents
+        .retain(|agent| layouts.iter().any(|(id, _, _)| *id == agent.id));
     for agent in &mut catalog.agents {
         let sub = match agent.id.as_str() {
             "claude_code" => "claude",
