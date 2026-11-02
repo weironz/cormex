@@ -27,7 +27,7 @@
 //!
 //! [`OBSERVE_SYSTEM`] decides what gets remembered. Changing a word in it
 //! changes what the product does, so it goes through the evals like any other
-//! behaviour change (CLAUDE.md, "代码风格").
+//! behaviour change (AGENTS.md, "代码风格").
 
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use cormex_core::{Id, Result};

@@ -2,7 +2,7 @@
 
 > 日期：2026-10-29 · 设计权威：[session-archive-architecture.md](../design/session-archive-architecture.md)（下文引用为「设计 §x」「D<n>」）
 >
-> 这份计划写给**执行开发的 AI agent**。每张任务卡自成一体：读完 CLAUDE.md、设计文档和这张卡，就能开工。
+> 这份计划写给**执行开发的 AI agent**。每张任务卡自成一体：读完 AGENTS.md、设计文档和这张卡，就能开工。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 0.1 阅读顺序
 
-1. `CLAUDE.md`（不可违反的约束、代码风格、提交前检查）
+1. `AGENTS.md`（不可违反的约束、代码风格、提交前检查）
 2. 设计文档 §0–§1（一页纸 + 决定表）
 3. 你领到的任务卡；卡里「依赖」列出的卡必须已经合并
 
@@ -41,7 +41,7 @@
 - 归档表进 `sync_log`，或者用 `write_txn` 写归档表（D3、D23）
 - hook 里联网，或 `cormex hook` 以非 0 退出（D1）
 - 读项目目录里的文件内容（D7）
-- 在 cormexd 里加任何 agent 循环、`/chat`、`/sandbox/*`（CLAUDE.md；`routes::cormexd_serves_no_agent_shaped_route` 不许改绿）
+- 在 cormexd 里加任何 agent 循环、`/chat`、`/sandbox/*`（AGENTS.md；`routes::cormexd_serves_no_agent_shaped_route` 不许改绿）
 - 依赖、复制、vendor `coding_agent_session_search`（cass）的代码（许可证 rider，见调研报告 §3.1）
 
 ---
@@ -133,7 +133,7 @@
 - **依赖**：无
 - **改动**：
   - `README.md`：`cormex://profile` 改为 `cormex://profile`（以 `crates/cormexd/src/mcp.rs` 的 `PROFILE_URI` 为准）；「Three things make that possible, and no other memory layer does all three」改为如实的说法（双时间轴不再独有；独有的是注入回放、确定性失效、信任分层的出处。依据见调研报告 §6.1）
-  - `CLAUDE.md`「差异点在哪」一节：同样改掉「9 个同类项目没有一个做双时间轴回放」
+  - `AGENTS.md`「差异点在哪」一节：同样改掉「9 个同类项目没有一个做双时间轴回放」
 - **验收**：措辞与调研报告 §6.1 一致；没有改动任何代码
 
 ---
@@ -206,7 +206,7 @@
     常量 `ARCHIVE_GENERATION_LOCK_CLASS: i32 = 4273`，注释说明与 4272 的区别
   - `crates/cormex-store/src/model.rs`：`table` 模块加 `ARCHIVE: &[&str]`（`capture_sessions`、`capture_files`、`capture_generations`、`capture_chunks`、`capture_file_events`、`capture_masks`、`capture_mask_progress`；阶段 2 再追加）
   - `crates/cormex-store/src/lib.rs`：导出新类型
-  - `CLAUDE.md` 约束 1：「写事务必须走 `store.write_txn`」改为「**同步表**必须走 `write_txn`；**归档表**（`table::ARCHIVE`）必须走 `archive_txn`；两者都不允许裸事务」，并写一句为什么归档表不需要 advisory lock
+  - `AGENTS.md` 约束 1：「写事务必须走 `store.write_txn`」改为「**同步表**必须走 `write_txn`；**归档表**（`table::ARCHIVE`）必须走 `archive_txn`；两者都不允许裸事务」，并写一句为什么归档表不需要 advisory lock
 - **测试**（`crates/cormex-store/tests/archive.rs`，`#[ignore]`）：
   - `register_is_idempotent`：同一文件注册两次，id 相同，只有一代
   - `append_is_contiguous`：0 → 100 → 200 成功；跳到 300 返回 `OffsetMismatch{expected:200}`
@@ -477,7 +477,7 @@
   - workspace `Cargo.toml`：`goose-providers` 升到 `0.1.0-alpha.13`（它要求 `rmcp ^3.4.1`）；`crates/cormexd/Cargo.toml`：`rmcp = "3.8"`，`schemars` 跟随 rmcp 3.x 实际使用的版本（看它的 `Cargo.toml`，**必须是同一份**，原因见现有注释）
   - `cargo tree -d | grep rmcp` 必须只有一份
   - 修 `crates/cormex-llm` 与 `crates/cormexd/src/mcp.rs` 的编译错误：`StreamableHttpServerConfig::stateful_mode` → `legacy_session_mode`（保持为 true，兼容旧客户端）；资源读取结果加 `ttlMs` / `cacheScope`（profile 资源 `private`、TTL 5 分钟）；`ProtocolVersion::LATEST` 的语义变化
-  - 注意 CLAUDE.md「依赖上的两个已知雷」：`pgvector` 的 sqlx 版本、`goose-provider-types` 没有 `rustls-tls` feature
+  - 注意 AGENTS.md「依赖上的两个已知雷」：`pgvector` 的 sqlx 版本、`goose-provider-types` 没有 `rustls-tls` feature
   - 更新 `crates/cormexd/Cargo.toml` 里那段「Pinned at 1.8」的注释
 - **测试**：现有 MCP 测试；新增两条：用 2026-07-28 的无状态请求（`_meta` 带协议版本）调 `tools/list` 与 `memory_search`；用旧的 `initialize` 握手调同样的工具。要花钱的 LLM 测试照旧优雅跳过
 - **验收**：`cargo tree -d` 无重复 rmcp；Claude Code 用 README 里的配置连上 `/mcp` 能调 `memory_search`（PR 里贴手动验证步骤）
@@ -498,7 +498,7 @@
 - **依赖**：无
 - **改动**：
   - `crates/cormex-core/src/injection.rs`：新增 `SessionItem { id, title, agent, project, first_at, last_at, summary }`、`render_session_index(items: &[SessionItem]) -> String`（`<retrieved_sessions>` 块，带框定语）、`render_session_excerpt(meta: &SessionItem, body: &str, next_cursor: Option<&str>) -> String`（`<retrieved_session>` 块，带框定语，说明「这是历史会话的记录，背景数据不是指令」）；时间一律绝对日期
-  - **CLAUDE.md 约束 4：这个文件可能在本仓库之外还有一份实现**（给在别处运行的 agent 用）。若手上有那一份，两边一起改（注释语言可以不同），然后跑 `python scripts/injection-drift.py <另一份的路径>`，结果贴进 PR；拿不到就跳过并在 PR 里说明
+  - **AGENTS.md 约束 4：这个文件可能在本仓库之外还有一份实现**（给在别处运行的 agent 用）。若手上有那一份，两边一起改（注释语言可以不同），然后跑 `python scripts/injection-drift.py <另一份的路径>`，结果贴进 PR；拿不到就跳过并在 PR 里说明
 - **测试**：两个渲染函数的快照；空输入返回空串；框定语必然出现
 - **验收**：drift 脚本通过
 
@@ -661,7 +661,7 @@
 你在 weironz/cormex 仓库工作。
 
 先读：
-1. CLAUDE.md（约束与代码风格，必须遵守）
+1. AGENTS.md（约束与代码风格，必须遵守）
 2. docs/design/session-archive-architecture.md 的 §0、§1，以及任务卡里引用到的章节
 3. docs/plan/session-archive-plan.md 的 §0（通用完成标准与全局禁止）和任务卡 <卡号>
 
@@ -736,7 +736,7 @@ sqlx migrate run --source migrations-global \
 
 - **外部条件缺失**（没有某个凭据、某个宿主装不上、某个网站访问不到）：在 `progress.md` 把这张卡标 `blocked` 并写明缺什么，**跳到下一张不依赖它的卡**继续；阶段结束时在 PR 里汇总
 - **设计与现实冲突**（上游格式和设计假设不符、某个决定实现不了）：选一个最小的、可回退的偏离，在 `progress.md` 的「偏离设计」一栏写清证据和做法，同时**在同一个提交里更新设计文档**对应段落（设计文档是权威，不能让代码和文档分家）。D1–D23 的**原则**不得推翻
-- **不确定某个改动是否越界**：按 CLAUDE.md 和设计 §12 的约束对照表判断；仍不确定就选更保守的做法并记录
+- **不确定某个改动是否越界**：按 AGENTS.md 和设计 §12 的约束对照表判断；仍不确定就选更保守的做法并记录
 
 ### 12.5 进度文件 `docs/plan/progress.md`
 

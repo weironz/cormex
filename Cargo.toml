@@ -73,7 +73,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # (see docs/sandbox.md, section 7).
 #
 # **Do not hand-roll a unix socket on top of hyper**: Docker's API version negotiation is
-# full of traps, and this is exactly the "tedious but industrially proven part" CLAUDE.md
+# full of traps, and this is exactly the "tedious but industrially proven part" AGENTS.md
 # talks about.
 #
 # Turn the default features off and enable them one at a time: the defaults pull in ssl
@@ -116,7 +116,7 @@ regex = "1"
 
 # Text diff. The de facto standard for doing this in Rust (the place highlight.js occupies
 # for code highlighting), Apache-2.0. Writing Myers yourself is precisely the kind of work
-# the first rule of CLAUDE.md forbids outright -- tedious, industrially proven, and getting
+# the first rule of AGENTS.md forbids outright -- tedious, industrially proven, and getting
 # it wrong buys you a diff that merely "looks right".
 #
 # Only `text` is enabled (`TextDiff` and unified diff both sit behind that feature), with

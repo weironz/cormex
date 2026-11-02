@@ -79,7 +79,7 @@ impl Budget {
 /// The fields marked "not in the injection block" below belong to the latter.
 /// Getting a field into the prompt means changing `render_*`, and that **blows
 /// through the prefix cache** (the profile block goes into the cacheable
-/// prefix; see CLAUDE.md inviolable constraint #4) — that is a decision to be
+/// prefix; see AGENTS.md inviolable constraint #4) — that is a decision to be
 /// weighed on its own, not something that tags along with adding a field line
 /// here.
 #[derive(Debug, Clone)]
@@ -403,7 +403,7 @@ mod tests {
     ///
     /// Once it does, **the profile block's content is no longer stable**:
     /// `confidence` shifts on re-extraction, `trust_tier` shifts with the
-    /// source. And that block goes into the **cacheable prefix** (CLAUDE.md
+    /// source. And that block goes into the **cacheable prefix** (AGENTS.md
     /// inviolable constraint #4); once the prefix changes, the cache is lost
     /// turn after turn — costs rise 5–10x, and it only becomes visible from the
     /// bill weeks later.

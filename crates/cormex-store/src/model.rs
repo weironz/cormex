@@ -664,7 +664,7 @@ impl NewEpisodeBlob {
 
 /// A vector backfilled for an existing fact when the embedding model changes.
 ///
-/// Not an in-place modification of `facts.embedding` — CLAUDE.md's append-only
+/// Not an in-place modification of `facts.embedding` — AGENTS.md's append-only
 /// rule does not allow that path, and "dual-model retrieval during backfill"
 /// requires one fact to hold vectors from two spaces **at the same time**, which
 /// one column cannot do. See

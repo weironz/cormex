@@ -302,7 +302,7 @@ Excel / PPT / Word / 散落文档**没有任何其他系统在替你保存历史
 
 新增 `office_text` 一档要动：
 
-1. **一个新 migration** 重建约束（CLAUDE.md：不改已应用的 migration，加新文件）——
+1. **一个新 migration** 重建约束（AGENTS.md：不改已应用的 migration，加新文件）——
    内联列级 CHECK 由 PG 自动命名为 `blob_transcripts_kind_check`，
    需 `DROP CONSTRAINT` + 重新 `ADD`
 2. **`cormex-store` 的 `TranscriptKind` 补一个变体**（`model.rs`）——
@@ -579,7 +579,7 @@ RAPTOR 的 collapsed-tree 结论：**摊平所有抽象层级进同一向量索�
 >
 > **二、过滤必须在 LLM 抽取之前、embedding 之前。** 这正是 Mem0 的反面教训 ——
 > 它的过滤在抽取层，原文已经完整过了一遍网络。
-> CLAUDE.md 约束 2 规定「embedding 计算一律在事务外完成」恰好提供了插入点：
+> AGENTS.md 约束 2 规定「embedding 计算一律在事务外完成」恰好提供了插入点：
 > **过滤与 embedding 同处事务外准备阶段，过滤必须排在 embedding 之前。**
 >
 > **三、「不该存」≠「不该记录曾经存在过」。** 但留痕的形式因级别而异：
@@ -738,7 +738,7 @@ let text = format!("用户：{}\n助手：{}", req.message, reply);
 >
 > 另外要写清**作用于哪个块**：只作用于**回合检索块**。
 > `render_profile_block` 按设计「绝不放本轮检索结果」，
-> 所以这条改动**不会**动到可缓存前缀（CLAUDE.md 约束 4 安全）。
+> 所以这条改动**不会**动到可缓存前缀（AGENTS.md 约束 4 安全）。
 >
 > 还有一个前置：按什么时间排？`valid_at` 可为 NULL 且 extract prompt 明令
 > 「推断不出必须填 null」。渲染排序需要一个确定性的回落规则
@@ -792,7 +792,7 @@ Anthropic 官方立场：Claude **把 `tool_result` 内容当作不可信数据�
 `tool_result` 之后的 user turn 里**。
 
 Anthropic 工程文章把持久化上下文明确标为**增长中的攻击面**：product memory、
-`CLAUDE.md`、挂载工作区、长期 agent 的 state 目录 —— 落进任何一处的注入
+`AGENTS.md`、挂载工作区、长期 agent 的 state 目录 —— 落进任何一处的注入
 **会在每次启动时重新加载，功能上等同于经典后渗透里的 persistence 机制**。
 难点说得很直白：**从模型视角看，上下文窗口里所有文本同等有效。**
 

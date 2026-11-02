@@ -23,7 +23,7 @@
 ## 已经做完的（别重做）
 
 - **MCP 门面**：`cormex://profile`（resource）+ `memory_search` / `remember`（tool）。
-  两个原语的分工对应注入的两半，见 CLAUDE.md 约束 4
+  两个原语的分工对应注入的两半，见 AGENTS.md 约束 4
 - **委托凭据**：`POST/DELETE /delegated-tokens`，用调用者自己的 bearer 签发
 - **agent 循环已从这里删除**，且有测试钉着不许回来
 - **记忆浏览器**：检索、provenance、可拖的时间轴。Flutter 一份源码出 Web 与桌面，
@@ -141,7 +141,7 @@ type "ulid" does not exist
 
 - **`app/` 与 `deploy/` 里的注释还是中文。** Rust crate 那一批翻完了，这两处没有。
   README 的 Status 已经如实写着这件事
-- **`injection-drift.py` 只是手工脚本。** 它守的是 CLAUDE.md 约束 4 —— 一条
+- **`injection-drift.py` 只是手工脚本。** 它守的是 AGENTS.md 约束 4 —— 一条
   漂了不报错的约束。要进 CI 得先解决「CI 上拿不到另一份实现」：可行的做法是
   把渲染实现连同测试一起做成一个可以被两边 vendor 的单文件并比对 sha256
 - **evals 不在 CI 里。** 它是 workspace member，所以 `cargo test` 会编它，

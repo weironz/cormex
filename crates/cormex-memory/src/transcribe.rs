@@ -29,7 +29,7 @@
 //!    This module builds that into the **signature**: [`TranscribePipeline::run`]
 //!    must be handed a [`RedactionGuard`], so whoever wires it up cannot forget.
 //! 2. **Model calls happen outside the transaction.** Same reasoning as
-//!    extraction (CLAUDE.md constraint 2): this module only produces "rows
+//!    extraction (AGENTS.md constraint 2): this module only produces "rows
 //!    waiting to be written" such as [`cormex_store::NewBlobTranscript`];
 //!    the actual `write_txn` is opened by the caller, and committed at once.
 //!
@@ -442,7 +442,7 @@ impl TranscribePipeline {
                 id: Id::new(),
                 blob_hash: blob_hash.to_string(),
                 // tsv must be written in the same transaction as the main row
-                // and never backfilled asynchronously (CLAUDE.md constraint 3),
+                // and never backfilled asynchronously (AGENTS.md constraint 3),
                 // so tokenization is done right here and handed to the caller
                 // together with the row
                 tsv_source: Some(tokenize::to_tsvector_input(&seg.text)),

@@ -56,7 +56,7 @@
 // `pub` does not exempt anything from dead_code here, and until it is wired up
 // every exported item is a compile error under `-D warnings`.
 //
-// That conflicts with CLAUDE.md's requirement to "make the code genuinely used
+// That conflicts with AGENTS.md's requirement to "make the code genuinely used
 // rather than adding an allow", and the truth here is "it is about to be used"
 // — so this allow is **scaffolding**: it should be deleted the moment the
 // routes are wired in, and if anything still reports dead_code afterwards, then

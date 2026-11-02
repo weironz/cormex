@@ -56,7 +56,7 @@ jobs:
       # `--locked`: a Cargo.lock that is in the repository has to be taken at its word.
       # pgvector's sqlx dependency range spans a semver group, and letting it float pulls
       # sqlx back to 0.8 and leaves two copies of sqlx-core coexisting (51 compile errors,
-      # see CLAUDE.md). Without this flag the lock file can be silently rewritten, and the
+      # see AGENTS.md). Without this flag the lock file can be silently rewritten, and the
       # rewrite happens in CI's temporary directory where nobody will ever see it
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

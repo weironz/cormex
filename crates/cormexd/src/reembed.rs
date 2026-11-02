@@ -191,7 +191,7 @@ async fn scan_all_tenants(st: &crate::state::AppState, live: &Arc<Live>, batch: 
 /// **outside the transaction** → insert them in bulk inside a short transaction.
 ///
 /// "Compute vectors outside the transaction" is a hard constraint from
-/// CLAUDE.md: `write_txn`'s very first statement takes an advisory lock to
+/// AGENTS.md: `write_txn`'s very first statement takes an advisory lock to
 /// serialize commit order, so crossing the network inside a lock-holding
 /// transaction pins global write throughput to that HTTP round trip.
 async fn scan_once(live: &Arc<Live>, batch: usize) -> Outcome {

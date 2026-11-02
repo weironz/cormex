@@ -30,7 +30,7 @@
 //! # Three rules
 //!
 //! 1. **LLM calls and embeddings are always computed outside the transaction**
-//!    (a corollary of constraint 2 in CLAUDE.md). This module splits "decide what
+//!    (a corollary of constraint 2 in AGENTS.md). This module splits "decide what
 //!    to write" from "write" into [`Linker::plan`] and [`Linker::write`], the same
 //!    shape as `extract` / `write_candidates` in [`crate::extract`].
 //! 2. **A unique constraint cannot be added** (the schema is outside this module's

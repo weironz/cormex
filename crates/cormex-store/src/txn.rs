@@ -449,7 +449,7 @@ impl WriteTxn {
     ///
     /// Two reasons; the second is the hard one:
     ///
-    /// 1. CLAUDE.md: "no table does UPDATE / DELETE". This crate contains zero
+    /// 1. AGENTS.md: "no table does UPDATE / DELETE". This crate contains zero
     ///    UPDATEs to date, and the existing precedent is `blob_transcripts` —
     ///    derived data gets new rows in a separate table
     /// 2. "Dual-model retrieval during backfill" (memory.md §7, step 3)

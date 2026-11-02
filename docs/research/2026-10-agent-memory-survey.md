@@ -25,7 +25,7 @@
 
 - **检索已经收敛**：语义、BM25、实体/图、时间几路并行召回再融合，是 Mem0（2026-04 新算法）、Graphiti、Hindsight 的共同答案。Cormex 的四路召回加 RRF 只够入场，算不上差异。
 - **写入从「改写」转向「只追加」**：Mem0 2026-04 的新算法明确改成 ADD-only，不再 UPDATE/DELETE；Graphiti 让失效的边留在原处，不删除。Cormex 的 append-only 得到了验证，但也不再是独有的。
-- **⚠️ CLAUDE.md 里「调研过的 9 个同类项目没有一个做双时间轴回放」这句已经不成立**（README 里「no other memory layer does all three」也站不住）。Graphiti/Zep 明确是双时间轴（`valid_at/invalid_at` + `created_at/expired_at`），文档还写了「某时刻系统知道什么」这种查询。Cormex 还独有的东西变成了：**注入回放**（`episode_memories` 记下每一轮实际注入了哪些记忆，所以能回放「agent 当时看到了什么」，而不只是「库里当时有什么」）、**确定性失效**（不让 LLM 裁决，失效原因分四种），以及**按信任分层的出处**。见 §6.1。
+- **⚠️ AGENTS.md 里「调研过的 9 个同类项目没有一个做双时间轴回放」这句已经不成立**（README 里「no other memory layer does all three」也站不住）。Graphiti/Zep 明确是双时间轴（`valid_at/invalid_at` + `created_at/expired_at`），文档还写了「某时刻系统知道什么」这种查询。Cormex 还独有的东西变成了：**注入回放**（`episode_memories` 记下每一轮实际注入了哪些记忆，所以能回放「agent 当时看到了什么」，而不只是「库里当时有什么」）、**确定性失效**（不让 LLM 裁决，失效原因分四种），以及**按信任分层的出处**。见 §6.1。
 - **原文的价值被重新认识**：MemPalace 逐字存原文，用普通 embedding 检索，在 LongMemEval 上自报 R@5 96.6%（这是召回，不是 QA 准确率，有争议，见 §2.6）。它自家的压缩方案让同一指标掉到 84.2%。结论是：**抽取和压缩一定会丢信息，原文必须留着，而且要能检索。**
 - **采集方式在变**：越来越少靠 agent 主动调 `remember`，越来越多靠**宿主 hooks 加读磁盘上的会话日志**。claude-mem 挂了 6 个生命周期 hook，宿主没有 hook 就直接监听日志文件；MemPalace 给 Claude Code、Codex、Cursor 都配了自动保存 hook。2026 年 Codex、Cursor、Gemini CLI 都有了 hooks。
 
@@ -90,7 +90,7 @@
 - 默认没有向量索引（要装 MemFS Search mod）
 - **前提是你得把 Letta 当成 agent 运行时用**
 
-**对 Cormex 的启示**：git 历史本身就是一条「系统时间轴」，Letta 也在往「历史可回溯」走。「常驻块 + 按需文件树」这种分法和 Cormex 的「profile resource + search tool」是同一个思路。Cormex 不做运行时（CLAUDE.md：这里不跑 agent 循环），所以只借思想，不借形态。
+**对 Cormex 的启示**：git 历史本身就是一条「系统时间轴」，Letta 也在往「历史可回溯」走。「常驻块 + 按需文件树」这种分法和 Cormex 的「profile resource + search tool」是同一个思路。Cormex 不做运行时（AGENTS.md：这里不跑 agent 循环），所以只借思想，不借形态。
 
 ### 2.4 Hindsight（MIT，`hindsight-api` 1.1.0，2026-10）
 
@@ -167,7 +167,7 @@
 
 ### 2.12 宿主自带的记忆
 
-- **Claude Code**：用户写的 `CLAUDE.md`（多级作用域），加上 2026-02 起默认开启的 **auto memory**：模型自己记笔记，写在 `~/.claude/projects/<project>/memory/MEMORY.md` 加主题文件里。每个会话只自动加载 MEMORY.md 的前 200 行或前 25KB（复核官方文档），**只在本机，不共享**；它不受 `cleanupPeriodDays` 清理
+- **Claude Code**：用户写的 `AGENTS.md`（多级作用域），加上 2026-02 起默认开启的 **auto memory**：模型自己记笔记，写在 `~/.claude/projects/<project>/memory/MEMORY.md` 加主题文件里。每个会话只自动加载 MEMORY.md 的前 200 行或前 25KB（复核官方文档），**只在本机，不共享**；它不受 `cleanupPeriodDays` 清理
 - **Codex 有一条完整的记忆管线**（复核 `openai/codex` 的 `codex-rs/memories/README.md`）：会话启动时在后台跑两个阶段。第一阶段对每个空闲足够久的 rollout 调模型，抽出 `raw_memory` 和 `rollout_summary`，并对密钥做脱敏；第二阶段把它们合并进 `~/.codex/memories/`（`raw_memories.md`、`rollout_summaries/`），这个目录本身是一个 git 基线，由一个专门的整理子 agent 根据 git diff 改写
 - Gemini CLI 也有一套「把记忆写进 Markdown 文件」的机制（`GEMINI.md`）
 
@@ -260,7 +260,7 @@
 
 ### 6.1 差异点要重新校准
 
-**「没有人做双时间轴回放」这句要改。** Graphiti 有了，而且写在 README 第一屏。继续这么说，读者一查就会觉得 Cormex 不老实。其实 2026-08 的 [memory-content.md](../memory-content.md) §一.5 早就写了「双时间轴是通用语，不是方言」，所以 CLAUDE.md 那句话和本项目自己的调研结论也是矛盾的。那份调研给出的准确说法是：**编码 agent 里**没有一家有这个能力。
+**「没有人做双时间轴回放」这句要改。** Graphiti 有了，而且写在 README 第一屏。继续这么说，读者一查就会觉得 Cormex 不老实。其实 2026-08 的 [memory-content.md](../memory-content.md) §一.5 早就写了「双时间轴是通用语，不是方言」，所以 AGENTS.md 那句话和本项目自己的调研结论也是矛盾的。那份调研给出的准确说法是：**编码 agent 里**没有一家有这个能力。
 
 在本次调研范围内，Cormex **仍然独有**、并且站得住的：
 
@@ -280,11 +280,11 @@
 
 它比「双时间轴」难复制得多。难的不是算法，是**二十几种格式的长期维护**加上**append-only 的原始层**。MemPalace（原文 + 挖 Claude Code）、claude-mem（hooks + 本机 viewer）、cass（多 agent 采集 + 原始镜像）各做了一部分，**没有人把它们和服务端记忆、双时间轴、MCP 放在一起**。
 
-建议评审通过后再改 README 和 CLAUDE.md 的措辞（这次提交没有改）。
+建议评审通过后再改 README 和 AGENTS.md 的措辞（这次提交没有改）。
 
 ### 6.2 保留什么
 
-CLAUDE.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每一条都用得上：
+AGENTS.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每一条都用得上：
 
 - append-only 和 `write_txn`：原始层天生 append-only
 - `tsv` 与主行同事务：归一化投影写入时同样适用
@@ -320,7 +320,7 @@ CLAUDE.md 里 6 条不可违反的约束全部保留，并且 §7 的需求每�
 1. **`as_of` 回放忽略了 `revoke`**。`crates/cormex-store/src/recall.rs` 里的 `as_of_snapshot!` 只要看到时刻 T 之前有过 `invalidate` 就排除这条事实，**不看之后有没有 `revoke` 把它恢复**；而 `fact_status` 视图是「以最后一条状态事件为准」。两者在「失效后又恢复」这种情况下结论相反。现在线上**没有任何代码写 `revoke`**（只有测试写），所以还是潜在问题；一旦做「用户手工恢复一条记忆」，回放就会静默出错。`tests/replay.rs` 里也没有覆盖这种情况
 2. **MCP 依赖落后两个大版本**：仓库锁的是 `rmcp` 1.8，crates.io 上已经是 3.8（2026-10-26）。MCP 的 **2026-07-28 修订版是一次无状态化的破坏性变更**：去掉了 session 和 `initialize` 握手，`resources/subscribe` 换成 `subscriptions/listen`，资源读取结果新增 `ttlMs` / `cacheScope`，Streamable HTTP 要求带 `Mcp-Method` / `Mcp-Name` 头。`ttlMs` / `cacheScope` 恰好能更好地表达「profile 是可缓存前缀」。复核 rmcp 的 CHANGELOG：3.0.0（2026-07-28）起支持这一版，**2026-07-28 的请求一律无状态服务**，老版本客户端走 `legacy_session_mode`（原来的 `stateful_mode` 改名而来）；但 2.0 → 3.x 之间有十几条破坏性变更（cache hints、MRTR、server/discover、标准 HTTP 头等），升级是一项独立的工作
 3. **L2 `summaries` 建了没人调**：只有测试写它。这正是 `routes.rs` 注释里说的「这个仓库头号复发病：built and never called」
-4. **profile 资源的 URI 文档与代码不一致**：代码里是 `cormex://profile`（`mcp.rs` 的 `PROFILE_URI`），CLAUDE.md 和 roadmap 也这么写，但 README 写成了 `cormex://profile`。照 README 配置的人会读不到资源。新增的会话资源用哪个 scheme，要和这一处一起定
+4. **profile 资源的 URI 文档与代码不一致**：代码里是 `cormex://profile`（`mcp.rs` 的 `PROFILE_URI`），AGENTS.md 和 roadmap 也这么写，但 README 写成了 `cormex://profile`。照 README 配置的人会读不到资源。新增的会话资源用哪个 scheme，要和这一处一起定
 
 ---
 
@@ -439,7 +439,7 @@ D   派生物（现有）  观察日志 / 交接简报（L2 summaries）、事�
 
 - **体积**：coding 会话的大头是工具输出，原文动辄几十万 token
 - **格式不兼容**：A 家的 tool_use / tool_result 结构，B 家的模型不认识；**thinking 块的签名不能跨供应商使用**
-- **前缀缓存**：大段原文贴在中间会打穿缓存（CLAUDE.md 约束 4 讲的就是这个）
+- **前缀缓存**：大段原文贴在中间会打穿缓存（AGENTS.md 约束 4 讲的就是这个）
 - **注入风险**：原文里的工具输出常常来自网页，正是记忆投毒的载体（§5 第 11 条）
 
 **改成两条路**：
@@ -544,7 +544,7 @@ UI 的时间轴要标明拖的是哪条轴。原始记录里的时间戳来自�
 - 解析器在服务端升级之后，**可以对全部历史重跑**，不需要每台机器都升级客户端
 - 解析器坏了（格式变了）的时候，采集照常进行，字节一个不丢，修好解析器再补投影
 
-这和 CLAUDE.md 讲 `cormex-import` 时说的「同一个解析器在几处跑，漂移的症状很难看」是同一个教训。解析器只存在一份。
+这和 AGENTS.md 讲 `cormex-import` 时说的「同一个解析器在几处跑，漂移的症状很难看」是同一个教训。解析器只存在一份。
 
 #### 8.4.2 数据分层与现有 schema 的关系
 
@@ -650,7 +650,7 @@ CLI 提供对应的命令：`cormex sessions ls / show / brief / restore`。
 - `cormex detect` 按目录逐个探测，列出「找到哪些 agent、多少会话、多大」。**只看路径和文件元数据，不读内容**
 - 探测不到的（自定义路径、冷门 agent）用 `cormex sources add <agent> <path>` 手工加，也可以让 agent 帮你加
 - 结果写进本机配置（如 `~/.config/cormex/sources.toml`），你可以看、可以改、可以排除某个项目
-- **agent 自己的记忆文件也在目录里**：宿主 home 目录下的那些，如 Claude Code 的 auto memory（`~/.claude/projects/<项目>/memory/`）、用户级的 `~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md`、`~/.gemini/GEMINI.md`，按快照采。项目仓库里的 `CLAUDE.md` / `AGENTS.md` 在 git 里，按 §8.4.7 的边界不采，只记引用
+- **agent 自己的记忆文件也在目录里**：宿主 home 目录下的那些，如 Claude Code 的 auto memory（`~/.claude/projects/<项目>/memory/`）、用户级的 `~/.claude/AGENTS.md`、`~/.codex/AGENTS.md`、`~/.gemini/GEMINI.md`，按快照采。项目仓库里的 `AGENTS.md` / `AGENTS.md` 在 git 里，按 §8.4.7 的边界不采，只记引用
 
 **② 谁触发、怎么触发：默认不常驻**
 
@@ -739,7 +739,7 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 7. **时间轴明确分开**「系统知道」（`as_of`）和「会话里发生」（`at`），否则回填的历史在回放时看起来像不存在
 8. **今天就处理 Claude Code 的 30 天删除**；Cormex 成为唯一副本之后，备份恢复演练是 P0
 9. **不依赖 cass**（许可证 rider 对 Anthropic / OpenAI 关联使用设限）；格式知识独立实现
-10. **对外的定位要更新**：「双时间轴」已经不独有了（Graphiti 有）。新的说法应该是**注入回放 + 确定性失效 + 跨 agent 原始会话档案**。README 和 CLAUDE.md 的措辞评审通过后再改
+10. **对外的定位要更新**：「双时间轴」已经不独有了（Graphiti 有）。新的说法应该是**注入回放 + 确定性失效 + 跨 agent 原始会话档案**。README 和 AGENTS.md 的措辞评审通过后再改
 11. **「原样录入」推翻了 2026-08 的一条定案**（工具输出原始字节不存）。**已拍板（2026-10-29）：只在归档层推翻**。R 层只在服务端、不同步、每来源一把密钥；默认的检索和注入继续执行原定案；原文永远对所有者可读、可显式搜索（§10.2）
 
 **更优的方法**，相对原始设想，核心只有一句：**让文件自己说话，不要让模型转述**。磁盘上的会话文件就是最原始的数据，采集器只读它的字节，Cormex 在服务端慢慢加工；回到上下文的时候，默认给一份带出处的简报，原文留给真正需要的那一步。
@@ -764,7 +764,7 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 |---|---|---|
 | 派生层之下必须保留原始层 | §一.1（Graphiti、Hindsight、Mem0 v3、MemOS 四个独立证据） | §5 第 3 条（又加上 MemPalace 的数据） |
 | ADD-only 战胜 LLM 仲裁的 UPDATE/DELETE | §一.4 | §2.1（Mem0 README 原话） |
-| 双时间轴是通用语，**编码 agent 里**没人有 | §一.5 | §6.1（并据此要求改 CLAUDE.md 的说法） |
+| 双时间轴是通用语，**编码 agent 里**没人有 | §一.5 | §6.1（并据此要求改 AGENTS.md 的说法） |
 | 来源分级是全行业空白 | §8.3 | §6.1 |
 | 失效由确定性代码裁决 | §5.1「LLM 提名，确定性代码裁决」 | §2.2、§6.4 |
 | 不让 LLM 整体重写画像 | §6.2（ACE 的 context collapse） | §2.5、§6.3：推荐**追加式**观察日志，与之相容 |
@@ -819,11 +819,11 @@ agent 很适合做两件事：首次接入时帮你执行 `cormex init`（探测
 
 | 位置 | 原文说的 | 现在 |
 |---|---|---|
-| memory-content §二②、§九、§十三 等 | `live.rs` 的 `tool_path()`、agent 的 `read_file`、「把 `render_profile_block` 接进 live 的 prompt 组装」 | agent 循环已从本仓库删除（CLAUDE.md「这里不跑 agent 循环」），`tool_path()` 已不存在；`render_profile_block` 现在由 MCP 的 profile 资源调用（`live.rs`） |
+| memory-content §二②、§九、§十三 等 | `live.rs` 的 `tool_path()`、agent 的 `read_file`、「把 `render_profile_block` 接进 live 的 prompt 组装」 | agent 循环已从本仓库删除（AGENTS.md「这里不跑 agent 循环」），`tool_path()` 已不存在；`render_profile_block` 现在由 MCP 的 profile 资源调用（`live.rs`） |
 | memory-content §8.6① | 多租户「被五条具体论证明确否决」，没有加归属列 | 已改成**每用户一个 schema**（`crates/cormex-store/src/tenant.rs`），并有账号注册。「没有归属列」仍然成立，但「不为他人处理数据」已不成立 |
 | memory-content §十三 第一批第 1、2 条 | `trust_tier`、派生边是待办 | 已落地：`source_channel` / `trust_tier`（`migrations/20260807000006_fact_provenance.sql`）、`derivations` 表；`insert_summary` 拒绝没有出处的摘要 |
 | memory.md §十二「检索评测体系」 | LongMemEval-S 回放 + 自建中英双语集 | 只有自建集（`evals/`）；LongMemEval-S 没做 |
-| 两份文档里提到的 `roadmap.md` / `operations.md` / `CLAUDE.md` | 写于 2026-08，指当时的同名文件 | 现在的 `roadmap.md` 和 `CLAUDE.md` 内容已经不同；`operations.md` 目前没有 |
+| 两份文档里提到的 `roadmap.md` / `operations.md` / `AGENTS.md` | 写于 2026-08，指当时的同名文件 | 现在的 `roadmap.md` 和 `AGENTS.md` 内容已经不同；`operations.md` 目前没有 |
 
 ---
 

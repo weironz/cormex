@@ -61,7 +61,7 @@ cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Po
 | **D12** | 取回走三层渐进披露（索引 → 简报 / 摘要视图 → 原文）；所有输出经 `cormex_core::injection` 框定 | 报告 §8.4.4 |
 | **D13** | 两条时间轴：`as_of`（Cormex 何时知道，系统时间）与 `at`（会话里何时发生，事件时间） | 报告 §8.2⑥ |
 | **D14** | 加工：观察日志（追加式）+ 交接简报（懒生成）写进现有 `summaries`；事实抽取通过**按策略晋升**为 `episodes` 复用现有抽取管线 | 报告 §8.4.3 |
-| **D15** | 原文档案索引用 **Postgres tsvector（jieba 分词，复用 `cormex_memory::tokenize`）**，不引入 Tantivy | CLAUDE.md「不加第二个存储后端」 |
+| **D15** | 原文档案索引用 **Postgres tsvector（jieba 分词，复用 `cormex_memory::tokenize`）**，不引入 Tantivy | AGENTS.md「不加第二个存储后端」 |
 | **D16** | RustFS 里采集数据用独立的 key 命名空间 `capture/`，与媒体 `blobs/` 分开；每个分块记自己的 `storage_key` | 本文 §4.3 |
 | **D17** | 加密：MVP 依赖传输 TLS + 部署层的静态加密；第 6 阶段引入每来源数据密钥（用 `CORMEX_SECRET_KEY` 包裹）做 crypto-shredding，并如实写清备份的限制 | 报告 §10.2、memory-content §8.6② |
 | **D18** | CLI 分发：单个静态二进制；GitHub Release + `install.sh` / `install.ps1` + npm 包装（主包 + 平台子包）；版本号与 workspace 同一条线 | 报告 §8.4.5 |
@@ -377,7 +377,7 @@ pub enum AppendOutcome {
 3. **事务短小、只写**：读 RustFS、解压、解析、调模型都在事务外完成；一次事务最多写 500 行
 4. **`append_chunk` 的连续性**：事务内先 `pg_advisory_xact_lock(4273, hashtext(generation_id))`，再算当前末尾（`max(byte_offset + byte_length)`），只接受 `offset == 末尾`；`UNIQUE(generation_id, byte_offset)` 撞上时，`content_sha256` 相同即幂等成功，不同即 409
 
-CLAUDE.md 约束 1 的「写事务必须走 `store.write_txn`」要改成：**同步表**必须走 `write_txn`；**归档表**必须走 `archive_txn`；两者都不允许裸事务。（计划 P1-3 里一并改 CLAUDE.md。）
+AGENTS.md 约束 1 的「写事务必须走 `store.write_txn`」要改成：**同步表**必须走 `write_txn`；**归档表**必须走 `archive_txn`；两者都不允许裸事务。（计划 P1-3 里一并改 AGENTS.md。）
 
 ### 4.5 全局 migration：`migrations-global/20261101000001_device_keys.sql`
 
@@ -861,9 +861,9 @@ URI scheme 沿用代码里的 `cormex://`（README 写成 `cormex://` 是文档�
 
 ## 12. 与现有约束的对照
 
-| CLAUDE.md 约束 | 本设计 |
+| AGENTS.md 约束 | 本设计 |
 |---|---|
-| 1. 存储三条纪律 | 归档表 append-only；同步表照旧走 `write_txn`；归档表走 `archive_txn`（D23，CLAUDE.md 同步修订）；`tsv` 同事务 |
+| 1. 存储三条纪律 | 归档表 append-only；同步表照旧走 `write_txn`；归档表走 `archive_txn`（D23，AGENTS.md 同步修订）；`tsv` 同事务 |
 | 2. migration 只增不改、LF | 新文件 + PINNED；`.gitattributes` 已覆盖 `*.sql` |
 | 3. 两套 migration 的 search_path | 全局新表在 `cormex_auth`，用 `public` 的 DOMAIN；D20 修空库顺序 |
 | 4. 注入走 `cormex_core::injection` | 会话工具的输出一律经 `render_*` 框定（D12）；需要新的渲染函数时，若本仓库之外还有一份实现就一起改，并跑 `scripts/injection-drift.py` |

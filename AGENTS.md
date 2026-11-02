@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 给在本仓库工作的 AI agent 的指引。
 
@@ -179,7 +179,7 @@ just run           # 跑 cormexd
 just ci            # fmt-check + lint + test（不需要数据库）
 just ci-full       # 上面这些 + test-db + flutter analyze/test —— **这才是全绿**
 just test-db       # 只跑要数据库的那些集成测试
-just release 0.1.12  # 发版：preflight → 六个 CLI 二进制 → 两个镜像 → 烟测 → 推送 → npm
+just release 0.1.14  # 本地发版：check → CLI 归档 → 两个镜像 + 烟测 → 推镜像 → 传 Release → npm
 ```
 
 **`just ci` 不等于全绿。** 它跑的是 `cargo test --workspace`，而要数据库的
@@ -191,9 +191,7 @@ just release 0.1.12  # 发版：preflight → 六个 CLI 二进制 → 两个镜
 是**注释掉**的，不是删掉 —— 额度恢复后去掉注释符即可。在那之前：
 
 - 提交前跑 `just ci-full`，它是唯一的门
-- 发版跑 `just release <version>`，它做的是流水线同一套事
-  （`release-check` / `release-cli` / `release-images` / `release-push` / `release-npm`
-  可以单独跑）
+- 发版走下面的「两条路径」中的本地那条
 
 `just ci-full` 里的每一步都和 `.github/workflows/ci.yml` 的 job 对应。
 **改了一边记得改另一边** —— 一个只写在 YAML 里的检查，在额度用光期间等于没人跑。
@@ -201,9 +199,45 @@ just release 0.1.12  # 发版：preflight → 六个 CLI 二进制 → 两个镜
 CI 三个 job：`lint`（fmt / clippy / rustdoc 死链）、`test`（带 pgvector 的
 Postgres + 两套 migration）、`app`（flutter analyze + test）。
 
-发版 = `just release <version>`（额度恢复后也可以打 `vX.Y.Z` tag）。preflight
-（版本与 Cargo.toml 一致、`Cargo.lock --locked` 自洽）→ 并行构建两个镜像 →
-各自烟测 → 推两个 registry（ACR 是生产真的拉的那个；Docker Hub 是异地副本）。
+## 发版：两条路径，同一套顺序
+
+两条路径做的事完全一样，差在「在几台机器上跑」：
+
+```
+release-check → release-cli → release-images（含烟测）→ release-push → release-assets → release-npm
+```
+
+| 路径 | 什么时候用 | 构建范围 | 触发 |
+|---|---|---|---|
+| **Actions** `.github/workflows/release.yml` | 额度正常时 | 六个平台各在自己的 runner 上原生构建 | 手动 `workflow_dispatch`，输入 `tag`（`push: tags` 触发器留着但注释掉了） |
+| **本地** `just release <version>` | 额度用光，或想立刻发 | 只有这台机器能构建的目标 | 本地命令，需要 `docker` + `gh` |
+
+**归档必须进 Release，这是两条路径共同的硬约束。** `cormex update` 和
+`install.sh` 只读 Release 资产（`cormex-<version>-<target>.tar.gz|zip` +
+`SHA256SUMS`）；只推镜像不发归档的「发版」，镜像看起来是新的，却更新不到任何一台
+CLI。所以 `just release` 里有 `release-assets` 这一步，而且它会拒绝：
+
+- tag 不在 origin 上 —— `gh release create` 遇到不存在的 tag 会**在默认分支头新建**一个，
+  Release 就挂到了没人构建过的提交上
+- tag 指向的提交不是 HEAD —— `dist/` 里的归档来自当前工作树，挂到别的提交上就是谎报来源
+
+**本地路径的固有短板**：一台机器通常只能构建 4 个（Linux musl 两个靠
+`cargo-zigbuild`，Windows 两个要在 Windows 上）；macOS 两个需要 Apple SDK。
+`just release` 会打印少了哪几个，并且**照发**——镜像是产品主线，CLI 是接入手段，
+因为笔记本发不了 macOS 就卡住服务端没有道理。代价是被漏掉的平台上
+`cormex update` 会回「release publishes no archive for this platform」。
+
+**npm 渠道默认关闭。** 包从未真正发布过（registry 上是 404），开关是仓库变量
+`PUBLISH_NPM`（本地跑则看同名环境变量）加 `NPM_TOKEN`，两个都齐才会发。代码
+（`npm/`、`publish.mjs`、`tests/npm_package.rs`）都在，接通不需要改代码。
+
+**两个镜像都先烟测再推**：`cormex` 要 `--version` 报得出版本、两套 migration 目录都在
+（部署机没有 Rust 工具链，迁移是进容器跑的）；`cormex-web` 要健康检查通过、`/` 返回
+真的 HTML、bundle 里还留着 `"/api"` 前缀（丢了它每个 API 请求都会拿回一份 200 的
+index.html，客户端报「JSON 解析失败」）。推两个 registry：ACR 是生产真的拉的那个
+（节点在国内，Docker Hub 走第三方镜像会缓存 tag→digest），Docker Hub 是异地副本。
+只打版本 tag，**从不打 `latest`** —— 生产钉版本、重启后要回到同一个，漂移的 tag
+会让「跑的是哪个版本」变成没人能回答的问题。
 
 **没有 CI 部署。** 部署是手工 ssh + `docker compose up -d`。节点侧的部署策略
 脚本目前没有 —— 要做的话见 roadmap。
@@ -243,7 +277,7 @@ agent 循环不在这个仓库里（见上文「agent 怎么接进来」），�
 | | 语言 |
 |---|---|
 | README / NOTICE / crate 里的注释与 rustdoc / CI | 英文 —— 开源读者第一眼看到的 |
-| CLAUDE.md / docs/ | 中文 —— 我们自己的工作文档 |
+| AGENTS.md / docs/ | 中文 —— 我们自己的工作文档 |
 | `app/` 与 `deploy/` 里的注释 | **还是中文，是欠账不是规矩**，见 roadmap |
 
 其余：
