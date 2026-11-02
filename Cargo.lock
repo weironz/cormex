@@ -1078,7 +1078,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cormex"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-blob"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-evals"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-import"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-llm"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-memory"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-proto"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "cormex-core",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-store"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "cormex-transcript"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "cormexd"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1680,7 +1680,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-capture"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "axum",
  "chrono",
