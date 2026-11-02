@@ -805,7 +805,7 @@ URI scheme 沿用代码里的 `cormex://`（README 写成 `cormex://` 是文档�
 
 - 现有 `release.yml` 增加 `cli` job（打 `vX.Y.Z` tag 时触发，与镜像并行）：矩阵 `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`（`cargo-zigbuild`）、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`；产物 `cormex-<version>-<target>.tar.gz|.zip` + `SHA256SUMS`，上传到同一个 GitHub Release
 - `scripts/install.sh` / `scripts/install.ps1`：按平台下载、校验 SHA256、放到 `~/.local/bin` / `%LOCALAPPDATA%\cormex\bin`
-- `npm/`：主包 `cormex`（`bin/cormex.js` 按平台找子包）+ 六个平台子包 `@cormex/cli-<platform>`，同一个 job 发布（需要 `NPM_TOKEN` secret；没配就跳过这一步，不让整个发布失败）
+- `npm/`：主包 `cormex`（`bin/cormex.js` 按平台找子包）+ 六个平台子包 `@cormex/cli-<platform>`，同一个 job 发布（需要 `NPM_TOKEN` secret；没配就跳过这一步，不让整个发布失败）。发布步骤另由仓库变量 `PUBLISH_NPM == 'true'` 控制，通道当前默认关闭（代码保留，包里从未发布过）；只配了 token 而没开变量时，步骤依旧是跳过的
 - 版本号来自 workspace（`cormex --version` = `env!("CARGO_PKG_VERSION")`），preflight 检查不变
 
 ### 9.3 配置项（服务端，新增）

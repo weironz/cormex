@@ -42,11 +42,9 @@ Linux/macOS：
 curl -fsSL https://raw.githubusercontent.com/weironz/cormex/main/scripts/install.sh | sh
 ```
 
-使用 Node 的环境也可选择：
+安装脚本先从同一个 Release 取 `SHA256SUMS` 校验归档，再放到 `~/.local/bin`（Windows 为 `%LOCALAPPDATA%\cormex\bin`）。
 
-```bash
-npm install -g cormex
-```
+> **npm 渠道当前关闭。** `cormex` 尚未发布到 npm（registry 返回 404），所以 `npm install -g cormex` 现在还跑不通。发版流水线里的发布步骤由仓库变量 `PUBLISH_NPM` 控制，默认不存在即关闭；代码（`npm/`）保留着，接通只需要设置该变量与 `NPM_TOKEN` secret。
 
 可先下载并检查安装脚本，再执行。安装依赖已发布的包或 release 资产，不等同于从最新 Git 提交构建。安装后核对：
 

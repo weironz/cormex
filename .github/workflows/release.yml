@@ -378,18 +378,27 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
 
-      # npm is **optional**: without `NPM_TOKEN` the step is skipped and the
-      # release still succeeds. A missing secret must not turn "the binaries
-      # shipped" into "the release failed" -- the npm package is a convenience,
-      # and `install.sh` is the primary path.
+      # ── npm: currently off, by a switch rather than by absence ──
+      #
+      # The step is skipped because `vars.PUBLISH_NPM` does not exist, not because
+      # a secret happens to be missing. That difference matters: `cormex` has never
+      # been published to npm (the registry answers 404), so for two releases the
+      # gate below was `env.NPM_TOKEN != ''` and the step was skipped every time --
+      # which reads identically to "published successfully" in a green run. An
+      # explicit variable says "off on purpose" and can be flipped without touching
+      # this file: Settings -> Variables -> `PUBLISH_NPM` = true, plus an `NPM_TOKEN`
+      # secret, and the next release publishes.
+      #
+      # Still optional even when switched on: a missing token skips the step and the
+      # release succeeds. A missing secret must not turn "the binaries shipped" into
+      # "the release failed" -- npm is a convenience, `install.sh` is the primary path.
       #
       # **The token is on the job, not the step.** A step's own `env` is not
       # visible to its own `if`, so `if: env.NPM_TOKEN != ''` with a step-level
       # `env:` is always false -- the step is skipped every time and the release
-      # looks fine. That is exactly what this was, and nothing said so: a
-      # skipped step in a green run is indistinguishable from a successful one.
+      # looks fine.
       - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
+        if: ${{ vars.PUBLISH_NPM == 'true' && env.NPM_TOKEN != '' }}
         run: |
           set -euo pipefail
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
