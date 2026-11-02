@@ -1526,6 +1526,76 @@ mod tests {
         db.drop().await;
     }
 
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn file_project_key_is_the_fallback_and_explicit_ui_null_overrides_it() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let (session, _, _) = seed(&st).await;
+
+        let facets = store
+            .archive_projects(Some("claude_code"), None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 1);
+        assert_eq!(facets[0].key.as_deref(), Some("github.com/u/p"));
+        assert_eq!(facets[0].chat_count, 1);
+        let sessions = store
+            .archive_sessions(
+                Some("claude_code"),
+                Some("github.com/u/p"),
+                None,
+                None,
+                None,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session);
+
+        sqlx::query(
+            "INSERT INTO capture_session_ui_metadata(session_id,device_id,project_id)
+             VALUES($1,$2,NULL)",
+        )
+        .bind(&session)
+        .bind(Id::new().to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let after_ui_null = store
+            .archive_projects(Some("claude_code"), None)
+            .await
+            .unwrap();
+        assert_eq!(after_ui_null.len(), 1);
+        assert!(
+            after_ui_null[0].key.is_none(),
+            "an explicit UI project_id = NULL is a user decision to ungroup; falling back to the \
+             captured project would make the session impossible to remove from a group"
+        );
+        assert!(
+            store
+                .archive_sessions(
+                    Some("claude_code"),
+                    Some("github.com/u/p"),
+                    None,
+                    None,
+                    None,
+                    20,
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "the project filter must use the same explicit-NULL rule as the facet list"
+        );
+        db.drop().await;
+    }
+
     #[test]
     fn message_statistics_follow_the_conversation_view() {
         let mut event = TranscriptEventDto {

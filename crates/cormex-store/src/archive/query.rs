@@ -36,7 +36,7 @@ impl Store {
                FROM capture_sessions s
                LEFT JOIN LATERAL (SELECT session_id,project_id,project_name,title FROM capture_session_ui_metadata
                  WHERE session_id=s.id ORDER BY updated_at DESC LIMIT 1) m ON true
-               LEFT JOIN LATERAL (SELECT min(project_key) AS project_key FROM capture_files
+               LEFT JOIN LATERAL (SELECT min(project_key) AS project_key FROM capture_file_project_keys
                  WHERE session_id=s.id AND project_key IS NOT NULL) f ON m.session_id IS NULL
                WHERE ($1::text IS NULL OR s.agent=$1) AND EXISTS(SELECT 1 FROM transcript_events e WHERE e.session_id=s.id)
              ) SELECT project_key AS key,max(project_name) AS name,count(*) AS chat_count FROM candidates
@@ -90,7 +90,7 @@ impl Store {
         let row = sqlx::query_as::<_, CaptureFile>(
             "SELECT id, session_id, device_id, agent, logical_path, role, framing,
                     cwd, project_key, first_seen_at
-               FROM capture_files
+               FROM capture_file_project_keys
               WHERE device_id = $1 AND agent = $2 AND logical_path = $3",
         )
         .bind(device_id)
@@ -294,7 +294,7 @@ impl Store {
                           AND e.text NOT LIKE '<user_instructions>%'))
                       ORDER BY e.seq ASC LIMIT 1) AS title_source,
                     (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
-                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=a.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=a.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_files f WHERE f.session_id=a.id AND f.project_key IS NOT NULL) END AS project_key,
+                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=a.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=a.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_file_project_keys f WHERE f.session_id=a.id AND f.project_key IS NOT NULL) END AS project_key,
                     (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
                     (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
                     (a.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = a.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
@@ -348,7 +348,7 @@ impl Store {
                           AND e.text NOT LIKE '<user_instructions>%'))
                       ORDER BY e.seq ASC LIMIT 1) AS title_source,
                     (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
-                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=s.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_files f WHERE f.session_id=s.id AND f.project_key IS NOT NULL) END AS project_key,
+                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=s.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_file_project_keys f WHERE f.session_id=s.id AND f.project_key IS NOT NULL) END AS project_key,
                     (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
                     (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
                     (s.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = s.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
@@ -443,7 +443,7 @@ impl Store {
     /// would mean the index silently stops covering new projects.
     pub async fn session_project_key(&self, session_id: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT project_key FROM capture_files
+            "SELECT project_key FROM capture_file_project_keys
               WHERE session_id = $1 AND project_key IS NOT NULL LIMIT 1",
         )
         .bind(session_id)
@@ -512,7 +512,7 @@ impl Store {
                     AND e.kind IN ('user_message', 'agent_message', 'plan')
                     AND ($2::text IS NULL OR s.agent = $2)
                     AND ($3::text IS NULL OR EXISTS (
-                            SELECT 1 FROM capture_files f
+                            SELECT 1 FROM capture_file_project_keys f
                              WHERE f.session_id = e.session_id AND f.project_key = $3))
                     AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
                     AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
@@ -604,7 +604,7 @@ impl Store {
                     AND v.embedding <=> $1 <= $9
                     AND ($3::text IS NULL OR s.agent = $3)
                     AND ($4::text IS NULL OR EXISTS (
-                            SELECT 1 FROM capture_files f
+                            SELECT 1 FROM capture_file_project_keys f
                              WHERE f.session_id = e.session_id AND f.project_key = $4))
                     AND ($5::timestamptz IS NULL OR e.occurred_at >= $5)
                     AND ($6::timestamptz IS NULL OR e.occurred_at <= $6)
@@ -797,7 +797,7 @@ impl Store {
                   WHERE c.tsv @@ to_tsquery('simple', $1)
                     AND ($2::text IS NULL OR s.agent = $2)
                     AND ($3::text IS NULL OR EXISTS (
-                            SELECT 1 FROM capture_files f
+                            SELECT 1 FROM capture_file_project_keys f
                              WHERE f.session_id = c.session_id AND f.project_key = $3))
                     AND ($4::timestamptz IS NULL OR e.occurred_at >= $4)
                     AND ($5::timestamptz IS NULL OR e.occurred_at <= $5)
@@ -806,7 +806,7 @@ impl Store {
                     -- here, not at write time: turning it back on must not
                     -- require re-indexing
                     AND NOT EXISTS (
-                            SELECT 1 FROM capture_files f
+                            SELECT 1 FROM capture_file_project_keys f
                              WHERE f.session_id = c.session_id
                                AND f.project_key IS NOT NULL
                                AND (SELECT ev.op FROM archive_index_events ev
@@ -871,7 +871,7 @@ impl Store {
         let rows = sqlx::query_as::<_, CaptureFile>(
             "SELECT id, session_id, device_id, agent, logical_path, role, framing,
                     cwd, project_key, first_seen_at
-               FROM capture_files WHERE session_id = $1
+               FROM capture_file_project_keys WHERE session_id = $1
               ORDER BY id",
         )
         .bind(session_id)
@@ -888,7 +888,7 @@ impl Store {
         let row = sqlx::query_as::<_, CaptureFile>(
             "SELECT id, session_id, device_id, agent, logical_path, role, framing,
                     cwd, project_key, first_seen_at
-               FROM capture_files WHERE id = $1",
+               FROM capture_file_project_keys WHERE id = $1",
         )
         .bind(file_id)
         .fetch_optional(self.pool())

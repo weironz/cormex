@@ -186,6 +186,12 @@ pub struct SessionUiMetadata<'a> {
     pub pinned_position: Option<i32>,
 }
 
+/// Device-owned discovery metadata that may be corrected after registration.
+pub struct FileClassification<'a> {
+    pub cwd: Option<&'a str>,
+    pub project_key: Option<&'a str>,
+}
+
 impl ArchiveTxn {
     /// Replace display hints only when the file belongs to this device.
     pub async fn update_session_ui_metadata(
@@ -210,6 +216,33 @@ impl ArchiveTxn {
         .bind(metadata.project_id)
         .bind(metadata.project_name)
         .bind(metadata.pinned_position)
+        .execute(&mut *self.inner.tx)
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
+    /// Replace the owning device's cwd and project classification for a file.
+    pub async fn update_file_classification(
+        &mut self,
+        file_id: &str,
+        device_id: &str,
+        classification: &FileClassification<'_>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT INTO capture_file_classifications
+                (file_id,device_id,cwd,project_key)
+             SELECT id,device_id,$3,$4 FROM capture_files
+             WHERE id=$1 AND device_id=$2
+             ON CONFLICT (file_id) DO UPDATE SET
+                device_id=EXCLUDED.device_id,
+                cwd=EXCLUDED.cwd,
+                project_key=EXCLUDED.project_key,
+                updated_at=clock_timestamp()",
+        )
+        .bind(file_id)
+        .bind(device_id)
+        .bind(classification.cwd)
+        .bind(classification.project_key)
         .execute(&mut *self.inner.tx)
         .await?;
         Ok(result.rows_affected() != 0)

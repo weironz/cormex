@@ -14,8 +14,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use cormex_proto::capture::{
-    ChunkAck, FileEventRequest, GenerationDto, NewGenerationRequest, RegisterFileRequest,
-    RegisterFileResponse,
+    ChunkAck, FileClassification, FileEventRequest, GenerationDto, NewGenerationRequest,
+    RegisterFileRequest, RegisterFileResponse,
 };
 
 use crate::client::ApiClient;
@@ -25,6 +25,9 @@ use crate::client::ApiClient;
 pub trait CaptureApi: Send + Sync {
     /// `POST /capture/files`.
     async fn register(&self, req: &RegisterFileRequest) -> Result<RegisterFileResponse>;
+
+    /// `POST /capture/files/{id}/classification`.
+    async fn update_classification(&self, file_id: &str, req: &FileClassification) -> Result<()>;
 
     /// `POST /capture/files/{id}/generations`.
     async fn open_generation(&self, file_id: &str, reason: &str) -> Result<GenerationDto>;
@@ -75,6 +78,17 @@ impl CaptureApi for HttpCaptureApi {
         self.client
             .post_json("/capture/files", req)
             .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn update_classification(&self, file_id: &str, req: &FileClassification) -> Result<()> {
+        self.client
+            .post_json::<_, serde_json::Value>(
+                &format!("/capture/files/{file_id}/classification"),
+                req,
+            )
+            .await
+            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 

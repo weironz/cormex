@@ -138,6 +138,15 @@ pub struct SessionUiMetadata {
     pub pinned_position: Option<i32>,
 }
 
+/// Device-owned cwd and project classification for one registered file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileClassification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+}
+
 /// `POST /capture/files/{id}/generations`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewGenerationRequest {

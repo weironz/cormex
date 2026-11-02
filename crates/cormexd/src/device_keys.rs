@@ -157,6 +157,7 @@ impl DeviceScope {
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "generations"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "events"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "metadata"]))
+                || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "classification"]))
                 // A batch of small snapshots (P4-0): SQLite rows
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "snapshots"]))
                 || (is(Method::PUT)
@@ -515,6 +516,7 @@ mod tests {
             (Method::PUT, "/capture/generations/01ABC/chunks/4096"),
             (Method::POST, "/capture/files/01ABC/events"),
             (Method::POST, "/capture/files/01ABC/metadata"),
+            (Method::POST, "/capture/files/01ABC/classification"),
             (Method::POST, "/capture/snapshots"),
         ] {
             assert!(

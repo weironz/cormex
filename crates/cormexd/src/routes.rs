@@ -141,6 +141,7 @@ protected_routes! {
     "/capture/catalog" [GET] => get(crate::capture::get_catalog),
     "/capture/files" [POST] => post(crate::capture::register_file),
     "/capture/files/{id}/metadata" [POST] => post(crate::capture::update_session_ui_metadata),
+    "/capture/files/{id}/classification" [POST] => post(crate::capture::update_file_classification),
     "/capture/files/{id}/generations" [POST] => post(crate::capture::open_generation),
     "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
     // A batch of small snapshots (P4-0): SQLite rows, which have no file to

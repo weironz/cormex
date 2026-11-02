@@ -38,9 +38,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use cormex_core::Id;
 use cormex_proto::capture::{
-    ChunkAck, FileEventOp, FileRole, Framing, GenerationReason, HEADER_CONTENT_SHA256,
-    HEADER_OBSERVED_AT, NewGenerationRequest, OffsetMismatchBody, RegisterFileRequest,
-    RegisterFileResponse, SnapshotBatchResponse, SnapshotEntry, SnapshotResult, SnapshotStatus,
+    ChunkAck, FileClassification, FileEventOp, FileRole, Framing, GenerationReason,
+    HEADER_CONTENT_SHA256, HEADER_OBSERVED_AT, NewGenerationRequest, OffsetMismatchBody,
+    RegisterFileRequest, RegisterFileResponse, SnapshotBatchResponse, SnapshotEntry,
+    SnapshotResult, SnapshotStatus,
 };
 use cormex_store::{
     AppendOutcome, ChunkEncoding, GenerationReason as StoreReason, NewCaptureChunk, NewCaptureFile,
@@ -185,6 +186,47 @@ pub async fn update_session_ui_metadata(
         })
         .await
         .map_err(|e| ApiError::internal(format!("could not update session metadata: {e}")))?;
+    if !updated {
+        return Err(ApiError::not_found("no such file for this device"));
+    }
+    Ok(axum::Json(serde_json::json!({"updated": true})))
+}
+
+/// Correct the owning device's cwd and project classification for a file.
+pub async fn update_file_classification(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<FileClassification>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let (tenant, device_id) = capture_caller(&st, &principal).await?;
+    id.parse::<Id>()
+        .map_err(|_| ApiError::bad_request("invalid capture file id"))?;
+    if req
+        .cwd
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 4096)
+        || req
+            .project_key
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > 512)
+    {
+        return Err(ApiError::bad_request("invalid file classification"));
+    }
+    let store = tenant
+        .store()
+        .map_err(|e| ApiError::unsupported(e.to_string()))?;
+    let classification = cormex_store::archive::FileClassification {
+        cwd: req.cwd.as_deref(),
+        project_key: req.project_key.as_deref(),
+    };
+    let updated = store
+        .archive_txn(async |tx| {
+            tx.update_file_classification(&id, &device_id, &classification)
+                .await
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("could not update file classification: {e}")))?;
     if !updated {
         return Err(ApiError::not_found("no such file for this device"));
     }
@@ -916,6 +958,51 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let classification_path = format!("/capture/files/{file_id}/classification");
+        let classification = serde_json::json!({
+            "cwd": "/home/u/repo",
+            "project_key": "github.com/u/repo"
+        });
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &classification_path,
+            None,
+            Some(classification.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &classification_path,
+            other["key"].as_str(),
+            Some(classification.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another device must not rewrite this file's project classification"
+        );
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &classification_path,
+            Some(&device_key),
+            Some(classification),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let corrected = st
+            .public_store()
+            .unwrap()
+            .capture_file_by_id(&file_id)
+            .await
+            .expect("read classification")
+            .expect("the registered file");
+        assert_eq!(corrected.cwd.as_deref(), Some("/home/u/repo"));
+        assert_eq!(corrected.project_key.as_deref(), Some("github.com/u/repo"));
         assert_eq!(
             registered["generation"]["end_offset"], 0,
             "a freshly registered file ends at 0"

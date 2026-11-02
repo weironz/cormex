@@ -115,6 +115,7 @@ pub mod table {
         "capture_sessions",
         "capture_session_ui_metadata",
         "capture_files",
+        "capture_file_classifications",
         "capture_generations",
         "capture_chunks",
         "capture_file_events",

@@ -487,6 +487,152 @@ async fn session_ui_metadata_is_device_owned_and_rolls_back() {
     db.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "needs Postgres; run with just test-db"]
+async fn file_classification_is_device_owned_and_rolls_back() {
+    use cormex_store::archive::FileClassification;
+
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let owner = device();
+    let stranger = device();
+    let (file, _) = register(&db.store, &owner, "classification.jsonl").await;
+    let cwd = "/home/user/project-b".to_owned();
+    let classification = FileClassification {
+        cwd: Some(&cwd),
+        project_key: Some("github.com/example/repository"),
+    };
+
+    assert!(
+        !db.store
+            .archive_txn(async |tx| {
+                tx.update_file_classification(&file, &stranger, &classification)
+                    .await
+            })
+            .await
+            .unwrap(),
+        "a different device must not reclassify this file"
+    );
+    let rolled_back: cormex_store::Result<()> = db
+        .store
+        .archive_txn(async |tx| {
+            assert!(
+                tx.update_file_classification(&file, &owner, &classification)
+                    .await?
+            );
+            Err(cormex_store::StoreError::Invalid(
+                "abort classification write".into(),
+            ))
+        })
+        .await;
+    assert!(
+        rolled_back.is_err(),
+        "the injected error should abort the transaction"
+    );
+    assert_eq!(
+        db.query_raw("SELECT count(*)::text FROM capture_file_classifications")
+            .await,
+        vec!["0"],
+        "an aborted archive transaction must leave no classification"
+    );
+    assert!(
+        db.store
+            .archive_txn(async |tx| {
+                tx.update_file_classification(&file, &owner, &classification)
+                    .await
+            })
+            .await
+            .unwrap(),
+        "the owning device should be able to correct its file"
+    );
+    let updated = db
+        .store
+        .capture_file_by_id(&file)
+        .await
+        .expect("read")
+        .expect("file");
+    assert_eq!(updated.cwd.as_deref(), Some("/home/user/project-b"));
+    assert_eq!(
+        updated.project_key.as_deref(),
+        Some("github.com/example/repository")
+    );
+    assert_eq!(
+        db.query_raw("SELECT count(*)::text FROM sync_log").await,
+        vec!["0"],
+        "classification is archive metadata and must stay out of device sync"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Postgres; run with just test-db"]
+async fn classification_migration_backfills_existing_cwds_without_changing_ids() {
+    let Some(db) = common::setup_upto(Some(20261125000014)).await else {
+        return;
+    };
+    let owner = device();
+    let (local_file, _) = register(&db.store, &owner, "local-before-upgrade.jsonl").await;
+    let unc = NewCaptureFile {
+        id: Id::new(),
+        native_session_id: "native-unc".into(),
+        parent_native_session_id: None,
+        device_id: owner.clone(),
+        agent: "claude_code".into(),
+        logical_path: "unc-before-upgrade.jsonl".into(),
+        role: FileRole::Transcript,
+        framing: Framing::Append,
+        cwd: Some(r"\\?\UNC\server\share\project".into()),
+        project_key: None,
+    };
+    let unc_file = db
+        .store
+        .archive_txn(async |tx| tx.register_capture_file(&unc).await)
+        .await
+        .expect("register UNC file")
+        .file
+        .id;
+
+    db.store
+        .migrate()
+        .await
+        .expect("upgrading the populated archive should succeed");
+    db.store
+        .migrate()
+        .await
+        .expect("reapplying migrations should be a no-op");
+
+    let local = db
+        .store
+        .capture_file_by_id(&local_file)
+        .await
+        .expect("read local")
+        .expect("local file");
+    let network = db
+        .store
+        .capture_file_by_id(&unc_file)
+        .await
+        .expect("read UNC")
+        .expect("UNC file");
+    assert_eq!(
+        local.project_key.as_deref(),
+        Some("local:/home/user/project-a"),
+        "existing files with a cwd must leave the uncategorized bucket after the upgrade"
+    );
+    assert_eq!(
+        network.project_key.as_deref(),
+        Some("local://server/share/project"),
+        "the migration must preserve a UNC share's two leading slashes"
+    );
+    assert_eq!(
+        db.query_raw("SELECT count(*)::text FROM capture_files")
+            .await,
+        vec!["2"],
+        "the migration must preserve every existing file id"
+    );
+    db.cleanup().await;
+}
+
 /// `table::ALL` is defined as "every table name that can appear in
 /// `sync_log.table_name`", and the archive tables never do.
 ///

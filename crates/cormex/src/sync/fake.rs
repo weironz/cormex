@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use anyhow::Result;
 use async_trait::async_trait;
 use cormex_proto::capture::{
-    ChunkAck, FileEventOp, FileEventRequest, GenerationDto, RegisterFileRequest,
-    RegisterFileResponse,
+    ChunkAck, FileClassification, FileEventOp, FileEventRequest, GenerationDto,
+    RegisterFileRequest, RegisterFileResponse,
 };
 
 use crate::sync::api::{CaptureApi, PutOutcome};
@@ -50,6 +50,8 @@ struct Inner {
     /// Force this `expected` on the next 409, to exercise both directions.
     force_mismatch: Option<i64>,
     puts: usize,
+    registrations: Vec<RegisterFileRequest>,
+    classifications: Vec<(String, FileClassification)>,
 }
 
 impl FakeCaptureApi {
@@ -121,12 +123,25 @@ impl FakeCaptureApi {
     pub fn events(&self) -> Vec<(String, FileEventOp)> {
         self.inner.lock().unwrap().events.clone()
     }
+
+    /// Every file registration the server received.
+    #[must_use]
+    pub fn registrations(&self) -> Vec<RegisterFileRequest> {
+        self.inner.lock().unwrap().registrations.clone()
+    }
+
+    /// Every classification correction, in arrival order.
+    #[must_use]
+    pub fn classifications(&self) -> Vec<(String, FileClassification)> {
+        self.inner.lock().unwrap().classifications.clone()
+    }
 }
 
 #[async_trait]
 impl CaptureApi for FakeCaptureApi {
     async fn register(&self, req: &RegisterFileRequest) -> Result<RegisterFileResponse> {
         let mut inner = self.inner.lock().unwrap();
+        inner.registrations.push(req.clone());
         let key = (req.agent.clone(), req.logical_path.clone());
         if let Some(file_id) = inner.files.get(&key) {
             // Idempotent: the newest generation, exactly like the real server
@@ -164,6 +179,15 @@ impl CaptureApi for FakeCaptureApi {
                 end_offset: 0,
             },
         })
+    }
+
+    async fn update_classification(&self, file_id: &str, req: &FileClassification) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .classifications
+            .push((file_id.to_owned(), req.clone()));
+        Ok(())
     }
 
     async fn open_generation(&self, file_id: &str, _reason: &str) -> Result<GenerationDto> {

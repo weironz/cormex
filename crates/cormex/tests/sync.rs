@@ -90,12 +90,22 @@ impl Fixture {
     }
 
     async fn sync_with(&self, opts: SyncOptions) -> cormex::sync::SyncReport {
+        self.sync_with_catalog_and_config(&self.catalog, &self.cfg, opts)
+            .await
+    }
+
+    async fn sync_with_catalog_and_config(
+        &self,
+        catalog: &cormex_proto::catalog::Catalog,
+        cfg: &Config,
+        opts: SyncOptions,
+    ) -> cormex::sync::SyncReport {
         run(
             &self.api,
             &self.db,
             self.data.path(),
-            &self.catalog,
-            &self.cfg,
+            catalog,
+            cfg,
             "device-1",
             &opts,
         )
@@ -109,6 +119,49 @@ impl Fixture {
             .expect("read")
             .expect("the file should have state")
     }
+}
+
+fn catalog_with_parent_cwd(home: &std::path::Path) -> cormex_proto::catalog::Catalog {
+    let mut catalog = catalog(home);
+    catalog.agents[0].sources[0].cwd = Some(cormex_proto::catalog::CwdRule {
+        from: "parent_dir".into(),
+        decode: None,
+    });
+    catalog
+}
+
+fn git_repository() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("repo");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repo.path())
+        .status()
+        .expect("git should be installed for the capture tests");
+    assert!(init.success());
+    let remote = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repository.git",
+        ])
+        .current_dir(repo.path())
+        .status()
+        .expect("git remote should run");
+    assert!(remote.success());
+    repo
+}
+
+fn normalized_windows_path(path: &std::path::Path) -> String {
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    if value.as_bytes().get(1) == Some(&b':')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+    {
+        let mut bytes = value.into_bytes();
+        bytes[0] = bytes[0].to_ascii_lowercase();
+        value = String::from_utf8(bytes).expect("ASCII drive letters stay UTF-8");
+    }
+    value
 }
 
 #[tokio::test]
@@ -385,6 +438,177 @@ async fn a_dry_run_uploads_nothing_and_records_no_run() {
         f.db.last_successful_run().expect("read").is_none(),
         "a dry run must not be recorded as a successful sync -- `doctor` would then say \
          everything is fine while nothing has uploaded"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_does_not_correct_server_classification() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"0123456789");
+    let catalog = catalog_with_parent_cwd(f.home.path());
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+    let mut state = f.state("s1.jsonl");
+    state.classification_sent = false;
+    f.db.put_file(&state).expect("write");
+    let before = f.api.classifications().len();
+
+    f.sync_with_catalog_and_config(
+        &catalog,
+        &f.cfg,
+        SyncOptions {
+            dry_run: true,
+            ..SyncOptions::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        f.api.classifications().len(),
+        before,
+        "a dry run must not mutate the server, including classification metadata"
+    );
+}
+
+#[tokio::test]
+async fn a_new_file_registers_its_classification_in_the_same_request() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let catalog = catalog_with_parent_cwd(f.home.path());
+
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+
+    let registrations = f.api.registrations();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].cwd.as_deref(), Some("/projects"));
+    assert_eq!(
+        registrations[0].project_key.as_deref(),
+        Some("local:/projects")
+    );
+    assert!(
+        f.api.classifications().is_empty(),
+        "a newly registered file already carries its classification; sending a second correction \
+         would double every first sync"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_file_is_corrected_once() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let catalog = catalog_with_parent_cwd(f.home.path());
+    let disabled = Config {
+        git_metadata: false,
+        ..Config::default()
+    };
+    f.sync_with_catalog_and_config(&catalog, &disabled, SyncOptions::default())
+        .await;
+    assert!(f.api.classifications().is_empty());
+
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+
+    let corrections = f.api.classifications();
+    assert_eq!(
+        corrections.len(),
+        1,
+        "the first enabled run must repair the old row exactly once"
+    );
+    assert_eq!(corrections[0].1.cwd.as_deref(), Some("/projects"));
+    assert_eq!(
+        corrections[0].1.project_key.as_deref(),
+        Some("local:/projects")
+    );
+}
+
+#[tokio::test]
+async fn disabled_git_metadata_sends_no_classification() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let catalog = catalog_with_parent_cwd(f.home.path());
+    let disabled = Config {
+        git_metadata: false,
+        ..Config::default()
+    };
+
+    f.sync_with_catalog_and_config(&catalog, &disabled, SyncOptions::default())
+        .await;
+
+    assert_eq!(
+        f.api.registrations()[0].project_key,
+        None,
+        "turning git metadata off must not invent a local project key"
+    );
+    assert!(f.api.classifications().is_empty());
+}
+
+#[tokio::test]
+async fn queued_cwd_wins_over_path_guessing_and_is_drained() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let repo = git_repository();
+    let path = f.home.path().join("projects/-home-u-proj/s1.jsonl");
+    f.db.enqueue(
+        "claude_code",
+        path.to_str().unwrap(),
+        Some(repo.path().to_str().unwrap()),
+        Some("Stop"),
+        "now",
+    )
+    .unwrap();
+
+    f.sync_with(SyncOptions {
+        trigger: Trigger::Queue,
+        ..SyncOptions::default()
+    })
+    .await;
+
+    let registrations = f.api.registrations();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0].cwd.as_deref(),
+        Some(normalized_windows_path(repo.path()).as_str())
+    );
+    assert_eq!(
+        registrations[0].project_key.as_deref(),
+        Some("github.com/example/repository"),
+        "the hook's cwd is accurate enough to use the real git project key"
+    );
+    assert_eq!(f.db.queue_len().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn spooled_cwd_wins_over_path_guessing_and_spool_is_removed() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"hello");
+    let repo = git_repository();
+    let spool = f.data.path().join("spool");
+    std::fs::create_dir(&spool).unwrap();
+    let source = f.home.path().join("projects/-home-u-proj/s1.jsonl");
+    let entry = spool.join("handled.json");
+    std::fs::write(
+        &entry,
+        serde_json::json!({
+            "agent": "claude_code",
+            "path": source,
+            "cwd": repo.path().to_string_lossy(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    f.sync().await;
+
+    assert_eq!(
+        f.api.registrations()[0].project_key.as_deref(),
+        Some("github.com/example/repository")
+    );
+    assert!(
+        !entry.exists(),
+        "a spool entry that contributed its cwd must be removed after the source syncs"
     );
 }
 

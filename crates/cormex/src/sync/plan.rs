@@ -157,6 +157,9 @@ mod tests {
             last_mtime_ns: None,
             missing_reported: false,
             last_ok_at: None,
+            classification_cwd: None,
+            classification_project_key: None,
+            classification_sent: false,
         }
     }
 

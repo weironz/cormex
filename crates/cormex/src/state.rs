@@ -27,7 +27,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 /// **newer** than this build is an error rather than an attempt to use it: the
 /// user downgraded, and reading a schema we do not know is how a column gets
 /// silently misread.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// One logical file's upload progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,12 @@ pub struct FileState {
     /// run.
     pub missing_reported: bool,
     pub last_ok_at: Option<String>,
+    /// The cwd last sent to the server's classification side table.
+    pub classification_cwd: Option<String>,
+    /// The project key last sent with that cwd.
+    pub classification_project_key: Option<String>,
+    /// False for rows created before classification updates existed.
+    pub classification_sent: bool,
 }
 
 /// One queued "this file changed" note from a hook.
@@ -153,55 +159,72 @@ impl StateDb {
             return Ok(());
         }
 
-        // v0 -> v1: the initial schema
-        let tx = self.conn.transaction().context("could not begin")?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS files (
-                 local_key         TEXT PRIMARY KEY,
-                 agent             TEXT NOT NULL,
-                 path              TEXT NOT NULL,
-                 file_id           TEXT,
-                 generation_id     TEXT,
-                 generation_ordinal INTEGER,
-                 uploaded_offset   INTEGER NOT NULL DEFAULT 0,
-                 tail_sha256       TEXT,
-                 whole_sha256      TEXT,
-                 last_size         INTEGER,
-                 last_mtime_ns     INTEGER,
-                 missing_reported  INTEGER NOT NULL DEFAULT 0,
-                 last_ok_at        TEXT
-             );
-             CREATE TABLE IF NOT EXISTS queue (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 agent TEXT NOT NULL,
-                 path TEXT NOT NULL,
-                 cwd TEXT,
-                 event TEXT,
-                 enqueued_at TEXT NOT NULL,
-                 attempts INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE IF NOT EXISTS runs (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 trigger TEXT NOT NULL,
-                 started_at TEXT,
-                 finished_at TEXT,
-                 files INTEGER,
-                 bytes INTEGER,
-                 errors INTEGER,
-                 last_error TEXT
-             );
-             CREATE TABLE IF NOT EXISTS installs (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 kind TEXT NOT NULL,
-                 target TEXT NOT NULL,
-                 backup_path TEXT,
-                 installed_at TEXT NOT NULL
-             );",
-        )
-        .context("could not create the schema")?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .context("could not set user_version")?;
-        tx.commit().context("could not commit the migration")?;
+        if version < 1 {
+            // v0 -> v1: the initial schema
+            let tx = self.conn.transaction().context("could not begin")?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS files (
+                     local_key         TEXT PRIMARY KEY,
+                     agent             TEXT NOT NULL,
+                     path              TEXT NOT NULL,
+                     file_id           TEXT,
+                     generation_id     TEXT,
+                     generation_ordinal INTEGER,
+                     uploaded_offset   INTEGER NOT NULL DEFAULT 0,
+                     tail_sha256       TEXT,
+                     whole_sha256      TEXT,
+                     last_size         INTEGER,
+                     last_mtime_ns     INTEGER,
+                     missing_reported  INTEGER NOT NULL DEFAULT 0,
+                     last_ok_at        TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS queue (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     cwd TEXT,
+                     event TEXT,
+                     enqueued_at TEXT NOT NULL,
+                     attempts INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS runs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     trigger TEXT NOT NULL,
+                     started_at TEXT,
+                     finished_at TEXT,
+                     files INTEGER,
+                     bytes INTEGER,
+                     errors INTEGER,
+                     last_error TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS installs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind TEXT NOT NULL,
+                     target TEXT NOT NULL,
+                     backup_path TEXT,
+                     installed_at TEXT NOT NULL
+                 );",
+            )
+            .context("could not create the schema")?;
+            tx.pragma_update(None, "user_version", 1)
+                .context("could not set user_version")?;
+            tx.commit().context("could not commit the migration")?;
+        }
+
+        if version < 2 {
+            // v1 -> v2: remember which discovery metadata was sent, so the
+            // first run after upgrading repairs existing files exactly once.
+            let tx = self.conn.transaction().context("could not begin")?;
+            tx.execute_batch(
+                "ALTER TABLE files ADD COLUMN classification_cwd TEXT;
+                 ALTER TABLE files ADD COLUMN classification_project_key TEXT;
+                 ALTER TABLE files ADD COLUMN classification_sent INTEGER NOT NULL DEFAULT 0;",
+            )
+            .context("could not add file classification columns")?;
+            tx.pragma_update(None, "user_version", 2)
+                .context("could not set user_version")?;
+            tx.commit().context("could not commit the migration")?;
+        }
         Ok(())
     }
 
@@ -215,7 +238,8 @@ impl StateDb {
             .query_row(
                 "SELECT local_key, agent, path, file_id, generation_id, generation_ordinal,
                         uploaded_offset, tail_sha256, whole_sha256, last_size, last_mtime_ns,
-                        missing_reported, last_ok_at
+                        missing_reported, last_ok_at, classification_cwd,
+                        classification_project_key, classification_sent
                    FROM files WHERE local_key = ?1",
                 params![local_key],
                 |r| {
@@ -233,6 +257,9 @@ impl StateDb {
                         last_mtime_ns: r.get(10)?,
                         missing_reported: r.get::<_, i64>(11)? != 0,
                         last_ok_at: r.get(12)?,
+                        classification_cwd: r.get(13)?,
+                        classification_project_key: r.get(14)?,
+                        classification_sent: r.get::<_, i64>(15)? != 0,
                     })
                 },
             )
@@ -251,8 +278,9 @@ impl StateDb {
                 "INSERT INTO files
                      (local_key, agent, path, file_id, generation_id, generation_ordinal,
                       uploaded_offset, tail_sha256, whole_sha256, last_size, last_mtime_ns,
-                      missing_reported, last_ok_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                      missing_reported, last_ok_at, classification_cwd,
+                      classification_project_key, classification_sent)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                  ON CONFLICT(local_key) DO UPDATE SET
                      path = excluded.path,
                      file_id = excluded.file_id,
@@ -264,7 +292,10 @@ impl StateDb {
                      last_size = excluded.last_size,
                      last_mtime_ns = excluded.last_mtime_ns,
                      missing_reported = excluded.missing_reported,
-                     last_ok_at = excluded.last_ok_at",
+                     last_ok_at = excluded.last_ok_at,
+                     classification_cwd = excluded.classification_cwd,
+                     classification_project_key = excluded.classification_project_key,
+                     classification_sent = excluded.classification_sent",
                 params![
                     f.local_key,
                     f.agent,
@@ -279,6 +310,9 @@ impl StateDb {
                     f.last_mtime_ns,
                     i64::from(f.missing_reported),
                     f.last_ok_at,
+                    f.classification_cwd,
+                    f.classification_project_key,
+                    i64::from(f.classification_sent),
                 ],
             )
             .context("could not write the file state")?;
@@ -556,6 +590,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_v1_database_adds_classification_tracking_without_losing_files() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open v1");
+        conn.execute_batch(
+            "CREATE TABLE files (
+                 local_key TEXT PRIMARY KEY,
+                 agent TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 file_id TEXT,
+                 generation_id TEXT,
+                 generation_ordinal INTEGER,
+                 uploaded_offset INTEGER NOT NULL DEFAULT 0,
+                 tail_sha256 TEXT,
+                 whole_sha256 TEXT,
+                 last_size INTEGER,
+                 last_mtime_ns INTEGER,
+                 missing_reported INTEGER NOT NULL DEFAULT 0,
+                 last_ok_at TEXT
+             );
+             INSERT INTO files(local_key,agent,path,file_id,uploaded_offset)
+             VALUES('claude_code|/p/s.jsonl','claude_code','/p/s.jsonl','01FILE',42);
+             PRAGMA user_version = 1;",
+        )
+        .expect("seed v1");
+        drop(conn);
+
+        let db = StateDb::open(dir.path()).expect("upgrade");
+        let state = db
+            .file("claude_code|/p/s.jsonl")
+            .expect("read")
+            .expect("the existing file");
+        assert_eq!(state.file_id.as_deref(), Some("01FILE"));
+        assert_eq!(state.uploaded_offset, 42);
+        assert_eq!(state.classification_cwd, None);
+        assert_eq!(state.classification_project_key, None);
+        assert!(
+            !state.classification_sent,
+            "an upgraded row must be repaired on the next run"
+        );
+    }
+
     /// A file's state round-trips, including the `Option` fields.
     #[test]
     fn the_file_state_round_trips() {
@@ -576,6 +653,9 @@ mod tests {
             last_mtime_ns: Some(123),
             missing_reported: true,
             last_ok_at: Some("2026-10-29T00:00:00Z".into()),
+            classification_cwd: Some("/p".into()),
+            classification_project_key: Some("local:/p".into()),
+            classification_sent: true,
         };
         db.put_file(&state).expect("write");
         assert_eq!(db.file(&state.local_key).expect("read"), Some(state));

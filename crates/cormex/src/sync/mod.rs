@@ -20,6 +20,7 @@
 //!    never leaves "uploaded" recorded for bytes the server does not have.
 
 pub mod api;
+mod classify;
 pub mod fake;
 pub mod lock;
 pub mod plan;
@@ -27,7 +28,9 @@ pub mod reader;
 pub mod upload;
 
 use anyhow::Result;
-use cormex_proto::capture::{FileEventOp, FileEventRequest, RegisterFileRequest};
+use cormex_proto::capture::{
+    FileClassification, FileEventOp, FileEventRequest, RegisterFileRequest,
+};
 
 use crate::catalog::{DiscoveredFile, discover_with_warnings};
 use crate::config::Config;
@@ -141,12 +144,37 @@ pub async fn run(
                 Some((
                     path,
                     std::path::PathBuf::from(content.get("path")?.as_str()?),
+                    content
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                 ))
             })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
+    let mut cwd_hints = std::collections::HashMap::new();
+    for entry in &queued {
+        if let Some(cwd) = entry.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+            cwd_hints.insert(
+                path_identity(
+                    std::path::Path::new(&entry.path),
+                    Some(std::path::Path::new(cwd)),
+                ),
+                cwd.to_owned(),
+            );
+        }
+    }
+    for (_, source, cwd) in &spool {
+        if let Some(cwd) = cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+            cwd_hints.insert(
+                path_identity(source, Some(std::path::Path::new(cwd))),
+                cwd.to_owned(),
+            );
+        }
+    }
+
     let (mut files, warnings) = discover_with_warnings(catalog, cfg, device_id)?;
     for warning in warnings {
         report.errors += 1;
@@ -160,20 +188,36 @@ pub async fn run(
     }
     report.files_seen = files.len();
     let mut handled_paths = std::collections::HashSet::new();
+    let mut project_cache = classify::ProjectCache::new();
 
-    for file in &files {
+    for file in &mut files {
         if budget.exhausted() {
             report.deferred += 1;
             continue;
         }
 
+        if let Some(cwd) = cwd_hints.get(&path_identity(&file.physical_path, None)) {
+            file.cwd = Some(cwd.clone());
+            file.cwd_guessed = false;
+        }
+        let classification = classify::for_file(file, cfg, &mut project_cache);
         let local_key = format!("{}|{}", file.agent, file.logical_path);
         let Some(_lock) = lock::FileLock::try_acquire(data_dir, &local_key)? else {
             report.locked += 1;
             continue;
         };
 
-        match sync_one(api, db, file, &local_key, opts, &mut budget).await {
+        match sync_one(
+            api,
+            db,
+            file,
+            classification.as_ref(),
+            &local_key,
+            opts,
+            &mut budget,
+        )
+        .await
+        {
             Ok(Some(uploaded)) => {
                 if uploaded > 0 {
                     report.files_uploaded += 1;
@@ -214,7 +258,7 @@ pub async fn run(
                 db.dequeue(entry.id)?;
             }
         }
-        for (path, source) in spool {
+        for (path, source, _) in spool {
             if handled_paths.contains(&source)
                 && let Err(error) = std::fs::remove_file(&path)
             {
@@ -246,6 +290,7 @@ async fn sync_one(
     api: &dyn CaptureApi,
     db: &StateDb,
     file: &DiscoveredFile,
+    classification: Option<&FileClassification>,
     local_key: &str,
     opts: &SyncOptions,
     budget: &mut Budget,
@@ -272,6 +317,9 @@ async fn sync_one(
         last_mtime_ns: None,
         missing_reported: false,
         last_ok_at: None,
+        classification_cwd: None,
+        classification_project_key: None,
+        classification_sent: false,
     });
 
     let observed = Observed {
@@ -299,8 +347,26 @@ async fn sync_one(
         return Ok(None);
     }
 
+    let mut classification_changed = false;
+    if let (Some(file_id), Some(classification)) = (state.file_id.as_deref(), classification)
+        && (!state.classification_sent
+            || state.classification_cwd.as_deref() != classification.cwd.as_deref()
+            || state.classification_project_key.as_deref() != classification.project_key.as_deref())
+    {
+        api.update_classification(file_id, classification).await?;
+        state.classification_cwd = classification.cwd.clone();
+        state.classification_project_key = classification.project_key.clone();
+        state.classification_sent = true;
+        classification_changed = true;
+    }
+
     match action {
-        Action::Skip => Ok(None),
+        Action::Skip => {
+            if classification_changed {
+                db.put_file(&state)?;
+            }
+            Ok(None)
+        }
         Action::Register => {
             let resp = api
                 .register(&RegisterFileRequest {
@@ -310,8 +376,11 @@ async fn sync_one(
                     logical_path: file.logical_path.clone(),
                     role: file.role,
                     framing: file.framing,
-                    cwd: file.cwd.clone(),
-                    project_key: None,
+                    cwd: classification
+                        .and_then(|classification| classification.cwd.clone())
+                        .or_else(|| file.cwd.clone()),
+                    project_key: classification
+                        .and_then(|classification| classification.project_key.clone()),
                 })
                 .await?;
             state.file_id = Some(resp.file_id);
@@ -322,6 +391,11 @@ async fn sync_one(
                 reader.tail_hash(u64::try_from(resp.generation.end_offset).unwrap_or(0))?;
             state.whole_sha256 = observed.whole_sha256.clone();
             state.last_size = Some(observed.size);
+            if let Some(classification) = classification {
+                state.classification_cwd = classification.cwd.clone();
+                state.classification_project_key = classification.project_key.clone();
+                state.classification_sent = true;
+            }
             db.put_file(&state)?;
 
             let generation = resp.generation.id.clone();
@@ -363,8 +437,33 @@ async fn sync_one(
         Action::Snapshot => {
             // `decide` only returns this for a snapshot source whose state has
             // no generation yet; registration handles the first one
+            if classification_changed {
+                db.put_file(&state)?;
+            }
             Ok(None)
         }
+    }
+}
+
+/// One comparison key for a hook path and a discovered path.
+///
+/// Hooks normally send absolute paths, but resolving first also handles a
+/// relative transcript path and Windows case differences. If the file vanished
+/// between discovery and this check, the lexical path is still stable enough.
+fn path_identity(path: &std::path::Path, base: Option<&std::path::Path>) -> String {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base) = base {
+        base.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    let value = resolved.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
     }
 }
 
