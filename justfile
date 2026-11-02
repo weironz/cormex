@@ -6,7 +6,7 @@
 #   just serve       run the whole stack in containers (cormexd included)
 #   just ci          run every check CI runs, locally
 #   just ci-full     the same, plus the tests that need a database
-#   just release     build and publish a release, locally
+#   just release     build and publish a release, locally (needs docker + gh + the tag)
 
 set shell := ["bash", "-uc"]
 set dotenv-load := true
@@ -119,14 +119,22 @@ app-check:
 
 # ── Releasing ───────────────────────────────────────────
 #
-# ★ **This is the release pipeline, run locally.** The workflow in
-#   .github/workflows/release.yml is the same sequence, and its `push: tags` trigger is
-#   commented out while the Actions quota is exhausted. `just release` is what ships a
-#   version until then.
+# ★ **Two release paths, one sequence.** The workflow in
+#   .github/workflows/release.yml and the recipes below do the same six things:
 #
-#   The preflight comes first and is the same gate: a version mismatch or an inconsistent
-#   lock file is a second to check and a quarter of an hour to discover at the end of a
-#   build.
+#     check → CLI archives → images + smoke → push images → publish archives → npm
+#
+#   The workflow runs it on six machines at once (each platform builds natively) and its
+#   `push: tags` trigger is commented out while the Actions quota is exhausted. These
+#   recipes are the same pipeline on one machine, so a release is possible with the quota
+#   at zero -- at the cost of building only the platforms this host can target.
+#
+#   ★ **Whichever path is used, the archives have to reach the Release.** They are the
+#   only thing `cormex update` and `install.sh` read; images alone update no CLI. That is
+#   why `release-assets` is in the sequence rather than being an optional extra.
+#
+#   The preflight comes first in both: a version mismatch or an inconsistent lock file is
+#   a second to check and a quarter of an hour to discover at the end of a build.
 
 # Check that the version, the tag and the lock file agree. No build.
 release-check version:
@@ -268,10 +276,63 @@ release-push version:
     docker run --rm "registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v$v" --version \
       | grep -qF "$v" || { echo "the pushed image reports a different version" >&2; exit 1; }
 
-# Publish the CLI artefacts to npm (skipped when NPM_TOKEN is unset).
+# Upload dist/ to the GitHub Release for the tag. Needs `gh`.
+release-assets version:
+    #!/usr/bin/env bash
+    # ★ The gate is the tag, and it is not a formality. `gh release create` given a tag that
+    #   does not exist on the remote **creates it at the default branch's head**, so the
+    #   Release silently attaches to whatever `main` happens to be -- and the assets were
+    #   built from a working tree, not from that commit. Both of the checks below exist to
+    #   make that impossible: the tag has to be pushed, and it has to point at HEAD.
+    #
+    #   The assets are the only channel `cormex update` and `install.sh` read. A release
+    #   that pushed images but no archives looks complete in the registry and updates
+    #   nobody -- which is why this runs in `just release`, not as an optional extra.
+    set -euo pipefail
+    v="{{version}}"
+    tag="v$v"
+    command -v gh >/dev/null \
+      || { echo "gh is not on PATH: it is what talks to the Release API" >&2; exit 1; }
+    [ -f dist/SHA256SUMS ] \
+      || { echo "dist/SHA256SUMS is missing: run \`just release-cli $v\` first" >&2; exit 1; }
+    remote=$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)
+    if [ -z "$remote" ]; then
+      echo "tag $tag is not on origin. Tag the commit that was actually built, then push it:" >&2
+      echo "  git tag -a $tag -m \"$tag\" && git push origin $tag" >&2
+      exit 1
+    fi
+    head=$(git rev-parse HEAD)
+    tagged=$(git rev-parse "$tag^{commit}")
+    if [ "$head" != "$tagged" ]; then
+      echo "tag $tag points at $tagged, but HEAD is $head." >&2
+      echo "dist/ was built from this working tree, so publishing it under that tag would" >&2
+      echo "describe a commit the archives did not come from." >&2
+      exit 1
+    fi
+    shopt -s nullglob
+    files=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
+    [ ${#files[@]} -gt 0 ] || { echo "dist/ holds no archives" >&2; exit 1; }
+    if gh release view "$tag" >/dev/null 2>&1; then
+      # A second run is normal -- a partial set being completed, or a rebuild after a bad
+      # archive. Replacing by name rather than failing keeps that possible.
+      gh release upload "$tag" "${files[@]}" --clobber
+    else
+      gh release create "$tag" "${files[@]}" --title "$tag" --notes "Release $tag"
+    fi
+    gh release view "$tag" --json assets --jq '.assets[] | "  \(.name)  \(.size)"'
+
+# Publish the CLI artefacts to npm. Off unless PUBLISH_NPM=true *and* NPM_TOKEN is set.
 release-npm version:
     #!/usr/bin/env bash
+    # Two keys, the same pair the workflow uses: the repository variable says the channel
+    # is open, the token says this machine may write to it. The channel has never been
+    # published, so `off by default` is the accurate default -- see release.yml.
     set -euo pipefail
+    if [ "${PUBLISH_NPM:-}" != "true" ]; then
+      echo "PUBLISH_NPM is not 'true': the npm channel is off. Skipping"
+      echo "  (the package is not on npm at all; install.sh and the Release are the paths)"
+      exit 0
+    fi
     if [ -z "${NPM_TOKEN:-}" ]; then
       echo "NPM_TOKEN is not set: skipping the npm publish (install.sh is the primary path)"
       exit 0
@@ -297,13 +358,15 @@ release version:
     if [ "$n" -lt 6 ]; then
       echo
       echo "WARNING: only $n of 6 CLI binaries were built on this machine."
-      echo "  The release will publish a partial set. To get all six, either run"
-      echo "  \`just release-cli\` on macOS and Windows too, or restore the tag trigger in"
-      echo "  .github/workflows/release.yml and let CI build them."
+      echo "  The Release will carry a partial set: on the platforms left out, \`cormex update\`"
+      echo "  answers 'release publishes no archive for this platform', and install.sh fails."
+      echo "  To get all six, either run \`just release-cli\` on macOS and Windows too, or"
+      echo "  restore the tag trigger in .github/workflows/release.yml and let CI build them."
       echo
     fi
     just release-images {{version}}
     just release-push {{version}}
+    just release-assets {{version}}
     just release-npm {{version}}
     echo
     echo "released v{{version}}"
