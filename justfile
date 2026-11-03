@@ -181,11 +181,19 @@ release-cli version:
       built=$((built + 1))
     done
     # The native targets build with the host toolchain
+    host=$(uname -s)
     for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+      # ★ `case`, not `[ "$host" = MINGW64_NT-* ]`. A glob is not expanded inside
+      #   test brackets, so that spelling compares against the literal string and
+      #   matches nothing -- which skipped **both Windows targets on Windows**, with
+      #   a message that reads like a correct decision. The build then reported
+      #   "2 of 6" on the one host that can make four.
       case "$target" in
-        *darwin*) [ "$(uname -s)" = Darwin ] || { echo "skipping $target: not on macOS" >&2; continue; } ;;
-        *windows*) [ "$(uname -s)" = MINGW64_NT-* ] || [ "$(uname -s)" = MSYS_NT-* ] \
-                     || { echo "skipping $target: not on Windows" >&2; continue; } ;;
+        *darwin*) [ "$host" = Darwin ] || { echo "skipping $target: not on macOS" >&2; continue; } ;;
+        *windows*) case "$host" in
+                     MINGW*|MSYS*|CYGWIN*) ;;
+                     *) echo "skipping $target: not on Windows" >&2; continue ;;
+                   esac ;;
       esac
       rustup target add "$target" 2>/dev/null || true
       cargo build --release --locked -p cormex --target "$target"
@@ -196,15 +204,32 @@ release-cli version:
       cp "$bin" "dist/$name/"
       cp README.md LICENSE "dist/$name/" 2>/dev/null || true
       case "$target" in
-        *windows*) (cd dist && zip -qr "$name.zip" "$name") ;;
-        *)         tar -czf "dist/$name.tar.gz" -C dist "$name" ;;
+        *windows*)
+          # Git for Windows ships no `zip` binary, so a Windows host could build the
+          # archives and then fail to pack them. Python is already a prerequisite of
+          # `release-check`; its zipfile writes `/` entry names, which the updater
+          # accepts (it splits on either separator).
+          if command -v zip >/dev/null 2>&1; then
+            (cd dist && zip -qr "$name.zip" "$name")
+          else
+            python -m zipfile -c "dist/$name.zip" "dist/$name"
+          fi ;;
+        *) tar -czf "dist/$name.tar.gz" -C dist "$name" ;;
       esac
       rm -rf "dist/$name"
       built=$((built + 1))
     done
     echo "built $built of 6 targets"
-    # The binary has to answer `--version` on the platform it was built for
-    out=$(./target/x86_64-unknown-linux-musl/release/cormex --version)
+    # The binary has to answer `--version` on the platform it was built for. On a host
+    # that cross-builds, that is this host's own target: a musl ELF does not execute on
+    # Windows or macOS, so naming it unconditionally turned the smoke test into the one
+    # step that fails *after* a successful build.
+    case "$host" in
+      Linux)  smoke="target/x86_64-unknown-linux-musl/release/cormex" ;;
+      Darwin) smoke="target/x86_64-apple-darwin/release/cormex" ;;
+      *)      smoke="target/x86_64-pc-windows-msvc/release/cormex.exe" ;;
+    esac
+    out=$("$smoke" --version)
     echo "$out"
     echo "$out" | grep -qF "$v" \
       || { echo "the binary reports a different version than $v" >&2; exit 1; }

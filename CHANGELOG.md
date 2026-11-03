@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.15 — 2026-11-03
+
+### Release tooling
+
+- `just release` now publishes the CLI archives to the GitHub Release (`release-assets`). It used to build `dist/`, push the images and stop — so a local release produced new images and updated no CLI on any machine, because the archives are the only channel `cormex update` and `install.sh` read. It refuses to publish when the tag is not on the origin or does not point at `HEAD`: `gh release create` given an unknown tag creates it at the default branch's head, which would attach archives built from a working tree to a commit nobody built.
+- The local path now works on Windows. Host detection used a glob inside test brackets (`[ "$host" = MINGW64_NT-* ]`), which compares against the literal string and matches nothing, so both Windows targets were skipped *on Windows*. `zip` — absent from Git for Windows — falls back to Python's `zipfile`. The `--version` smoke test runs the host's own binary instead of the musl one, which cannot execute there.
+- The npm channel is explicitly off, gated on `PUBLISH_NPM=true` **and** `NPM_TOKEN`. `npm install -g cormex` had been listed as an install option while the package has never been on the registry.
+- `CLAUDE.md` is now `AGENTS.md`, and the release section documents both paths — the workflow (six platforms, natively) and `just release` (only what the host can target).
+
 ## 0.1.14 — 2026-11-03
 
 ### Capture CLI
