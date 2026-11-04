@@ -1,5 +1,6 @@
 # Rust
 /target/
+/.zig-cache/
 **/*.rs.bk
 
 # Flutter / Dart
