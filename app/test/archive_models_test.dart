@@ -3,6 +3,33 @@ import 'package:cormex_app/models/transcript_event.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  group('ArchiveProject display names', () {
+    test('explicit names take priority over repository keys', () {
+      const p = ArchiveProject(
+        key: 'github.com/u/repo',
+        name: ' My Project ',
+        chatCount: 1,
+      );
+      expect(p.displayName, 'My Project');
+    });
+    test('repository and local paths use their final component', () {
+      for (final key in [
+        'github.com/u/cormex',
+        'local:d:/codes/cormex/',
+        r'local:D:\codes\cormex',
+        'cormex',
+      ]) {
+        final p = ArchiveProject(key: key, name: ' ', chatCount: 1);
+        expect(p.displayName, 'cormex');
+        expect(
+          p.key,
+          key,
+          reason: 'Display labels must not change project identity',
+        );
+      }
+      expect(const ArchiveProject(chatCount: 1).displayName, '未分类');
+    });
+  });
   group('ArchiveSession', () {
     test('解析服务端返回的会话行', () {
       final s = ArchiveSession.fromJson({

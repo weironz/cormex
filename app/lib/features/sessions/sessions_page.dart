@@ -273,8 +273,9 @@ class _ProjectGroup extends ConsumerWidget {
           project.key == null ? Icons.inbox_outlined : Icons.folder_outlined,
           size: 20,
         ),
-        title: Text(
-          project.key == null ? '未分类' : (project.name ?? project.key!),
+        title: Tooltip(
+          message: project.key ?? '未分类',
+          child: Text(project.displayName),
         ),
         subtitle: Text('${project.chatCount} 个聊天'),
         onExpansionChanged: (expanded) {

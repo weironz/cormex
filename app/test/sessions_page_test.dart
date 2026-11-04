@@ -30,6 +30,31 @@ ProviderContainer apiContainer(
 );
 
 void main() {
+  testWidgets('short project labels preserve the full key for filtering', (
+    tester,
+  ) async {
+    const projectKey = 'github.com/u/cormex';
+    Uri? requested;
+    final c = apiContainer((r) async {
+      if (r.url.path.endsWith('/projects')) {
+        return response({
+          'projects': [
+            {'key': projectKey, 'chat_count': 7},
+          ],
+        });
+      }
+      requested = r.url;
+      return response({'sessions': []});
+    });
+    addTearDown(c.dispose);
+    await tester.pumpWidget(wrap(c));
+    await tester.pumpAndSettle();
+    expect(find.text('cormex'), findsOneWidget);
+    expect(find.byTooltip(projectKey), findsOneWidget);
+    await tester.tap(find.text('cormex'));
+    await tester.pumpAndSettle();
+    expect(requested!.queryParameters['project'], projectKey);
+  });
   test('older responses do not invent source tags or message counts', () {
     final s = ArchiveSession.fromJson({'id': 'one', 'agent': 'codex'});
     expect(s.sourceArchived, isFalse);

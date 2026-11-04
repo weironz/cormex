@@ -5,6 +5,18 @@ class ArchiveProject {
   final String? key;
   final String? name;
   final int chatCount;
+
+  String get displayName {
+    if (key == null) return '未分类';
+    final label = name?.trim();
+    if (label != null && label.isNotEmpty) return label;
+    final path = key!
+        .replaceFirst(RegExp(r'^local:'), '')
+        .replaceAll('\\', '/');
+    final segments = path.split('/').where((part) => part.isNotEmpty);
+    return segments.isEmpty ? path : segments.last;
+  }
+
   factory ArchiveProject.fromJson(Map<String, dynamic> json) => ArchiveProject(
     key: asStringOrNull(json['key']),
     name: asStringOrNull(json['name']),
