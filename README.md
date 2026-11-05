@@ -104,9 +104,11 @@ Then open <http://127.0.0.1:8080>. Everything binds to the loopback, so the
 host is the boundary — put a proxy with TLS in front before exposing any of it.
 
 `docker-compose.prod.yml` beside it is our own deployment, and shows the shape
-a real one takes: an edge proxy splitting `/api` from the browser, WAL
-archiving to a separate disk, volumes that already exist under names nobody can
-change. Read it; do not run it.
+a real one takes: an edge proxy splitting `/api` from the browser, a backup
+volume on a separate disk, volumes that already exist under names nobody can
+change. WAL archiving is deliberately off — nothing here does point-in-time
+recovery, and a failing `archive_command` silently grows `pg_wal` until the
+disk fills. Read it; do not run it.
 
 **The web image carries no domain name.** The API address compiled into it is
 the relative prefix `/api`, which the browser resolves against whatever origin

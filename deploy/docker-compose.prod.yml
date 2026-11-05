@@ -66,24 +66,33 @@ services:
       # 只对**新建**的库生效。已有的库用 just pg-enable-checksums 离线补。
       # 没有它时坏道翻的那一位 Postgres 读出来照样返回，不报错
       POSTGRES_INITDB_ARGS: --data-checksums
+    # WAL 归档关闭，是修正而不是省略。以前是 `archive_mode=on` +
+    # `archive_command` 写 /backup/wal，但 /backup 是宿主机 bind mount、Docker
+    # 以 root 创建，归档进程却以 postgres(uid 999) 运行 —— 每次都是
+    # "archive command failed with exit code 1"。归档失败 = 该段永不回收，叠加
+    # `archive_timeout=60` 每分钟切一段，pg_wal 会一直涨到撑满磁盘
+    #（node72 实测：3.4 GB 的库配了 49 GB WAL，3079 个 .ready、0 个 .done）。
+    # 这里没人做 PITR，备份是 pg_dump + 对象存储卷，关掉才是诚实的配置。
+    # 真要 PITR 必须同时做三件事：CORMEX_BACKUP_DIR 对 uid 999 可写、
+    # 保持 archive_mode=on、监控 pg_stat_archiver.failed_count。
+    # summarize_wal 保留：PG17 增量基础备份的前提，关归档时零成本。
     command:
       - postgres
       - -c
-      - archive_mode=on
-      - -c
-      - archive_command=mkdir -p /backup/wal && test ! -f /backup/wal/%f && cp %p /backup/wal/%f
-      - -c
-      - archive_timeout=60
+      - archive_mode=off
       - -c
       - wal_level=replica
       - -c
       - wal_compression=on
       - -c
       - summarize_wal=on
+      # 归档关掉之后，这是防止长事务再次把磁盘写满的唯一一道闸
+      - -c
+      - max_wal_size=2GB
     shm_size: 256mb
     volumes:
       - cormex-prod-postgres:/var/lib/postgresql/data
-      # WAL 归档与全量备份的落点。**指到与数据盘不同的物理盘** ——
+      # 全量备份(pg_dump)的落点，不再用于 WAL 归档。**指到与数据盘不同的物理盘** ——
       # 和数据同盘的备份防得住误删，防不住盘坏，而盘坏才是备份存在的理由
       - ${CORMEX_BACKUP_DIR:-/data/cormex/backup}:/backup
     healthcheck:

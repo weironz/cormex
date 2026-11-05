@@ -288,7 +288,7 @@ docker compose -f docker-compose.yml -f compose.override.yaml logs --tail 100 co
 
 完整备份应包含全部租户及认证 schema 的数据库、对象存储、主加密密钥、版本记录和部署配置。不要只备份 `public`；后创建的账号可能使用单独 schema。
 
-自足模板默认没有配置连续 WAL 归档。定期 dump 提供的是备份时点恢复能力；如果需要任意时间点恢复，需另外设计基础备份、连续 WAL 归档和保留策略，并执行恢复演练。
+两套 compose 模板都**不启用**连续 WAL 归档（PITR）。原因见 `docker-compose.yml` 中 postgres 段的注释：`/backup` 是 Docker 以 root 创建的 bind mount，而归档进程以 `postgres`(uid 999) 运行，命令必然失败；归档失败的 WAL 段永不回收，磁盘会被写满。定期 dump 提供的是备份时点恢复能力；如果确实需要任意时间点恢复，必须同时让备份目录对 uid 999 可写、开启 `archive_mode`、监控 `pg_stat_archiver.failed_count`，并执行恢复演练。
 
 下面使用容器内生成 dump 再复制的方式，避免旧版 PowerShell 对二进制重定向的处理差异：
 
