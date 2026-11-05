@@ -15,10 +15,13 @@
 #
 #  * No TLS. Everything binds to 127.0.0.1, so the host is the boundary. Put a
 #    real proxy in front before exposing any of it; the prod file shows how.
-#  * No WAL archiving. Point-in-time recovery needs somewhere to archive to,
-#    and a wrong archive_command is worse than none: Postgres treats a failing
-#    archive as "archiving finished", completes recovery, promotes, and says
-#    nothing at all. Set it up deliberately, with the prod file as reference.
+#  * No WAL archiving, stated explicitly in the postgres `command` rather than
+#    left to the image default. A failing archive_command means a WAL segment
+#    is never recycled and pg_wal grows until the disk fills, silently; see the
+#    root compose file for the incident that taught us this. Point-in-time
+#    recovery needs a writable archive target, monitoring of
+#    `pg_stat_archiver.failed_count`, and a rehearsed restore -- set all three
+#    up deliberately if you need PITR.
 #  * No embedding container by default. See the `embeddings` service.
 # ══════════════════════════════════════════════════════════
 
@@ -48,6 +51,27 @@ services:
       # Only applies to a database being created here. Without checksums, a bit
       # flipped on disk is handed back to the caller as data, with no error.
       POSTGRES_INITDB_ARGS: --data-checksums
+    # WAL archiving is **off**, stated explicitly rather than left to the image
+    # default. A failing archive_command never recycles a WAL segment, so an
+    # accidental `on` (a custom postgresql.conf, a changed image default) grows
+    # pg_wal until the disk fills. Nothing here does PITR: backups are pg_dump
+    # plus the object-store volume. See the postgres block in the root
+    # docker-compose.yml for the measured cost of getting this wrong.
+    # `summarize_wal` stays: PG17 incremental base backups need it, and it is
+    # costless when archiving is off.
+    command:
+      - postgres
+      - -c
+      - archive_mode=off
+      - -c
+      - wal_level=replica
+      - -c
+      - wal_compression=on
+      - -c
+      - summarize_wal=on
+      # With archiving off, this is the only bound on a long-running transaction
+      - -c
+      - max_wal_size=2GB
     shm_size: 256mb
     volumes:
       - pg_data:/var/lib/postgresql/data

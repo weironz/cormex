@@ -4,6 +4,7 @@
 
 ### Deployment
 
+- `deploy/docker-compose.yml` now states `archive_mode=off` and `max_wal_size=2GB` explicitly, matching the other two compose files. It had no `command` at all, which worked only because PostgreSQL defaults archiving to off; there was no bound on WAL growth either. The header comment used to say a failing archive is "treated as finished" and pointed to the prod file as a PITR reference — both wrong now, so it says what actually happens and what PITR would require.
 - `deploy/docker-compose.prod.yml` no longer enables WAL archiving. It had `archive_mode=on` with an `archive_command` writing to `/backup/wal`, but `/backup` is a root-owned bind mount while the archiver runs as `postgres` (uid 999), so every attempt failed and PostgreSQL could never recycle a WAL segment. Measured on node72: 49 GB of `pg_wal` / 3079 `.ready` files for a 3.4 GB database. Archived WAL was never used — backups are `pg_dump` plus the object-store volume — so archiving is off, `archive_timeout=60` is gone, and `max_wal_size=2GB` now bounds the WAL. Root `docker-compose.yml` had already made this change; the prod reference had not.
 
 ## 0.1.15 — 2026-11-03
