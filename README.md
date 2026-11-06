@@ -175,6 +175,17 @@ deletes old sessions, and a capture client cannot recover what is already gone).
 `cormex uninstall` restores each file from a backup — byte for byte, not
 "removes what it thinks it added".
 
+The device key minted at login is this machine's **identity** to the server
+(only its sha256 is stored server-side, so it cannot be re-issued). Before
+wiping or reinstalling the machine, back it up and reuse it — a new key is a
+new device, and the server then captures every file again under a second
+`device_id`:
+
+```bash
+cormex login --print-key > cormex-device-key.txt    # back up
+cormex login --key "$(cat cormex-device-key.txt)"   # restore after reinstall
+```
+
 ### Updating
 
 ```bash

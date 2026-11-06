@@ -75,6 +75,13 @@ enum Command {
         /// The account username. Prompted for when omitted.
         #[arg(long)]
         username: Option<String>,
+        /// Print the stored device key and exit, without logging in.
+        ///
+        /// The key is the only copy of this machine's identity — the server
+        /// stores its sha256, so it cannot be re-issued. Back it up before a
+        /// reinstall; restore with `cormex login --key`.
+        #[arg(long, conflicts_with_all = ["force", "server", "label", "key", "device_code", "username"])]
+        print_key: bool,
     },
     /// Put a ChatGPT or Claude export into the archive (P4-7).
     ///
@@ -353,7 +360,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             key,
             device_code,
             username,
+            print_key,
         } => {
+            if print_key {
+                // **The key alone on stdout**: `cormex login --print-key > key.txt`
+                // is the backup this flag exists for. The where-it-came-from
+                // line is stderr, so it never lands in the backup file.
+                let (key, source) = cormex::credentials::load(&dirs.config, &cfg.server_url)?;
+                eprintln!(
+                    "the key below came from {}. Back it up; restore it after reinstall with \
+                     `cormex login --key`.",
+                    source.as_str()
+                );
+                println!("{key}");
+                return Ok(ExitCode::Ok);
+            }
             if !force
                 && server.is_none()
                 && label.is_none()
@@ -666,7 +687,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::Ok)
         }
         Command::Uninstall { drop_data } => {
-            let report = uninstall::run(&cfg, &dirs.data, drop_data)?;
+            let report = uninstall::run(&cfg, &dirs.config, &dirs.data, drop_data)?;
             print!("{}", uninstall::render(&report));
             Ok(ExitCode::Ok)
         }

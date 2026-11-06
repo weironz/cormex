@@ -20,6 +20,16 @@
 //! **The flag is named for what it does.** It used to be `--keep-data`, whose
 //! default (`false`) deleted the database — the opposite of what the name and
 //! the documentation both said.
+//!
+//! # The device key is not touched
+//!
+//! Uninstall removes the hooks, not the login: the device key survives in
+//! whatever store holds it. That matters because the key is this machine's
+//! **identity** to the server — a reinstall that keeps the key is merged into
+//! the machine's existing captures, and a reinstall that mints a new key is a
+//! *new device* whose files are captured again under a second `device_id`.
+//! So the report names where the key is, and `login --print-key` exists to
+//! back it up.
 
 use anyhow::Result;
 
@@ -35,13 +45,21 @@ use crate::install::scheduler::Scheduler;
 pub struct UninstallReport {
     pub restored: Vec<String>,
     pub data_removed: bool,
+    /// Where the device key survived, in words. `None` = no key is stored on
+    /// this machine at all, so there is nothing to warn about.
+    pub key_retained_at: Option<String>,
 }
 
 /// Undo everything, in reverse order of installation.
 ///
 /// # Errors
 /// A backup cannot be restored.
-pub fn run(cfg: &Config, data_dir: &std::path::Path, drop_data: bool) -> Result<UninstallReport> {
+pub fn run(
+    cfg: &Config,
+    config_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    drop_data: bool,
+) -> Result<UninstallReport> {
     let db = crate::state::StateDb::open(data_dir)?;
     let mut report = UninstallReport::default();
 
@@ -85,6 +103,11 @@ pub fn run(cfg: &Config, data_dir: &std::path::Path, drop_data: bool) -> Result<
         report.data_removed = true;
     }
 
+    // The key outlives everything we just undid. Saying where it is costs one
+    // line; finding out "the server treated the reinstall as a new device"
+    // costs a duplicated archive
+    report.key_retained_at = crate::credentials::describe_location(config_dir, &cfg.server_url);
+
     Ok(report)
 }
 
@@ -107,6 +130,13 @@ pub fn render(r: &UninstallReport) -> String {
     } else {
         out.push_str("\nthe local upload state was kept (pass --drop-data to remove it)\n");
     }
+    if let Some(where_) = &r.key_retained_at {
+        out.push_str(&format!(
+            "\nthe device key was not touched; it is in {where_}. After reinstall, reuse it with\n\
+             `cormex login --key` (`cormex login --print-key` prints it) so the server sees the\n\
+             same device and merges the new uploads instead of capturing everything twice.\n"
+        ));
+    }
     out
 }
 
@@ -127,6 +157,7 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
+        let config = tempfile::tempdir().expect("config");
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
             std::env::set_var("CODEX_HOME", home.path());
@@ -134,8 +165,13 @@ mod tests {
         let _db = crate::state::StateDb::open(data.path()).expect("db");
         drop(_db);
 
-        let cfg = Config::default();
-        let report = run(&cfg, data.path(), false).expect("uninstall");
+        // A bogus server URL: `describe_location` probes the keyring by URL,
+        // and a real one might match an entry on a developer's machine
+        let cfg = Config {
+            server_url: "https://never-configured.invalid".into(),
+            ..Config::default()
+        };
+        let report = run(&cfg, config.path(), data.path(), false).expect("uninstall");
         assert!(
             !report.data_removed,
             "the default removed the state database; the next run would re-upload everything"
@@ -143,6 +179,10 @@ mod tests {
         assert!(
             data.path().join("state.db").exists(),
             "the default removed the state database anyway"
+        );
+        assert_eq!(
+            report.key_retained_at, None,
+            "no key is stored in this test, so the hint has nothing to say"
         );
 
         unsafe {
@@ -161,6 +201,7 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
+        let config = tempfile::tempdir().expect("config");
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
             std::env::set_var("CODEX_HOME", home.path());
@@ -168,8 +209,11 @@ mod tests {
         let _db = crate::state::StateDb::open(data.path()).expect("db");
         drop(_db);
 
-        let cfg = Config::default();
-        let report = run(&cfg, data.path(), true).expect("uninstall");
+        let cfg = Config {
+            server_url: "https://never-configured.invalid".into(),
+            ..Config::default()
+        };
+        let report = run(&cfg, config.path(), data.path(), true).expect("uninstall");
         assert!(report.data_removed);
         assert!(!data.path().join("state.db").exists());
 
@@ -193,6 +237,7 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("home");
         let data = tempfile::tempdir().expect("data");
+        let config = tempfile::tempdir().expect("config");
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
             std::env::set_var("CODEX_HOME", home.path());
@@ -218,7 +263,7 @@ mod tests {
             "init did not change the file, so this test proves nothing"
         );
 
-        run(&cfg, data.path(), false).expect("uninstall");
+        run(&cfg, config.path(), data.path(), false).expect("uninstall");
 
         let restored = std::fs::read(home.path().join("settings.json")).expect("read");
         assert_eq!(
@@ -231,5 +276,31 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("CODEX_HOME");
         }
+    }
+
+    /// The report names where the key survived, so a reinstall can reuse it;
+    /// with no key stored there is no hint at all.
+    #[test]
+    fn the_render_points_at_the_retained_key() {
+        let report = UninstallReport {
+            restored: vec!["/p/settings.json".into()],
+            data_removed: false,
+            key_retained_at: Some("the system keyring (entry `https://m.example.cormex`)".into()),
+        };
+        let out = render(&report);
+        assert!(
+            out.contains("the system keyring (entry `https://m.example.cormex`)"),
+            "the key's location is the point of the hint, got:\n{out}"
+        );
+        assert!(
+            out.contains("cormex login --print-key"),
+            "the hint must name the command that backs the key up, got:\n{out}"
+        );
+
+        let out = render(&UninstallReport::default());
+        assert!(
+            !out.contains("device key"),
+            "a hint about a key that does not exist is worse than none, got:\n{out}"
+        );
     }
 }

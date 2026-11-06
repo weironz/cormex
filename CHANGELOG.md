@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Capture CLI
+
+- `cormex login --print-key` prints the stored device key — the only copy of this machine's identity, since the server keeps its sha256 and cannot re-issue it. The key goes to stdout alone, so `cormex login --print-key > key.txt` is a working backup; the "where it came from" line goes to stderr. Restore after a reinstall with `cormex login --key`, and the server sees the same device and merges rather than capturing every file again under a new `device_id` — which duplicates the projected events, because the event id derives from the generation.
+- `cormex uninstall` now says where the device key survives (keyring entry, credentials file, or `CORMEX_DEVICE_KEY`). Uninstall removes the hooks, not the login — a reinstall that reuses the key is the cheap path.
+
 ### Deployment
 
 - `deploy/docker-compose.yml` now states `archive_mode=off` and `max_wal_size=2GB` explicitly, matching the other two compose files. It had no `command` at all, which worked only because PostgreSQL defaults archiving to off; there was no bound on WAL growth either. The header comment used to say a failing archive is "treated as finished" and pointed to the prod file as a PITR reference — both wrong now, so it says what actually happens and what PITR would require.

@@ -102,6 +102,29 @@ pub fn store(config_dir: &Path, server_url: &str, key: &str) -> Result<Credentia
     Ok(CredentialSource::File)
 }
 
+/// Where the stored key lives, in words — for messages that must never print
+/// the key itself (the `uninstall` hint, `doctor`).
+///
+/// Returns `None` when nothing is stored. Unlike [`load`] this cannot fail:
+/// it is a hint line, and a hint must not turn a working command into an
+/// error.
+pub fn describe_location(config_dir: &Path, server_url: &str) -> Option<String> {
+    if std::env::var(DEVICE_KEY_ENV).is_ok_and(|k| !k.trim().is_empty()) {
+        return Some(format!("the {DEVICE_KEY_ENV} environment variable"));
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+    if keyring_get(server_url).is_some() {
+        return Some(format!(
+            "the system keyring (entry `{server_url}.{KEYRING_SERVICE}`)"
+        ));
+    }
+    let path = file_path(config_dir);
+    if path.exists() {
+        return Some(format!("the file {}", path.display()));
+    }
+    None
+}
+
 /// Remove the key from wherever it is.
 ///
 /// # Errors
@@ -236,6 +259,25 @@ mod tests {
             err.to_string().contains("cormex login"),
             "the error should name the command that fixes it, got: {err}"
         );
+        //    And the uninstall hint has nothing to point at
+        assert_eq!(
+            describe_location(dir.path(), "https://never-configured.invalid"),
+            None,
+            "nothing is stored, so the location must be None"
+        );
+
+        // 2b. The file fallback is named by its path, so the hint can be acted
+        //     on ("back up exactly this file")
+        write_file(dir.path(), "a-device-key").expect("write");
+        assert_eq!(
+            describe_location(dir.path(), "https://never-configured.invalid"),
+            Some(format!(
+                "the file {}",
+                dir.path().join("credentials").display()
+            )),
+            "a stored file key must be located by its path"
+        );
+        std::fs::remove_file(dir.path().join("credentials")).expect("remove");
 
         // 3. The environment variable wins over everything. It is the
         //    container/CI path, where there is no keyring and the file may be a
@@ -246,6 +288,11 @@ mod tests {
         let (key, source) = load(dir.path(), "https://example").expect("load");
         assert_eq!(key, "from-env");
         assert_eq!(source, CredentialSource::Environment);
+        assert_eq!(
+            describe_location(dir.path(), "https://example"),
+            Some(format!("the {DEVICE_KEY_ENV} environment variable")),
+            "the location must follow the same precedence as load"
+        );
         unsafe { std::env::remove_var(DEVICE_KEY_ENV) };
     }
 }
