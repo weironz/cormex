@@ -27,7 +27,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 /// **newer** than this build is an error rather than an attempt to use it: the
 /// user downgraded, and reading a schema we do not know is how a column gets
 /// silently misread.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// One logical file's upload progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +225,53 @@ impl StateDb {
                 .context("could not set user_version")?;
             tx.commit().context("could not commit the migration")?;
         }
+
+        if version < 3 {
+            // v2 -> v3: the host metadata last sent per file, as a hash, so
+            // every sync can read the host's metadata and send only what changed
+            let tx = self.conn.transaction().context("could not begin")?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS metadata_sent (
+                     local_key TEXT PRIMARY KEY,
+                     sha256    TEXT NOT NULL
+                 );",
+            )
+            .context("could not create metadata_sent")?;
+            tx.pragma_update(None, "user_version", 3)
+                .context("could not set user_version")?;
+            tx.commit().context("could not commit the migration")?;
+        }
+        Ok(())
+    }
+
+    /// The hash of the host metadata last sent for a file, if any.
+    ///
+    /// # Errors
+    /// The query failed.
+    pub fn metadata_sent(&self, local_key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT sha256 FROM metadata_sent WHERE local_key = ?1",
+                [local_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("could not read metadata_sent")
+    }
+
+    /// Remember that this metadata (by hash) has been sent for a file.
+    ///
+    /// # Errors
+    /// The write failed.
+    pub fn put_metadata_sent(&self, local_key: &str, sha256: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO metadata_sent (local_key, sha256) VALUES (?1, ?2)
+                 ON CONFLICT (local_key) DO UPDATE SET sha256 = excluded.sha256",
+                [local_key, sha256],
+            )
+            .context("could not write metadata_sent")?;
         Ok(())
     }
 

@@ -53,7 +53,16 @@ pub fn run(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<DetectRep
 
     let mut agents: Vec<AgentSummary> = Vec::new();
     for agent in &catalog.agents {
-        let home = crate::catalog::resolve_home(agent).map(|p| p.display().to_string());
+        // Every home this run scans, so a second directory (a `CODEX_HOME` beside
+        // `~/.codex`) is visible here rather than captured silently
+        let homes = crate::catalog::resolve_homes(agent, cfg);
+        let home = (!homes.is_empty()).then(|| {
+            homes
+                .iter()
+                .map(|h| h.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         let mine: Vec<&DiscoveredFile> = files.iter().filter(|f| f.agent == agent.id).collect();
         if mine.is_empty() && home.is_none() {
             // Not installed here. Reporting it as "0 files" would look like an

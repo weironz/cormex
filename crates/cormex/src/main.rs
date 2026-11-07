@@ -125,7 +125,8 @@ enum Command {
         /// Only scan and upload this agent.
         #[arg(long)]
         agent: Option<String>,
-        /// Also upload Codex's local titles, project assignments and pins.
+        /// Send every Codex session's desktop title, project and pin again. Every
+        /// sync already sends the ones that changed; this resends all of them.
         #[arg(long)]
         codex_metadata: bool,
         /// Only this logical path.
@@ -575,8 +576,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 only: source,
                 budget: cormex::sync::upload::Budget::new(budget_secs, 512 << 20),
                 dry_run,
+                // `--codex-metadata` now means "send all of it again"; every
+                // sync sends what changed
+                force_metadata: codex_metadata,
             };
-            let mut report = cormex::sync::run(
+            let report = cormex::sync::run(
                 &api,
                 &db,
                 &dirs.data,
@@ -586,43 +590,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 &opts,
             )
             .await?;
-            if codex_metadata && !dry_run {
-                let home = cormex::codex_metadata::home()
-                    .ok_or_else(|| anyhow::anyhow!("Codex home unavailable"))?;
-                let metadata = cormex::codex_metadata::read(&home)?;
-                let (files, _) = cormex::catalog::discover_with_warnings(
-                    &catalog,
-                    &sync_cfg,
-                    &cfg.device_label,
-                )?;
-                let mut sent = 0usize;
-                for file in files.iter().filter(|f| f.agent == "codex") {
-                    let Some(item) = metadata.get(&file.native_session_id) else {
-                        continue;
-                    };
-                    let Some(file_id) = db
-                        .file(&format!("{}|{}", file.agent, file.logical_path))?
-                        .and_then(|s| s.file_id)
-                    else {
-                        continue;
-                    };
-                    match client
-                        .post_json::<_, serde_json::Value>(
-                            &format!("/capture/files/{file_id}/metadata"),
-                            item,
-                        )
-                        .await
-                    {
-                        Ok(_) => sent += 1,
-                        Err(e) => {
-                            report.errors += 1;
-                            if report.last_error.is_none() {
-                                report.last_error = Some(format!("Codex metadata: {e}"));
-                            }
-                        }
-                    }
-                }
-                println!("{sent} Codex session metadata records updated");
+            if report.metadata_updated > 0 || report.metadata_failed > 0 {
+                println!(
+                    "Codex desktop metadata: {} sessions updated, {} failed (retried next sync)",
+                    report.metadata_updated, report.metadata_failed
+                );
             }
             println!(
                 "{} seen, {} uploaded, {} bytes, {} errors, {} deferred, {} locked",

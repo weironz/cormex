@@ -348,6 +348,7 @@ async fn sync(
             only: None,
             budget: Budget::unlimited(),
             dry_run: false,
+            force_metadata: false,
         },
     )
     .await
@@ -705,6 +706,7 @@ async fn every_agent_layout_round_trips() {
             only: None,
             budget: Budget::unlimited(),
             dry_run: false,
+            force_metadata: false,
         },
     )
     .await

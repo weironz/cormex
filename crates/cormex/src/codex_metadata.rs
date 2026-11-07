@@ -1,17 +1,13 @@
-//! Read only Codex's session index and sidebar metadata for explicit import.
+//! Read Codex's session index and desktop sidebar metadata (titles, project
+//! assignments, pins). Every sync reads it for every Codex home; see
+//! `sync::metadata`.
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use cormex_proto::capture::SessionUiMetadata;
 use serde_json::Value;
-
-pub fn home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".codex")))
-}
 
 // Codex can persist Windows extended paths in its thread index while the
 // sidebar stores normal paths. Compare exact roots after lexical normalization.

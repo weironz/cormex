@@ -83,6 +83,7 @@ struct Inner {
     adoptions: usize,
     registrations: Vec<RegisterFileRequest>,
     classifications: Vec<(String, FileClassification)>,
+    metadata: Vec<(String, cormex_proto::capture::SessionUiMetadata)>,
 }
 
 impl Inner {
@@ -210,6 +211,12 @@ impl FakeCaptureApi {
         self.inner.lock().unwrap().registrations.clone()
     }
 
+    /// Every host-metadata upload, in arrival order.
+    #[must_use]
+    pub fn metadata(&self) -> Vec<(String, cormex_proto::capture::SessionUiMetadata)> {
+        self.inner.lock().unwrap().metadata.clone()
+    }
+
     /// Every classification correction, in arrival order.
     #[must_use]
     pub fn classifications(&self) -> Vec<(String, FileClassification)> {
@@ -283,6 +290,19 @@ impl CaptureApi for FakeCaptureApi {
             .unwrap()
             .classifications
             .push((file_id.to_owned(), req.clone()));
+        Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        file_id: &str,
+        metadata: &cormex_proto::capture::SessionUiMetadata,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .metadata
+            .push((file_id.to_owned(), metadata.clone()));
         Ok(())
     }
 

@@ -51,25 +51,114 @@ pub struct DiscoveredFile {
     pub bytes: Option<Vec<u8>>,
 }
 
-/// Resolve an agent's home directory.
+/// One directory an agent keeps its files in, as this run found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub path: PathBuf,
+    /// Put in front of every logical path found under this home, or `None`
+    /// for a home at the catalog's own default location.
+    ///
+    /// # Why homes other than the default are prefixed
+    ///
+    /// A file's identity is `(device, agent, logical path)`, and the logical
+    /// path is relative to the home. Two homes of one agent can hold the same
+    /// relative path for different files (`sessions/2026/11/07/rollout-….jsonl`
+    /// under `~/.codex` and under `$CODEX_HOME`), and without a prefix they
+    /// would be one file whose bytes flip between two conversations.
+    ///
+    /// The prefix comes from the directory, not from the order homes were
+    /// found in: a hook sees `CODEX_HOME` and a scheduled run may not, and an
+    /// order-based rule would give the same directory different names in the
+    /// two. The default location gets no prefix, so everything captured before
+    /// homes were scanned keeps its identity.
+    pub prefix: Option<String>,
+}
+
+/// Every existing home of an agent: its environment variables, its catalogued
+/// paths, and the `extra_homes` this machine's config names — each directory
+/// once, however many of those point at it.
 ///
-/// Environment variable first, then the literal path: `CLAUDE_CONFIG_DIR` is
-/// how a user says "my config is not in the default place", and ignoring it
-/// would capture the wrong directory — or nothing.
+/// The environment variable used to **win**: when it was set, the default
+/// directory was not looked at at all, so a CLI with its own `CODEX_HOME` and
+/// a desktop app on the default captured one of the two. Now both are.
 #[must_use]
-pub fn resolve_home(entry: &AgentEntry) -> Option<PathBuf> {
-    for root in &entry.home {
-        let candidate = match root {
-            HomeRoot::Env { env } => std::env::var(env).ok().map(PathBuf::from),
+pub fn resolve_homes(entry: &AgentEntry, cfg: &Config) -> Vec<Home> {
+    let defaults: Vec<PathBuf> = entry
+        .home
+        .iter()
+        .filter_map(|root| match root {
             HomeRoot::Path { path } => expand_tilde(path),
-        };
-        if let Some(p) = candidate
-            && p.is_dir()
-        {
-            return Some(p);
+            HomeRoot::Env { .. } => None,
+        })
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    let candidates = entry
+        .home
+        .iter()
+        .filter_map(|root| match root {
+            HomeRoot::Env { env } => std::env::var_os(env)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            HomeRoot::Path { path } => expand_tilde(path),
+        })
+        .chain(
+            cfg.extra_homes
+                .get(&entry.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|p| expand_tilde(p)),
+        );
+    let mut out: Vec<Home> = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let real = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        if out.iter().any(|h| h.path == real) {
+            continue;
+        }
+        let prefix = (!defaults.contains(&real)).then(|| home_prefix(&real));
+        out.push(Home { path: real, prefix });
+    }
+    out
+}
+
+/// Homes this run sees only through an environment variable, and that the
+/// config does not name yet: `(agent id, directory)`.
+///
+/// `cormex init` records them in `extra_homes`, so a scheduled run — which
+/// usually does not inherit the variables of the shell `init` ran in — scans
+/// the same directories a hook does.
+#[must_use]
+pub fn homes_only_in_environment(catalog: &Catalog, cfg: &Config) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for agent in &catalog.agents {
+        let configured: Vec<PathBuf> = cfg
+            .extra_homes
+            .get(&agent.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| expand_tilde(p))
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect();
+        for home in resolve_homes(agent, cfg) {
+            if home.prefix.is_none() || configured.contains(&home.path) {
+                continue;
+            }
+            out.push((agent.id.clone(), home.path.display().to_string()));
         }
     }
-    None
+    out
+}
+
+/// `@home-<12 hex>`: a short, stable name for a non-default home, from its
+/// canonical path. The `@` cannot start a path segment any catalogued host
+/// writes, so a prefixed logical path never collides with an unprefixed one.
+fn home_prefix(path: &Path) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(to_slash(path).as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("@home-{hex}")
 }
 
 /// Decode a percent-encoded absolute path (`%2Fhome%2Fuser%2Frepo`).
@@ -125,11 +214,10 @@ fn expand_tilde(path: &str) -> Option<PathBuf> {
 pub fn discover(catalog: &Catalog, cfg: &Config, device_id: &str) -> Result<Vec<DiscoveredFile>> {
     let mut out = Vec::new();
     for agent in &catalog.agents {
-        let Some(home) = resolve_home(agent) else {
-            continue;
-        };
-        for source in &agent.sources {
-            out.extend(discover_source(agent, source, &home, cfg, device_id)?);
+        for home in resolve_homes(agent, cfg) {
+            for source in &agent.sources {
+                out.extend(discover_source(agent, source, &home, cfg, device_id)?);
+            }
         }
     }
     // **Hand-added sources, after the catalog's.** They exist for hosts whose
@@ -150,13 +238,14 @@ pub fn discover_with_warnings(
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     for agent in &catalog.agents {
-        let Some(home) = resolve_home(agent) else {
-            continue;
-        };
-        for source in &agent.sources {
-            match discover_source(agent, source, &home, cfg, device_id) {
-                Ok(found) => files.extend(found),
-                Err(error) => warnings.push(format!("{}: {error:#}", agent.id)),
+        for home in resolve_homes(agent, cfg) {
+            for source in &agent.sources {
+                match discover_source(agent, source, &home, cfg, device_id) {
+                    Ok(found) => files.extend(found),
+                    Err(error) => {
+                        warnings.push(format!("{} ({}): {error:#}", agent.id, home.path.display()))
+                    }
+                }
             }
         }
     }
@@ -235,7 +324,7 @@ fn discover_extra_sources(cfg: &Config, device_id: &str) -> Result<Vec<Discovere
 fn discover_source(
     agent: &AgentEntry,
     source: &SourceSpec,
-    home: &Path,
+    home: &Home,
     cfg: &Config,
     device_id: &str,
 ) -> Result<Vec<DiscoveredFile>> {
@@ -260,7 +349,7 @@ fn discover_source(
     let mut by_logical: std::collections::BTreeMap<String, DiscoveredFile> =
         std::collections::BTreeMap::new();
 
-    for entry in walkdir::WalkDir::new(home)
+    for entry in walkdir::WalkDir::new(&home.path)
         .follow_links(false)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -268,7 +357,7 @@ fn discover_source(
         if !entry.file_type().is_file() {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(home) else {
+        let Ok(rel) = entry.path().strip_prefix(&home.path) else {
             continue;
         };
         let logical = to_slash(rel);
@@ -330,7 +419,7 @@ fn discover_source(
             agent: agent.id.clone(),
             role: source.role,
             framing: source.framing,
-            logical_path: logical_plain.clone(),
+            logical_path: with_prefix(home, &logical_plain),
             physical_path: entry.path().to_path_buf(),
             compressed,
             native_session_id: native_session_id.clone(),
@@ -367,17 +456,17 @@ fn discover_sqlite(
     agent: &AgentEntry,
     source: &SourceSpec,
     spec: &cormex_proto::catalog::SqliteSpec,
-    home: &Path,
+    home: &Home,
     cfg: &Config,
     device_id: &str,
 ) -> Result<Vec<DiscoveredFile>> {
-    let db = crate::sqlite_source::db_path(home, &source.glob);
+    let db = crate::sqlite_source::db_path(&home.path, &source.glob);
     if !db.exists() {
         // A host that has never run has no database. Not an error: the same
         // rule as a home that does not exist
         return Ok(Vec::new());
     }
-    let db_rel = crate::sqlite_source::db_rel_path(home, &db);
+    let db_rel = crate::sqlite_source::db_rel_path(&home.path, &db);
     let rows = if agent.id == "opencode" {
         crate::sqlite_source::read_opencode(&db, &db_rel, spec)
     } else {
@@ -403,7 +492,7 @@ fn discover_sqlite(
             );
             continue;
         };
-        let logical_path = row.logical_path.clone();
+        let logical_path = with_prefix(home, &row.logical_path);
         // `per_device` applies to a `const` rule; a column-derived id is
         // already unique per host because the database is per host
         if row.session.is_none()
@@ -441,6 +530,14 @@ fn discover_sqlite(
 }
 
 /// Apply the session-id rule to a path.
+/// A logical path found under `home`, with the home's prefix when it has one.
+fn with_prefix(home: &Home, logical: &str) -> String {
+    match &home.prefix {
+        Some(prefix) => format!("{prefix}/{logical}"),
+        None => logical.to_owned(),
+    }
+}
+
 fn session_id(rule: &SessionIdRule, logical: &str, segments: &[&str]) -> Option<String> {
     match rule {
         SessionIdRule::Stem {} => {
@@ -546,36 +643,127 @@ mod tests {
         assert!(!expanded.to_string_lossy().contains('~'));
     }
 
-    /// The environment variable wins over the literal path.
-    ///
-    /// `CLAUDE_CONFIG_DIR` is how a user says "my config is not in the default
-    /// place"; ignoring it captures the wrong directory.
+    /// The variable's directory **and** the default one are both scanned; the
+    /// default keeps unprefixed logical paths, and a variable pointing at the
+    /// default is one home, not two.
     #[test]
-    fn the_environment_variable_wins() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        // SAFETY: this test is the only one in this file that touches this
-        // variable, and it removes it again
-        unsafe { std::env::set_var("CORMEX_TEST_HOME", dir.path()) };
+    fn every_existing_home_is_scanned_and_only_the_default_is_unprefixed() {
+        let default = tempfile::tempdir().expect("a temp dir");
+        let custom = tempfile::tempdir().expect("a temp dir");
         let mut e = entry();
         e.home = vec![
             HomeRoot::Env {
-                env: "CORMEX_TEST_HOME".into(),
+                env: "CORMEX_TEST_HOMES".into(),
             },
             HomeRoot::Path {
-                path: "/definitely/not/here".into(),
+                path: default.path().display().to_string(),
             },
         ];
-        assert_eq!(resolve_home(&e), Some(dir.path().to_path_buf()));
-        unsafe { std::env::remove_var("CORMEX_TEST_HOME") };
+        // SAFETY: only this test touches this variable, and it removes it
+        unsafe { std::env::set_var("CORMEX_TEST_HOMES", custom.path()) };
+        let homes = resolve_homes(&e, &Config::default());
+        let real = |p: &Path| std::fs::canonicalize(p).expect("canonical");
+        assert_eq!(homes.len(), 2, "{homes:?}");
+        assert_eq!(homes[0].path, real(custom.path()));
+        assert!(
+            homes[0]
+                .prefix
+                .as_deref()
+                .is_some_and(|p| p.starts_with("@home-")),
+            "a home outside the default location is prefixed: {homes:?}"
+        );
+        assert_eq!(homes[1].path, real(default.path()));
+        assert_eq!(
+            homes[1].prefix, None,
+            "the default location keeps the logical paths it always had"
+        );
+
+        unsafe { std::env::set_var("CORMEX_TEST_HOMES", default.path()) };
+        assert_eq!(
+            resolve_homes(&e, &Config::default()).len(),
+            1,
+            "a variable pointing at the default directory is the same home"
+        );
+        unsafe { std::env::remove_var("CORMEX_TEST_HOMES") };
     }
 
+    /// `extra_homes` is scanned whatever the environment of this run.
     #[test]
-    fn a_home_that_does_not_exist_resolves_to_none() {
+    fn a_configured_home_is_scanned_without_its_variable() {
+        let custom = tempfile::tempdir().expect("a temp dir");
         let mut e = entry();
         e.home = vec![HomeRoot::Path {
             path: "/definitely/not/here".into(),
         }];
-        assert!(resolve_home(&e).is_none());
+        let mut cfg = Config::default();
+        cfg.extra_homes
+            .insert(e.id.clone(), vec![custom.path().display().to_string()]);
+        let homes = resolve_homes(&e, &cfg);
+        assert_eq!(homes.len(), 1);
+        assert!(homes[0].prefix.is_some());
+        assert_eq!(
+            homes[0].prefix,
+            resolve_homes(&e, &cfg)[0].prefix,
+            "the prefix is a function of the directory, the same on every run"
+        );
+    }
+
+    #[test]
+    fn a_home_that_does_not_exist_is_not_scanned() {
+        let mut e = entry();
+        e.home = vec![HomeRoot::Path {
+            path: "/definitely/not/here".into(),
+        }];
+        assert!(resolve_homes(&e, &Config::default()).is_empty());
+    }
+
+    /// The same relative path in two homes is two files, with one session id
+    /// rule applied to the unprefixed path.
+    #[test]
+    fn the_same_relative_path_in_two_homes_is_two_files() {
+        let default = tempfile::tempdir().expect("a temp dir");
+        let custom = tempfile::tempdir().expect("a temp dir");
+        for dir in [default.path(), custom.path()] {
+            std::fs::create_dir_all(dir.join("projects/-p")).expect("mkdir");
+        }
+        std::fs::write(default.path().join("projects/-p/a.jsonl"), b"{}\n").expect("write");
+        std::fs::write(custom.path().join("projects/-p/b.jsonl"), b"{}\n").expect("write");
+        std::fs::write(custom.path().join("projects/-p/a.jsonl"), b"{}\n").expect("write");
+        let mut e = entry();
+        e.home = vec![HomeRoot::Path {
+            path: default.path().display().to_string(),
+        }];
+        e.sources = vec![SourceSpec {
+            role: FileRole::Transcript,
+            glob: "projects/*/*.jsonl".into(),
+            framing: Framing::Append,
+            also_compressed: None,
+            session_id: SessionIdRule::Stem {},
+            parent_session_id: None,
+            cwd: None,
+            sqlite: None,
+        }];
+        let mut cfg = Config::default();
+        cfg.extra_homes
+            .insert(e.id.clone(), vec![custom.path().display().to_string()]);
+        let catalog = Catalog {
+            schema: 1,
+            version: "t".into(),
+            agents: vec![e],
+        };
+        let mut files = discover(&catalog, &cfg, "dev").expect("discover");
+        files.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
+        let paths: Vec<_> = files.iter().map(|f| f.logical_path.as_str()).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths.contains(&"projects/-p/a.jsonl"));
+        let custom_a = files
+            .iter()
+            .find(|f| f.logical_path.starts_with("@home-") && f.logical_path.ends_with("/a.jsonl"))
+            .expect("the custom home's a.jsonl");
+        assert_eq!(
+            custom_a.native_session_id, "a",
+            "the session id rule reads the path without the home prefix"
+        );
     }
 
     /// Claude Code's project directory decode is lossy and says so.

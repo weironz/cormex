@@ -30,6 +30,13 @@ pub trait CaptureApi: Send + Sync {
     /// `POST /capture/files/{id}/classification`.
     async fn update_classification(&self, file_id: &str, req: &FileClassification) -> Result<()>;
 
+    /// `POST /capture/files/{id}/metadata`: the host's title, project and pin.
+    async fn update_metadata(
+        &self,
+        file_id: &str,
+        metadata: &cormex_proto::capture::SessionUiMetadata,
+    ) -> Result<()>;
+
     /// `POST /capture/files/{id}/generations`.
     async fn open_generation(&self, file_id: &str, reason: &str) -> Result<GenerationDto>;
 
@@ -103,6 +110,21 @@ impl CaptureApi for HttpCaptureApi {
             .post_json::<_, serde_json::Value>(
                 &format!("/capture/files/{file_id}/classification"),
                 req,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn update_metadata(
+        &self,
+        file_id: &str,
+        metadata: &cormex_proto::capture::SessionUiMetadata,
+    ) -> Result<()> {
+        self.client
+            .post_json::<_, serde_json::Value>(
+                &format!("/capture/files/{file_id}/metadata"),
+                metadata,
             )
             .await
             .map(|_| ())

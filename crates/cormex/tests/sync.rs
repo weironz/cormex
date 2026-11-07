@@ -1023,3 +1023,145 @@ async fn a_different_conversation_under_the_same_session_id_is_not_merged() {
     );
     assert_eq!(f.api.non_empty_generations(), 2);
 }
+
+/// A Codex home holding one rollout and the desktop app's sidebar state.
+fn codex_home(name: &str) -> (tempfile::TempDir, cormex_proto::catalog::Catalog) {
+    use cormex_proto::capture::{FileRole, Framing};
+    use cormex_proto::catalog::{AgentEntry, HomeRoot, SessionIdRule, SourceSpec};
+    let home = tempfile::tempdir().expect("home");
+    let id = "01234567-89ab-cdef-0123-456789abcdef";
+    let dir = home.path().join("sessions/2026/11/07");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join(format!("rollout-2026-11-07T10-00-00-{id}.jsonl")),
+        format!(
+            "{{\"timestamp\":\"2026-11-07T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/r\"}}}}\n"
+        ),
+    )
+    .expect("rollout");
+    let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).expect("sqlite");
+    db.execute_batch(
+        "CREATE TABLE threads (id TEXT, cwd TEXT, name TEXT, title TEXT, is_pinned INTEGER, project_id TEXT);",
+    )
+    .expect("table");
+    db.execute(
+        "INSERT INTO threads VALUES (?1, '/r', ?2, 'first prompt', 0, NULL)",
+        [id, name],
+    )
+    .expect("row");
+    std::fs::write(
+        home.path().join(".codex-global-state.json"),
+        r#"{"local-projects":{"p1":{"name":"Proj","rootPaths":["/r"]}}}"#,
+    )
+    .expect("sidebar");
+    let catalog = cormex_proto::catalog::Catalog {
+        schema: 1,
+        version: "test".into(),
+        agents: vec![AgentEntry {
+            id: "codex".into(),
+            name: "Codex".into(),
+            provider: None,
+            kind: None,
+            home: vec![HomeRoot::Path {
+                path: home.path().display().to_string(),
+            }],
+            sources: vec![SourceSpec {
+                role: FileRole::Transcript,
+                glob: "{sessions,archived_sessions}/**/rollout-*.jsonl".into(),
+                framing: Framing::Append,
+                also_compressed: None,
+                session_id: SessionIdRule::StemRegex {
+                    regex: "rollout-[0-9T-]+-(?P<id>[0-9a-f-]{36})".into(),
+                },
+                parent_session_id: None,
+                cwd: None,
+                sqlite: None,
+            }],
+            manual_only: false,
+            import_only: false,
+            hooks: None,
+            retention: None,
+        }],
+    };
+    (home, catalog)
+}
+
+/// Every sync sends the Codex desktop metadata, but only when it changed;
+/// `--codex-metadata` resends it all.
+#[tokio::test]
+async fn codex_desktop_metadata_is_sent_when_it_changes_and_only_then() {
+    let f = Fixture::new();
+    let (home, catalog) = codex_home("Named in the sidebar");
+    let plain = SyncOptions::default();
+
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, plain.clone())
+        .await;
+    let sent = f.api.metadata();
+    assert_eq!(sent.len(), 1, "the first sync sends it: {sent:?}");
+    assert_eq!(sent[0].1.title.as_deref(), Some("Named in the sidebar"));
+    assert_eq!(
+        sent[0].1.project_name.as_deref(),
+        Some("Proj"),
+        "the project comes from the sidebar's root paths"
+    );
+
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, plain.clone())
+        .await;
+    assert_eq!(
+        f.api.metadata().len(),
+        1,
+        "nothing changed, nothing is sent: a scheduled sync every few minutes must not resend \
+         every session"
+    );
+
+    rusqlite::Connection::open(home.path().join("state_5.sqlite"))
+        .expect("sqlite")
+        .execute("UPDATE threads SET name = 'Renamed'", [])
+        .expect("rename");
+    f.sync_with_catalog_and_config(&catalog, &f.cfg, plain.clone())
+        .await;
+    let sent = f.api.metadata();
+    assert_eq!(
+        sent.len(),
+        2,
+        "a rename in Codex reaches the archive on the next sync"
+    );
+    assert_eq!(sent[1].1.title.as_deref(), Some("Renamed"));
+
+    f.sync_with_catalog_and_config(
+        &catalog,
+        &f.cfg,
+        SyncOptions {
+            force_metadata: true,
+            ..SyncOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(f.api.metadata().len(), 3, "--codex-metadata resends");
+}
+
+/// A Codex home that is only in `extra_homes` is captured, under a prefixed
+/// logical path, whatever this run's environment.
+#[tokio::test]
+async fn a_configured_extra_home_is_captured() {
+    let f = Fixture::new();
+    let (home, mut catalog) = codex_home("x");
+    let real = home.path().display().to_string();
+    // The catalog's own path points nowhere; only the config names the home
+    catalog.agents[0].home = vec![cormex_proto::catalog::HomeRoot::Path {
+        path: "/definitely/not/here".into(),
+    }];
+    let mut cfg = f.cfg.clone();
+    cfg.extra_homes.insert("codex".into(), vec![real]);
+    let report = f
+        .sync_with_catalog_and_config(&catalog, &cfg, SyncOptions::default())
+        .await;
+    assert_eq!(report.files_uploaded, 1, "{report:?}");
+    let registered = f.api.registrations();
+    assert!(
+        registered
+            .iter()
+            .any(|r| r.logical_path.starts_with("@home-") && r.native_session_id.len() == 36),
+        "a non-default home's files carry its prefix and keep their session id: {registered:?}"
+    );
+}

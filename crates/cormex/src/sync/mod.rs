@@ -23,6 +23,7 @@ pub mod api;
 mod classify;
 pub mod fake;
 pub mod lock;
+pub mod metadata;
 pub mod plan;
 pub mod reader;
 pub mod reconcile;
@@ -54,6 +55,10 @@ pub struct SyncReport {
     pub locked: usize,
     /// The first error, for `doctor`.
     pub last_error: Option<String>,
+    /// Sessions whose host metadata (Codex desktop titles, projects, pins) was
+    /// sent because it changed, and reads or sends of it that failed.
+    pub metadata_updated: usize,
+    pub metadata_failed: usize,
 }
 
 /// How a run was triggered, for the `runs` table.
@@ -86,6 +91,9 @@ pub struct SyncOptions {
     pub budget: Budget,
     /// Decide and report, upload nothing.
     pub dry_run: bool,
+    /// Send every session's host metadata, not only what changed
+    /// (`cormex sync --codex-metadata`).
+    pub force_metadata: bool,
 }
 
 impl Default for SyncOptions {
@@ -95,6 +103,7 @@ impl Default for SyncOptions {
             only: None,
             budget: Budget::default_budget(),
             dry_run: false,
+            force_metadata: false,
         }
     }
 }
@@ -246,6 +255,15 @@ pub async fn run(
                 );
             }
         }
+    }
+
+    // Host metadata after the transcripts: it is attached to files the pass
+    // above registered, and its failures do not count as sync errors
+    if !opts.dry_run && opts.only.is_none() {
+        let outcome =
+            metadata::sync_codex(api, db, catalog, cfg, &files, opts.force_metadata).await?;
+        report.metadata_updated = outcome.updated;
+        report.metadata_failed = outcome.failed;
     }
 
     if !opts.dry_run

@@ -34,6 +34,9 @@ pub struct InitReport {
     pub estimate_bytes: u64,
     pub backfill: Option<crate::sync::SyncReport>,
     pub warnings: Vec<String>,
+    /// Homes recorded in `extra_homes` because only an environment variable
+    /// pointed at them: `agent: directory`.
+    pub recorded_homes: Vec<String>,
 }
 
 /// The options `init` takes.
@@ -128,6 +131,26 @@ pub async fn run(
     let db = crate::state::StateDb::open(data_dir)?;
     let mut report = InitReport::default();
 
+    // ── Homes the environment points at ──
+    //
+    // A hook inherits the agent's environment and a scheduled run usually does
+    // not, so a `CODEX_HOME` set in the shell was captured by one and not the
+    // other. Recording the directory makes every run scan it
+    let catalog = cormex_proto::catalog::Catalog::builtin().clone();
+    let mut cfg = cfg.clone();
+    let found = crate::catalog::homes_only_in_environment(&catalog, &cfg);
+    for (agent, dir) in &found {
+        cfg.extra_homes
+            .entry(agent.clone())
+            .or_default()
+            .push(dir.clone());
+        report.recorded_homes.push(format!("{agent}: {dir}"));
+    }
+    if !found.is_empty() && !opts.dry_run {
+        cfg.save(config_dir)?;
+    }
+    let cfg = &cfg;
+
     let mut plan: Vec<Box<dyn Installer>> = installers(cfg, &opts.agents);
     plan.extend(mcp_installers(cfg, config_dir, &opts.agents));
     for installer in &plan {
@@ -140,7 +163,6 @@ pub async fn run(
 
     // The estimate comes before anything is applied, so the user sees what the
     // backfill would cost while deciding whether to proceed
-    let catalog = cormex_proto::catalog::Catalog::builtin().clone();
     let detected = detect::run(&catalog, cfg, &cfg.device_label)?;
     report.estimate_files = detected.total_files();
     report.estimate_bytes = detected.total_bytes();
@@ -185,6 +207,7 @@ pub async fn run(
                     only: None,
                     budget: crate::sync::upload::Budget::unlimited(),
                     dry_run: false,
+                    force_metadata: false,
                 },
             )
             .await?,
@@ -204,6 +227,15 @@ pub fn render_plan(report: &InitReport) -> String {
         out.push_str("will change:\n");
         for c in &report.planned {
             out.push_str(&format!("  · {}\n", c.description));
+        }
+    }
+    if !report.recorded_homes.is_empty() {
+        out.push_str(
+            "\nalso capturing (found through an environment variable, now saved in config.toml so \
+             scheduled runs see them too):\n",
+        );
+        for h in &report.recorded_homes {
+            out.push_str(&format!("  · {h}\n"));
         }
     }
     out.push_str(&format!(

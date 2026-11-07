@@ -244,6 +244,9 @@ pub async fn run(
         fix: (!hooks_present).then(|| "run `cormex init` to install the hooks".into()),
     });
 
+    // ── Agent homes ──
+    checks.push(homes_check(cormex_proto::catalog::Catalog::builtin(), cfg));
+
     // ── Retention ──
     let retention = crate::install::retention::Retention::discover();
     let days = std::fs::read_to_string(&retention.settings_path)
@@ -270,6 +273,77 @@ pub async fn run(
     Ok(Report { checks })
 }
 
+/// Whether every agent directory this machine means to capture is one every
+/// run will see.
+///
+/// Three ways it goes wrong, each silent without this check: a variable that
+/// points nowhere (that agent captures nothing from it); a directory only a
+/// variable names (a hook sees it, a scheduled run usually does not, so its
+/// sessions arrive only while the agent is running); a configured home that
+/// was removed.
+#[must_use]
+pub fn homes_check(catalog: &cormex_proto::catalog::Catalog, cfg: &Config) -> Check {
+    use cormex_proto::catalog::HomeRoot;
+    let mut problems = Vec::new();
+    for agent in &catalog.agents {
+        for root in &agent.home {
+            if let HomeRoot::Env { env } = root
+                && let Some(v) = std::env::var_os(env).filter(|v| !v.is_empty())
+                && !std::path::Path::new(&v).is_dir()
+            {
+                problems.push(format!(
+                    "{env} points at {}, which is not a directory",
+                    std::path::Path::new(&v).display()
+                ));
+            }
+        }
+        for dir in cfg.extra_homes.get(&agent.id).into_iter().flatten() {
+            let expanded = dir.strip_prefix("~/").map_or_else(
+                || std::path::PathBuf::from(dir),
+                |rest| {
+                    directories::BaseDirs::new().map_or_else(
+                        || std::path::PathBuf::from(dir),
+                        |b| b.home_dir().join(rest),
+                    )
+                },
+            );
+            if !expanded.is_dir() {
+                problems.push(format!(
+                    "extra_homes names {dir} for {}, which is not a directory",
+                    agent.id
+                ));
+            }
+        }
+    }
+    let unrecorded = crate::catalog::homes_only_in_environment(catalog, cfg);
+    for (agent, dir) in &unrecorded {
+        problems.push(format!(
+            "{dir} ({agent}) is only named by an environment variable; scheduled runs may not see it"
+        ));
+    }
+    let scanned: usize = catalog
+        .agents
+        .iter()
+        .map(|a| crate::catalog::resolve_homes(a, cfg).len())
+        .sum();
+    Check {
+        name: "homes".into(),
+        ok: problems.is_empty(),
+        detail: if problems.is_empty() {
+            format!("{scanned} agent directories, all seen by every run")
+        } else {
+            problems.join("; ")
+        },
+        fix: (!problems.is_empty()).then(|| {
+            if unrecorded.is_empty() {
+                "fix the variable, or remove the directory from extra_homes in config.toml".into()
+            } else {
+                "run `cormex init` to record these directories in config.toml".into()
+            }
+        }),
+    }
+}
+
 /// Render for a terminal.
 #[must_use]
 pub fn render(r: &Report) -> String {
@@ -293,6 +367,57 @@ pub fn render(r: &Report) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A directory only a variable names is flagged with the fix; recording it
+    /// in `extra_homes` clears the check.
+    #[test]
+    fn a_home_only_in_the_environment_is_flagged_until_recorded() {
+        let custom = tempfile::tempdir().expect("a temp dir");
+        let catalog = cormex_proto::catalog::Catalog {
+            schema: 1,
+            version: "t".into(),
+            agents: vec![cormex_proto::catalog::AgentEntry {
+                id: "codex".into(),
+                name: "Codex".into(),
+                provider: None,
+                kind: None,
+                home: vec![
+                    cormex_proto::catalog::HomeRoot::Env {
+                        env: "CORMEX_DOCTOR_TEST_HOME".into(),
+                    },
+                    cormex_proto::catalog::HomeRoot::Path {
+                        path: "/definitely/not/here".into(),
+                    },
+                ],
+                sources: Vec::new(),
+                hooks: None,
+                retention: None,
+                import_only: false,
+                manual_only: false,
+            }],
+        };
+        // SAFETY: only this test touches this variable, and it removes it
+        unsafe { std::env::set_var("CORMEX_DOCTOR_TEST_HOME", custom.path()) };
+        let mut cfg = Config::default();
+        let flagged = homes_check(&catalog, &cfg);
+        assert!(!flagged.ok, "{flagged:?}");
+        assert!(
+            flagged
+                .fix
+                .as_deref()
+                .is_some_and(|f| f.contains("cormex init")),
+            "{flagged:?}"
+        );
+        cfg.extra_homes
+            .insert("codex".into(), vec![custom.path().display().to_string()]);
+        let recorded = homes_check(&catalog, &cfg);
+        unsafe { std::env::remove_var("CORMEX_DOCTOR_TEST_HOME") };
+        assert!(
+            recorded.ok,
+            "recorded homes are seen by every run: {recorded:?}"
+        );
+    }
+
     use super::*;
 
     /// Every failing check carries a fix.

@@ -50,6 +50,19 @@ pub struct Config {
     /// this describes what one person chose to add on one machine.
     #[serde(default)]
     pub extra_sources: Vec<ExtraSource>,
+    /// More homes for a catalogued agent, by agent id:
+    /// `extra_homes = { codex = ["/data/codex"] }`.
+    ///
+    /// # Why this exists
+    ///
+    /// An agent's home normally comes from its environment variable or its
+    /// default path. The variable is only seen by a process that inherits it:
+    /// a hook launched by the agent does, the scheduler usually does not, so
+    /// the two used to capture different directories. `cormex init` records
+    /// the directories the variables point at here, and every run scans them
+    /// whatever its environment. A user can add directories by hand too.
+    #[serde(default)]
+    pub extra_homes: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// One source the user added by hand.
@@ -84,6 +97,7 @@ impl Default for Config {
             exclusions: Vec::new(),
             git_metadata: true,
             extra_sources: Vec::new(),
+            extra_homes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -223,6 +237,9 @@ mod tests {
             ],
             git_metadata: false,
             extra_sources: Vec::new(),
+            extra_homes: [("codex".to_owned(), vec!["/data/codex".to_owned()])]
+                .into_iter()
+                .collect(),
         };
         cfg.save(dir.path()).expect("save");
         let back = Config::load(dir.path()).expect("load");

@@ -10,6 +10,18 @@
 - New migration `20261127000001_capture_generation_adoptions.sql` (table `capture_generation_adoptions`, view `capture_current_generations`). Append-only; `ON DELETE CASCADE` so purge is unaffected.
 - Not covered: conversations that were already duplicated before this change stay duplicated in the archive until a repair pass is run.
 
+### Capture CLI: every agent directory, every run
+
+- An agent's home used to be the **first** existing candidate: with `CODEX_HOME` (or `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, …) set, the default directory was not scanned at all, so a CLI with its own home and a desktop app on the default captured one of the two. Every existing home is now scanned: the variable's directory, the catalog's defaults, and the new `extra_homes` in `config.toml` (`extra_homes = { codex = ["/data/codex"] }`), each directory once.
+- Files under the default location keep their logical paths. Files under any other home get a stable `@home-<hash>/` prefix derived from the directory, so the same relative path in two homes is two files, and a hook and a scheduled run name the same directory the same way. A home that was only captured through its variable before this change is registered again under the prefix; its bytes are recognised and adopted, not uploaded a second time (snapshot sources such as SQLite rows are uploaded once more).
+- `cormex init` records the directories the environment variables point at in `extra_homes`. A hook inherits the agent's environment but a scheduler usually does not, so a home named only by a shell variable used to be captured only while the agent ran.
+- `cormex doctor` has a `homes` check: a variable that points at no directory, a directory only a variable names, a configured home that was removed. `cormex detect` lists every home it scans.
+
+### Capture CLI: Codex desktop metadata on every sync
+
+- Titles, project assignments and pins from the Codex desktop app are read on every sync, from every Codex home, and sent only for sessions whose metadata changed (its hash is kept in `state.db`, schema 3). They used to be sent only by `cormex sync --codex-metadata`, which neither hooks nor the scheduler run, so a session renamed or moved into a project in Codex kept its old place in the archive. `--codex-metadata` now resends everything.
+- A locked Codex database or a failed send is logged and retried on the next sync; it does not mark the sync as failed.
+
 ### Archive: import chat exports from the browser
 
 - The archive has an **Import** button: pick a ChatGPT, Claude or Grok export zip, or a Gemini Takeout, and it is previewed (new / changed / already archived) before anything is written. `POST /archive/import/preview` and `POST /archive/import/run` take a file from `POST /import/upload`; the existing `/import/*` routes, which feed **memory**, are unchanged.
