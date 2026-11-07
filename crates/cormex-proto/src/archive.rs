@@ -222,3 +222,36 @@ mod tests {
         assert_eq!(TITLE_CHARS, 80);
     }
 }
+
+/// `POST /archive/import/preview` and `/archive/import/run`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveImportRequest {
+    /// From `POST /import/upload`.
+    pub handle: String,
+    /// `chatgpt` / `claude` / `grok` / `gemini`; detected from the file when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+/// What an archive import found, and — after `run` — wrote.
+///
+/// `new + changed + unchanged == conversations`. A second run of the same file
+/// reports everything as `unchanged` and writes nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveImportSummary {
+    /// The agent id the conversations are archived under (`chatgpt_export`, …).
+    pub agent: String,
+    /// The display name (`ChatGPT`, …).
+    pub source: String,
+    pub conversations: usize,
+    /// Not in the archive yet.
+    pub new: usize,
+    /// In the archive with different content: a new snapshot generation,
+    /// the old one kept.
+    pub changed: usize,
+    /// Byte-for-byte what the archive already has: skipped.
+    pub unchanged: usize,
+    /// `false` for a preview.
+    pub written: bool,
+}

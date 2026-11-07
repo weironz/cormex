@@ -327,6 +327,39 @@ class CormexApi {
         .toList();
   }
 
+  /// `POST /import/upload` —— 把导出文件原样传上去，换一个句柄。
+  ///
+  /// 先传后解析：浏览器读不到磁盘，而一份真实导出可能有上百 MB，服务端边收
+  /// 边落盘，解析时再读。
+  Future<String> uploadExport(List<int> bytes) async {
+    final json = await _send(
+      'POST',
+      '/import/upload',
+      bytes,
+      'application/octet-stream',
+    );
+    final handle = asStringOrNull(json['handle']);
+    if (handle == null) {
+      throw CormexApiException('/import/upload 没有返回句柄');
+    }
+    return handle;
+  }
+
+  /// `POST /archive/import/preview` 或 `/run` —— 把一份已上传的导出放进聊天档案。
+  ///
+  /// [run] 为 false 时只预览：数一数新增、有变化、未变的对话，什么都不写。
+  Future<ArchiveImportSummary> archiveImport(
+    String handle, {
+    required bool run,
+  }) async => ArchiveImportSummary.fromJson(
+    await _send(
+      'POST',
+      run ? '/archive/import/run' : '/archive/import/preview',
+      utf8.encode(jsonEncode({'handle': handle})),
+      'application/json',
+    ),
+  );
+
   /// `GET /archive/sessions/{id}` —— 会话详情：元数据、文件与代。
   Future<ArchiveSessionDetail> archiveSession(String id) async =>
       ArchiveSessionDetail.fromJson(
@@ -545,6 +578,30 @@ class CormexApi {
         _uri(path, query),
         headers: _headers(const {'accept': 'application/json'}),
       );
+    } on Object catch (e) {
+      throw CormexApiException(_unreachableMessage(e), cause: e);
+    }
+    if (response.statusCode >= 400) {
+      throw _failure(response.statusCode, _errorMessage(response));
+    }
+    return _decodeObject(path, utf8.decode(response.bodyBytes));
+  }
+
+  /// 发一个带 body 的请求，按与 [_getJson] 相同的规矩处理错误。
+  Future<Map<String, dynamic>> _send(
+    String method,
+    String path,
+    List<int> body,
+    String contentType,
+  ) async {
+    final http.Response response;
+    try {
+      final req = http.Request(method, _uri(path))
+        ..headers.addAll(
+          _headers({'content-type': contentType, 'accept': 'application/json'}),
+        )
+        ..bodyBytes = body;
+      response = await http.Response.fromStream(await _client.send(req));
     } on Object catch (e) {
       throw CormexApiException(_unreachableMessage(e), cause: e);
     }

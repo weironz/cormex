@@ -40,6 +40,8 @@ use crate::parser::{ParsedEvent, Parser};
 pub enum ExportPlatform {
     ChatGpt,
     Claude,
+    Grok,
+    Gemini,
 }
 
 impl ExportPlatform {
@@ -49,6 +51,38 @@ impl ExportPlatform {
         match self {
             Self::ChatGpt => "chatgpt_export",
             Self::Claude => "claude_export",
+            Self::Grok => "grok_export",
+            Self::Gemini => "gemini_takeout",
+        }
+    }
+
+    /// The platform an `agent` id was captured under.
+    #[must_use]
+    pub fn from_agent(agent: &str) -> Option<Self> {
+        match agent {
+            "chatgpt_export" => Some(Self::ChatGpt),
+            "claude_export" => Some(Self::Claude),
+            "grok_export" => Some(Self::Grok),
+            "gemini_takeout" => Some(Self::Gemini),
+            _ => None,
+        }
+    }
+
+    const fn import(self) -> cormex_import::Platform {
+        match self {
+            Self::ChatGpt => cormex_import::Platform::ChatGpt,
+            Self::Claude => cormex_import::Platform::Claude,
+            Self::Grok => cormex_import::Platform::Grok,
+            Self::Gemini => cormex_import::Platform::Gemini,
+        }
+    }
+
+    const fn from_import(p: cormex_import::Platform) -> Self {
+        match p {
+            cormex_import::Platform::ChatGpt => Self::ChatGpt,
+            cormex_import::Platform::Claude => Self::Claude,
+            cormex_import::Platform::Grok => Self::Grok,
+            cormex_import::Platform::Gemini => Self::Gemini,
         }
     }
 }
@@ -78,6 +112,8 @@ impl Parser for ExportParser {
         match self.platform {
             ExportPlatform::ChatGpt => "chatgpt_export@2",
             ExportPlatform::Claude => "claude_export@2",
+            ExportPlatform::Grok => "grok_export@1",
+            ExportPlatform::Gemini => "gemini_takeout@1",
         }
     }
 
@@ -90,10 +126,7 @@ impl Parser for ExportParser {
         // `cormex-import`'s platform detection is used rather than a second
         // sniff: the export format is what drifts, and its error names the keys
         // it saw
-        let platform = match self.platform {
-            ExportPlatform::ChatGpt => cormex_import::Platform::ChatGpt,
-            ExportPlatform::Claude => cormex_import::Platform::Claude,
-        };
+        let platform = self.platform.import();
         let parsed = match cormex_import::parse(bytes, Some(platform)) {
             Ok((_, conversations)) => conversations,
             Err(e) => {
@@ -178,7 +211,18 @@ pub struct SplitConversation {
     pub bytes: Vec<u8>,
 }
 
-/// Split an export's `conversations.json` into one file per conversation.
+/// Split an export into one file per conversation.
+///
+/// Accepts every shape [`cormex_import::parse`] does: a top-level array
+/// (ChatGPT, Claude, Gemini Takeout) or Grok's account object.
+///
+/// # Ids come from the parser, not from a second rule
+///
+/// The session id comes from [`cormex_import::identity`], the function the
+/// vendor's parser itself uses. This used to read `id` and fall back to the record's
+/// **position**; Claude names its id `uuid`, so every Claude conversation got
+/// `claude_export-<n>`, and a newer export with one more conversation shifted
+/// every one of them onto its neighbour's session.
 ///
 /// # Errors
 /// The file is not an export, or its shape is not recognised. The error names
@@ -189,68 +233,54 @@ pub fn split_export(
     bytes: &[u8],
     platform: Option<ExportPlatform>,
 ) -> anyhow::Result<Vec<SplitConversation>> {
+    Ok(split_export_detected(bytes, platform)?.1)
+}
+
+/// [`split_export`], also saying which platform the file turned out to be.
+///
+/// # Errors
+/// As [`split_export`].
+pub fn split_export_detected(
+    bytes: &[u8],
+    platform: Option<ExportPlatform>,
+) -> anyhow::Result<(ExportPlatform, Vec<SplitConversation>)> {
     let root: Value = serde_json::from_slice(bytes)
         .map_err(|e| anyhow::anyhow!("this file is not valid JSON: {e}"))?;
-    let items = root.as_array().ok_or_else(|| {
-        anyhow::anyhow!(
-            "the top level of an export has to be an array, but this one is: {}",
-            match &root {
-                Value::Object(_) => "an object",
-                Value::String(_) => "a string",
-                Value::Number(_) => "a number",
-                Value::Bool(_) => "a boolean",
-                Value::Null => "null",
-                Value::Array(_) => "an array",
-            }
-        )
-    })?;
-
+    let items = cormex_import::export_items(&root)?;
+    let first = items
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the export contains no conversations at all"))?;
     let platform = match platform {
         Some(p) => p,
-        None => {
-            let first = items
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("the export contains no conversations at all"))?;
-            if first.get("mapping").is_some() {
-                ExportPlatform::ChatGpt
-            } else if first.get("chat_messages").is_some() {
-                ExportPlatform::Claude
-            } else {
-                return Err(anyhow::anyhow!(
-                    "cannot tell which vendor this export came from: the first record has \
-                     neither `mapping` (ChatGPT) nor `chat_messages` (Claude). The keys it does \
-                     have: {}",
-                    cormex_import::keys_of(first)
-                ));
-            }
-        }
+        None => ExportPlatform::from_import(cormex_import::sniff_platform(first)?),
     };
 
-    // The vendor's id field differs; both are `id` in practice, and the fallback
-    // is a positional name so a single missing id does not lose the conversation
     let mut out = Vec::with_capacity(items.len());
-    for (i, item) in items.iter().enumerate() {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{}-{i}", platform.agent()));
-        let title = item
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+    for item in items {
         // **A one-element array**, so `cormex-import::parse` reads it with no
-        // second entry point
+        // second entry point, here and in the projector
         let bytes = serde_json::to_vec(&Value::Array(vec![item.clone()]))
             .map_err(|e| anyhow::anyhow!("could not re-serialize a conversation: {e}"))?;
+        let Some((session_id, title)) = cormex_import::identity(platform.import(), item) else {
+            // A Gemini activity that is not a prompt with an answer is not a
+            // conversation. A record of the other vendors with no id at all
+            // cannot be imported idempotently, and is refused rather than given
+            // a positional id that would move to another conversation next time
+            if platform == ExportPlatform::Gemini {
+                continue;
+            }
+            return Err(anyhow::anyhow!(
+                "a conversation in this export has no id; the keys it does have: {}",
+                cormex_import::keys_of(item)
+            ));
+        };
         out.push(SplitConversation {
-            session_id: id,
+            session_id,
             title,
             bytes,
         });
     }
-    Ok(out)
+    Ok((platform, out))
 }
 
 #[cfg(test)]
@@ -396,5 +426,86 @@ mod tests {
     fn an_empty_export_is_refused() {
         let err = split_export(b"[]", None).expect_err("an empty export must fail");
         assert!(err.to_string().contains("no conversations"), "{err}");
+    }
+
+    /// Claude names its conversation id `uuid`. The splitter used to read `id`
+    /// and fall back to the position in the file, so a later export with one
+    /// more conversation moved every conversation onto its neighbour's session.
+    #[test]
+    fn a_claude_conversation_keeps_its_uuid_whatever_its_position() {
+        let one = claude_export();
+        let mut two = vec![serde_json::json!({
+            "uuid": "conv-new", "name": "Newer", "created_at": "2026-11-01T00:00:00Z",
+            "chat_messages": [{"uuid": "n1", "sender": "human",
+                               "created_at": "2026-11-01T00:00:00Z", "text": "hi"}]
+        })];
+        two.extend(one.as_array().expect("array").iter().cloned());
+
+        let first = split_export(&serde_json::to_vec(&one).expect("bytes"), None).expect("split");
+        let second = split_export(
+            &serde_json::to_vec(&Value::Array(two)).expect("bytes"),
+            None,
+        )
+        .expect("split");
+        assert_eq!(first[0].session_id, "conv-2");
+        assert_eq!(
+            second
+                .iter()
+                .find(|c| c.title == "Deploy notes")
+                .map(|c| c.session_id.as_str()),
+            Some("conv-2"),
+            "the same conversation is the same session in both exports"
+        );
+    }
+
+    /// Grok's file is the whole account: an object with `conversations`.
+    #[test]
+    fn a_grok_account_export_splits_into_conversations() {
+        let account = serde_json::json!({
+            "conversations": [{
+                "conversation": {"id": "g1", "title": "Rust", "create_time": "2026-01-02T03:04:05Z"},
+                "responses": [
+                    {"response": {"_id": "r1", "message": "what is a lifetime", "sender": "human",
+                                  "create_time": "2026-01-02T03:04:05Z"}},
+                    {"response": {"_id": "r2", "message": "a scope a reference is valid in",
+                                  "sender": "ASSISTANT", "create_time": "2026-01-02T03:04:09Z"}}
+                ]
+            }],
+            "projects": []
+        });
+        let (platform, split) =
+            split_export_detected(&serde_json::to_vec(&account).expect("bytes"), None)
+                .expect("split");
+        assert_eq!(platform, ExportPlatform::Grok);
+        assert_eq!(split[0].session_id, "g1");
+        let events = ExportParser::new(ExportPlatform::Grok)
+            .feed(0, &split[0].bytes)
+            .expect("feed");
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![TranscriptKind::UserMessage, TranscriptKind::AgentMessage]
+        );
+    }
+
+    /// A Takeout activity log: one prompt and answer per session; activities
+    /// with no answer are not sessions.
+    #[test]
+    fn a_gemini_takeout_log_splits_into_prompts() {
+        let log = serde_json::json!([
+            {"header": "Gemini Apps", "title": "Prompted 什么是幂等", "time": "2026-01-02T03:04:05Z",
+             "products": ["Gemini Apps"], "safeHtmlItem": [{"html": "<p>执行多次与一次效果相同。</p>"}]},
+            {"header": "Gemini Apps", "title": "Used Gemini Apps", "time": "2026-01-02T03:05:00Z",
+             "products": ["Gemini Apps"]}
+        ]);
+        let (platform, split) =
+            split_export_detected(&serde_json::to_vec(&log).expect("bytes"), None).expect("split");
+        assert_eq!(platform, ExportPlatform::Gemini);
+        assert_eq!(split.len(), 1, "the answerless activity is skipped");
+        assert_eq!(split[0].title, "什么是幂等");
+        let events = ExportParser::new(ExportPlatform::Gemini)
+            .feed(0, &split[0].bytes)
+            .expect("feed");
+        assert_eq!(events.len(), 2);
     }
 }

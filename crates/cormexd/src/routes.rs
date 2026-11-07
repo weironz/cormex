@@ -164,6 +164,8 @@ protected_routes! {
     "/archive/sessions" [GET] => get(crate::archive_api::list_sessions),
     "/archive/projects" [GET] => get(crate::archive_api::list_projects),
     "/archive/sources" [GET] => get(crate::archive_api::list_sources),
+    "/archive/import/preview" [POST] => post(crate::archive_import::preview),
+    "/archive/import/run" [POST] => post(crate::archive_import::run),
     "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),
@@ -1150,6 +1152,16 @@ impl ApiError {
             message: Some(message.into()),
             inner: cormex_core::CormexError::Invalid("not found".into()),
             status: Some(StatusCode::NOT_FOUND),
+        }
+    }
+
+    /// 409: the request is valid but raced another write to the same thing;
+    /// running it again resolves it.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            inner: cormex_core::CormexError::Invalid("conflict".into()),
+            status: Some(StatusCode::CONFLICT),
         }
     }
 

@@ -75,6 +75,27 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
     Ok(out)
 }
 
+/// A conversation's id and title: `uuid` (or `id`) and `name` (or `title`).
+///
+/// The only place this rule is written; the archive's splitter calls it too.
+/// It used to read `id` alone there, and Claude has no `id`.
+#[must_use]
+pub fn identity(raw: &Value) -> (String, String) {
+    let id = raw
+        .get("uuid")
+        .or_else(|| raw.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let title = raw
+        .get("name")
+        .or_else(|| raw.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    (id, title)
+}
+
 fn one(raw: &Value) -> Result<Option<Conversation>> {
     let Some(list) = raw.get("chat_messages").and_then(Value::as_array) else {
         bail!(
@@ -83,11 +104,7 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
         );
     };
 
-    let source_id = raw
-        .get("uuid")
-        .or_else(|| raw.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let (source_id, title) = identity(raw);
     if source_id.is_empty() {
         bail!(
             "neither `uuid` nor `id` — without a stable identifier there is no idempotent \
@@ -95,13 +112,6 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
             keys_of(raw)
         );
     }
-
-    let title = raw
-        .get("name")
-        .or_else(|| raw.get("title"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
 
     let ordered = current_branch(list);
     let mut messages: Vec<Message> = ordered.into_iter().filter_map(message_of).collect();

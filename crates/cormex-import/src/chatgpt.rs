@@ -56,6 +56,26 @@ pub fn parse(items: &[Value]) -> Result<Vec<Conversation>> {
     Ok(out)
 }
 
+/// A conversation's id and title: `conversation_id` (or `id`) and `title`.
+///
+/// The only place this rule is written; the archive's splitter calls it too, so
+/// a session's id is the same however the conversation reached the archive.
+#[must_use]
+pub fn identity(raw: &Value) -> (String, String) {
+    let id = raw
+        .get("conversation_id")
+        .or_else(|| raw.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let title = raw
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    (id, title)
+}
+
 fn one(raw: &Value) -> Result<Option<Conversation>> {
     let Some(mapping) = raw.get("mapping").and_then(Value::as_object) else {
         bail!(
@@ -64,11 +84,7 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
         );
     };
 
-    let source_id = raw
-        .get("conversation_id")
-        .or_else(|| raw.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let (source_id, title) = identity(raw);
     if source_id.is_empty() {
         bail!(
             "neither `conversation_id` nor `id` — without a stable identifier there is no \
@@ -76,12 +92,6 @@ fn one(raw: &Value) -> Result<Option<Conversation>> {
             keys_of(raw)
         );
     }
-
-    let title = raw
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
 
     // Walk up from current_node. With no current_node, fall back to "all nodes
     // sorted by time" — less accurate than the tree path (abandoned branches

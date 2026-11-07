@@ -10,6 +10,17 @@
 - New migration `20261127000001_capture_generation_adoptions.sql` (table `capture_generation_adoptions`, view `capture_current_generations`). Append-only; `ON DELETE CASCADE` so purge is unaffected.
 - Not covered: conversations that were already duplicated before this change stay duplicated in the archive until a repair pass is run.
 
+### Archive: import chat exports from the browser
+
+- The archive has an **Import** button: pick a ChatGPT, Claude or Grok export zip, or a Gemini Takeout, and it is previewed (new / changed / already archived) before anything is written. `POST /archive/import/preview` and `POST /archive/import/run` take a file from `POST /import/upload`; the existing `/import/*` routes, which feed **memory**, are unchanged.
+- Re-importing is idempotent: an unchanged conversation is skipped, a changed one gets a new snapshot generation with the old one kept, and a conversation deleted at the vendor stays archived. A full export imported every month writes only what changed. The same conversation is recognised whether it first arrived through the CLI or the browser.
+- New export formats: **Grok** (`prod-grok-backend.json`, the account object) and **Gemini** (Takeout `MyActivity.json`). Neither vendor documents its format; both parsers follow the shape community tools describe and name the keys they saw when it does not match. Takeout does not record which prompts formed one conversation, so each prompt and answer is one session.
+- Exports can be given as the zip the vendor sends; the CLI and the server pick the export file out of it the same way.
+- Fixed in `cormex import`:
+  - Claude conversations were stored under a **positional** id (`claude_export-<n>`), because the splitter read `id` and Claude names it `uuid`. A later export with one more conversation would have written each conversation into its neighbour's session. The splitter now uses the parser's own id rule (`identity()`), the one place it is written. Claude conversations already imported keep their old sessions; a re-import creates sessions under the real id beside them.
+  - A changed conversation was appended to its previous version (two JSON documents in one file), and an unchanged re-run could append a second copy. Same bytes are now skipped and changed ones get a new generation.
+  - Without `--platform`, every export was archived under `chatgpt_export`, so a Claude export then failed to parse. The detected platform is used. `--platform` also takes `grok` and `gemini`.
+
 ### Capture: five more agents
 
 - New sources, each parser written against sessions the real CLI wrote (pi 1.5.0, omp 18.18.0, DeepSeek Harness 0.2.2-rc.1, Grok Build 1.0.77, Hermes Agent 0.19.0, run against a toy repository) and committed as fixtures:

@@ -8,6 +8,7 @@ import '../../state/sessions_controller.dart';
 import '../../widgets/empty_state.dart';
 import '../home/home_page.dart';
 import '../settings/settings_page.dart';
+import 'import_dialog.dart';
 import 'session_detail_page.dart';
 import 'widgets/archive_source_label.dart';
 
@@ -159,6 +160,20 @@ class _SessionsPageState extends ConsumerState<SessionsPage> {
     );
 
     final actions = [
+      IconButton(
+        tooltip: '导入聊天记录',
+        icon: const Icon(Icons.upload_file_outlined),
+        onPressed: () async {
+          final imported = await showDialog<bool>(
+            context: context,
+            builder: (_) => const ImportArchiveDialog(),
+          );
+          if (imported == true) {
+            _debounce?.cancel();
+            notifier.load(agent: state.agent, query: _search.text);
+          }
+        },
+      ),
       IconButton(
         tooltip: '刷新',
         icon: const Icon(Icons.refresh),

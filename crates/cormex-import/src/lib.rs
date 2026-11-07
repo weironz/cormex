@@ -48,6 +48,8 @@
 
 pub mod chatgpt;
 pub mod claude;
+pub mod gemini;
+pub mod grok;
 pub mod plan;
 
 pub use plan::{Estimate, PACE, Plan, Progress, Sink, execute, load, plan_from_bytes};
@@ -65,6 +67,10 @@ use cormex_core::Id;
 pub enum Platform {
     ChatGpt,
     Claude,
+    /// Grok's account export (`prod-grok-backend.json`).
+    Grok,
+    /// Gemini's Google Takeout activity log (`MyActivity.json`).
+    Gemini,
 }
 
 impl Platform {
@@ -74,6 +80,8 @@ impl Platform {
         match self {
             Self::ChatGpt => "chatgpt",
             Self::Claude => "claude",
+            Self::Grok => "grok",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -84,6 +92,8 @@ impl Platform {
         match self {
             Self::ChatGpt => "ChatGPT",
             Self::Claude => "Claude",
+            Self::Grok => "Grok",
+            Self::Gemini => "Gemini",
         }
     }
 }
@@ -259,13 +269,7 @@ pub fn requests_for(
 pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<Conversation>)> {
     let root: serde_json::Value =
         serde_json::from_slice(bytes).context("this file is not valid JSON")?;
-    let items = root.as_array().ok_or_else(|| {
-        anyhow::anyhow!(
-            "the top level of an export file has to be an array, but this one is: {}. Check \
-             that this is conversations.json and not some other file from the archive",
-            type_name(&root)
-        )
-    })?;
+    let items = export_items(&root)?;
     if items.is_empty() {
         bail!("the export file contains no conversations at all");
     }
@@ -277,21 +281,129 @@ pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<
     let conversations = match platform {
         Platform::ChatGpt => chatgpt::parse(items)?,
         Platform::Claude => claude::parse(items)?,
+        Platform::Grok => grok::parse(items)?,
+        Platform::Gemini => gemini::parse(items)?,
     };
     Ok((platform, conversations))
 }
 
+/// The export JSON inside what the user handed over: the file itself, or the
+/// right member of the zip the vendor sent.
+///
+/// The member is chosen by name, most specific first: `conversations.json`
+/// (ChatGPT, Claude), `prod-grok-backend.json` (Grok), and a `MyActivity.json`
+/// under a Gemini directory (Takeout). Any other zip is refused with the names
+/// it holds, so the user can see what they picked.
+///
+/// # Errors
+/// A zip that cannot be read or holds none of those files.
+pub fn export_json(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    use std::io::Read as _;
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("this zip cannot be read")?;
+    let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+    let wanted = |n: &str| -> u8 {
+        let lower = n.to_ascii_lowercase();
+        let base = lower.rsplit('/').next().unwrap_or(&lower);
+        match base {
+            "conversations.json" => 1,
+            "prod-grok-backend.json" => 2,
+            "myactivity.json" if lower.contains("gemini") || lower.contains("bard") => 3,
+            _ => 0,
+        }
+    };
+    let Some(name) = names
+        .iter()
+        .filter(|n| wanted(n) > 0)
+        .min_by_key(|n| (wanted(n), n.len()))
+        .cloned()
+    else {
+        let shown: Vec<&str> = names.iter().map(String::as_str).take(20).collect();
+        bail!(
+            "this zip holds no conversations.json, prod-grok-backend.json or Gemini \
+             MyActivity.json; it holds: {}",
+            shown.join(", ")
+        );
+    };
+    let mut member = archive
+        .by_name(&name)
+        .with_context(|| format!("could not open {name} in the zip"))?;
+    let mut out = Vec::with_capacity(usize::try_from(member.size()).unwrap_or(0));
+    member
+        .read_to_end(&mut out)
+        .with_context(|| format!("could not read {name} from the zip"))?;
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// The conversation records of an export file.
+///
+/// Every vendor but one puts them in a top-level array. Grok's file is the
+/// whole account, with conversations under `conversations` beside projects and
+/// media.
+///
+/// # Errors
+/// The file is neither an array nor an object with a `conversations` array.
+pub fn export_items(root: &serde_json::Value) -> Result<&[serde_json::Value]> {
+    if let Some(items) = root.as_array() {
+        return Ok(items);
+    }
+    if let Some(items) = root
+        .get("conversations")
+        .and_then(serde_json::Value::as_array)
+    {
+        return Ok(items);
+    }
+    bail!(
+        "the top level of an export file has to be an array (or, for Grok, an object with \
+         `conversations`), but this one is: {}. Check that this is conversations.json, \
+         prod-grok-backend.json or MyActivity.json and not some other file from the archive",
+        type_name(root)
+    )
+}
+
 /// Identify the platform from the shape of the first record.
+/// One record's conversation id and title, by the same rule the platform's
+/// parser uses. `None` when the record is not a conversation (a Gemini
+/// activity that is not a prompt with an answer) or names no id.
+#[must_use]
+pub fn identity(platform: Platform, record: &serde_json::Value) -> Option<(String, String)> {
+    let (id, title) = match platform {
+        Platform::ChatGpt => chatgpt::identity(record),
+        Platform::Claude => claude::identity(record),
+        Platform::Grok => grok::identity(record),
+        Platform::Gemini => return gemini::identity(record),
+    };
+    (!id.is_empty()).then_some((id, title))
+}
+
+/// Identify the platform from one record. See [`parse`] for the shapes.
+///
+/// # Errors
+/// The record matches no known export.
+pub fn sniff_platform(first: &serde_json::Value) -> Result<Platform> {
+    sniff(first)
+}
+
 fn sniff(first: &serde_json::Value) -> Result<Platform> {
     if first.get("mapping").is_some() {
         return Ok(Platform::ChatGpt);
+    }
+    if first.get("conversation").is_some() && first.get("responses").is_some() {
+        return Ok(Platform::Grok);
+    }
+    if first.get("header").is_some() && first.get("time").is_some() {
+        return Ok(Platform::Gemini);
     }
     if first.get("chat_messages").is_some() {
         return Ok(Platform::Claude);
     }
     bail!(
-        "cannot tell which vendor this export came from: the first record has neither \
-         `mapping` (ChatGPT) nor `chat_messages` (Claude). The keys it does have: {}\n\
+        "cannot tell which vendor this export came from: the first record has none of \
+         `mapping` (ChatGPT), `chat_messages` (Claude), `conversation` + `responses` (Grok) or \
+         `header` + `time` (Gemini Takeout). The keys it does have: {}\n\
          The format may have changed — pass --platform, or report this key list back",
         keys_of(first)
     );
@@ -330,6 +442,42 @@ pub fn from_unix_secs(v: &serde_json::Value) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in files {
+            w.start_file(*name, opts).expect("start");
+            w.write_all(body).expect("write");
+        }
+        w.finish().expect("finish").into_inner()
+    }
+
+    /// The zip a vendor mails is read as the export inside it.
+    #[test]
+    fn the_export_is_found_inside_its_zip() {
+        let zipped = zip_of(&[
+            ("user.json", b"{}"),
+            ("conversations.json", b"[1]"),
+            ("chat.html", b"<html/>"),
+        ]);
+        assert_eq!(export_json(&zipped).expect("found").as_ref(), b"[1]");
+        let takeout = zip_of(&[("Takeout/My Activity/Gemini Apps/MyActivity.json", b"[2]")]);
+        assert_eq!(export_json(&takeout).expect("found").as_ref(), b"[2]");
+        assert_eq!(
+            export_json(b"[3]").expect("plain").as_ref(),
+            b"[3]",
+            "a JSON file is passed through"
+        );
+    }
+
+    #[test]
+    fn a_zip_without_an_export_names_what_it_holds() {
+        let err = export_json(&zip_of(&[("photos/1.jpg", b"x")])).expect_err("refused");
+        assert!(format!("{err}").contains("photos/1.jpg"), "{err}");
+    }
     use super::*;
 
     fn msg(id: &str, role: Role, text: &str) -> Message {

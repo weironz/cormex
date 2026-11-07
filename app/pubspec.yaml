@@ -27,6 +27,8 @@ dependencies:
   web: ^1.1.0
   flutter_secure_storage: ^10.3.1
   flutter_markdown_plus: ^1.0.12
+  # 聊天档案的「导入」：选一份导出文件。Web 与 Windows 桌面同一套 API
+  file_picker: 13.1.0
 
 dev_dependencies:
   flutter_test:

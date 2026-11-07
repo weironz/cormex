@@ -939,6 +939,21 @@ impl Store {
     /// The projector needs all of them: a session's conversation may be spread
     /// across the main transcript, a sub-agent's own file, and the host's
     /// memory pseudo-session.
+    /// The session id for a host's own session id, if it has been captured.
+    pub async fn capture_session_by_native(
+        &self,
+        agent: &str,
+        native_session_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id::text FROM capture_sessions WHERE agent = $1 AND native_session_id = $2",
+        )
+        .bind(agent)
+        .bind(native_session_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
     pub async fn capture_files_of_session(&self, session_id: &str) -> Result<Vec<CaptureFile>> {
         let rows = sqlx::query_as::<_, CaptureFile>(
             "SELECT id, session_id, device_id, agent, logical_path, role, framing,

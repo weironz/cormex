@@ -468,9 +468,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 None => None,
                 Some("chatgpt") => Some(cormex_transcript::export::ExportPlatform::ChatGpt),
                 Some("claude") => Some(cormex_transcript::export::ExportPlatform::Claude),
-                Some(other) => {
-                    anyhow::bail!("--platform accepts `chatgpt` or `claude`, not {other:?}")
-                }
+                Some("grok") => Some(cormex_transcript::export::ExportPlatform::Grok),
+                Some("gemini") => Some(cormex_transcript::export::ExportPlatform::Gemini),
+                Some(other) => anyhow::bail!(
+                    "--platform accepts `chatgpt`, `claude`, `grok` or `gemini`, not {other:?}"
+                ),
             };
             let report = cormex::cmd::import::run(client, &path, platform, !yes).await?;
             println!(
@@ -480,7 +482,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if !yes {
                 println!("dry run: nothing was uploaded. Pass --yes to upload.");
             } else {
-                println!("uploaded {}", report.uploaded);
+                println!(
+                    "uploaded {}, unchanged {} (already archived, skipped)",
+                    report.uploaded, report.unchanged
+                );
             }
             Ok(ExitCode::Ok)
         }

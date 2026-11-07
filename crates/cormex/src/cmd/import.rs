@@ -33,7 +33,7 @@
 
 use anyhow::{Context as _, Result};
 use cormex_proto::capture::{FileRole, Framing, RegisterFileRequest};
-use cormex_transcript::export::{ExportPlatform, split_export};
+use cormex_transcript::export::ExportPlatform;
 
 use crate::client::ApiClient;
 use crate::sync::api::CaptureApi;
@@ -43,7 +43,10 @@ use crate::sync::api::HttpCaptureApi;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {
     pub conversations: usize,
+    /// Written: new conversations, and changed ones as a new generation.
     pub uploaded: usize,
+    /// Byte-for-byte what the archive already had: skipped.
+    pub unchanged: usize,
     pub bytes: u64,
     pub platform: &'static str,
 }
@@ -58,18 +61,19 @@ pub async fn run(
     platform: Option<ExportPlatform>,
     dry_run: bool,
 ) -> Result<ImportReport> {
-    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let conversations = split_export(&bytes, platform)
-        .with_context(|| format!("{} is not a ChatGPT or Claude export", path.display()))?;
+    let raw = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let json = cormex_import::export_json(&raw)
+        .with_context(|| format!("cannot read an export out of {}", path.display()))?;
+    let (detected, conversations) =
+        cormex_transcript::export::split_export_detected(&json, platform).with_context(|| {
+            format!(
+                "{} is not a ChatGPT, Claude, Grok or Gemini export",
+                path.display()
+            )
+        })?;
     if conversations.is_empty() {
         anyhow::bail!("{} holds no conversations", path.display());
     }
-
-    let platform_name = match platform {
-        Some(p) => p.agent(),
-        // `split_export` sniffs when not told; the report says which it was
-        None => conversations.first().map(|_| "auto").unwrap_or("auto"),
-    };
 
     let total_bytes: u64 = conversations
         .iter()
@@ -79,8 +83,12 @@ pub async fn run(
     let mut report = ImportReport {
         conversations: conversations.len(),
         bytes: total_bytes,
-        platform: platform_name,
+        // The **detected** platform: this used to fall back to ChatGPT when
+        // `--platform` was not given, so a Claude export was archived under
+        // `chatgpt_export` and then failed to parse
+        platform: detected.agent(),
         uploaded: 0,
+        unchanged: 0,
     };
     if dry_run {
         return Ok(report);
@@ -88,19 +96,14 @@ pub async fn run(
 
     let api = HttpCaptureApi::new(client);
     for conversation in &conversations {
-        let sha = {
-            use sha2::Digest as _;
-            format!("{:x}", sha2::Sha256::digest(&conversation.bytes))
-        };
+        let sha = crate::sync::reader::sha256_hex(&conversation.bytes);
+        let len = i64::try_from(conversation.bytes.len()).unwrap_or(i64::MAX);
 
         // **One logical file per conversation**, `snapshot`: an export is
         // written once and never appended to
         let registered = api
             .register(&RegisterFileRequest {
-                agent: platform
-                    .unwrap_or(ExportPlatform::ChatGpt)
-                    .agent()
-                    .to_owned(),
+                agent: detected.agent().to_owned(),
                 native_session_id: conversation.session_id.clone(),
                 parent_native_session_id: None,
                 logical_path: format!("conversations/{}.json", conversation.session_id),
@@ -112,13 +115,45 @@ pub async fn run(
             .await
             .with_context(|| format!("registering {} failed", conversation.session_id))?;
 
-        // A re-run lands on the same generation; the server answers
-        // `already_present` for bytes it already has, which is why this is safe
-        // to repeat
+        // **A snapshot is replaced, never extended.** This used to upload at
+        // the generation's end, so a conversation that had changed since the
+        // last import was appended to the old one -- two JSON documents in one
+        // file, which no parser reads -- and an unchanged one could be appended
+        // as a second copy. Same bytes: skip. Anything else: a new generation,
+        // the old one kept
+        let mut generation = registered.generation.id.clone();
+        if registered.generation.end_offset > 0 {
+            let reader = crate::sync::reader::LogicalReader::from_bytes(conversation.bytes.clone());
+            let same = matches!(
+                crate::sync::reconcile::compare(
+                    &api,
+                    &reader,
+                    &generation,
+                    registered.generation.end_offset
+                )
+                .await?,
+                crate::sync::reconcile::Verdict::Extends { end } if end == len
+            );
+            if same {
+                report.unchanged += 1;
+                continue;
+            }
+            generation = api
+                .open_generation(&registered.file_id, "snapshot")
+                .await
+                .with_context(|| {
+                    format!(
+                        "opening a new version of {} failed",
+                        conversation.session_id
+                    )
+                })?
+                .id;
+        }
+
         let outcome = api
             .put_chunk(
-                &registered.generation.id,
-                registered.generation.end_offset,
+                &generation,
+                0,
                 conversation.bytes.clone(),
                 &sha,
                 &chrono::Utc::now().to_rfc3339(),
@@ -127,10 +162,9 @@ pub async fn run(
             .with_context(|| format!("uploading {} failed", conversation.session_id))?;
         match outcome {
             crate::sync::api::PutOutcome::Accepted(_) => report.uploaded += 1,
-            // The server's generation ends somewhere else, which for a snapshot
-            // source means the file was rewritten between the register and the
-            // upload. Reported rather than retried: a retry loop here would be
-            // a loop on a race that the next run resolves anyway
+            // The generation filled up between the register and the upload:
+            // another import of the same file ran at the same time. Reported
+            // rather than retried; the next run settles it
             crate::sync::api::PutOutcome::OffsetMismatch { expected } => {
                 anyhow::bail!(
                     "{} moved while it was being uploaded (the server expects offset {expected}); \
@@ -196,7 +230,7 @@ mod tests {
             .await
             .expect_err("a non-export must fail");
         assert!(
-            format!("{err:#}").contains("not a ChatGPT or Claude export"),
+            format!("{err:#}").contains("not a ChatGPT, Claude, Grok or Gemini export"),
             "{err:#}"
         );
     }

@@ -72,7 +72,7 @@ fn spool_dir() -> PathBuf {
 /// and it gets joined into a path. Only the ULID alphabet is accepted, so `..`,
 /// `/` and `\` cannot get through — the consequence of path traversal here is
 /// "parse any file at all on the server".
-fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
+pub(crate) fn path_of(handle: &str) -> Result<PathBuf, ApiError> {
     let ok = handle.len() == 26
         && handle
             .bytes()

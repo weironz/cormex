@@ -179,6 +179,12 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("claude_export", FileRole::Transcript) => Some(Box::new(
             crate::export::ExportParser::new(crate::export::ExportPlatform::Claude),
         )),
+        ("grok_export", FileRole::Transcript) => Some(Box::new(crate::export::ExportParser::new(
+            crate::export::ExportPlatform::Grok,
+        ))),
+        ("gemini_takeout", FileRole::Transcript) => Some(Box::new(
+            crate::export::ExportParser::new(crate::export::ExportPlatform::Gemini),
+        )),
         _ => None,
     }
 }

@@ -1086,6 +1086,7 @@ dependencies = [
  "chrono",
  "clap",
  "cormex-core",
+ "cormex-import",
  "cormex-proto",
  "cormex-transcript",
  "directories",
@@ -1181,10 +1182,12 @@ dependencies = [
  "chrono",
  "cormex-core",
  "cormex-proto",
+ "flate2",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]

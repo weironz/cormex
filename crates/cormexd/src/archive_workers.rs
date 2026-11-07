@@ -1471,12 +1471,9 @@ fn restore_parser(
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
             ))
         }
-        ("chatgpt_export" | "claude_export", W::Transcript) => {
-            let platform = if agent == "chatgpt_export" {
-                cormex_transcript::export::ExportPlatform::ChatGpt
-            } else {
-                cormex_transcript::export::ExportPlatform::Claude
-            };
+        ("chatgpt_export" | "claude_export" | "grok_export" | "gemini_takeout", W::Transcript) => {
+            let platform = cormex_transcript::export::ExportPlatform::from_agent(agent)
+                .ok_or_else(|| anyhow::anyhow!("no export platform for {agent}"))?;
             Ok(Box::new(
                 cormex_transcript::export::ExportParser::restore(platform, state)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,

@@ -17,6 +17,7 @@
 
 pub mod accounts;
 pub mod archive_api;
+pub mod archive_import;
 pub mod archive_workers;
 pub mod auth;
 pub mod backfill;

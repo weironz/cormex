@@ -18,3 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
+# Exports arrive as the zip the vendor mailed; reading it here means the CLI and
+# the server unpack them the same way. Deflate only, like the CLI's own use.
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# Selects flate2's default (pure Rust) backend, as the CLI does; `zip` alone leaves it unset
+flate2 = "1"

@@ -722,14 +722,73 @@ pub async fn put_chunk(
         ));
     }
 
+    let outcome = store_chunk(
+        &st,
+        &tenant,
+        store,
+        &file,
+        &generation_id,
+        offset,
+        &logical,
+        &actual,
+        observed_at,
+    )
+    .await?;
+
+    match outcome {
+        AppendOutcome::Appended { end_offset } => Ok(axum::Json(ChunkAck {
+            end_offset,
+            already_present: false,
+        })
+        .into_response()),
+        AppendOutcome::AlreadyPresent { end_offset } => Ok(axum::Json(ChunkAck {
+            end_offset,
+            already_present: true,
+        })
+        .into_response()),
+        AppendOutcome::OffsetMismatch { expected } => Ok((
+            StatusCode::CONFLICT,
+            axum::Json(OffsetMismatchBody::new(expected)),
+        )
+            .into_response()),
+    }
+}
+
+/// Store one chunk of logical bytes in a generation: the object (compressed,
+/// and sealed under the file's data key when the deployment has a master
+/// key), then the row, with the continuity check `append_chunk` makes.
+///
+/// The one write path for the R layer. `PUT /capture/…/chunks` reaches it
+/// after authenticating a device, and the archive import reaches it from inside
+/// the server; a second copy of the encryption branch would be a second place
+/// to forget it.
+///
+/// `logical` must already be validated against `sha256`; the caller has
+/// checked that it may write to `generation_id`.
+///
+/// # Errors
+/// The object or the row could not be written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_chunk(
+    st: &AppState,
+    tenant: &crate::request_tenant::Tenant,
+    store: &cormex_store::Store,
+    file: &cormex_store::CaptureFile,
+    generation_id: &str,
+    offset: i64,
+    logical: &[u8],
+    sha256: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<AppendOutcome, ApiError> {
+    let actual = sha256.to_owned();
     // ── ② the object, before the row ──
     //
     // Stored zstd-compressed whatever the client sent: the R layer is written
     // once and read many times (projector, masker, restore), and JSONL
     // compresses about 3.5×. The key names the *logical* hash, so the same
     // content from a plaintext client and a zstd client lands on one object.
-    let prefix = tenant_prefix(&tenant)?;
-    let compressed = zstd::encode_all(logical.as_slice(), 3)
+    let prefix = tenant_prefix(tenant)?;
+    let compressed = zstd::encode_all(logical, 3)
         .map_err(|e| ApiError::internal(format!("could not compress the chunk: {e}")))?;
 
     // ── encryption, when this deployment has a master key (P6-1) ──
@@ -789,7 +848,7 @@ pub async fn put_chunk(
         .map_err(|e| ApiError::internal(format!("could not store the chunk: {e}")))?;
 
     // ── ③ the row ──
-    let outcome = store
+    store
         .archive_txn(async |t| {
             t.append_chunk(&NewCaptureChunk {
                 id: Id::new(),
@@ -808,25 +867,7 @@ pub async fn put_chunk(
             .await
         })
         .await
-        .map_err(store_err)?;
-
-    match outcome {
-        AppendOutcome::Appended { end_offset } => Ok(axum::Json(ChunkAck {
-            end_offset,
-            already_present: false,
-        })
-        .into_response()),
-        AppendOutcome::AlreadyPresent { end_offset } => Ok(axum::Json(ChunkAck {
-            end_offset,
-            already_present: true,
-        })
-        .into_response()),
-        AppendOutcome::OffsetMismatch { expected } => Ok((
-            StatusCode::CONFLICT,
-            axum::Json(OffsetMismatchBody::new(expected)),
-        )
-            .into_response()),
-    }
+        .map_err(store_err)
 }
 
 /// `POST /capture/files/{id}/events` — record one lifecycle observation.

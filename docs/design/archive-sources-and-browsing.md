@@ -1,6 +1,6 @@
 # 聊天档案：来源、导入与浏览 —— 最终方案
 
-> 状态：**已决策，待实施**（2026-11-07）。本文汇总 2026-11-07 前后几轮讨论里的问题，每一条都给出结论和理由。
+> 状态：**第 1 阶段已实施**（2026-11-07）：来源两维度与 `/archive/sources`、只列有数据的来源、聊天导入入口（ChatGPT / Claude / Grok / Gemini，网页与 CLI）、pi / omp / DeepSeek Harness / Grok Build / Hermes 五个新来源。多目录采集与 Codex 元数据自动同步仍待做。原决策如下。本文汇总 2026-11-07 前后几轮讨论里的问题，每一条都给出结论和理由。
 > 写入规则、幂等等既有约束见 [session-archive-architecture.md](session-archive-architecture.md)
 > 与 [capture-idempotency.md](capture-idempotency.md)，本文不重复。
 

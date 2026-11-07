@@ -53,6 +53,44 @@ class ArchiveSource {
   );
 }
 
+/// 一次导入的结果（`/archive/import/preview` 与 `/run`）。
+///
+/// `newCount + changed + unchanged == conversations`。同一份文件导第二次，
+/// 全部是 unchanged，什么都不写。
+class ArchiveImportSummary {
+  const ArchiveImportSummary({
+    required this.agent,
+    required this.source,
+    required this.conversations,
+    required this.newCount,
+    required this.changed,
+    required this.unchanged,
+    required this.written,
+  });
+
+  final String agent;
+  final String source;
+  final int conversations;
+  final int newCount;
+  final int changed;
+  final int unchanged;
+  final bool written;
+
+  /// 这次（会）写入的对话数。
+  int get toWrite => newCount + changed;
+
+  factory ArchiveImportSummary.fromJson(Map<String, dynamic> json) =>
+      ArchiveImportSummary(
+        agent: asString(json['agent']),
+        source: asString(json['source'], asString(json['agent'])),
+        conversations: asInt(json['conversations']),
+        newCount: asInt(json['new']),
+        changed: asInt(json['changed']),
+        unchanged: asInt(json['unchanged']),
+        written: json['written'] == true,
+      );
+}
+
 /// 档案里的一段会话。
 ///
 /// 与服务端 `cormex_proto::archive::ArchiveSessionDto` 一一对应。
