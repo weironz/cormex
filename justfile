@@ -141,28 +141,27 @@ app-check:
 
 # ── Build and publish are independent choices ────────────
 # Parameters are positional, never pasted into shell source. See docs/release.md.
+#
+# Local CLI targets are x86_64 only: linux-musl, plus windows-msvc on Linux (cross-compiled
+# with cargo-xwin) and apple-darwin on macOS. CORMEX_CLI_TARGETS is the opt-in for the
+# aarch64 and second Apple targets; the Apple ones need a macOS host with the SDK.
 
 # Build locally, then upload an immutable draft candidate (no registry credentials).
-# Default CLI targets are x86_64 only: linux-musl plus windows-msvc (cross-compiled with
-# cargo-xwin). Set CORMEX_CLI_TARGETS to a comma-separated list to include the aarch64 or
-# Apple targets; the Apple ones only build on a macOS host with the SDK.
 build-local tag:
     #!/usr/bin/env bash
     set -euo pipefail
     just _build "$1"
     just _stage "$1"
 
-# Windows CLI for the local candidate. Builds with cargo-xwin (CRT and Windows SDK come
-# from Microsoft's CDN on the first run) and packs the .zip; a binary cannot be executed
-# on Linux, so no version smoke test runs for it.
+# Windows CLI (x86_64 MSVC), cross-compiled here and not smoke-tested.
 build-cli-windows tag:
     python3 scripts/release.py build-cli "$1" x86_64-pc-windows-msvc
 
-# Windows on ARM. Off by default; same cross-compile path as above.
+# Windows on ARM; off by default, same cross-compile path.
 build-cli-windows-arm64 tag:
     python3 scripts/release.py build-cli "$1" aarch64-pc-windows-msvc
 
-# Any other single target. musl needs cargo-zigbuild, everything else the platform's SDK.
+# One CLI target by name; musl uses cargo-zigbuild, the rest the platform SDK.
 build-cli target tag:
     python3 scripts/release.py build-cli "$1" "$2"
 
