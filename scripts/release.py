@@ -156,6 +156,20 @@ def ensure_new(path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def cli_builder(target):
+    """Cargo subcommand that produces `target` without a native toolchain on this host.
+
+    musl goes through cargo-zigbuild; the MSVC targets go through cargo-xwin, which
+    downloads the CRT and Windows SDK from Microsoft's CDN. Every other target links
+    against the platform's own SDK, so it is only buildable on that platform.
+    """
+    if target.endswith("-unknown-linux-musl"):
+        return ["zigbuild"], "cargo-zigbuild"
+    if target.endswith("-pc-windows-msvc"):
+        return ["xwin", "build"], "cargo-xwin"
+    return ["build"], None
+
+
 def build_cli(tag, target):
     require(target in TARGETS, "unsupported CLI target")
     context = source_context(tag)
@@ -165,8 +179,11 @@ def build_cli(tag, target):
     sidecar = directory / f"{target}.cli.json"
     ensure_new(path)
     ensure_new(sidecar)
+    subcommand, tool = cli_builder(target)
+    require(tool is None or shutil.which(tool) is not None,
+            f"{target} needs {tool}; install it (cargo install {tool}) before building this target")
     run("rustup", "target", "add", target)
-    run("cargo", "zigbuild" if target.endswith("musl") else "build",
+    run("cargo", *subcommand,
         "--release", "--locked", "-p", "cormex", "--target", target,
         "--target-dir", ROOT / "target")
     binary = ROOT / "target" / target / "release" / ("cormex.exe" if "windows" in target else "cormex")
@@ -190,16 +207,40 @@ def build_cli(tag, target):
     write_json(sidecar, {**context, "cli": entry})
 
 
+DEFAULT_LOCAL_TARGETS = {
+    "linux": ["x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"],
+    "darwin": ["x86_64-unknown-linux-musl", "x86_64-apple-darwin"],
+    "win32": ["x86_64-pc-windows-msvc"],
+}
+
+
+def local_targets():
+    """CLI targets a local candidate builds; `CORMEX_CLI_TARGETS` replaces the default.
+
+    The default is the x86_64 set this host can actually produce: musl and MSVC cross
+    compile from Linux, macOS builds its own. The aarch64 targets and the second Apple
+    target are off by default -- they need a native runner or an SDK this host does not
+    have -- and `CORMEX_CLI_TARGETS` is the opt-in, so enabling them never means editing
+    this file. Anything named here is built and packed, and the rest are recorded as
+    missing in the manifest.
+    """
+    override = os.environ.get("CORMEX_CLI_TARGETS", "")
+    if override.strip():
+        targets = [target.strip() for target in override.split(",") if target.strip()]
+        for target in targets:
+            require(target in TARGETS, f"unsupported CLI target in CORMEX_CLI_TARGETS: {target}")
+        require(len(set(targets)) == len(targets), "CORMEX_CLI_TARGETS names a target twice")
+        return targets
+    return list(DEFAULT_LOCAL_TARGETS[sys.platform])
+
+
 def build_cli_local(tag):
-    host = sys.platform
-    targets = list(TARGETS[:2])
-    if host == "darwin":
-        targets += list(TARGETS[2:4])
-    elif host == "win32":
-        targets += list(TARGETS[4:])
+    targets = local_targets()
     for target in targets:
         build_cli(tag, target)
-    print("WARNING: missing CLI targets: " + ", ".join(sorted(set(TARGETS) - set(targets))))
+    missing = sorted(set(TARGETS) - set(targets))
+    if missing:
+        print("WARNING: missing CLI targets: " + ", ".join(missing))
 
 
 def image_info(reference):

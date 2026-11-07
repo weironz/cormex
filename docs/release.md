@@ -41,7 +41,12 @@ just build-local vX.Y.Z
 - `gh` 已对目标仓库登录。构建上传 draft 需要 contents write，但不需要 registry 凭据。
 - Flutter 3.44.1，与 Dockerfile.web 一致。
 - pgvector/Postgres 17 开发数据库、sqlx-cli 0.9.0、Postgres 17 客户端；设置开发 DATABASE_URL。
-- Linux musl CLI 需要 cargo-zigbuild、ziglang 以及相应 rustup targets；macOS 目标需要 Apple SDK，Windows 目标需要 MSVC/Windows SDK。
+- Linux musl CLI 需要 cargo-zigbuild、ziglang 以及相应 rustup targets。
+- Windows MSVC CLI 在 Linux 上用 cargo-xwin（`cargo install cargo-xwin`）：还需要 `clang-cl`
+  与 `llvm-lib`（clang/llvm 包），首次构建会从微软 CDN 下载 CRT 与 Windows SDK 到
+  `~/.cache/cargo-xwin`。目标三元组仍是 `*-pc-windows-msvc`，与 Actions 一致。
+- macOS 目标需要 Apple SDK，只能在 macOS 宿主上构建（zig 只带 libc stub，不带
+  `Security` / `CoreFoundation` framework，Linux 上交叉构建会在链接期失败）。
 
 `just ci-full` = `just ci` + 数据库测试 + Flutter。`just ci` 包含 fmt、clippy、rustdoc
 断链检查、workspace 单测、capture 非空测试门、两套 eval validate、Python pipeline 单测。
@@ -71,6 +76,20 @@ manifest 与校验表，禁止矩阵任务各自覆盖同一个 Release。六个
 
 本地保留部分 CLI 目标的能力，缺失清单写入 manifest 并警告；两个镜像缺一不可。
 若需要完整六平台版本，选择 Actions 构建。不能把不同提交的 sidecar 混成一个候选。
+
+本地构建的默认目标只有 x86_64：`x86_64-unknown-linux-musl` 与
+`x86_64-pc-windows-msvc`（Linux 宿主交叉编译；macOS 宿主产出
+`x86_64-apple-darwin`）。aarch64 与第二个 Apple 目标默认**不**构建，
+`CORMEX_CLI_TARGETS` 是启用入口，不写在脚本里改：
+
+```bash
+CORMEX_CLI_TARGETS=aarch64-unknown-linux-musl,aarch64-pc-windows-msvc just build-local vX.Y.Z
+```
+
+单个目标可以单独补进当前候选，例如 `just build-cli-windows vX.Y.Z`、
+`just build-cli-windows-arm64 vX.Y.Z`、`just build-cli vX.Y.Z <target>`。
+Windows 二进制在 Linux 上不能执行，因此只完成编译、打包与 `file` 校验，
+**没有版本烟测**；manifest 里也只有目标清单，别把「编出来了」写成「验证过」。
 
 记录构建输出中的 `BUNDLE_SHA256`，它是 **SHA256SUMS 文件的 SHA-256**，不是
 manifest 哈希、镜像 digest 或 tag。Actions 的聚合步骤把它写入 run summary。

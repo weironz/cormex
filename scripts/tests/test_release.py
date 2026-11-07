@@ -534,5 +534,38 @@ class ReleaseInputTests(unittest.TestCase):
                 release.validate_checksum(checksum)
 
 
+class LocalBuildTargetTests(unittest.TestCase):
+    def test_builder_per_target(self):
+        self.assertEqual(release.cli_builder("x86_64-unknown-linux-musl"), (["zigbuild"], "cargo-zigbuild"))
+        self.assertEqual(release.cli_builder("aarch64-pc-windows-msvc"), (["xwin", "build"], "cargo-xwin"))
+        self.assertEqual(release.cli_builder("x86_64-apple-darwin"), (["build"], None))
+
+    def test_default_local_targets_stay_x86_64(self):
+        for platform, expected in release.DEFAULT_LOCAL_TARGETS.items():
+            with self.subTest(platform=platform), \
+                    mock.patch.object(release.sys, "platform", platform), \
+                    mock.patch.dict(release.os.environ, {"CORMEX_CLI_TARGETS": ""}):
+                targets = release.local_targets()
+                self.assertEqual(targets, expected)
+                self.assertFalse([t for t in targets if t.startswith("aarch64")],
+                                 "arm targets must stay off until CORMEX_CLI_TARGETS enables them")
+        self.assertEqual(release.DEFAULT_LOCAL_TARGETS["linux"],
+                         ["x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"],
+                         "a Linux local build must produce the Windows x86_64 CLI")
+
+    def test_env_override_enables_the_other_targets(self):
+        wanted = "aarch64-unknown-linux-musl, x86_64-apple-darwin"
+        with mock.patch.dict(release.os.environ, {"CORMEX_CLI_TARGETS": wanted}):
+            self.assertEqual(release.local_targets(),
+                             ["aarch64-unknown-linux-musl", "x86_64-apple-darwin"])
+
+    def test_env_override_rejects_unknown_and_duplicate_targets(self):
+        for value in ("aarch64-unknown-linux", "x86_64-unknown-linux-musl,x86_64-unknown-linux-musl"):
+            with self.subTest(value=value), \
+                    mock.patch.dict(release.os.environ, {"CORMEX_CLI_TARGETS": value}):
+                with self.assertRaises(release.ReleaseError):
+                    release.local_targets()
+
+
 if __name__ == "__main__":
     unittest.main()
