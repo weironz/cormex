@@ -47,6 +47,21 @@ impl Store {
             .bind(agent).bind(query).fetch_all(self.pool()).await?)
     }
 
+    /// How many sessions each agent has, counting only sessions that have at
+    /// least one projected event (the same rule the session list uses, so the
+    /// counts match what a click on the source shows).
+    pub async fn archive_source_counts(&self) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT s.agent, count(*)
+               FROM capture_sessions s
+              WHERE EXISTS (SELECT 1 FROM transcript_events e WHERE e.session_id = s.id)
+              GROUP BY s.agent
+              ORDER BY s.agent",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     pub async fn message_counts_pending(
         &self,
         versions: &serde_json::Value,

@@ -24,7 +24,16 @@ ProviderContainer apiContainer(
 ) => ProviderContainer(
   overrides: [
     apiProvider.overrideWithValue(
-      CormexApi(baseUrl: 'http://localhost', client: MockClient(f)),
+      CormexApi(
+        baseUrl: 'http://localhost',
+        // The source list is its own endpoint; answering it here keeps each
+        // test's handler about the requests it is testing
+        client: MockClient(
+          (r) => r.url.path.endsWith('/archive/sources')
+              ? Future.value(http.Response('{"sources":[]}', 200))
+              : f(r),
+        ),
+      ),
     ),
   ],
 );
@@ -184,5 +193,59 @@ void main() {
     expect(find.text('项目'), findsOneWidget);
     expect(find.text('选择聊天'), findsNothing);
     expect(tester.takeException(), isNull);
+  });
+  testWidgets('the source filter lists only sources with chats, by maker', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final c = ProviderContainer(
+      overrides: [
+        apiProvider.overrideWithValue(
+          CormexApi(
+            baseUrl: 'http://localhost',
+            client: MockClient((r) async {
+              if (r.url.path.endsWith('/archive/sources')) {
+                return response({
+                  'sources': [
+                    {
+                      'agent': 'claude_code',
+                      'name': 'Claude Code',
+                      'provider': 'Anthropic',
+                      'kind': 'code',
+                      'chat_count': 12,
+                    },
+                    {
+                      'agent': 'chatgpt_export',
+                      'name': 'ChatGPT',
+                      'provider': 'OpenAI',
+                      'kind': 'chat',
+                      'chat_count': 3,
+                    },
+                  ],
+                });
+              }
+              return response({'projects': []});
+            }),
+          ),
+        ),
+      ],
+    );
+    addTearDown(c.dispose);
+    await tester.pumpWidget(wrap(c));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('全部来源'));
+    await tester.pumpAndSettle();
+    expect(find.text('Anthropic'), findsOneWidget);
+    expect(find.text('OpenAI'), findsOneWidget);
+    expect(find.text('编程 · 12'), findsOneWidget);
+    expect(find.text('聊天 · 3'), findsOneWidget);
+    expect(
+      find.text('Gemini CLI'),
+      findsNothing,
+      reason: 'a source with no chats is noise in the filter',
+    );
   });
 }

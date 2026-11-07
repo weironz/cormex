@@ -38,6 +38,8 @@ fn catalog(home: &std::path::Path) -> Catalog {
         agents: vec![AgentEntry {
             id: "claude_code".into(),
             name: "Claude Code".into(),
+            provider: None,
+            kind: None,
             home: vec![HomeRoot::Path {
                 path: home.display().to_string(),
             }],

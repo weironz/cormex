@@ -21,6 +21,8 @@ fn catalog(home: &std::path::Path) -> cormex_proto::catalog::Catalog {
         agents: vec![AgentEntry {
             id: "claude_code".into(),
             name: "Claude Code".into(),
+            provider: None,
+            kind: None,
             home: vec![HomeRoot::Path {
                 path: home.display().to_string(),
             }],
@@ -126,6 +128,7 @@ fn catalog_with_parent_cwd(home: &std::path::Path) -> cormex_proto::catalog::Cat
     catalog.agents[0].sources[0].cwd = Some(cormex_proto::catalog::CwdRule {
         from: "parent_dir".into(),
         decode: None,
+        index: None,
     });
     catalog
 }

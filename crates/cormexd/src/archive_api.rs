@@ -63,7 +63,7 @@ fn archive_details_use_each_agents_parser_version() {
         Some("claude_code@1")
     );
     assert_eq!(parser_version_for_agent("codex"), Some("codex@1"));
-    assert_eq!(parser_version_for_agent("opencode"), Some("opencode@1"));
+    assert_eq!(parser_version_for_agent("opencode"), Some("opencode@2"));
     assert_eq!(parser_version_for_agent("unrecognized"), None);
 }
 
@@ -709,6 +709,45 @@ pub async fn list_projects(
                 chat_count: r.chat_count,
             })
             .collect(),
+    }))
+}
+
+/// `GET /archive/sources` — the sources that have sessions, with their maker
+/// and kind, for the archive's source filter.
+///
+/// # Errors
+/// The caller may not read sessions, or the query failed.
+pub async fn list_sources(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+) -> Result<Json<cormex_proto::archive::ArchiveSourcesResponse>, ApiError> {
+    let store = archive_store(&st, &principal).await?;
+    let counts = store.archive_source_counts().await.map_err(store_err)?;
+    let catalog = crate::capture::effective_catalog(&st)?;
+    let mut sources: Vec<cormex_proto::archive::ArchiveSourceDto> = counts
+        .into_iter()
+        .map(|(agent, chat_count)| {
+            let entry = catalog.agents.iter().find(|a| a.id == agent);
+            cormex_proto::archive::ArchiveSourceDto {
+                name: entry.map_or_else(|| agent.clone(), |a| a.name.clone()),
+                provider: entry.and_then(|a| a.provider.clone()),
+                kind: entry.and_then(|a| a.kind),
+                agent,
+                chat_count,
+            }
+        })
+        .collect();
+    // Grouped by maker in the filter, so sorted that way; an agent the catalog
+    // no longer knows sorts last rather than first
+    sources.sort_by(|a, b| {
+        (a.provider.is_none(), &a.provider, &a.name).cmp(&(
+            b.provider.is_none(),
+            &b.provider,
+            &b.name,
+        ))
+    });
+    Ok(Json(cormex_proto::archive::ArchiveSourcesResponse {
+        sources,
     }))
 }
 
@@ -1696,6 +1735,50 @@ mod tests {
             "the indexer's exclusion check follows the same rule"
         );
         db.drop().await;
+    }
+
+    /// The source filter lists only sources with sessions, named and placed by
+    /// the catalog.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_source_list_has_only_sources_with_sessions() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let _ = seed(&st).await;
+        let user = st
+            .create_account("reader", "correct horse battery")
+            .await
+            .expect("create the account");
+        let token = st
+            .access_book()
+            .issue_for_test(&user, std::time::Duration::from_secs(600));
+        let app = crate::routes::router(st.clone());
+
+        let (status, body) = crate::test_support::call(
+            &app,
+            axum::http::Method::GET,
+            "/archive/sources",
+            Some(&token),
+            None,
+        )
+        .await;
+        db.drop().await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"sources": [{
+                "agent": "claude_code",
+                "name": "Claude Code",
+                "provider": "Anthropic",
+                "kind": "code",
+                "chat_count": 1,
+            }]}),
+            "one seeded Claude Code session, and none of the twenty other catalogued agents: an \
+             empty source is noise in the filter"
+        );
     }
 
     #[test]

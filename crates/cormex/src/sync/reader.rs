@@ -42,6 +42,15 @@ pub struct LogicalReader {
     /// For a plaintext file this is the file's size. For a compressed one it is
     /// the frame's declared content size, or a streaming count when omitted.
     len: u64,
+    /// For a compressed file: how many of its bytes are **complete** zstd
+    /// frames. Every read decodes only this prefix.
+    ///
+    /// A host that appends a frame per write (DeepSeek Harness) can be caught
+    /// mid-frame. Decoding that partial frame fails, and counting it would
+    /// report bytes that cannot be read yet; stopping at the last complete
+    /// frame reads the file as it was a moment earlier, and the next sync picks
+    /// up the rest.
+    frames_end: u64,
 }
 
 impl LogicalReader {
@@ -50,33 +59,35 @@ impl LogicalReader {
     /// # Errors
     /// The file cannot be opened or decompressed.
     pub fn open(path: &Path, compressed: bool) -> Result<Self> {
-        let len = if compressed {
-            // Streaming writers may omit content size. Count their decoded
-            // bytes without retaining the decompressed file in memory.
+        let (len, frames_end) = if compressed {
             let head = std::fs::read(path)
                 .with_context(|| format!("could not read {}", path.display()))?;
-            match zstd::zstd_safe::get_frame_content_size(&head).map_err(|e| {
-                anyhow::anyhow!("{} is not a readable zstd frame: {e}", path.display())
-            })? {
+            let (frames_end, declared) = complete_frames(&head);
+            let len = match declared {
                 Some(size) => size,
+                // A streaming writer may omit the content size. Count the
+                // decoded bytes of the complete frames without keeping them
                 None => {
-                    let file = std::fs::File::open(path)?;
-                    let mut decoder = zstd::Decoder::new(file)?;
+                    let complete = std::io::Cursor::new(&head[..frames_end]);
+                    let mut decoder = zstd::Decoder::new(complete)?;
                     std::io::copy(&mut decoder, &mut std::io::sink()).with_context(|| {
                         format!("could not count decoded bytes of {}", path.display())
                     })?
                 }
-            }
+            };
+            (len, u64::try_from(frames_end).unwrap_or(u64::MAX))
         } else {
-            std::fs::metadata(path)
+            let len = std::fs::metadata(path)
                 .with_context(|| format!("could not stat {}", path.display()))?
-                .len()
+                .len();
+            (len, 0)
         };
         Ok(Self {
             path: path.to_path_buf(),
             compressed,
             memory: None,
             len,
+            frames_end,
         })
     }
 
@@ -91,6 +102,7 @@ impl LogicalReader {
             compressed: false,
             memory: Some(bytes),
             len,
+            frames_end: 0,
         }
     }
 
@@ -143,9 +155,13 @@ impl LogicalReader {
         let mut sink = std::io::sink();
         std::io::copy(&mut (&mut decoder).take(offset), &mut sink)
             .context("could not skip to the offset")?;
-        let mut buf = vec![0u8; want];
-        let n = decoder.read(&mut buf).context("could not read")?;
-        buf.truncate(n);
+        // `read_to_end` rather than one `read`: a single read returns at a frame
+        // boundary, which for a file of appended frames is after the first line
+        let mut buf = Vec::with_capacity(want);
+        (&mut decoder)
+            .take(want as u64)
+            .read_to_end(&mut buf)
+            .context("could not read")?;
         Ok(buf)
     }
 
@@ -247,12 +263,43 @@ impl LogicalReader {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    fn decoder(&self) -> Result<zstd::Decoder<'static, std::io::BufReader<std::fs::File>>> {
+    fn decoder(
+        &self,
+    ) -> Result<zstd::Decoder<'static, std::io::BufReader<std::io::Take<std::fs::File>>>> {
         let file = std::fs::File::open(&self.path)
             .with_context(|| format!("could not open {}", self.path.display()))?;
-        zstd::Decoder::new(file)
+        zstd::Decoder::new(file.take(self.frames_end))
             .with_context(|| format!("{} is not a zstd frame", self.path.display()))
     }
+}
+
+/// The length of the complete zstd frames at the start of `bytes`, and the sum
+/// of their declared content sizes when **every** one declares it.
+///
+/// The old reader asked only the first frame for its size, which is the whole
+/// file for Codex's single-frame `.jsonl.zst` and a small fraction of it for a
+/// log that appends a frame per write: everything after the first frame was
+/// never captured.
+fn complete_frames(bytes: &[u8]) -> (usize, Option<u64>) {
+    let mut end = 0;
+    let mut declared = Some(0_u64);
+    while end < bytes.len() {
+        let Ok(size) = zstd::zstd_safe::find_frame_compressed_size(&bytes[end..]) else {
+            break;
+        };
+        if size == 0 || end + size > bytes.len() {
+            break;
+        }
+        declared = match (
+            declared,
+            zstd::zstd_safe::get_frame_content_size(&bytes[end..end + size]),
+        ) {
+            (Some(total), Ok(Some(n))) => Some(total + n),
+            _ => None,
+        };
+        end += size;
+    }
+    (end, declared)
 }
 
 /// Lowercase hex SHA-256.
@@ -264,6 +311,58 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log that appends one zstd frame per write (DeepSeek Harness) is read
+    /// whole, not just its first frame.
+    #[test]
+    fn a_file_of_appended_frames_is_read_to_the_end() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("session.v4.jsonl.zstd");
+        let lines = [
+            b"{\"seq\":0}\n".as_slice(),
+            b"{\"seq\":1}\n",
+            b"{\"seq\":2}\n",
+        ];
+        let mut file = Vec::new();
+        for line in lines {
+            file.extend(zstd::encode_all(line, 3).expect("compress"));
+        }
+        std::fs::write(&path, &file).expect("write");
+
+        let r = LogicalReader::open(&path, true).expect("open");
+        let whole: Vec<u8> = lines.concat();
+        assert_eq!(
+            r.len(),
+            whole.len() as u64,
+            "the logical length is every frame's content, not the first frame's"
+        );
+        assert_eq!(r.read_all().expect("read"), whole);
+        assert_eq!(
+            r.prefix_hash(r.len()).expect("hash"),
+            sha256_hex(&whole),
+            "the prefix hash the server verifies covers the same bytes"
+        );
+    }
+
+    /// A frame the host is still writing is left for the next sync.
+    #[test]
+    fn a_frame_cut_off_mid_write_is_not_counted_yet() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("session.v4.jsonl.zstd");
+        let done = zstd::encode_all(b"{\"seq\":0}\n".as_slice(), 3).expect("compress");
+        let partial = zstd::encode_all(b"{\"seq\":1}\n".as_slice(), 3).expect("compress");
+        let mut file = done.clone();
+        file.extend(&partial[..partial.len() / 2]);
+        std::fs::write(&path, &file).expect("write");
+
+        let r = LogicalReader::open(&path, true).expect("open");
+        assert_eq!(
+            r.read_all().expect("read"),
+            b"{\"seq\":0}\n",
+            "only the complete frame is readable; counting the partial one would report bytes \
+             that fail to decode, and the upload would stop with an error"
+        );
+    }
 
     #[test]
     fn a_plaintext_file_reads_ranges_and_hashes() {

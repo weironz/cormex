@@ -11,11 +11,13 @@
 # - `glob` 用 globset 语法；`**` 匹配任意深度
 
 schema = 1
-version = "2026-11-01"
+version = "2026-11-07"
 
 [[agents]]
 id = "claude_code"
 name = "Claude Code"
+provider = "Anthropic"
+kind = "code"
 home = [
   { env = "CLAUDE_CONFIG_DIR" },
   { path = "~/.claude" },
@@ -62,7 +64,9 @@ home = [
 
 [[agents]]
 id = "codex"
-name = "Codex CLI"
+name = "Codex"
+provider = "OpenAI"
+kind = "code"
 home = [
   { env = "CODEX_HOME" },
   { path = "~/.codex" },
@@ -92,6 +96,8 @@ home = [
 [[agents]]
 id = "gemini_cli"
 name = "Gemini CLI"
+provider = "Google"
+kind = "code"
 home = [
   { env = "GEMINI_CLI_HOME" },
   { path = "~/.gemini" },
@@ -131,6 +137,8 @@ home = [
 [[agents]]
 id = "cline"
 name = "Cline"
+provider = "Cline"
+kind = "code"
 # VS Code's global storage. The extension id is the directory name; Roo Code is a
 # fork with its own id and the same file layout, so it gets its own entry below
 home = [
@@ -158,6 +166,8 @@ home = [
 [[agents]]
 id = "roo_code"
 name = "Roo Code"
+provider = "Roo Code"
+kind = "code"
 home = [
   { env = "ROO_GLOBAL_STORAGE" },
   { path = "~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline" },
@@ -174,6 +184,8 @@ home = [
 [[agents]]
 id = "opencode"
 name = "OpenCode"
+provider = "OpenCode"
+kind = "code"
 home = [
   { env = "OPENCODE_DATA" },
   { path = "~/.local/share/opencode" },
@@ -211,6 +223,8 @@ home = [
 [[agents]]
 id = "goose"
 name = "Goose"
+provider = "Block"
+kind = "code"
 home = [
   { env = "GOOSE_DATA" },
   { path = "~/.local/share/goose/sessions" },
@@ -248,7 +262,9 @@ home = [
 # 没有 `home`，也没有 glob 会让 `discover` 找到它们 —— 它们是导入器的产物
 [[agents]]
 id = "chatgpt_export"
-name = "ChatGPT export"
+name = "ChatGPT"
+provider = "OpenAI"
+kind = "chat"
 import_only = true
 
   [[agents.source]]
@@ -259,7 +275,9 @@ import_only = true
 
 [[agents]]
 id = "claude_export"
-name = "Claude export"
+name = "Claude"
+provider = "Anthropic"
+kind = "chat"
 import_only = true
 
   [[agents.source]]
@@ -271,6 +289,8 @@ import_only = true
 [[agents]]
 id = "qwen_code"
 name = "Qwen Code"
+provider = "Alibaba"
+kind = "code"
 home = [
   { env = "QWEN_HOME" },
   { path = "~/.qwen" },
@@ -288,6 +308,8 @@ home = [
 [[agents]]
 id = "copilot_chat"
 name = "VS Code Copilot Chat"
+provider = "GitHub"
+kind = "code"
 # VS Code 的 workspaceStorage：每个工作区一个目录，里面是 chatSessions/
 home = [
   { env = "VSCODE_WORKSPACE_STORAGE" },
@@ -316,6 +338,8 @@ home = [
 [[agents]]
 id = "cursor"
 name = "Cursor"
+provider = "Cursor"
+kind = "code"
 home = [
   { env = "CURSOR_HOME" },
   { path = "~/.cursor" },
@@ -382,6 +406,8 @@ home = [
 [[agents]]
 id = "aider"
 name = "Aider"
+provider = "Aider"
+kind = "code"
 manual_only = true
 
 # Copilot CLI（P4-6）。`github/copilot-cli` 是**闭源**的，但它的原生二进制里
@@ -396,6 +422,8 @@ manual_only = true
 [[agents]]
 id = "copilot_cli"
 name = "GitHub Copilot CLI"
+provider = "GitHub"
+kind = "code"
 home = [
   { env = "COPILOT_HOME" },
   { path = "~/.copilot" },
@@ -407,3 +435,174 @@ home = [
   framing = "append"
   session_id = { from = "path_segment", index = 1 }
 
+
+# pi（`@earendil-works/pi-coding-agent`，原 `@mariozechner/pi-coding-agent`，MIT）。
+# 格式见上游 `packages/coding-agent/docs/session-format.md`，并用本机真实会话核对过：
+#   sessions/--<cwd 把 / \ : 换成 ->--/<ISO 时间>_<会话 id>.jsonl
+# 第一行 `{"type":"session","version":3,"id":…,"cwd":…}`，其后每行一个条目，
+# `id` / `parentId` 串成树（分支不另开文件）。append-only
+#
+# `PI_CODING_AGENT_DIR` 覆盖整个 agent 目录（会话在其下的 `sessions/`）。
+# `PI_CODING_AGENT_SESSION_DIR` 只改会话目录，**不支持**：它可以指向任何地方，
+# 而这里的 glob 是相对 home 的
+[[agents]]
+id = "pi"
+name = "pi"
+provider = "Earendil"
+kind = "code"
+home = [
+  { env = "PI_CODING_AGENT_DIR" },
+  { path = "~/.pi/agent" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "sessions/*/*.jsonl"
+  framing = "append"
+  # `--session-id` 可以给任意 id，所以不假设它是 UUID：取第一个 `_` 之后的全部
+  session_id = { from = "stem_regex", regex = "^[0-9T:.-]+Z_(?P<id>.+)$" }
+
+# omp（oh-my-pi，`@oh-my-pi/pi-coding-agent`）：pi 的分支，会话格式相同，多了
+# 首行 `title` 记录与 `custom` 条目（见解析器）。
+#
+# **不读 `PI_CODING_AGENT_DIR`**，虽然 omp 也认这个变量：pi 也读它，两边都读的话，
+# 设了这个变量的机器上同一批文件会以两个来源各采一遍，成了两份会话
+[[agents]]
+id = "omp"
+name = "omp"
+provider = "Oh My Pi"
+kind = "code"
+home = [
+  { path = "~/.omp/agent" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "sessions/*/*.jsonl"
+  framing = "append"
+  session_id = { from = "stem_regex", regex = "^[0-9T:.-]+Z_(?P<id>.+)$" }
+
+# DeepSeek Harness（`@deepseek-ai/dsh`，MIT，开发者预览）。上游
+# `packages/session/session-persistence-jsonl`：一个会话一个目录，日志是**一串追加的
+# zstd 帧**，解压后是 JSONL 事件流（`user/message`、`assistant/message`、
+# `tool/result`、…，见解析器）。文件名带格式版本：v4 时是 `session.v4.jsonl.zstd`。
+#
+# `also_compressed = ".zstd"`：磁盘上只有压缩形态，逻辑文件是解压后的字节，
+# 与 Codex 的 `.jsonl.zst` 同一套机制。逻辑字节只在末尾增长（追加的是新帧），所以
+# 仍是 append
+[[agents]]
+id = "deepseek_harness"
+name = "DeepSeek Harness"
+provider = "DeepSeek"
+kind = "code"
+home = [
+  { env = "DSH_HOME" },
+  { path = "~/.dsh" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "sessions/*/session-*/session.v*.jsonl"
+  framing = "append"
+  also_compressed = ".zstd"
+  session_id = { from = "path_segment", index = 2 }
+
+# Hermes Agent（Nous Research，`hermes-agent`，MIT）。上游
+# `website/docs/developer-guide/session-storage.md`：所有会话（CLI、TUI、消息网关）
+# 都在 `state.db`，`messages` 一行一条消息。旧版留下的 `sessions/*.jsonl`
+# 上游已不再读写，不采。
+#
+# 命名 profile 各有自己的 `profiles/<名字>/state.db`，**暂不采**：sqlite 来源的
+# glob 是一个固定路径
+[[agents]]
+id = "hermes"
+name = "Hermes Agent"
+provider = "Nous Research"
+kind = "code"
+home = [
+  { env = "HERMES_HOME" },
+  { path = "~/.hermes" },
+]
+
+  [[agents.source]]
+  role = "row"
+  glob = "state.db"
+  framing = "snapshot"
+  session_id = { from = "const", value = "hermes", per_device = true }
+  [agents.source.sqlite]
+  key_column = "id"
+  session_column = "session_id"
+  text_column = "row_json"
+  busy_timeout_ms = 5000
+  query = """
+    SELECT m.id AS id,
+           m.session_id AS session_id,
+           json_object(
+             'role', m.role,
+             'content', m.content,
+             'tool_calls', m.tool_calls,
+             'tool_name', m.tool_name,
+             'tool_call_id', m.tool_call_id,
+             'reasoning', coalesce(m.reasoning_content, m.reasoning),
+             'timestamp', m.timestamp,
+             'active', m.active,
+             'compacted', m.compacted,
+             'cwd', (SELECT s.cwd FROM sessions s WHERE s.id = m.session_id)
+           ) AS row_json
+      FROM messages m
+     ORDER BY m.session_id, m.timestamp, m.id
+  """
+
+# Grok Build（xAI，`grok`）。上游 `xai-org/grok-build` 的
+# `docs/user-guide/17-sessions.md`：
+#   sessions/<百分号编码的 cwd>/<会话 id>/updates.jsonl
+# `updates.jsonl` 是 ACP 会话更新流，上游称它为「权威的对话日志」；同目录的
+# `chat_history.jsonl` 是发给模型的消息，与它重复，不采。
+#
+# cwd 编码超过 255 字节时上游改用 slug + 哈希，此时解码出来不是绝对路径，
+# 规则返回 None，项目归类退回到别的线索
+[[agents]]
+id = "grok_build"
+name = "Grok Build"
+provider = "xAI"
+kind = "code"
+home = [
+  { env = "GROK_HOME" },
+  { path = "~/.grok" },
+]
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "sessions/*/*/updates.jsonl"
+  framing = "append"
+  session_id = { from = "path_segment", index = 2 }
+  cwd = { from = "path_segment", decode = "percent", index = 1 }
+
+# 聊天导出：Gemini（Google Takeout 的「我的活动 › Gemini Apps」）与 Grok
+# （accounts.x.ai/data 的 `prod-grok-backend.json`）。与 ChatGPT / Claude 导出一样，
+# 由导入器拆成每段对话一个文件再上传，这里只登记 id
+[[agents]]
+id = "gemini_takeout"
+name = "Gemini"
+provider = "Google"
+kind = "chat"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }
+
+[[agents]]
+id = "grok_export"
+name = "Grok"
+provider = "xAI"
+kind = "chat"
+import_only = true
+
+  [[agents.source]]
+  role = "transcript"
+  glob = "conversations/*.json"
+  framing = "snapshot"
+  session_id = { from = "stem" }

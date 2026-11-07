@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../api/api_exception.dart';
+import '../core/agents.dart';
 import '../models/archive_session.dart';
 import 'connection_controller.dart';
 
@@ -26,13 +27,25 @@ class SessionsState {
     this.error,
     this.agent,
     this.query = '',
+    this.sources = const [],
   });
   final List<ArchiveProject> projects;
+
+  /// 有会话的来源。取不到时为空 —— 筛选器只剩「全部来源」，列表照常可用。
+  final List<ArchiveSource> sources;
   final Map<String?, ProjectChats> groups;
   final bool loading;
   final String? error;
   final String? agent;
   final String query;
+
+  /// 来源的显示名：服务端给的名字，取不到时退回内置表。
+  String sourceName(String agent) {
+    for (final s in sources) {
+      if (s.agent == agent) return s.name;
+    }
+    return Agents.label(agent);
+  }
 }
 
 class SessionsController extends Notifier<SessionsState> {
@@ -42,23 +55,39 @@ class SessionsController extends Notifier<SessionsState> {
 
   Future<void> load({String? agent, String query = ''}) async {
     final generation = ++_generation;
-    state = SessionsState(loading: true, agent: agent, query: query.trim());
+    final keep = state.sources;
+    state = SessionsState(
+      loading: true,
+      agent: agent,
+      query: query.trim(),
+      sources: keep,
+    );
+    // 来源与项目并行取；来源失败不拖垮页面，只是筛选器少了选项
+    final sourcesFuture = ref
+        .read(apiProvider)
+        .archiveSources()
+        .then<List<ArchiveSource>?>((v) => v)
+        .catchError((Object _) => null);
     try {
       final projects = await ref
           .read(apiProvider)
           .archiveProjects(agent: agent, query: query.trim());
+      final sources = await sourcesFuture ?? keep;
       if (!ref.mounted || generation != _generation) return;
       state = SessionsState(
         projects: projects,
         agent: agent,
         query: query.trim(),
+        sources: sources,
       );
     } on CormexApiException catch (e) {
+      final sources = await sourcesFuture ?? keep;
       if (!ref.mounted || generation != _generation) return;
       state = SessionsState(
         agent: agent,
         query: query.trim(),
         error: e.message,
+        sources: sources,
       );
     }
   }
@@ -138,6 +167,7 @@ class SessionsController extends Notifier<SessionsState> {
       groups: {...state.groups, key: group},
       agent: state.agent,
       query: state.query,
+      sources: state.sources,
     );
   }
 }

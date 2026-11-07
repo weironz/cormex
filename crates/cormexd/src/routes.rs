@@ -163,6 +163,7 @@ protected_routes! {
     // unmasked bytes", and the two differ per call.
     "/archive/sessions" [GET] => get(crate::archive_api::list_sessions),
     "/archive/projects" [GET] => get(crate::archive_api::list_projects),
+    "/archive/sources" [GET] => get(crate::archive_api::list_sources),
     "/archive/sessions/{id}" [GET] => get(crate::archive_api::get_session),
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),

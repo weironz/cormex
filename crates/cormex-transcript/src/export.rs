@@ -76,8 +76,8 @@ impl ExportParser {
 impl Parser for ExportParser {
     fn version(&self) -> &'static str {
         match self.platform {
-            ExportPlatform::ChatGpt => "chatgpt_export@1",
-            ExportPlatform::Claude => "claude_export@1",
+            ExportPlatform::ChatGpt => "chatgpt_export@2",
+            ExportPlatform::Claude => "claude_export@2",
         }
     }
 

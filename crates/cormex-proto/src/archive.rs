@@ -76,6 +76,30 @@ pub struct ArchiveProjectsResponse {
     pub projects: Vec<ArchiveProjectDto>,
 }
 
+/// One source that has sessions in the archive, for the source filter.
+///
+/// Only sources with at least one session are listed: the filter used to offer
+/// every agent Cormex knows, most of them empty for any one person.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSourceDto {
+    /// The agent id (`claude_code`, `chatgpt_export`, …): what the `agent`
+    /// filter of `/archive/sessions` takes.
+    pub agent: String,
+    /// The display name from the catalog, or the id for an agent the catalog
+    /// no longer lists.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::catalog::SourceKind>,
+    pub chat_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSourcesResponse {
+    pub sources: Vec<ArchiveSourceDto>,
+}
+
 /// One file of a session, with its generations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveFileDto {

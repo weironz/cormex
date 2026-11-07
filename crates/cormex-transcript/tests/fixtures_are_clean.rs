@@ -19,7 +19,14 @@ use std::path::Path;
 fn fixture_files() -> Vec<std::path::PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut out = Vec::new();
-    for agent in ["claude_code", "codex"] {
+    for agent in [
+        "claude_code",
+        "codex",
+        "pi",
+        "omp",
+        "deepseek_harness",
+        "grok_build",
+    ] {
         let dir = root.join(agent);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;

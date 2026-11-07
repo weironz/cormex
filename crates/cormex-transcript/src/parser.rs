@@ -162,6 +162,15 @@ pub fn parser_for(agent: &str, role: cormex_proto::capture::FileRole) -> Option<
         ("aider", FileRole::Transcript) => Some(Box::new(crate::aider::AiderParser::new())),
         // Qwen Code (P4-6). Same family as Gemini CLI, different record shape
         ("qwen_code", FileRole::Transcript) => Some(Box::new(crate::qwen::QwenParser::new())),
+        // pi and its fork omp write the same session file
+        ("pi" | "omp", FileRole::Transcript) => Some(Box::new(crate::pi::PiParser::new())),
+        ("deepseek_harness", FileRole::Transcript) => Some(Box::new(crate::dsh::DshParser::new())),
+        ("grok_build", FileRole::Transcript) => {
+            Some(Box::new(crate::grok_build::GrokBuildParser::new()))
+        }
+        ("hermes", FileRole::Row) => Some(Box::new(crate::rows::RowParser::new(
+            crate::rows::RowFormat::Hermes,
+        ))),
         // Export files (P4-7). The client splits `conversations.json` into one
         // file per conversation before uploading, so one file is one session
         ("chatgpt_export", FileRole::Transcript) => Some(Box::new(

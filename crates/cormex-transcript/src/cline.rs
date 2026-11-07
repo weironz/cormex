@@ -262,7 +262,7 @@ fn flatten(v: Option<&Value>) -> String {
 
 impl Parser for ClineParser {
     fn version(&self) -> &'static str {
-        "cline@1"
+        "cline@2"
     }
 
     fn feed(&mut self, offset: u64, bytes: &[u8]) -> Result<Vec<ParsedEvent>, String> {

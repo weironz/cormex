@@ -176,7 +176,7 @@ impl Default for CursorParser {
 
 impl Parser for CursorParser {
     fn version(&self) -> &'static str {
-        "cursor@2"
+        "cursor@3"
     }
 
     fn feed(&mut self, offset: u64, bytes: &[u8]) -> Result<Vec<ParsedEvent>, String> {

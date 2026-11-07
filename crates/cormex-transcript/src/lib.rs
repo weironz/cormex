@@ -25,10 +25,13 @@ pub mod codex;
 pub mod copilot_chat;
 pub mod copilot_cli;
 pub mod cursor;
+pub mod dsh;
 pub mod export;
 pub mod gemini;
+pub mod grok_build;
 pub mod jsonl;
 pub mod parser;
+pub mod pi;
 pub mod qwen;
 pub mod rows;
 

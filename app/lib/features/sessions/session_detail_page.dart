@@ -8,6 +8,7 @@ import '../../models/archive_session.dart';
 import '../../models/transcript_event.dart';
 import '../../state/connection_controller.dart';
 import '../../state/reading_preferences.dart';
+import '../../state/sessions_controller.dart';
 import '../../widgets/empty_state.dart';
 import 'widgets/event_tile.dart';
 import 'widgets/archive_source_label.dart';
@@ -264,7 +265,12 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
                       (preparation.isNotEmpty ? 1 : 0) +
                       (_loadingMore ? 1 : 0),
                   itemBuilder: (context, index) {
-                    if (index == 0) return _SessionHeader(detail: detail);
+                    if (index == 0) {
+                      return _SessionHeader(
+                        detail: detail,
+                        label: ref.watch(sessionsControllerProvider).sourceName,
+                      );
+                    }
                     final i = index - 1;
                     if (preparation.isNotEmpty && i == 0) {
                       return Theme(
@@ -315,8 +321,9 @@ String _projectLabel(ArchiveSession s) {
 
 /// 正文顶上的标题区：这段聊天叫什么、来自哪、跨了多久、多长。
 class _SessionHeader extends StatelessWidget {
-  const _SessionHeader({required this.detail});
+  const _SessionHeader({required this.detail, required this.label});
   final ArchiveSessionDetail? detail;
+  final String Function(String) label;
 
   @override
   Widget build(BuildContext context) {
@@ -350,7 +357,7 @@ class _SessionHeader extends StatelessWidget {
               ),
               const SizedBox(width: 7),
               Text(
-                Agents.label(session.agent),
+                label(session.agent),
                 style: theme.textTheme.labelMedium?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                   fontWeight: FontWeight.w600,

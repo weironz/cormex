@@ -24,6 +24,35 @@ class ArchiveProject {
   );
 }
 
+/// 有会话的一个来源，给来源筛选用（`GET /archive/sources`）。
+///
+/// 名字、厂商、形态都来自服务端的采集目录，和 CLI 采集时用的是同一份。
+class ArchiveSource {
+  const ArchiveSource({
+    required this.agent,
+    required this.name,
+    this.provider,
+    this.kind,
+    required this.chatCount,
+  });
+
+  final String agent;
+  final String name;
+  final String? provider;
+
+  /// `chat` / `code`。
+  final String? kind;
+  final int chatCount;
+
+  factory ArchiveSource.fromJson(Map<String, dynamic> json) => ArchiveSource(
+    agent: asString(json['agent']),
+    name: asString(json['name'], asString(json['agent'])),
+    provider: asStringOrNull(json['provider']),
+    kind: asStringOrNull(json['kind']),
+    chatCount: asInt(json['chat_count']),
+  );
+}
+
 /// 档案里的一段会话。
 ///
 /// 与服务端 `cormex_proto::archive::ArchiveSessionDto` 一一对应。

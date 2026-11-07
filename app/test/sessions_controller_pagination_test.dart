@@ -18,7 +18,16 @@ ProviderContainer containerFor(
 ) => ProviderContainer(
   overrides: [
     apiProvider.overrideWithValue(
-      CormexApi(baseUrl: 'http://localhost', client: MockClient(handler)),
+      CormexApi(
+        baseUrl: 'http://localhost',
+        // The source list is its own endpoint; answering it here keeps each
+        // test's handler about the requests it is testing
+        client: MockClient(
+          (r) => r.url.path.endsWith('/archive/sources')
+              ? Future.value(http.Response('{"sources":[]}', 200))
+              : handler(r),
+        ),
+      ),
     ),
   ],
 );

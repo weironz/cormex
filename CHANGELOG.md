@@ -10,6 +10,22 @@
 - New migration `20261127000001_capture_generation_adoptions.sql` (table `capture_generation_adoptions`, view `capture_current_generations`). Append-only; `ON DELETE CASCADE` so purge is unaffected.
 - Not covered: conversations that were already duplicated before this change stay duplicated in the archive until a repair pass is run.
 
+### Capture: five more agents
+
+- New sources, each parser written against sessions the real CLI wrote (pi 1.5.0, omp 18.18.0, DeepSeek Harness 0.2.2-rc.1, Grok Build 1.0.77, Hermes Agent 0.19.0, run against a toy repository) and committed as fixtures:
+  - **pi** (`~/.pi/agent/sessions`) and its fork **omp** (`~/.omp/agent/sessions`), one parser for both. omp does not read `PI_CODING_AGENT_DIR`: pi does, and reading it in both would capture the same files twice under two agents.
+  - **DeepSeek Harness** (`~/.dsh/sessions/*/session-*/session.v*.jsonl.zstd`), an event log of appended zstd frames. Its runtime-context snapshot, also written as a `user/message`, is shown as system text, not as a second question.
+  - **Grok Build** (`~/.grok/sessions/<cwd>/<id>/updates.jsonl`), the ACP update stream; streamed chunks are merged into one message, and the project comes from the percent-encoded cwd in the path.
+  - **Hermes Agent** (`~/.hermes/state.db`, `messages` table), with the session's cwd carried into each row so it gets a project.
+- Every catalogued agent now has a `provider` and a `kind` (`chat` / `code`); the catalog test refuses one without them, and refuses a chat source that is not import-only.
+- `GET /archive/sources` lists the sources that have sessions, with name, maker, kind and count. The archive's source filter uses it: grouped by maker, with counts, and without the agents nobody on this server uses.
+- The client now reads every frame of a zstd file. It asked the first frame for its size, so a log that appends a frame per write was captured up to the end of its first frame. A frame still being written is left for the next sync.
+
+### Archive: events from one line were silently dropped
+
+- A projected event's id came from the offset of its line. When a line produced several events — thinking, text and a tool call in one assistant record, or one message per row of a whole-document export — they shared an id and the insert kept only the first. Measured on the fixtures: a Gemini CLI session lost 107 of 138 events; every imported ChatGPT or Claude conversation kept only its first message; Cursor lost the tool call after a text block. The second and later events of a line now get an ordinal in their seed; the first keeps exactly the old id, so nothing already projected changes identity.
+- To recover what was dropped, the affected parsers' versions are bumped (`gemini@2`, `cursor@3`, `cline@2`, `copilot_chat@2`, `chatgpt_export@2`, `claude_export@2`, `opencode@2`, `goose@2`). The projector builds a new projection for those sessions beside the old one; nothing is deleted. Expect a one-off round of projection work after deploying, and memory extraction may revisit those sessions. Claude Code, Codex, Copilot CLI, Qwen Code and Aider emit one event per line and are unchanged.
+
 ### Archive browser: expanding a project no longer scans the whole archive
 
 - `GET /archive/sessions?project=…` grouped every event of every session and only then kept the project's sessions, so each expansion cost a sequential scan of `transcript_events` that grew with the whole archive. The project / agent / unassigned scope is now resolved against `capture_sessions` first, and only the surviving sessions are aggregated, each through its own index range. On a 1.2 M-event fixture (3 000 sessions, 60 projects): expanding a project 300 ms → 14 ms; a searched expansion 1.7 s → 12 ms.

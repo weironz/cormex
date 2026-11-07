@@ -318,6 +318,15 @@ class CormexApi {
         .toList();
   }
 
+  /// `GET /archive/sources` —— 有会话的来源，带厂商与形态。
+  Future<List<ArchiveSource>> archiveSources() async {
+    final json = await _getJson('/archive/sources', const {});
+    return (json['sources'] as List<dynamic>? ?? [])
+        .whereType<Map<String, dynamic>>()
+        .map(ArchiveSource.fromJson)
+        .toList();
+  }
+
   /// `GET /archive/sessions/{id}` —— 会话详情：元数据、文件与代。
   Future<ArchiveSessionDetail> archiveSession(String id) async =>
       ArchiveSessionDetail.fromJson(

@@ -101,7 +101,12 @@ class _SessionsPageState extends ConsumerState<SessionsPage> {
           padding: const EdgeInsets.fromLTRB(12, 0, 16, 6),
           child: Row(
             children: [
-              _AgentFilter(agent: state.agent, onChanged: _changeAgent),
+              _AgentFilter(
+                agent: state.agent,
+                sources: state.sources,
+                label: state.sourceName,
+                onChanged: _changeAgent,
+              ),
               const Spacer(),
               if (!state.loading && state.error == null)
                 Text(
@@ -141,6 +146,7 @@ class _SessionsPageState extends ConsumerState<SessionsPage> {
                     final project = state.projects[i];
                     return _ProjectGroup(
                       key: ObjectKey(project),
+                      label: state.sourceName,
                       project: project,
                       group: state.groups[project.key] ?? const ProjectChats(),
                       selectedId: _selectedId,
@@ -254,33 +260,72 @@ class _SessionsPageState extends ConsumerState<SessionsPage> {
 
 /// 来源筛选。一枚小筹码而不是整行下拉框：它是次要的过滤条件，
 /// 大多数时候停在「全部来源」，不该和搜索框抢同样的分量。
+///
+/// 只列**有会话的**来源（服务端 `/archive/sources`），按厂商分组，带数量。
+/// 以前列的是 Cormex 认识的全部 agent，对任何一个人来说大半是空的。
 class _AgentFilter extends StatelessWidget {
-  const _AgentFilter({required this.agent, required this.onChanged});
+  const _AgentFilter({
+    required this.agent,
+    required this.sources,
+    required this.label,
+    required this.onChanged,
+  });
   final String? agent;
+  final List<ArchiveSource> sources;
+  final String Function(String) label;
   final ValueChanged<String?> onChanged;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final items = <PopupMenuEntry<String>>[
+      const PopupMenuItem(value: '', child: Text('全部来源')),
+    ];
+    String? lastProvider;
+    for (final s in sources) {
+      final provider = s.provider ?? '其他';
+      if (provider != lastProvider) {
+        items.add(const PopupMenuDivider());
+        items.add(
+          PopupMenuItem<String>(
+            enabled: false,
+            height: 28,
+            child: Text(
+              provider,
+              style: theme.textTheme.labelSmall?.copyWith(
+                letterSpacing: 0.4,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        );
+        lastProvider = provider;
+      }
+      items.add(
+        PopupMenuItem(
+          value: s.agent,
+          child: Row(
+            children: [
+              _Dot(color: Agents.dot(s.agent, theme.brightness)),
+              const SizedBox(width: 10),
+              Expanded(child: Text(s.name)),
+              const SizedBox(width: 12),
+              Text(
+                '${s.kind == 'chat' ? '聊天' : '编程'} · ${s.chatCount}',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
     return PopupMenuButton<String>(
       tooltip: '按来源筛选',
       initialValue: agent ?? '',
       onSelected: (v) => onChanged(v.isEmpty ? null : v),
-      itemBuilder: (context) => [
-        const PopupMenuItem(value: '', child: Text('全部来源')),
-        const PopupMenuDivider(),
-        for (final a in Agents.known)
-          PopupMenuItem(
-            value: a,
-            child: Row(
-              children: [
-                _Dot(color: Agents.dot(a, theme.brightness)),
-                const SizedBox(width: 10),
-                Text(Agents.label(a)),
-              ],
-            ),
-          ),
-      ],
+      itemBuilder: (context) => items,
       child: Container(
         padding: const EdgeInsets.fromLTRB(10, 5, 6, 5),
         decoration: BoxDecoration(
@@ -302,7 +347,7 @@ class _AgentFilter extends StatelessWidget {
               const SizedBox(width: 6),
             ],
             Text(
-              agent == null ? '全部来源' : Agents.label(agent!),
+              agent == null ? '全部来源' : label(agent!),
               style: theme.textTheme.labelMedium?.copyWith(
                 color: agent == null
                     ? theme.colorScheme.onSurfaceVariant
@@ -336,11 +381,13 @@ class _Dot extends StatelessWidget {
 class _ProjectGroup extends ConsumerStatefulWidget {
   const _ProjectGroup({
     super.key,
+    required this.label,
     required this.project,
     required this.group,
     required this.onOpen,
     this.selectedId,
   });
+  final String Function(String) label;
   final ArchiveProject project;
   final ProjectChats group;
   final ValueChanged<ArchiveSession> onOpen;
@@ -429,6 +476,7 @@ class _ProjectGroupState extends ConsumerState<_ProjectGroup> {
           for (final session in group.sessions)
             _SessionTile(
               key: ValueKey(session.id),
+              label: widget.label(session.agent),
               session: session,
               onOpen: widget.onOpen,
               selected: session.id == widget.selectedId,
@@ -489,11 +537,13 @@ class _ProjectGroupState extends ConsumerState<_ProjectGroup> {
 class _SessionTile extends StatelessWidget {
   const _SessionTile({
     super.key,
+    required this.label,
     required this.session,
     required this.onOpen,
     required this.selected,
   });
 
+  final String label;
   final ArchiveSession session;
   final ValueChanged<ArchiveSession> onOpen;
   final bool selected;
@@ -563,7 +613,7 @@ class _SessionTile extends StatelessWidget {
                     Flexible(
                       child: Text(
                         [
-                          Agents.label(session.agent),
+                          label,
                           session.messageCount == null
                               ? '消息数统计中'
                               : '${session.messageCount} 条消息',

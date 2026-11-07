@@ -1152,6 +1152,7 @@ async fn project_session(
         #[allow(unused_assignments)]
         let mut projected_to = through;
 
+        let mut same_offset = SameOffset::default();
         for chunk in chunks {
             let bytes = read_chunk_logical(st, store, &chunk).await?;
             // The chunk may start before `through` when it straddles the resume
@@ -1169,6 +1170,7 @@ async fn project_session(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             for e in events {
+                let ordinal = same_offset.next(e.src_offset);
                 let masked_text = cormex_memory::redaction::mask_text(&e.text).replace('\0', "�");
                 let content = mask_blocks(&e.content);
                 let mut content = serde_json::to_value(&content)?;
@@ -1177,11 +1179,12 @@ async fn project_session(
                 pending.push(NewTranscriptEvent {
                     id: Id::derived(
                         occurred_at,
-                        &format!(
-                            "{session_id}|{}|{}|{}",
+                        &event_seed(
+                            session_id,
                             parser.version(),
-                            generation.id,
-                            e.src_offset
+                            &generation.id,
+                            e.src_offset,
+                            ordinal,
                         ),
                     ),
                     session_id: session_id.parse()?,
@@ -1446,11 +1449,22 @@ fn restore_parser(
             cormex_transcript::qwen::QwenParser::restore(state)
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         )),
-        ("opencode" | "goose", W::Row) => {
-            let format = if agent == "opencode" {
-                cormex_transcript::rows::RowFormat::OpenCode
-            } else {
-                cormex_transcript::rows::RowFormat::Goose
+        ("pi" | "omp", W::Transcript) => Ok(Box::new(
+            cormex_transcript::pi::PiParser::restore(state).map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("deepseek_harness", W::Transcript) => Ok(Box::new(
+            cormex_transcript::dsh::DshParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("grok_build", W::Transcript) => Ok(Box::new(
+            cormex_transcript::grok_build::GrokBuildParser::restore(state)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
+        ("opencode" | "goose" | "hermes", W::Row) => {
+            let format = match agent {
+                "opencode" => cormex_transcript::rows::RowFormat::OpenCode,
+                "goose" => cormex_transcript::rows::RowFormat::Goose,
+                _ => cormex_transcript::rows::RowFormat::Hermes,
             };
             Ok(Box::new(
                 cormex_transcript::rows::RowParser::restore(format, state)
@@ -1469,6 +1483,50 @@ fn restore_parser(
             ))
         }
         _ => anyhow::bail!("no parser for {agent}"),
+    }
+}
+
+/// The seed a projected event's id is derived from.
+///
+/// # Why the ordinal
+///
+/// The seed used to be `session|parser|generation|offset`, the offset being
+/// where the event's line starts. A parser that turns one line into several
+/// events — an assistant record holding thinking, text and a tool call (pi,
+/// DeepSeek Harness, Cursor), or a database row holding a message and its
+/// calls (OpenCode, goose, Hermes) — gave all of them **the same id**, and the
+/// insert's `ON CONFLICT DO NOTHING` kept the first and dropped the rest
+/// without a word. The tool call after an answer's text was the usual victim.
+///
+/// The first event at an offset keeps exactly the old seed, so every event
+/// projected before this change keeps its id and nothing is duplicated by a
+/// re-projection; only the second and later ones get `#<n>`.
+fn event_seed(session: &str, parser: &str, generation: &str, offset: u64, ordinal: u32) -> String {
+    if ordinal == 0 {
+        format!("{session}|{parser}|{generation}|{offset}")
+    } else {
+        format!("{session}|{parser}|{generation}|{offset}#{ordinal}")
+    }
+}
+
+/// Counts events that share a source offset, in the order a parser emits
+/// them. A parser emits all events of a line in one `feed`, so the count never
+/// straddles a checkpoint.
+#[derive(Default)]
+struct SameOffset {
+    last: Option<u64>,
+    ordinal: u32,
+}
+
+impl SameOffset {
+    fn next(&mut self, offset: u64) -> u32 {
+        if self.last == Some(offset) {
+            self.ordinal += 1;
+        } else {
+            self.last = Some(offset);
+            self.ordinal = 0;
+        }
+        self.ordinal
     }
 }
 
@@ -1599,6 +1657,32 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(events[0].text.as_deref(), Some(content.as_str()));
         db.drop().await;
+    }
+
+    #[test]
+    fn events_from_one_line_get_distinct_ids_and_the_first_keeps_the_old_one() {
+        let mut same = SameOffset::default();
+        let ordinals: Vec<u32> = [10, 10, 10, 42, 42, 99]
+            .iter()
+            .map(|o| same.next(*o))
+            .collect();
+        assert_eq!(ordinals, vec![0, 1, 2, 0, 1, 0]);
+        let seeds: std::collections::BTreeSet<String> = [(10, 0), (10, 1), (10, 2)]
+            .iter()
+            .map(|(o, n)| event_seed("s", "pi@1", "g", *o, *n))
+            .collect();
+        assert_eq!(
+            seeds.len(),
+            3,
+            "three events from one line need three ids; with one id the insert keeps the first \
+             and silently drops the tool call that follows an answer"
+        );
+        assert_eq!(
+            event_seed("s", "claude_code@1", "g", 10, 0),
+            "s|claude_code@1|g|10",
+            "the first event at an offset keeps the pre-existing seed, so already-projected \
+             events keep their ids and a re-projection does not duplicate them"
+        );
     }
 
     #[test]

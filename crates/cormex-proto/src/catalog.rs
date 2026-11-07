@@ -68,6 +68,17 @@ pub struct AgentEntry {
     pub id: String,
     /// What to show a human.
     pub name: String,
+    /// Who makes it, for grouping and filtering: `OpenAI`, `Anthropic`,
+    /// `Google`, … A model-agnostic tool (Cursor, Cline, Aider) names its own
+    /// maker rather than a model vendor.
+    ///
+    /// Optional on the wire only so that a catalog served by an older server
+    /// still parses; every built-in entry carries one (tested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Chat or coding agent. See [`SourceKind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SourceKind>,
     /// Where the agent keeps its files, in the order to try them.
     #[serde(default)]
     pub home: Vec<HomeRoot>,
@@ -96,6 +107,22 @@ pub struct AgentEntry {
     /// and the parser dispatch is keyed on the same id.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_only: bool,
+}
+
+/// What a source holds, as a person would put it.
+///
+/// A separate axis from the agent id on purpose: "every coding session" and
+/// "everything from OpenAI" are both ordinary questions, and a flat list of
+/// names like `chatgpt-code` answers neither (and has no place for Cursor,
+/// which is a coding tool from no model vendor at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Conversations with an assistant: ChatGPT, Claude, Gemini, Grok on the
+    /// web or in their apps. Only ever imported from an export.
+    Chat,
+    /// An agent that works on files and runs tools: Claude Code, Codex, pi, …
+    Code,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -239,8 +266,16 @@ pub struct CwdRule {
     /// `-`. The decode is **lossy** (a directory name containing a literal `-`
     /// is ambiguous), so the result is a fallback for when a hook did not
     /// supply the cwd, and the client marks it as guessed.
+    ///
+    /// `percent`: the segment is the cwd percent-encoded, as Grok Build names
+    /// its session groups (`%2Fhome%2Fuser%2Frepo`). Lossless, so the result is
+    /// not marked as guessed. Used with [`Self::index`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode: Option<String>,
+    /// Which path segment to decode, counting from zero, for `from =
+    /// "path_segment"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 /// The host's hook mechanism.
@@ -341,6 +376,36 @@ mod tests {
                  `cormex sources add`, so it does nothing at all",
                 a.id
             );
+        }
+    }
+
+    /// Every built-in agent says who makes it and whether it is chat or code.
+    ///
+    /// The archive's filters group by these two. An agent without them would
+    /// still be captured, and then show up under no maker and no kind: present
+    /// in "all sources", missing from every narrower view.
+    #[test]
+    fn every_builtin_agent_has_a_provider_and_a_kind() {
+        for a in &Catalog::builtin().agents {
+            assert!(
+                a.provider.as_deref().is_some_and(|p| !p.trim().is_empty()),
+                "agent {:?} has no provider; the archive's source filter could not place it",
+                a.id
+            );
+            assert!(
+                a.kind.is_some(),
+                "agent {:?} has no kind (chat / code); the archive's kind filter would never show \
+                 its sessions",
+                a.id
+            );
+            if a.kind == Some(SourceKind::Chat) {
+                assert!(
+                    a.import_only,
+                    "agent {:?} is a chat source but is not import_only: chat history lives on the \
+                     vendor's servers, so there is no local file for discovery to find",
+                    a.id
+                );
+            }
         }
     }
 
@@ -500,6 +565,12 @@ mod tests {
             "aider",
             "cursor",
             "copilot_cli",
+            "pi",
+            "omp",
+            "deepseek_harness",
+            "grok_build",
+            "gemini_takeout",
+            "grok_export",
         ];
         for agent in &Catalog::builtin().agents {
             let conversation_roles = agent

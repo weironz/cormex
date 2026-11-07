@@ -74,6 +74,16 @@ pub async fn get_catalog(
     // kinds of caller, and the next endpoint added would have to remember which
     // kind it belongs to
     capture_caller(&st, &principal).await?;
+    effective_catalog(&st).map(axum::Json)
+}
+
+/// The catalog in effect: `CORMEX_CAPTURE_CATALOG` when set, else the one
+/// compiled in. Shared by the capture route and the archive's source list, so
+/// the names and kinds a browser shows are the ones the CLI captured under.
+///
+/// # Errors
+/// The override is set but cannot be read or does not parse.
+pub(crate) fn effective_catalog(st: &AppState) -> Result<cormex_proto::catalog::Catalog, ApiError> {
     // `CORMEX_CAPTURE_CATALOG` points at a newer copy than the one compiled in.
     // A malformed override is an error rather than a silent fallback to the
     // built-in: falling back would leave the operator believing their update
@@ -83,14 +93,11 @@ pub async fn get_catalog(
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 ApiError::internal(format!("could not read CORMEX_CAPTURE_CATALOG={path}: {e}"))
             })?;
-            let catalog = cormex_proto::catalog::Catalog::parse(&text).map_err(|e| {
+            cormex_proto::catalog::Catalog::parse(&text).map_err(|e| {
                 ApiError::internal(format!("CORMEX_CAPTURE_CATALOG={path} does not parse: {e}"))
-            })?;
-            Ok(axum::Json(catalog))
+            })
         }
-        None => Ok(axum::Json(
-            cormex_proto::catalog::Catalog::builtin().clone(),
-        )),
+        None => Ok(cormex_proto::catalog::Catalog::builtin().clone()),
     }
 }
 

@@ -307,7 +307,7 @@ fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
 
 impl Parser for GeminiParser {
     fn version(&self) -> &'static str {
-        "gemini@1"
+        "gemini@2"
     }
 
     fn feed(&mut self, offset: u64, bytes: &[u8]) -> Result<Vec<ParsedEvent>, String> {

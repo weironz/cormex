@@ -101,13 +101,22 @@ pub fn render(r: &DetectReport) -> String {
         return out;
     }
     let mut out = String::new();
+    // As wide as the longest id present: `deepseek_harness` is 16 characters,
+    // and a fixed 14 pushed its row out of line with the others
+    let w = r
+        .agents
+        .iter()
+        .map(|a| a.agent.len())
+        .max()
+        .unwrap_or(0)
+        .max(14);
     out.push_str(&format!(
-        "{:<14} {:>9} {:>7} {:>12}  {}\n",
+        "{:<w$} {:>9} {:>7} {:>12}  {}\n",
         "agent", "sessions", "files", "bytes", "home"
     ));
     for a in &r.agents {
         out.push_str(&format!(
-            "{:<14} {:>9} {:>7} {:>12}  {}\n",
+            "{:<w$} {:>9} {:>7} {:>12}  {}\n",
             a.agent,
             a.sessions,
             a.files,
@@ -173,6 +182,8 @@ mod tests {
             agents: vec![AgentEntry {
                 id: "claude_code".into(),
                 name: "Claude Code".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: home.display().to_string(),
                 }],
@@ -280,6 +291,8 @@ mod tests {
             agents: vec![AgentEntry {
                 id: "codex".into(),
                 name: "Codex".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: p.display().to_string(),
                 }],
@@ -331,6 +344,8 @@ mod tests {
             agents: vec![AgentEntry {
                 id: "codex".into(),
                 name: "Codex".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: p.display().to_string(),
                 }],
@@ -374,6 +389,7 @@ mod tests {
         catalog.agents[0].sources[0].cwd = Some(cormex_proto::catalog::CwdRule {
             from: "parent_dir".into(),
             decode: Some("claude_project_dir".into()),
+            index: None,
         });
         let report = run(&catalog, &cfg, "dev").expect("detect");
         assert_eq!(
@@ -416,6 +432,8 @@ mod tests {
             agents: vec![AgentEntry {
                 id: "codex".into(),
                 name: "Codex".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: "/definitely/not/installed".into(),
                 }],
@@ -477,6 +495,8 @@ mod no_open_tests {
             agents: vec![AgentEntry {
                 id: "claude_code".into(),
                 name: "Claude Code".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: p.display().to_string(),
                 }],

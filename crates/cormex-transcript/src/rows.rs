@@ -54,6 +54,10 @@ use crate::parser::{ParsedEvent, Parser};
 pub enum RowFormat {
     OpenCode,
     Goose,
+    /// Hermes Agent's `state.db` `messages` table, as the catalog query shapes
+    /// it: `{role, content, tool_calls, tool_name, tool_call_id, reasoning,
+    /// timestamp, active, compacted}`.
+    Hermes,
 }
 
 /// A parser over one row's JSON bytes.
@@ -85,8 +89,9 @@ impl RowParser {
 impl Parser for RowParser {
     fn version(&self) -> &'static str {
         match self.format {
-            RowFormat::OpenCode => "opencode@1",
-            RowFormat::Goose => "goose@1",
+            RowFormat::OpenCode => "opencode@2",
+            RowFormat::Goose => "goose@2",
+            RowFormat::Hermes => "hermes@1",
         }
     }
 
@@ -105,6 +110,7 @@ impl Parser for RowParser {
         Ok(match self.format {
             RowFormat::OpenCode => parse_opencode(&v, offset, len),
             RowFormat::Goose => parse_goose(&v, offset, len),
+            RowFormat::Hermes => parse_hermes(&v, offset, len),
         })
     }
 
@@ -334,6 +340,153 @@ fn opencode_part(
             len,
         )],
     }
+}
+
+/// One Hermes Agent `messages` row.
+///
+/// Upstream `NousResearch/hermes-agent` stores messages in the OpenAI chat
+/// shape: `role` is `user` / `assistant` / `tool` / `system`, an assistant's
+/// calls are an OpenAI `tool_calls` array **serialised as a string**, and a
+/// `tool` row answers one call by `tool_call_id`. Checked against a
+/// `state.db` (schema 22) that Hermes 0.19 wrote on a real run.
+///
+/// Rows that compaction folded away (`active = 0`) are still projected: they
+/// were said, and the archive does not lose what compaction hid from the
+/// model.
+fn parse_hermes(row: &Value, offset: u64, len: u64) -> Vec<ParsedEvent> {
+    let role = row.get("role").and_then(Value::as_str).unwrap_or("");
+    let occurred_at = row
+        .get("timestamp")
+        .and_then(Value::as_f64)
+        .and_then(|secs| {
+            #[allow(clippy::cast_possible_truncation)]
+            let millis = (secs * 1000.0) as i64;
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        });
+    let content = row
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let base = |kind, content: Vec<ContentBlock>, text: String| ParsedEvent {
+        kind,
+        role: Some(role.to_owned()),
+        occurred_at,
+        content,
+        text,
+        tool_name: None,
+        tool_call_id: None,
+        src_offset: offset,
+        src_length: len,
+    };
+    let mut out = Vec::new();
+    match role {
+        "user" | "system" => {
+            let kind = if role == "user" {
+                TranscriptKind::UserMessage
+            } else {
+                TranscriptKind::System
+            };
+            out.push(base(
+                kind,
+                vec![ContentBlock::Text {
+                    text: content.clone(),
+                }],
+                content,
+            ));
+        }
+        "assistant" => {
+            if let Some(thought) = row.get("reasoning").and_then(Value::as_str)
+                && !thought.trim().is_empty()
+            {
+                out.push(base(
+                    TranscriptKind::AgentThought,
+                    vec![ContentBlock::Thought {
+                        text: thought.to_owned(),
+                    }],
+                    thought.to_owned(),
+                ));
+            }
+            // A turn that only calls tools stores a single space as content
+            if !content.trim().is_empty() {
+                out.push(base(
+                    TranscriptKind::AgentMessage,
+                    vec![ContentBlock::Text {
+                        text: content.clone(),
+                    }],
+                    content,
+                ));
+            }
+            let calls: Vec<Value> = row
+                .get("tool_calls")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            for call in calls {
+                let id = call
+                    .get("id")
+                    .or_else(|| call.get("call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let input = match call.pointer("/function/arguments") {
+                    Some(Value::String(s)) => {
+                        serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                    }
+                    Some(other) => other.clone(),
+                    None => Value::Null,
+                };
+                let mut e = base(
+                    TranscriptKind::ToolCall,
+                    vec![ContentBlock::ToolCall {
+                        tool_call_id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    }],
+                    input.to_string(),
+                );
+                e.tool_name = Some(name);
+                e.tool_call_id = Some(id);
+                out.push(e);
+            }
+        }
+        "tool" => {
+            let id = row
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let mut e = base(
+                TranscriptKind::ToolResult,
+                vec![ContentBlock::ToolResult {
+                    tool_call_id: id.clone(),
+                    output: content.clone(),
+                    is_error: false,
+                }],
+                content,
+            );
+            e.tool_name = row
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            e.tool_call_id = Some(id);
+            out.push(e);
+        }
+        other => out.push(ParsedEvent::unknown(
+            &format!("hermes:role:{other}"),
+            offset,
+            len,
+        )),
+    }
+    if out.is_empty() {
+        out.push(ParsedEvent::unknown("hermes:empty", offset, len));
+    }
+    out
 }
 
 /// One `messages` row from Goose.

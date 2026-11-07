@@ -416,7 +416,7 @@ fn get_at_mut<'a>(root: &'a mut Value, path: &[PathSeg]) -> Option<&'a mut Value
 
 impl Parser for CopilotChatParser {
     fn version(&self) -> &'static str {
-        "copilot_chat@1"
+        "copilot_chat@2"
     }
 
     fn feed(&mut self, offset: u64, bytes: &[u8]) -> Result<Vec<ParsedEvent>, String> {

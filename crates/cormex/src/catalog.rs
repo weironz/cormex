@@ -72,6 +72,31 @@ pub fn resolve_home(entry: &AgentEntry) -> Option<PathBuf> {
     None
 }
 
+/// Decode a percent-encoded absolute path (`%2Fhome%2Fuser%2Frepo`).
+///
+/// `None` unless the result is absolute: Grok Build falls back to a slug plus
+/// a hash when the encoded name would exceed 255 bytes, and decoding that would
+/// produce a plausible-looking path that is not the cwd at all.
+fn decode_percent_path(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = segment.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    let windows_drive =
+        path.len() > 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic();
+    (path.starts_with('/') || windows_drive).then_some(path)
+}
+
 /// Expand a leading `~`.
 ///
 /// `directories::BaseDirs` rather than `$HOME`: on Windows the home directory
@@ -290,6 +315,12 @@ fn discover_source(
             Some(rule) if rule.decode.as_deref() == Some("claude_project_dir") => {
                 (decode_claude_project_dir(&segments), true)
             }
+            Some(rule) if rule.decode.as_deref() == Some("percent") => (
+                rule.index
+                    .and_then(|i| segments.get(i))
+                    .and_then(|s| decode_percent_path(s)),
+                false,
+            ),
             Some(_) => (segments.first().map(|s| format!("/{s}")), true),
             None => (None, false),
         };
@@ -493,6 +524,8 @@ mod tests {
         AgentEntry {
             id: "claude_code".into(),
             name: "Claude Code".into(),
+            provider: None,
+            kind: None,
             home: Vec::new(),
             sources: Vec::new(),
             manual_only: false,
@@ -622,6 +655,8 @@ mod tests {
         let agent = AgentEntry {
             id: "cursor".into(),
             name: "Cursor".into(),
+            provider: None,
+            kind: None,
             home: vec![HomeRoot::Path {
                 path: home.path().display().to_string(),
             }],
@@ -678,6 +713,8 @@ mod tests {
             agents: vec![AgentEntry {
                 id: "cursor".into(),
                 name: "Cursor".into(),
+                provider: None,
+                kind: None,
                 home: vec![HomeRoot::Path {
                     path: home.path().display().to_string(),
                 }],
@@ -731,6 +768,8 @@ mod tests {
         let agent = AgentEntry {
             id: "goose".into(),
             name: "Goose".into(),
+            provider: None,
+            kind: None,
             home: vec![HomeRoot::Path {
                 path: home.path().display().to_string(),
             }],

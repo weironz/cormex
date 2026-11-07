@@ -62,9 +62,13 @@ pub fn for_file(
 /// was persisted: a Codex rollout path contains no project name at all, and
 /// Claude's encoded project directory is lossy.
 fn transcript_cwd(file: &DiscoveredFile) -> Option<String> {
+    // A SQLite row counts too: Hermes's catalog query puts the session's cwd
+    // into every message row, and without it a Hermes session has no project
     if !matches!(
         file.role,
-        cormex_proto::capture::FileRole::Transcript | cormex_proto::capture::FileRole::Subagent
+        cormex_proto::capture::FileRole::Transcript
+            | cormex_proto::capture::FileRole::Subagent
+            | cormex_proto::capture::FileRole::Row
     ) {
         return None;
     }

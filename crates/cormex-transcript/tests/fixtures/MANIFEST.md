@@ -32,3 +32,33 @@ Every free-text value has been replaced with synthetic text of the same length a
 
 **To replace these with real-derived fixtures**: run the sampler on a machine
 that has Codex installed, and change the marker above.
+
+## pi, omp, deepseek_harness, grok_build, hermes
+
+- source: **real**, generated on 2026-11-07 for this purpose — not sampled from
+  anyone's history. Each CLI was installed in a scratch environment and run
+  against a toy repository (`todo-app`, two Python functions) with DeepSeek as
+  the model: pi 1.5.0, omp 18.18.0, DeepSeek Harness 0.2.2-rc.1, Grok Build
+  1.0.77, Hermes Agent 0.19.0.
+- The prompts were written for the test (read a file, run a command, explain a
+  term). Nothing else was anonymized because nothing else was private; the
+  working directory was replaced with `/home/user/todo-app` and the home
+  directory with `/home/user`.
+- Each tool has one session that calls tools and one that does not.
+- `deepseek_harness/*.jsonl` are the **decompressed** logs: on disk they are
+  `session.v4.jsonl.zstd`, a series of appended zstd frames.
+- `grok_build/updates-*.jsonl` are `updates.jsonl`, the ACP stream Grok Build
+  treats as authoritative.
+- `hermes/messages.json` is the `messages` table of `state.db` as rows.
+
+Files:
+
+- `pi/session-01.jsonl`: 11 lines
+- `pi/session-02.jsonl`: 25 lines
+- `omp/session-01.jsonl`: 14 lines
+- `omp/session-02.jsonl`: 9 lines
+- `deepseek_harness/session-01.jsonl`: 21 lines
+- `deepseek_harness/session-02.jsonl`: 29 lines
+- `grok_build/updates-01.jsonl`: 4 lines
+- `grok_build/updates-02.jsonl`: 12 lines
+- `hermes/messages.json`: 162 lines
