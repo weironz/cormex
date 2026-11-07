@@ -10,6 +10,13 @@
 - New migration `20261127000001_capture_generation_adoptions.sql` (table `capture_generation_adoptions`, view `capture_current_generations`). Append-only; `ON DELETE CASCADE` so purge is unaffected.
 - Not covered: conversations that were already duplicated before this change stay duplicated in the archive until a repair pass is run.
 
+### Archive browser: expanding a project no longer scans the whole archive
+
+- `GET /archive/sessions?project=…` grouped every event of every session and only then kept the project's sessions, so each expansion cost a sequential scan of `transcript_events` that grew with the whole archive. The project / agent / unassigned scope is now resolved against `capture_sessions` first, and only the surviving sessions are aggregated, each through its own index range. On a 1.2 M-event fixture (3 000 sessions, 60 projects): expanding a project 300 ms → 14 ms; a searched expansion 1.7 s → 12 ms.
+- New migration `20261128000001_transcript_events_user_text_index.sql`: a partial index on `(session_id, seq)` for non-empty user messages, which is where every untitled row's title comes from. Without it each title read the session's events and sorted them, and the inflated cost estimate pushed the query over PostgreSQL's JIT threshold — the compile alone was 0.7–1.3 s of the searched case. `CREATE INDEX` takes a write lock on `transcript_events` while it builds; on the fixture it took 0.3 s.
+- A page's "only copy" flags are one query instead of one per row.
+- A session whose files carry different project keys — a renamed project directory leaves the old file behind — is listed under its **newest** file's project. It used to take the alphabetically smallest key, so a renamed project could keep showing its chats under the old name. The facet counts, the expanded list, the detail view and the indexer's exclusion check all use the same rule.
+
 ### Capture CLI
 
 - `cormex login --print-key` prints the stored device key — the only copy of this machine's identity, since the server keeps its sha256 and cannot re-issue it. The key goes to stdout alone, so `cormex login --print-key > key.txt` is a working backup; the "where it came from" line goes to stderr. Restore after a reinstall with `cormex login --key`, and the server sees the same device and merges rather than capturing every file again under a new `device_id` — which duplicates the projected events, because the event id derives from the generation.

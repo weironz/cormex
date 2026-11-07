@@ -36,8 +36,9 @@ impl Store {
                FROM capture_sessions s
                LEFT JOIN LATERAL (SELECT session_id,project_id,project_name,title FROM capture_session_ui_metadata
                  WHERE session_id=s.id ORDER BY updated_at DESC LIMIT 1) m ON true
-               LEFT JOIN LATERAL (SELECT min(project_key) AS project_key FROM capture_file_project_keys
-                 WHERE session_id=s.id AND project_key IS NOT NULL) f ON m.session_id IS NULL
+               LEFT JOIN LATERAL (SELECT project_key FROM capture_file_project_keys
+                 WHERE session_id=s.id AND project_key IS NOT NULL
+                 ORDER BY first_seen_at DESC, id DESC LIMIT 1) f ON m.session_id IS NULL
                WHERE ($1::text IS NULL OR s.agent=$1) AND EXISTS(SELECT 1 FROM transcript_events e WHERE e.session_id=s.id)
              ) SELECT project_key AS key,max(project_name) AS name,count(*) AS chat_count FROM candidates
                WHERE $2::text IS NULL OR strpos(lower(title),lower($2))>0
@@ -253,6 +254,24 @@ impl Store {
         .await
     }
 
+    /// One page of archive sessions, newest activity first.
+    ///
+    /// # Why the scope is resolved before anything touches `transcript_events`
+    ///
+    /// The UI calls this once per expanded project. The earlier shape grouped
+    /// **every event of every session** and only then kept the project's
+    /// sessions, so opening a project of 50 chats cost a sequential scan of the
+    /// whole archive, and grew with it (300 ms at 1.2 M events, and the
+    /// planner's estimate was high enough to buy a JIT compile on top, which on
+    /// a searched list took the total past a second and a half). Now the
+    /// project, agent and "unassigned" filters run against `capture_sessions`
+    /// and its metadata first, and each surviving session is aggregated through
+    /// its own index range. The cost follows the size of the project, not the
+    /// size of the archive.
+    ///
+    /// The title lookup uses `idx_transcript_events_user_text`; without it a
+    /// session's first user message is found by reading the session's events
+    /// one by one.
     #[allow(clippy::too_many_arguments)]
     pub async fn archive_sessions_filtered_at(
         &self,
@@ -268,47 +287,56 @@ impl Store {
         unassigned: bool,
     ) -> Result<Vec<ArchiveSessionRow>> {
         let rows = sqlx::query_as::<_, ArchiveSessionRow>(
-            "WITH agg AS (
+            "WITH scoped AS (
                  SELECT s.id, s.agent,
-                        min(e.occurred_at) AS first_at,
-                        max(e.occurred_at) AS last_at,
-                        count(*)           AS event_count
+                        m.title AS original_title, m.project_name, m.pinned_position,
+                        CASE WHEN m.session_id IS NOT NULL THEN m.project_id ELSE fk.project_key END AS project_key
                    FROM capture_sessions s
-                   JOIN transcript_events e ON e.session_id = s.id
-                  WHERE ($8::timestamptz IS NULL OR e.occurred_at <= $8)
-                    AND ($9::timestamptz IS NULL OR e.created_at <= $9)
-                  GROUP BY s.id, s.agent
+                   LEFT JOIN LATERAL (SELECT session_id, title, project_id, project_name, pinned_position
+                                        FROM capture_session_ui_metadata
+                                       WHERE session_id = s.id ORDER BY updated_at DESC LIMIT 1) m ON true
+                   LEFT JOIN LATERAL (SELECT project_key FROM capture_file_project_keys
+                                       WHERE session_id = s.id AND project_key IS NOT NULL
+                                       ORDER BY first_seen_at DESC, id DESC LIMIT 1) fk ON m.session_id IS NULL
+                  WHERE ($1::text IS NULL OR s.agent = $1)
              ), candidates AS (
-             SELECT a.id, a.agent, a.first_at, a.last_at, a.event_count,
-                    (SELECT c.message_count FROM archive_message_counts c WHERE c.session_id=a.id AND $8::timestamptz IS NULL AND $9::timestamptz IS NULL AND c.rule_version='conversation@1' AND c.projection_id=(SELECT p.id FROM transcript_projections p WHERE p.session_id=a.id AND p.parser_version=c.parser_version ORDER BY p.created_at DESC,p.id DESC LIMIT 1)) AS message_count,
-                    (SELECT e.text FROM transcript_events e
-                      WHERE e.session_id = a.id AND e.kind = 'user_message'
-                        AND e.text IS NOT NULL AND e.text <> ''
-                        AND (a.agent <> 'codex' OR (e.text NOT LIKE '# AGENTS.md instructions%'
-                          AND e.text NOT LIKE '<environment_context>%'
-                          AND e.text NOT LIKE '<recommended_plugins>%'
-                          AND e.text NOT LIKE '<permissions instructions>%'
-                          AND e.text NOT LIKE '<external_codex_apps_open_page>%'
-                          AND e.text NOT LIKE '<user_instructions>%'))
-                      ORDER BY e.seq ASC LIMIT 1) AS title_source,
-                    (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
-                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=a.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=a.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_file_project_keys f WHERE f.session_id=a.id AND f.project_key IS NOT NULL) END AS project_key,
-                    (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
-                    (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = a.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
-                    (a.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = a.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
-                    (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f
-                      WHERE f.session_id = a.id) AS devices
-               FROM agg a
-              WHERE ($1::text IS NULL OR a.agent = $1)
-                AND ($3::timestamptz IS NULL OR a.last_at >= $3)
-                AND ($4::timestamptz IS NULL OR a.first_at <= $4)
-                AND ($5::timestamptz IS NULL OR (a.last_at, a.id) < ($5, $6))
-             ) SELECT * FROM candidates
-              WHERE ($2::text IS NULL OR project_key=$2)
-                AND (NOT $11 OR project_key IS NULL)
-                AND ($10::text IS NULL OR strpos(lower(coalesce(nullif(original_title,''),title_source,'')),lower($10))>0
-                     OR strpos(lower(coalesce(project_name,project_key,'')),lower($10))>0)
-              ORDER BY last_at DESC, id DESC
+                 SELECT sc.*, a.first_at, a.last_at, a.event_count
+                   FROM scoped sc
+                  CROSS JOIN LATERAL (
+                        SELECT min(e.occurred_at) AS first_at, max(e.occurred_at) AS last_at, count(*) AS event_count
+                          FROM transcript_events e
+                         WHERE e.session_id = sc.id
+                           AND ($8::timestamptz IS NULL OR e.occurred_at <= $8)
+                           AND ($9::timestamptz IS NULL OR e.created_at <= $9)) a
+                  WHERE ($2::text IS NULL OR sc.project_key = $2)
+                    AND (NOT $11 OR sc.project_key IS NULL)
+                    AND a.event_count > 0
+                    AND ($3::timestamptz IS NULL OR a.last_at >= $3)
+                    AND ($4::timestamptz IS NULL OR a.first_at <= $4)
+                    AND ($5::timestamptz IS NULL OR (a.last_at, sc.id) < ($5, $6))
+             ), titled AS (
+                 SELECT c.*,
+                        (SELECT e.text FROM transcript_events e
+                          WHERE e.session_id = c.id AND e.kind = 'user_message'
+                            AND e.text IS NOT NULL AND e.text <> ''
+                            AND (c.agent <> 'codex' OR (e.text NOT LIKE '# AGENTS.md instructions%'
+                              AND e.text NOT LIKE '<environment_context>%'
+                              AND e.text NOT LIKE '<recommended_plugins>%'
+                              AND e.text NOT LIKE '<permissions instructions>%'
+                              AND e.text NOT LIKE '<external_codex_apps_open_page>%'
+                              AND e.text NOT LIKE '<user_instructions>%'))
+                          ORDER BY e.seq ASC LIMIT 1) AS title_source
+                   FROM candidates c
+             )
+             SELECT t.id, t.agent, t.first_at, t.last_at, t.event_count,
+                    (SELECT c.message_count FROM archive_message_counts c WHERE c.session_id=t.id AND $8::timestamptz IS NULL AND $9::timestamptz IS NULL AND c.rule_version='conversation@1' AND c.projection_id=(SELECT p.id FROM transcript_projections p WHERE p.session_id=t.id AND p.parser_version=c.parser_version ORDER BY p.created_at DESC,p.id DESC LIMIT 1)) AS message_count,
+                    t.title_source, t.original_title, t.project_key, t.project_name, t.pinned_position,
+                    (t.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = t.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
+                    (SELECT array_agg(DISTINCT f.device_id::text) FROM capture_files f WHERE f.session_id = t.id) AS devices
+               FROM titled t
+              WHERE ($10::text IS NULL OR strpos(lower(coalesce(nullif(t.original_title,''),t.title_source,'')),lower($10))>0
+                     OR strpos(lower(coalesce(t.project_name,t.project_key,'')),lower($10))>0)
+              ORDER BY t.last_at DESC, t.id DESC
               LIMIT $7",
         )
         .bind(agent)
@@ -346,7 +374,7 @@ impl Store {
                           AND e.text NOT LIKE '<user_instructions>%'))
                       ORDER BY e.seq ASC LIMIT 1) AS title_source,
                     (SELECT m.title FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS original_title,
-                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=s.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT min(f.project_key) FROM capture_file_project_keys f WHERE f.session_id=s.id AND f.project_key IS NOT NULL) END AS project_key,
+                    CASE WHEN EXISTS (SELECT 1 FROM capture_session_ui_metadata m WHERE m.session_id=s.id) THEN (SELECT m.project_id FROM capture_session_ui_metadata m WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1) ELSE (SELECT f.project_key FROM capture_file_project_keys f WHERE f.session_id=s.id AND f.project_key IS NOT NULL ORDER BY f.first_seen_at DESC, f.id DESC LIMIT 1) END AS project_key,
                     (SELECT m.project_name FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS project_name,
                     (SELECT m.pinned_position FROM capture_session_ui_metadata m WHERE m.session_id = s.id ORDER BY m.updated_at DESC LIMIT 1) AS pinned_position,
                     (s.agent = 'codex' AND EXISTS (SELECT 1 FROM capture_files f WHERE f.session_id = s.id AND f.role = 'transcript' AND starts_with(f.logical_path, 'archived_sessions/'))) AS source_archived,
@@ -412,6 +440,34 @@ impl Store {
         Ok(total > 0 && total == missing)
     }
 
+    /// [`Self::session_is_sole_copy`] for a whole page at once: the ids of the
+    /// sessions in `session_ids` that are Cormex's only copy.
+    ///
+    /// A list page used to ask once per row, which is thirty round trips for
+    /// what one query answers.
+    pub async fn sessions_that_are_sole_copies(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if session_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT f.session_id::text
+               FROM capture_files f
+              WHERE f.session_id = ANY($1::text[])
+              GROUP BY f.session_id
+             HAVING count(*) > 0
+                AND bool_and((SELECT ev.op FROM capture_file_events ev
+                               WHERE ev.file_id = f.id
+                               ORDER BY ev.created_at DESC, ev.id DESC LIMIT 1) IS NOT DISTINCT FROM 'missing')",
+        )
+        .bind(session_ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     /// Tool events that have no archive-index chunks yet.
     ///
     /// The todo is derived, like the masker's and the projector's: an event is
@@ -434,7 +490,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// The project key of a session, from any of its files.
+    /// The project key of a session: its newest file's, the same rule the
+    /// archive list uses (a renamed project directory leaves the old file
+    /// behind, and the session belongs where it lives now).
     ///
     /// Used by the indexer to honour a project's exclusion. `None` = the
     /// session has no project, which is **not** excluded: excluding by default
@@ -442,7 +500,8 @@ impl Store {
     pub async fn session_project_key(&self, session_id: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT project_key FROM capture_file_project_keys
-              WHERE session_id = $1 AND project_key IS NOT NULL LIMIT 1",
+              WHERE session_id = $1 AND project_key IS NOT NULL
+              ORDER BY first_seen_at DESC, id DESC LIMIT 1",
         )
         .bind(session_id)
         .fetch_optional(self.pool())

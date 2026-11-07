@@ -659,10 +659,15 @@ pub async fn list_sessions(
         .await
         .map_err(store_err)?;
 
-    let mut sessions = Vec::with_capacity(rows.len());
-    for r in &rows {
-        sessions.push(to_dto(&store, r).await?);
-    }
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let sole = store
+        .sessions_that_are_sole_copies(&ids)
+        .await
+        .map_err(store_err)?;
+    let sessions = rows
+        .iter()
+        .map(|r| dto_from_row(r, sole.contains(&r.id)))
+        .collect();
     let next_cursor = if rows.len() < limit.clamp(1, 200) as usize {
         None
     } else {
@@ -1189,7 +1194,15 @@ async fn to_dto(
     store: &Store,
     row: &cormex_store::ArchiveSessionRow,
 ) -> Result<ArchiveSessionDto, ApiError> {
-    Ok(ArchiveSessionDto {
+    let sole_copy = store
+        .session_is_sole_copy(&row.id)
+        .await
+        .map_err(store_err)?;
+    Ok(dto_from_row(row, sole_copy))
+}
+
+fn dto_from_row(row: &cormex_store::ArchiveSessionRow, sole_copy: bool) -> ArchiveSessionDto {
+    ArchiveSessionDto {
         id: row.id.clone(),
         agent: row.agent.clone(),
         title: row.original_title.clone().or_else(|| {
@@ -1207,11 +1220,8 @@ async fn to_dto(
         event_count: row.event_count,
         message_count: row.message_count,
         summary: None,
-        sole_copy: store
-            .session_is_sole_copy(&row.id)
-            .await
-            .map_err(store_err)?,
-    })
+        sole_copy,
+    }
 }
 
 /// Turn a stored event into the wire DTO, optionally digesting it.
@@ -1592,6 +1602,98 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the project filter must use the same explicit-NULL rule as the facet list"
+        );
+        db.drop().await;
+    }
+
+    /// A renamed project directory leaves the old file behind; the session is
+    /// listed where it lives now, and only there.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_session_follows_its_newest_file_into_a_renamed_project() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap();
+        let (session, _, _) = seed(&st).await;
+        let native: String =
+            sqlx::query_scalar("SELECT native_session_id FROM capture_sessions WHERE id = $1")
+                .bind(&session)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+
+        // The host now keeps the same conversation under the renamed directory.
+        // "github.com/u/p" sorts after "github.com/u/a-renamed", so a rule of
+        // "smallest key wins" would keep the session in the old project
+        let moved = NewCaptureFile {
+            id: Id::new(),
+            native_session_id: native,
+            parent_native_session_id: None,
+            device_id: Id::new().to_string(),
+            agent: "claude_code".into(),
+            logical_path: "projects/-a-renamed/s1.jsonl".into(),
+            role: FileRole::Transcript,
+            framing: Framing::Append,
+            cwd: None,
+            project_key: Some("github.com/u/a-renamed".into()),
+        };
+        let registered = store
+            .archive_txn(async |t| t.register_capture_file(&moved).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            registered.session.id, session,
+            "same native id, same session"
+        );
+
+        let facets = store
+            .archive_projects(Some("claude_code"), None)
+            .await
+            .unwrap();
+        let keys: Vec<_> = facets.iter().map(|p| p.key.as_deref()).collect();
+        assert_eq!(
+            keys,
+            vec![Some("github.com/u/a-renamed")],
+            "the facet list must count the session once, under the project its newest file is in"
+        );
+        let listed = |key: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .archive_sessions(Some("claude_code"), Some(key), None, None, None, 20)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(listed("github.com/u/a-renamed").await, 1);
+        assert_eq!(
+            listed("github.com/u/p").await,
+            0,
+            "expanding the old project must not show a chat the facet list counts elsewhere"
+        );
+        assert_eq!(
+            store
+                .archive_session(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .project_key
+                .as_deref(),
+            Some("github.com/u/a-renamed"),
+            "the detail view agrees with the list"
+        );
+        assert_eq!(
+            store
+                .session_project_key(&session)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("github.com/u/a-renamed"),
+            "the indexer's exclusion check follows the same rule"
         );
         db.drop().await;
     }
@@ -2229,6 +2331,14 @@ mod tests {
                 .expect("query"),
             "a file never observed missing is not the only copy"
         );
+        assert!(
+            store
+                .sessions_that_are_sole_copies(std::slice::from_ref(&session_id))
+                .await
+                .expect("batch query")
+                .is_empty(),
+            "the list page's batched answer must agree with the per-session one"
+        );
 
         // Record the file as missing
         let files = store
@@ -2252,7 +2362,17 @@ mod tests {
             .session_is_sole_copy(&session_id)
             .await
             .expect("query");
+        let batched = store
+            .sessions_that_are_sole_copies(&[session_id.clone(), "0".repeat(26)])
+            .await
+            .expect("batch query");
         db.drop().await;
+        assert_eq!(
+            batched.into_iter().collect::<Vec<_>>(),
+            vec![session_id.clone()],
+            "the list page marks a session as the last copy through the batched query; it must \
+             flag exactly the sessions the detail page flags, and nothing for an unknown id"
+        );
         assert!(
             sole,
             "every file is missing, so Cormex holds the only copy -- and a user deleting the \
