@@ -444,7 +444,13 @@ def load_images(directory, manifest):
             config = archive.getmember(config_name)
             require(config.isfile() and config.size < 16 * 1024 * 1024, "invalid Docker image config")
             data = archive.extractfile(config).read()
-            require("sha256:" + hashlib.sha256(data).hexdigest() == entry["image_id"], "Docker config differs from reviewed image ID")
+            # The archive's config blob is **not** compared with `image_id`: only the classic
+            # image store names an image by its config digest. Under the containerd image
+            # store (Docker 29's default) the image ID is the manifest digest and
+            # `docker save` re-serialises the config into the Docker schema, so the two
+            # digests differ by design. The bytes are already pinned by SHA256SUMS, and the
+            # identity check that matters -- load, then require the daemon to report the
+            # reviewed ID -- happens below and holds in both stores.
             spec = json.loads(data)
             require(spec.get("os") == "linux" and spec.get("architecture") == "amd64", "Docker archive platform mismatch")
         run("docker", "image", "load", "--input", path)
@@ -452,7 +458,16 @@ def load_images(directory, manifest):
         smoke_image(entry["name"], entry["image_id"], manifest["version"])
 
 
-def registry_config(reference):
+def registry_image(reference):
+    """Return the image ID the registry serves at `reference`, or None when it is absent.
+
+    The comparison is made on the daemon's image ID rather than on the registry's config
+    digest, because the two image stores name images differently: the classic store uses
+    the config digest, while the containerd image store (Docker 29's default) uses the
+    manifest digest and pushes a config blob under a different digest. An image ID, by
+    contrast, survives push and pull unchanged in both stores -- verified by removing the
+    local tag first, so this reads the registry's bytes and not a leftover local copy.
+    """
     result = subprocess.run(["docker", "manifest", "inspect", reference], cwd=ROOT,
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode:
@@ -464,7 +479,10 @@ def registry_config(reference):
     manifest = json.loads(result.stdout)
     require(manifest.get("schemaVersion") == 2 and "config" in manifest,
             f"{reference} is an index/unsupported manifest; refusing to replace it")
-    return manifest["config"]["digest"]
+    subprocess.run(["docker", "image", "rm", reference], cwd=ROOT, text=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    run("docker", "pull", reference, capture=True)
+    return image_info(reference)
 
 
 def registry_login():
@@ -485,16 +503,16 @@ def push_images(manifest):
     for entry in manifest["images"]:
         for registry in REGISTRIES:
             reference = f"{registry}/{entry['name']}:{manifest['tag']}"
-            existing = registry_config(reference)
+            existing = registry_image(reference)
             require(existing in (None, entry["image_id"]), f"refusing to overwrite different image at {reference}")
             pending.append((entry, reference, existing))
     for entry, reference, existing in pending:
         if existing is None:
             run("docker", "tag", entry["image_id"], reference)
             run("docker", "push", reference)
-        require(registry_config(reference) == entry["image_id"], f"registry image mismatch after push: {reference}")
-        run("docker", "pull", reference)
-        require(image_info(reference) == entry["image_id"], f"pulled image differs: {reference}")
+            # Re-read the registry now that the tag exists: the local tag alone proves nothing.
+            require(registry_image(reference) == entry["image_id"],
+                    f"registry image mismatch after push: {reference}")
         smoke_image(entry["name"], reference, manifest["version"])
 
 

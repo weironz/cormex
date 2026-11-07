@@ -451,7 +451,7 @@ class ReleaseOperationTests(unittest.TestCase):
 
     def test_push_checks_every_destination_before_first_push(self):
         with mock.patch.object(release, "registry_login"), \
-                mock.patch.object(release, "registry_config", side_effect=[None, None, None, "sha256:" + "b" * 64]) as lookup, \
+                mock.patch.object(release, "registry_image", side_effect=[None, None, None, "sha256:" + "b" * 64]) as lookup, \
                 mock.patch.object(release, "run") as runner:
             with self.assertRaises(release.ReleaseError):
                 release.push_images(self.manifest)
@@ -461,23 +461,48 @@ class ReleaseOperationTests(unittest.TestCase):
     def test_push_resumes_matching_images_without_overwriting(self):
         image_id = self.manifest["images"][0]["image_id"]
         with mock.patch.object(release, "registry_login"), \
-                mock.patch.object(release, "registry_config", return_value=image_id), \
-                mock.patch.object(release, "image_info", return_value=image_id), \
+                mock.patch.object(release, "registry_image", return_value=image_id), \
                 mock.patch.object(release, "smoke_image") as smoke, \
                 mock.patch.object(release, "run") as runner:
             release.push_images(self.manifest)
-            self.assertEqual(smoke.call_count, 4)
-            self.assertEqual(runner.call_count, 4)
-            for call in runner.call_args_list:
-                self.assertEqual(call.args[:2], ("docker", "pull"), "Existing matching tags must not be pushed again")
+            self.assertEqual(smoke.call_count, 4, "Resumed tags are still smoke-tested from the registry")
+            runner.assert_not_called()
 
-    def test_registry_auth_or_network_failure_does_not_mean_missing_image(self):
+    def test_registry_image_removes_the_local_tag_before_reading_it(self):
+        image_id = "sha256:" + "c" * 64
+        probes = []
+
+        def fake_subprocess(args, **kwargs):
+            probes.append(args[:3])
+            if args[:2] == ["docker", "manifest"]:
+                return mock.Mock(returncode=0, stdout=json.dumps(
+                    {"schemaVersion": 2, "config": {"digest": "sha256:" + "d" * 64}}), stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        events = []
+        with mock.patch.object(release.subprocess, "run", side_effect=fake_subprocess), \
+                mock.patch.object(release, "run", side_effect=lambda *args, **kwargs: events.append(args)) as runner, \
+                mock.patch.object(release, "image_info", return_value=image_id):
+            self.assertEqual(release.registry_image("registry.example/cormex:v0.1.17"), image_id)
+        self.assertEqual(probes, [["docker", "manifest", "inspect"], ["docker", "image", "rm"]],
+                         "The stale local tag must go before the registry's copy is pulled")
+        self.assertEqual(len(events), 1, "One pull, then the identity is read from the daemon")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.args[:2], ("docker", "pull"),
+                         "The registry's copy must be fetched again, not read from a stale local tag")
+
+    def test_registry_image_fails_closed_on_ambiguous_errors(self):
         for message in ("unauthorized", "permission denied", "connection timed out"):
             with self.subTest(message=message), \
                     mock.patch.object(release.subprocess, "run", return_value=mock.Mock(
                         returncode=1, stdout="", stderr=message)):
                 with self.assertRaises(release.ReleaseError):
-                    release.registry_config("example/cormex:v0.1.17")
+                    release.registry_image("example/cormex:v0.1.17")
+
+    def test_registry_image_reports_a_missing_tag_as_absent(self):
+        with mock.patch.object(release.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout="", stderr="no such manifest: example/cormex:v0.1.17")):
+            self.assertIsNone(release.registry_image("example/cormex:v0.1.17"))
 
     def test_failed_push_never_publishes_release(self):
         checksum = digest((self.directory / "SHA256SUMS").read_bytes())

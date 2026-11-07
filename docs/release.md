@@ -104,6 +104,15 @@ Flutter，不调用 docker build。正式资产和 draft 中批准的是同一�
 两套 migration 目录；cormex-web 检查健康状态、真实 HTML 和编译后的 `/api` 前缀。
 构建与发布都验证镜像能运行。
 
+**镜像身份按「镜像 ID」比对，不是按 config digest。** 两套 image store 给镜像起名的
+方式不同：经典 store 用 config digest 当镜像 ID，而 Docker 29 默认的 containerd
+store 用 manifest digest，`docker save` 还会把 config 重写成 Docker schema，
+registry 里的 config digest 又是第三个值。镜像 ID 在两种 store 下 push→pull 都不变，
+所以发布只验证它：`load` 后必须报出候选记录的 ID；推送前后各拉一次注册表里的
+tag（先删本地 tag），ID 必须与候选一致。候选的字节由 `SHA256SUMS` 与
+`BUNDLE_SHA256` 钉住，归档内 config 不再与镜像 ID 比较 ——
+那条等式只在经典 store 下成立。
+
 npm 默认关闭。只有 `PUBLISH_NPM=true`、`NPM_TOKEN` 和完整六平台候选齐备才运行；
 Actions 使用同名仓库变量与 secret。缺少 token 或完整目标集合时明确失败，不静默跳过。
 发布使用候选提交中的 npm 包装文件和已校验的 CLI 归档，不重新编译，也没有单独的
