@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../home/home_page.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/formatting.dart';
@@ -157,15 +158,22 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 20,
-        title: Row(
-          children: [
-            Icon(Icons.psychology_rounded, size: 20, color: scheme.secondary),
-            const SizedBox(width: 9),
-            const Flexible(
-              child: Text('Cormex 记忆', overflow: TextOverflow.ellipsis),
-            ),
-          ],
-        ),
+        // 宽屏时品牌标识已经在侧栏顶上，页头只说这是哪一页
+        title: MediaQuery.sizeOf(context).width >= HomePage.wideBreakpoint
+            ? const Text('我的记忆')
+            : Row(
+                children: [
+                  Icon(
+                    Icons.psychology_rounded,
+                    size: 20,
+                    color: scheme.secondary,
+                  ),
+                  const SizedBox(width: 9),
+                  const Flexible(
+                    child: Text('Cormex 记忆', overflow: TextOverflow.ellipsis),
+                  ),
+                ],
+              ),
         actions: [
           IconButton(
             tooltip: '设置',

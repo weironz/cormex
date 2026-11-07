@@ -16,6 +16,10 @@ abstract final class CormexTheme {
   static const memoryAccentLight = Color(0xFF0E7C86);
   static const memoryAccentDark = Color(0xFF4FD1C5);
 
+  /// 当前亮度下的记忆青。
+  static Color memoryAccent(Brightness b) =>
+      b == Brightness.dark ? memoryAccentDark : memoryAccentLight;
+
   static ThemeData light() => _build(_lightScheme, Brightness.light);
   static ThemeData dark() => _build(_darkScheme, Brightness.dark);
 
@@ -84,6 +88,47 @@ abstract final class CormexTheme {
 
     return base.copyWith(
       scaffoldBackgroundColor: scheme.surface,
+      // 页头与内容同色、不投影：分隔交给一条细线。Material 3 默认在滚动时
+      // 给页头染一层主色调，配上左右分栏，看起来像三块颜色不同的面板。
+      appBarTheme: AppBarTheme(
+        backgroundColor: scheme.surface,
+        foregroundColor: scheme.onSurface,
+        surfaceTintColor: Colors.transparent,
+        scrolledUnderElevation: 0,
+        elevation: 0,
+        centerTitle: false,
+        titleSpacing: 20,
+        toolbarHeight: 60,
+        titleTextStyle: base.textTheme.titleLarge?.copyWith(
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -0.2,
+          color: scheme.onSurface,
+          fontFamilyFallback: _cjkFallback,
+        ),
+        shape: Border(bottom: BorderSide(color: scheme.outlineVariant)),
+      ),
+      navigationRailTheme: NavigationRailThemeData(
+        indicatorColor: scheme.primaryContainer,
+        selectedIconTheme: IconThemeData(color: scheme.onPrimaryContainer),
+        unselectedIconTheme: IconThemeData(color: scheme.onSurfaceVariant),
+        selectedLabelTextStyle: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+          color: scheme.onSurface,
+        ),
+        unselectedLabelTextStyle: TextStyle(
+          fontSize: 12,
+          color: scheme.onSurfaceVariant,
+        ),
+        minWidth: 76,
+      ),
+      navigationBarTheme: NavigationBarThemeData(
+        backgroundColor: scheme.surfaceContainerLow,
+        indicatorColor: scheme.primaryContainer,
+        surfaceTintColor: Colors.transparent,
+        height: 64,
+      ),
       dividerTheme: DividerThemeData(
         color: scheme.outlineVariant,
         thickness: 1,

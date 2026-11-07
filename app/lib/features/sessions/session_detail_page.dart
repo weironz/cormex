@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/api_exception.dart';
+import '../../core/agents.dart';
+import '../../core/formatting.dart';
 import '../../models/archive_session.dart';
 import '../../models/transcript_event.dart';
 import '../../state/connection_controller.dart';
@@ -22,9 +24,16 @@ import 'widgets/archive_source_label.dart';
 /// `projection_status == failed` 时显示原因，而不是一段空对话 —— 空对话
 /// 读起来像「这段聊天没内容」，而实际是「解析器在这份输入上失败了」。
 class SessionDetailPage extends ConsumerStatefulWidget {
-  const SessionDetailPage({super.key, required this.sessionId});
+  const SessionDetailPage({
+    super.key,
+    required this.sessionId,
+    this.embedded = false,
+  });
 
   final String sessionId;
+
+  /// 嵌在聊天档案右栏里，而不是单独推入的一页：没有返回按钮可按。
+  final bool embedded;
 
   @override
   ConsumerState<SessionDetailPage> createState() => _SessionDetailPageState();
@@ -179,21 +188,29 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        automaticallyImplyLeading: !widget.embedded,
+        // 页头只放「在哪」：项目名。这段聊天叫什么、多长、什么时候，放在
+        // 正文顶上那块标题区里 —— 页头一行塞不下两行的标题，硬塞就是截断
+        title: Row(
           children: [
-            Text(
-              detail?.session.displayTitle ?? '聊天',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+            Icon(
+              Icons.folder_outlined,
+              size: 16,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
-            if (detail?.session.sourceArchived == true)
-              const ArchiveSourceLabel(),
-            if (detail != null)
-              Text(
-                '${detail.session.messageCount == null ? '消息数统计中' : '${detail.session.messageCount} 条消息'} · ${detail.session.eventCount} 个事件',
-                style: Theme.of(context).textTheme.labelSmall,
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                detail == null ? '聊天' : _projectLabel(detail.session),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontSize: 13,
+                  letterSpacing: 0,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
+            ),
           ],
         ),
         actions: [
@@ -214,6 +231,7 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
               _load();
             },
           ),
+          const SizedBox(width: 8),
         ],
       ),
       body: _loading
@@ -239,12 +257,15 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
                 ),
                 child: ListView.builder(
                   controller: _scroll,
-                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  padding: const EdgeInsets.only(bottom: 32),
                   itemCount:
+                      1 +
                       remaining.length +
                       (preparation.isNotEmpty ? 1 : 0) +
                       (_loadingMore ? 1 : 0),
-                  itemBuilder: (context, i) {
+                  itemBuilder: (context, index) {
+                    if (index == 0) return _SessionHeader(detail: detail);
+                    final i = index - 1;
                     if (preparation.isNotEmpty && i == 0) {
                       return Theme(
                         data: Theme.of(
@@ -282,6 +303,86 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
                 ),
               ),
             ),
+    );
+  }
+}
+
+String _projectLabel(ArchiveSession s) {
+  final name = s.projectName?.trim();
+  if (name != null && name.isNotEmpty) return name;
+  return ArchiveProject(key: s.projectKey, chatCount: 0).displayName;
+}
+
+/// 正文顶上的标题区：这段聊天叫什么、来自哪、跨了多久、多长。
+class _SessionHeader extends StatelessWidget {
+  const _SessionHeader({required this.detail});
+  final ArchiveSessionDetail? detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final session = detail?.session;
+    if (session == null) return const SizedBox(height: 16);
+    final span = session.firstAt == null || session.lastAt == null
+        ? null
+        : formatDate(session.firstAt) == formatDate(session.lastAt)
+        ? formatAbsolute(session.firstAt)
+        : '${formatDate(session.firstAt)} – ${formatDate(session.lastAt)}';
+    final facts = [
+      ?span,
+      session.messageCount == null ? '消息数统计中' : '${session.messageCount} 条消息',
+      '${session.eventCount} 个事件',
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 28, 16, 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: Agents.dot(session.agent, theme.brightness),
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 7),
+              Text(
+                Agents.label(session.agent),
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SelectableText(
+            session.displayTitle,
+            style: theme.textTheme.headlineSmall?.copyWith(
+              fontSize: 22,
+              height: 1.35,
+              fontWeight: FontWeight.w600,
+              letterSpacing: -0.3,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            facts.join(' · '),
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+          if (session.sourceArchived) ...[
+            const SizedBox(height: 6),
+            const ArchiveSourceLabel(),
+          ],
+          const SizedBox(height: 18),
+          Divider(color: theme.colorScheme.outlineVariant),
+        ],
+      ),
     );
   }
 }

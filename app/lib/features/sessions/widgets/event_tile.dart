@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../../../core/agents.dart';
 import '../../../core/formatting.dart';
+import '../../../core/theme.dart';
 import '../../../models/transcript_event.dart';
 
 bool isConversationEvent(TranscriptEvent event, {String? agent}) {
@@ -204,19 +206,13 @@ class EventTile extends StatelessWidget {
           padding: conversation
               ? const EdgeInsets.symmetric(horizontal: 20, vertical: 18)
               : EdgeInsets.zero,
-          decoration: conversation
+          // 只有提问带底色，回答不带框：读一段聊天时，眼睛要找的是「每一轮从
+          // 哪开始」，提问就是那个锚点。两边都套同样的边框卡片时，一屏全是
+          // 一样的盒子，轮次反而看不出来
+          decoration: event.kind == TranscriptKind.userMessage
               ? BoxDecoration(
-                  color: event.kind == TranscriptKind.userMessage
-                      ? theme.colorScheme.primaryContainer.withValues(
-                          alpha: 0.25,
-                        )
-                      : theme.colorScheme.surface,
-                  border: Border.all(
-                    color: theme.colorScheme.outlineVariant.withValues(
-                      alpha: 0.55,
-                    ),
-                  ),
-                  borderRadius: BorderRadius.circular(16),
+                  color: theme.colorScheme.surfaceContainer,
+                  borderRadius: BorderRadius.circular(14),
                 )
               : null,
           child: Column(
@@ -235,12 +231,7 @@ class EventTile extends StatelessWidget {
   Widget _header(ThemeData theme) {
     final label = switch (event.kind) {
       TranscriptKind.userMessage => '你',
-      TranscriptKind.agentMessage => switch (agent) {
-        'codex' => 'Codex',
-        'claude_code' => 'Claude',
-        'gemini_cli' => 'Gemini',
-        _ => 'AI 助手',
-      },
+      TranscriptKind.agentMessage => Agents.speaker(agent),
       TranscriptKind.agentThought => '思考',
       TranscriptKind.toolCall => '调用 ${event.toolName ?? ''}',
       TranscriptKind.toolResult => '结果',
@@ -297,8 +288,24 @@ class EventTile extends StatelessWidget {
         selectable: true,
         softLineBreak: true,
         styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
-          p: theme.textTheme.bodyMedium?.copyWith(height: 1.65),
-          listBullet: theme.textTheme.bodyMedium?.copyWith(height: 1.65),
+          p: theme.textTheme.bodyMedium?.copyWith(height: 1.7),
+          listBullet: theme.textTheme.bodyMedium?.copyWith(height: 1.7),
+          code: theme.textTheme.bodySmall?.copyWith(
+            fontFamily: CormexTheme.monoFallback.first,
+            fontFamilyFallback: CormexTheme.monoFallback,
+            fontSize: 12.5,
+            color: theme.colorScheme.onSurface,
+            // 与代码块同色：flutter_markdown 把这条样式也用在代码块的每一行上，
+            // 取别的颜色会在块里画出一行一道的色带
+            backgroundColor: theme.colorScheme.surfaceContainerLow,
+          ),
+          codeblockPadding: const EdgeInsets.all(14),
+          codeblockDecoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerLow,
+            border: Border.all(color: theme.colorScheme.outlineVariant),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          blockSpacing: 12,
         ),
         // Archives are untrusted; opening a conversation must not fetch URLs.
         imageBuilder: (uri, title, alt) =>

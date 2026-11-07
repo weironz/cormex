@@ -16,7 +16,8 @@ void main() {
       expect(
         base.toString(),
         'https://memory.example.com',
-        reason: '同源解析必须只保留 scheme+host+port —— '
+        reason:
+            '同源解析必须只保留 scheme+host+port —— '
             '页面的路径、查询串、锚点都不属于 API 根，留着它们之后每个请求都会带上',
       );
     });
@@ -56,17 +57,21 @@ void main() {
       expect(
         CormexApi.resolveBase('/api', Uri.parse('file:///C:/app/')).toString(),
         'http://127.0.0.1:8080/api',
-        reason: '「API 挂在哪个前缀下」与「哪台机器」是两件事 —— '
+        reason:
+            '「API 挂在哪个前缀下」与「哪台机器」是两件事 —— '
             '回落换的是主机，不该把前缀一起丢掉',
       );
     });
 
     test('尾斜杠削干净后单独一个斜杠就是同源根', () {
       expect(
-        CormexApi.resolveBase('/', Uri.parse('https://cormex.example.com/'))
-            .toString(),
+        CormexApi.resolveBase(
+          '/',
+          Uri.parse('https://cormex.example.com/'),
+        ).toString(),
         'https://cormex.example.com',
-        reason: '`/` 与空串是同一件事，不能变成一个尾巴上挂着斜杠的 base —— '
+        reason:
+            '`/` 与空串是同一件事，不能变成一个尾巴上挂着斜杠的 base —— '
             '那之后每个请求的路径都会是 //health',
       );
     });
@@ -94,7 +99,8 @@ void main() {
       expect(
         back?.kind,
         CredentialKind.refresh,
-        reason: 'kind 丢了的话，启动时就只能靠「先当 bearer 试一次，401 了再当 '
+        reason:
+            'kind 丢了的话，启动时就只能靠「先当 bearer 试一次，401 了再当 '
             'refresh 试」来猜，而猜错那一半会在服务端留下一条失败的认证记录',
       );
       expect(back?.value, 'abc');
@@ -137,7 +143,8 @@ void main() {
       expect(
         r.invalidatedCount,
         1,
-        reason: '回放路径靠这个数字告诉用户「这一屏里有几条当时成立、现在已被推翻」—— '
+        reason:
+            '回放路径靠这个数字告诉用户「这一屏里有几条当时成立、现在已被推翻」—— '
             '不带 as_of 时它恒为 0，因为那条路查的是 active_facts 视图',
       );
     });

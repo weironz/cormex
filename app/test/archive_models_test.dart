@@ -47,11 +47,7 @@ void main() {
       expect(s.title, '对象存储用什么');
       expect(s.devices, ['01D1', '01D2']);
       expect(s.eventCount, 42);
-      expect(
-        s.soleCopy,
-        isTrue,
-        reason: '宿主已经删掉原始文件时界面必须知道 —— 在这里删除就是删掉最后一份',
-      );
+      expect(s.soleCopy, isTrue, reason: '宿主已经删掉原始文件时界面必须知道 —— 在这里删除就是删掉最后一份');
       expect(s.lastAt, isNotNull);
     });
 
@@ -71,18 +67,20 @@ void main() {
 
     test('空白标题也退回 agent 名', () {
       const s = ArchiveSession(id: '01S', agent: 'codex', title: '   ');
-      expect(
-        s.displayTitle,
-        'codex',
-        reason: '一个全是空格的标题在列表里是一行空白，读起来像界面坏了',
-      );
+      expect(s.displayTitle, 'codex', reason: '一个全是空格的标题在列表里是一行空白，读起来像界面坏了');
     });
   });
 
   group('TranscriptKind', () {
     test('已知类型按线上拼写解析', () {
-      expect(TranscriptKind.fromWire('user_message'), TranscriptKind.userMessage);
-      expect(TranscriptKind.fromWire('agent_thought'), TranscriptKind.agentThought);
+      expect(
+        TranscriptKind.fromWire('user_message'),
+        TranscriptKind.userMessage,
+      );
+      expect(
+        TranscriptKind.fromWire('agent_thought'),
+        TranscriptKind.agentThought,
+      );
       expect(TranscriptKind.fromWire('tool_result'), TranscriptKind.toolResult);
     });
 
@@ -167,12 +165,14 @@ void main() {
     });
 
     test('diff 的 `new` 键映射到 newContent（Dart 关键字）', () {
-      final b = ContentBlock.fromJson({
-        'type': 'diff',
-        'path': '/p',
-        'old': 'before',
-        'new': 'after',
-      }) as DiffBlock;
+      final b =
+          ContentBlock.fromJson({
+                'type': 'diff',
+                'path': '/p',
+                'old': 'before',
+                'new': 'after',
+              })
+              as DiffBlock;
       expect(b.oldContent, 'before');
       expect(
         b.newContent,
@@ -182,22 +182,26 @@ void main() {
     });
 
     test('工具调用的一行摘要优先取命令', () {
-      final b = ContentBlock.fromJson({
-        'type': 'tool_call',
-        'tool_call_id': 'c',
-        'name': 'Bash',
-        'input': {'command': 'cargo test'},
-      }) as ToolCallBlock;
+      final b =
+          ContentBlock.fromJson({
+                'type': 'tool_call',
+                'tool_call_id': 'c',
+                'name': 'Bash',
+                'input': {'command': 'cargo test'},
+              })
+              as ToolCallBlock;
       expect(b.summary, 'cargo test');
     });
 
     test('没有可识别的参数时摘要退回工具名', () {
-      final b = ContentBlock.fromJson({
-        'type': 'tool_call',
-        'tool_call_id': 'c',
-        'name': 'Bash',
-        'input': <String, dynamic>{},
-      }) as ToolCallBlock;
+      final b =
+          ContentBlock.fromJson({
+                'type': 'tool_call',
+                'tool_call_id': 'c',
+                'name': 'Bash',
+                'input': <String, dynamic>{},
+              })
+              as ToolCallBlock;
       expect(b.summary, 'Bash');
     });
   });
@@ -225,11 +229,7 @@ void main() {
       expect(e.seq, 3);
       expect(e.kind, TranscriptKind.toolCall);
       expect(e.toolName, 'Bash');
-      expect(
-        e.sourceGenerationId,
-        '01G',
-        reason: '出处是「凭什么这么认为」的最后一跳，界面要能指回原文',
-      );
+      expect(e.sourceGenerationId, '01G', reason: '出处是「凭什么这么认为」的最后一跳，界面要能指回原文');
       expect(e.sourceOffset, 1024);
     });
 

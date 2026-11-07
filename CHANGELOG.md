@@ -17,6 +17,15 @@
 - A page's "only copy" flags are one query instead of one per row.
 - A session whose files carry different project keys — a renamed project directory leaves the old file behind — is listed under its **newest** file's project. It used to take the alphabetically smallest key, so a renamed project could keep showing its chats under the old name. The facet counts, the expanded list, the detail view and the indexer's exclusion check all use the same rule.
 
+### Archive browser: layout and reading
+
+- On wide screens the two pages move to a side rail instead of a bottom bar, so the archive reads left to right: where to go, which chat, the chat itself. Phones keep the bottom bar.
+- The project list is a directory rather than a stack of cards: projects are group rows with a count, chats are rows under them with a two-line title (the first question's topic is usually in its second half), a source dot, the message count and the date. Sources show their product names everywhere (`Claude Code`, not `claude_code`), from one table in `core/agents.dart`.
+- The source filter is a small chip next to the totals, not a full-width dropdown.
+- The detail pane's header names the project; the chat's title, source, date range and length sit at the top of the conversation, where a long title can wrap instead of being cut off. In the split view the two headers sit side by side at the same height.
+- Questions get a tinted block and answers have no frame, so each turn's start is easy to find. Code blocks get a bordered panel and a monospace face.
+- Dates stay absolute; a chat from this year drops the year (`11月7日`).
+
 ### Capture CLI
 
 - `cormex login --print-key` prints the stored device key — the only copy of this machine's identity, since the server keeps its sha256 and cannot re-issue it. The key goes to stdout alone, so `cormex login --print-key > key.txt` is a working backup; the "where it came from" line goes to stderr. Restore after a reinstall with `cormex login --key`, and the server sees the same device and merges rather than capturing every file again under a new `device_id` — which duplicates the projected events, because the event id derives from the generation.

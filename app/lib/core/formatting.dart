@@ -2,6 +2,7 @@ import 'package:intl/intl.dart';
 
 final _full = DateFormat('yyyy年M月d日 HH:mm');
 final _dateOnly = DateFormat('yyyy-MM-dd');
+final _monthDay = DateFormat('M月d日');
 
 /// 出处那一类时间戳：精确比简短重要。
 String formatAbsolute(DateTime? when) =>
@@ -14,6 +15,15 @@ String formatAbsolute(DateTime? when) =>
 /// 于今天还是相对于那一刻，没有人答得上来。
 String formatDate(DateTime? when) =>
     when == null ? '—' : _dateOnly.format(when);
+
+/// 列表行尾那种窄位置上的日期：今年的省掉年份，其余同 [formatDate]。
+///
+/// 仍然是绝对日期（理由见 [formatDate]），只是更短。
+String formatCompactDate(DateTime? when, {DateTime? now}) {
+  if (when == null) return '—';
+  final year = (now ?? DateTime.now()).year;
+  return when.year == year ? _monthDay.format(when) : _dateOnly.format(when);
+}
 
 String formatConfidence(double? c) => c == null ? '' : '${(c * 100).round()}%';
 

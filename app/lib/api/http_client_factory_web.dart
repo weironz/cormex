@@ -12,9 +12,7 @@ import 'package:http/http.dart' as http;
 /// * `credentials: omit` —— 凭据走 `Authorization` 头，不走 cookie。带上
 ///   cookie 只会让 CORS 变严（`Access-Control-Allow-Origin: *` 当场失效），
 ///   换来的是这个应用根本不用的东西。
-http.Client createHttpClient() => FetchClient(
-  mode: RequestMode.cors,
-  credentials: RequestCredentials.omit,
-);
+http.Client createHttpClient() =>
+    FetchClient(mode: RequestMode.cors, credentials: RequestCredentials.omit);
 
 const String kHttpClientKind = 'browser fetch (FetchClient)';
