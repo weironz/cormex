@@ -223,6 +223,8 @@ fn check_executable(bytes: &[u8], archive: Archive, exe: &str) -> Result<()> {
 /// about what a release looks like.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    // Only the Windows zip builder writes through `Write`
+    #[cfg(windows)]
     use std::io::Write as _;
 
     /// Payload with the magic number of an executable and enough size to pass.

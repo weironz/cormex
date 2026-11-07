@@ -25,6 +25,7 @@ pub mod fake;
 pub mod lock;
 pub mod plan;
 pub mod reader;
+pub mod reconcile;
 pub mod upload;
 
 use anyhow::Result;
@@ -383,12 +384,68 @@ async fn sync_one(
                         .and_then(|classification| classification.project_key.clone()),
                 })
                 .await?;
+            let file_id = resp.file_id.clone();
             state.file_id = Some(resp.file_id);
-            state.generation_id = Some(resp.generation.id.clone());
-            state.generation_ordinal = Some(resp.generation.ordinal);
-            state.uploaded_offset = resp.generation.end_offset;
-            state.tail_sha256 =
-                reader.tail_hash(u64::try_from(resp.generation.end_offset).unwrap_or(0))?;
+
+            // ── Never resume on an offset alone ──
+            //
+            // Reaching `Register` means this machine has no memory of the file:
+            // first sight, `state.db` lost, or a reinstall. The server may
+            // already hold this exact stream — under this file (state lost),
+            // or under another file of the same session (a new device key, a
+            // host-side move, a second machine). Each case is settled by a
+            // prefix hash, not by trusting where the server says it ends.
+            let local = observed.size;
+            let mut generation = resp.generation.clone();
+            let mut from = 0_i64;
+            if generation.end_offset > 0 {
+                match reconcile::compare(api, &reader, &generation.id, generation.end_offset)
+                    .await?
+                {
+                    reconcile::Verdict::Extends { end } => from = end,
+                    // An older copy of what the server already has: nothing new
+                    reconcile::Verdict::Behind => from = local,
+                    reconcile::Verdict::Diverged => {
+                        // Rewritten while this machine was not watching. A new
+                        // generation, not a splice onto the old history
+                        generation = api
+                            .open_generation(
+                                &file_id,
+                                if snapshot { "snapshot" } else { "rewrite" },
+                            )
+                            .await?;
+                    }
+                }
+            } else if !snapshot {
+                // A file the server has never seen under this name. If its bytes
+                // are a stream the session already has, follow that stream
+                for candidate in &resp.candidates {
+                    let verdict =
+                        reconcile::compare(api, &reader, &candidate.id, candidate.end_offset)
+                            .await?;
+                    let next_from = match verdict {
+                        reconcile::Verdict::Extends { end } => end,
+                        reconcile::Verdict::Behind => local,
+                        reconcile::Verdict::Diverged => continue,
+                    };
+                    generation = api
+                        .adopt(&file_id, &candidate.id, next_from.min(candidate.end_offset))
+                        .await?;
+                    from = next_from;
+                    tracing::info!(
+                        path = %file.logical_path,
+                        generation = %generation.id,
+                        "already archived under another name; following that copy instead of \
+                         uploading it again"
+                    );
+                    break;
+                }
+            }
+
+            state.generation_id = Some(generation.id.clone());
+            state.generation_ordinal = Some(generation.ordinal);
+            state.uploaded_offset = from;
+            state.tail_sha256 = reader.tail_hash(u64::try_from(from).unwrap_or(0))?;
             state.whole_sha256 = observed.whole_sha256.clone();
             state.last_size = Some(observed.size);
             if let Some(classification) = classification {
@@ -398,10 +455,8 @@ async fn sync_one(
             }
             db.put_file(&state)?;
 
-            let generation = resp.generation.id.clone();
-            let from = resp.generation.end_offset;
             let uploaded =
-                upload::upload(api, db, &reader, &mut state, &generation, from, budget).await?;
+                upload::upload(api, db, &reader, &mut state, &generation.id, from, budget).await?;
             Ok(Some(uploaded.bytes))
         }
         Action::Append { from } => {

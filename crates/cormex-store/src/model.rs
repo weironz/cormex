@@ -133,6 +133,7 @@ pub mod table {
         "promote_progress",
         "transcript_embeddings",
         "capture_keys",
+        "capture_generation_adoptions",
     ];
 }
 

@@ -14,8 +14,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use cormex_proto::capture::{
-    ChunkAck, FileClassification, FileEventRequest, GenerationDto, NewGenerationRequest,
-    RegisterFileRequest, RegisterFileResponse,
+    AdoptGenerationRequest, ChunkAck, FileClassification, FileEventRequest, GenerationDto,
+    NewGenerationRequest, RegisterFileRequest, RegisterFileResponse, VerifyPrefixRequest,
+    VerifyPrefixResponse,
 };
 
 use crate::client::ApiClient;
@@ -48,6 +49,22 @@ pub trait CaptureApi: Send + Sync {
 
     /// `POST /capture/files/{id}/events`.
     async fn file_event(&self, file_id: &str, req: &FileEventRequest) -> Result<()>;
+
+    /// Do the first `length` bytes of this generation hash to `sha256`?
+    async fn verify_prefix(
+        &self,
+        generation_id: &str,
+        length: i64,
+        sha256: &str,
+    ) -> Result<VerifyPrefixResponse>;
+
+    /// Make this file follow an existing generation of the same stream.
+    async fn adopt(
+        &self,
+        file_id: &str,
+        generation_id: &str,
+        verified_through: i64,
+    ) -> Result<GenerationDto>;
 }
 
 /// What one chunk upload produced.
@@ -151,6 +168,42 @@ impl CaptureApi for HttpCaptureApi {
             .post_json::<_, serde_json::Value>(&format!("/capture/files/{file_id}/events"), req)
             .await
             .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn verify_prefix(
+        &self,
+        generation_id: &str,
+        length: i64,
+        sha256: &str,
+    ) -> Result<VerifyPrefixResponse> {
+        self.client
+            .post_json(
+                &format!("/capture/generations/{generation_id}/verify"),
+                &VerifyPrefixRequest {
+                    length,
+                    sha256: sha256.to_owned(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn adopt(
+        &self,
+        file_id: &str,
+        generation_id: &str,
+        verified_through: i64,
+    ) -> Result<GenerationDto> {
+        self.client
+            .post_json(
+                &format!("/capture/files/{file_id}/adopt"),
+                &AdoptGenerationRequest {
+                    generation_id: generation_id.to_owned(),
+                    verified_through,
+                },
+            )
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }

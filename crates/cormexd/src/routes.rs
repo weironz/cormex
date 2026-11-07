@@ -144,6 +144,10 @@ protected_routes! {
     "/capture/files/{id}/classification" [POST] => post(crate::capture::update_file_classification),
     "/capture/files/{id}/generations" [POST] => post(crate::capture::open_generation),
     "/capture/files/{id}/events" [POST] => post(crate::capture::file_event),
+    // Idempotency across reinstalls, host-side moves and machines: prove a
+    // local file matches an existing generation, then follow it
+    "/capture/files/{id}/adopt" [POST] => post(crate::capture::adopt_generation),
+    "/capture/generations/{id}/verify" [POST] => post(crate::capture::verify_prefix),
     // A batch of small snapshots (P4-0): SQLite rows, which have no file to
     // append to. One request rather than three per row
     "/capture/snapshots" [POST] => post(crate::capture::put_snapshots)

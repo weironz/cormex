@@ -1081,9 +1081,15 @@ async fn project_session(
     session_id: &str,
     agent: &str,
 ) -> Result<usize> {
-    // Every file of the session, with its newest generation
+    // Every file of the session, with the generation it currently follows
     let files = store.capture_files_of_session(session_id).await?;
     let mut written = 0;
+    // Several files can follow one generation (a reinstall, a host-side move,
+    // a second machine — see `capture_generation_adoptions`). Event ids are
+    // derived from the generation, so projecting it once per *file* would not
+    // duplicate rows, but it would feed the same bytes through the parser again
+    // and race the checkpoint. Once per generation is the actual unit
+    let mut projected_generations = std::collections::HashSet::new();
 
     for file in files {
         // The store's `FileRole` and the wire's are two types (the store must
@@ -1096,6 +1102,9 @@ async fn project_session(
         let Some((generation, end)) = store.latest_generation(&file.id).await? else {
             continue;
         };
+        if !projected_generations.insert(generation.id.clone()) {
+            continue;
+        }
 
         // ── Resume from the parser's own checkpoint ──
         //
@@ -1252,7 +1261,11 @@ async fn project_session(
 }
 
 /// Read one chunk's logical bytes from object storage.
-async fn read_chunk_logical(st: &AppState, store: &Store, chunk: &CaptureChunk) -> Result<Vec<u8>> {
+pub(crate) async fn read_chunk_logical(
+    st: &AppState,
+    store: &Store,
+    chunk: &CaptureChunk,
+) -> Result<Vec<u8>> {
     let stored = st.get_capture_chunk(store, chunk).await?;
     match chunk.encoding {
         ChunkEncoding::Zstd => Ok(zstd::decode_all(&stored[..])?),
@@ -1924,6 +1937,83 @@ pub(crate) mod tests {
             events.len()
         );
         assert_eq!(events[1].kind, TranscriptEventKind::AgentMessage);
+
+        db.drop().await;
+    }
+
+    /// Two files following one generation — the original and a reinstall that
+    /// adopted it — project once. Projecting per file would feed the same bytes
+    /// through the parser twice and race the checkpoint.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn an_adopted_generation_is_projected_once() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+
+        let body = br#"{"type":"user","message":{"role":"user","content":"one"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"two"}]}}
+"#;
+        let store = st.public_store().expect("a live backend");
+        let (session, generation) = seed(&store, "claude_code", body).await;
+        store_object(&st, body).await;
+
+        // A second device registers the same session and adopts the stream
+        let (native,): (String,) =
+            sqlx::query_as("SELECT native_session_id FROM capture_sessions WHERE id = $1")
+                .bind(&session)
+                .fetch_one(store.pool())
+                .await
+                .expect("native id");
+        let reinstall = NewCaptureFile {
+            id: Id::new(),
+            native_session_id: native,
+            parent_native_session_id: None,
+            device_id: Id::new().to_string(),
+            agent: "claude_code".into(),
+            logical_path: "projects/-p/s1.jsonl".into(),
+            role: FileRole::Transcript,
+            framing: Framing::Append,
+            cwd: None,
+            project_key: None,
+        };
+        let registered = store
+            .archive_txn(async |t| t.register_capture_file(&reinstall).await)
+            .await
+            .expect("register");
+        assert_eq!(
+            registered.session.id, session,
+            "same native id, same session"
+        );
+        store
+            .archive_txn(async |t| {
+                t.adopt_generation(&registered.file.id, &generation, 0)
+                    .await
+            })
+            .await
+            .expect("adopt");
+
+        let tenant = Tenant::Live {
+            schema: cormex_store::SchemaName::public(),
+            store: store.clone(),
+        };
+        project_tick(&st, &tenant).await.expect("tick");
+        project_tick(&st, &tenant)
+            .await
+            .expect("a second tick changes nothing");
+
+        let events = store
+            .transcript_page(&session, "claude_code@1", -1, 100)
+            .await
+            .expect("page");
+        assert_eq!(
+            events.len(),
+            2,
+            "one stream followed by two files must project its two records once, got {}",
+            events.len()
+        );
 
         db.drop().await;
     }

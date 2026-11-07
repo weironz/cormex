@@ -407,6 +407,64 @@ impl ArchiveTxn {
         self.generation(&id).await
     }
 
+    /// Make `file_id` follow `generation_id`, a generation of another file.
+    ///
+    /// The caller has already proved, with a prefix hash, that the file's local
+    /// bytes agree with the generation for `verified_through` bytes; this only
+    /// records the decision. What it does check is that the two files are the
+    /// same stream — one session, one role. Adopting across sessions would move
+    /// a conversation's bytes under another conversation, and nothing
+    /// downstream would notice.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] when either row is missing or the files are not
+    /// the same stream.
+    pub async fn adopt_generation(
+        &mut self,
+        file_id: &str,
+        generation_id: &str,
+        verified_through: i64,
+    ) -> Result<(Generation, i64)> {
+        let same_stream: Option<(bool,)> = sqlx::query_as(
+            "SELECT (owner.session_id = f.session_id AND owner.role = f.role)
+               FROM capture_files f, capture_generations g
+               JOIN capture_files owner ON owner.id = g.file_id
+              WHERE f.id = $1 AND g.id = $2",
+        )
+        .bind(file_id)
+        .bind(generation_id)
+        .fetch_optional(&mut *self.inner.tx)
+        .await?;
+        match same_stream {
+            None => {
+                return Err(StoreError::Invalid(
+                    "no such capture file or generation".into(),
+                ));
+            }
+            Some((false,)) => {
+                return Err(StoreError::Invalid(
+                    "a file can only adopt a generation of the same session and role".into(),
+                ));
+            }
+            Some((true,)) => {}
+        }
+
+        sqlx::query(
+            "INSERT INTO capture_generation_adoptions (id, file_id, generation_id, verified_through)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(cormex_core::Id::new().to_string())
+        .bind(file_id)
+        .bind(generation_id)
+        .bind(verified_through.max(0))
+        .execute(&mut *self.inner.tx)
+        .await?;
+
+        let generation = self.generation(generation_id).await?;
+        let end = self.generation_end(generation_id).await?;
+        Ok((generation, end))
+    }
+
     // ── chunks ─────────────────────────────────────────────
 
     /// Append one chunk to a generation.
@@ -778,12 +836,17 @@ impl ArchiveTxn {
         Ok(end)
     }
 
-    /// The newest generation of a file, with the offset it currently ends at.
+    /// The generation a file currently follows, with the offset it ends at.
+    ///
+    /// Usually the file's own newest generation; after an adoption it is the
+    /// adopted one, which belongs to another file. Read through
+    /// `capture_current_generations` so this and every other reader agree.
     pub async fn latest_generation(&mut self, file_id: &str) -> Result<Option<(Generation, i64)>> {
         let row = sqlx::query_as::<_, Generation>(
-            "SELECT id, file_id, ordinal, reason, created_at
-               FROM capture_generations WHERE file_id = $1
-              ORDER BY ordinal DESC LIMIT 1",
+            "SELECT g.id, g.file_id, g.ordinal, g.reason, g.created_at
+               FROM capture_current_generations c
+               JOIN capture_generations g ON g.id = c.generation_id
+              WHERE c.file_id = $1",
         )
         .bind(file_id)
         .fetch_optional(&mut *self.inner.tx)

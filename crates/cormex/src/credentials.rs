@@ -118,6 +118,10 @@ pub fn describe_location(config_dir: &Path, server_url: &str) -> Option<String> 
             "the system keyring (entry `{server_url}.{KEYRING_SERVICE}`)"
         ));
     }
+    // The keyring is only consulted where it is reliable (the branch above);
+    // elsewhere the URL that names its entry has nothing to name
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    let _ = server_url;
     let path = file_path(config_dir);
     if path.exists() {
         return Some(format!("the file {}", path.display()));

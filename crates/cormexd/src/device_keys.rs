@@ -158,6 +158,9 @@ impl DeviceScope {
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "events"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "metadata"]))
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "classification"]))
+                // Adoption: prove a local file is a copy, then follow the copy
+                || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "files", _, "adopt"]))
+                || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "generations", _, "verify"]))
                 // A batch of small snapshots (P4-0): SQLite rows
                 || (is(Method::POST) && matches!(segs.as_slice(), ["capture", "snapshots"]))
                 || (is(Method::PUT)
@@ -518,6 +521,8 @@ mod tests {
             (Method::POST, "/capture/files/01ABC/metadata"),
             (Method::POST, "/capture/files/01ABC/classification"),
             (Method::POST, "/capture/snapshots"),
+            (Method::POST, "/capture/files/01ABC/adopt"),
+            (Method::POST, "/capture/generations/01ABC/verify"),
         ] {
             assert!(
                 capture.allows(&method, path),

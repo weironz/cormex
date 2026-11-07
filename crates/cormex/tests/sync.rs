@@ -787,3 +787,236 @@ async fn an_api_that_always_fails_counts_one_error_and_continues() {
         "the first error must be kept for `doctor`"
     );
 }
+
+// ── Idempotency: the same conversation is archived once, whatever happens ──
+//
+// Each test below is one way a machine can lose track of what it already sent:
+// a deleted `state.db`, an uninstall that also dropped the device key, the host
+// moving the file, a second machine with the same session. The assertion that
+// matters in every one is `bytes_received`: the server must not receive the
+// history a second time, and must not end up with two copies of one stream.
+
+/// A second installation on the same fake server: its own empty state, its
+/// own device id. Exactly what `cormex uninstall` + wiping the data directory
+/// + `cormex login` (a new device key) leaves behind.
+struct Install {
+    data: tempfile::TempDir,
+    db: StateDb,
+    device: &'static str,
+}
+
+impl Install {
+    fn new(device: &'static str) -> Self {
+        let data = tempfile::tempdir().expect("data");
+        let db = StateDb::open(data.path()).expect("db");
+        Self { data, db, device }
+    }
+
+    async fn sync(&self, f: &Fixture) -> cormex::sync::SyncReport {
+        f.api.set_device(self.device);
+        let report = run(
+            &f.api,
+            &self.db,
+            self.data.path(),
+            &f.catalog,
+            &f.cfg,
+            self.device,
+            &SyncOptions::default(),
+        )
+        .await
+        .expect("the run itself should not fail");
+        f.api.set_device("device-1");
+        report
+    }
+}
+
+const HISTORY: &[u8] = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
+
+#[tokio::test]
+async fn a_lost_state_db_sends_nothing_again() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", HISTORY);
+    f.sync().await;
+    let sent = f.api.bytes_received();
+
+    // Same device key, state gone: `rm state.db`
+    let again = Install::new("device-1");
+    let report = again.sync(&f).await;
+
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        f.api.bytes_received(),
+        sent,
+        "losing the local state must not re-upload a file the server already has"
+    );
+    assert_eq!(f.api.non_empty_generations(), 1);
+}
+
+#[tokio::test]
+async fn a_reinstall_with_a_new_device_key_follows_the_archived_copy() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", HISTORY);
+    f.sync().await;
+    let sent = f.api.bytes_received();
+
+    // Uninstall, wipe everything, log in again: a new device id
+    let reinstall = Install::new("device-2");
+    let report = reinstall.sync(&f).await;
+
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        f.api.bytes_received(),
+        sent,
+        "a new device key made the whole history upload a second time"
+    );
+    assert_eq!(
+        f.api.adoptions(),
+        1,
+        "the new file should follow the archived stream"
+    );
+    assert_eq!(
+        f.api.non_empty_generations(),
+        1,
+        "two generations with the same bytes is the same conversation archived twice"
+    );
+}
+
+#[tokio::test]
+async fn a_reinstall_then_more_chat_sends_only_the_new_turn() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", HISTORY);
+    f.sync().await;
+    let sent = f.api.bytes_received();
+
+    let reinstall = Install::new("device-2");
+    let more = b"{\"type\":\"user\",\"n\":2}\n";
+    let mut grown = HISTORY.to_vec();
+    grown.extend_from_slice(more);
+    f.write("s1.jsonl", &grown);
+    reinstall.sync(&f).await;
+
+    assert_eq!(
+        f.api.bytes_received() - sent,
+        i64::try_from(more.len()).expect("small"),
+        "only the turn appended after the reinstall is new"
+    );
+    assert_eq!(f.api.non_empty_generations(), 1);
+
+    // And it keeps working as an ordinary append afterwards
+    let even_more = b"{\"type\":\"assistant\",\"n\":2}\n";
+    grown.extend_from_slice(even_more);
+    f.write("s1.jsonl", &grown);
+    reinstall.sync(&f).await;
+    assert_eq!(
+        f.api.bytes_received() - sent,
+        i64::try_from(more.len() + even_more.len()).expect("small")
+    );
+}
+
+#[tokio::test]
+async fn a_file_the_host_moved_is_not_uploaded_again() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", HISTORY);
+    f.sync().await;
+    let sent = f.api.bytes_received();
+
+    // The project directory is renamed (Claude Code encodes the cwd in it);
+    // the session file keeps its name, so it is the same session
+    let projects = f.home.path().join("projects");
+    std::fs::rename(
+        projects.join("-home-u-proj"),
+        projects.join("-home-u-renamed"),
+    )
+    .expect("rename");
+    let report = f.sync().await;
+
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        f.api.bytes_received(),
+        sent,
+        "a renamed project directory re-uploaded every session in it"
+    );
+    assert_eq!(f.api.non_empty_generations(), 1);
+}
+
+#[tokio::test]
+async fn an_older_copy_on_another_machine_sends_nothing_and_later_only_the_new_bytes() {
+    let f = Fixture::new();
+    let mut long = HISTORY.to_vec();
+    long.extend_from_slice(b"{\"type\":\"user\",\"n\":2}\n");
+    f.write("s1.jsonl", &long);
+    f.sync().await;
+    let sent = f.api.bytes_received();
+
+    // A second machine whose copy of the session stopped earlier
+    let laptop = Install::new("device-2");
+    f.write("s1.jsonl", HISTORY);
+    laptop.sync(&f).await;
+    assert_eq!(
+        f.api.bytes_received(),
+        sent,
+        "a copy that is a prefix of the archive holds nothing new"
+    );
+
+    // The laptop catches up with the same bytes and then goes further
+    let more = b"{\"type\":\"assistant\",\"n\":3}\n";
+    let mut laptop_copy = long.clone();
+    laptop_copy.extend_from_slice(more);
+    f.write("s1.jsonl", &laptop_copy);
+    laptop.sync(&f).await;
+    assert_eq!(
+        f.api.bytes_received() - sent,
+        i64::try_from(more.len()).expect("small"),
+        "the bytes another machine already sent must be verified and skipped, not resent"
+    );
+    assert_eq!(f.api.non_empty_generations(), 1);
+}
+
+#[tokio::test]
+async fn a_file_rewritten_while_uninstalled_starts_a_new_generation() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"0123456789");
+    f.sync().await;
+
+    // Rewritten (same length, different bytes) while no state existed to
+    // notice: resuming at the server's end would splice two histories
+    let again = Install::new("device-1");
+    f.write("s1.jsonl", b"ABCDEFGHIJKLMN");
+    let report = again.sync(&f).await;
+
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        f.api.non_empty_generations(),
+        2,
+        "different bytes are a different generation, and the old one stays intact"
+    );
+    let state = again
+        .db
+        .file("claude_code|projects/-home-u-proj/s1.jsonl")
+        .expect("read")
+        .expect("state");
+    assert_eq!(
+        f.api
+            .assembled(state.generation_id.as_deref().expect("generation")),
+        b"ABCDEFGHIJKLMN".to_vec(),
+        "the new generation holds exactly the rewritten file"
+    );
+}
+
+#[tokio::test]
+async fn a_different_conversation_under_the_same_session_id_is_not_merged() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", b"one machine's history\n");
+    f.sync().await;
+
+    let other = Install::new("device-2");
+    f.write("s1.jsonl", b"a different history altogether\n");
+    other.sync(&f).await;
+
+    assert_eq!(
+        f.api.adoptions(),
+        0,
+        "content that disagrees must never be adopted"
+    );
+    assert_eq!(f.api.non_empty_generations(), 2);
+}

@@ -173,6 +173,43 @@ impl LogicalReader {
         Ok(Some(sha256_hex(&bytes)))
     }
 
+    /// The sha256 of the first `len` logical bytes (all of them if the file is
+    /// shorter).
+    ///
+    /// What the client sends to `/capture/generations/{id}/verify` before it
+    /// trusts any offset the server gives it. Streams in one pass — a
+    /// compressed file is decompressed once, not once per block.
+    ///
+    /// # Errors
+    /// The file cannot be read.
+    pub fn prefix_hash(&self, len: u64) -> Result<String> {
+        let len = len.min(self.len);
+        let mut hasher = Sha256::new();
+        if let Some(bytes) = &self.memory {
+            let end = usize::try_from(len).unwrap_or(bytes.len()).min(bytes.len());
+            hasher.update(&bytes[..end]);
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        let mut source: Box<dyn std::io::Read> = if self.compressed {
+            Box::new(self.decoder()?.take(len))
+        } else {
+            Box::new(
+                std::fs::File::open(&self.path)
+                    .with_context(|| format!("could not open {}", self.path.display()))?
+                    .take(len),
+            )
+        };
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = source.read(&mut buf).context("could not read")?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     /// The sha256 of the whole file.
     ///
     /// # Errors

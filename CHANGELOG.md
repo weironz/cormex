@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Capture: the same conversation is archived once, whatever happens
+
+- A file the server has never seen under this device and path is offered the generations other files of the **same session and role** already hold. The client proves its bytes match one with a prefix hash (`POST /capture/generations/{id}/verify`) and follows it (`POST /capture/files/{id}/adopt`) instead of uploading the history again. Covered: reinstalling with a **new** device key, Codex moving a rollout into `archived_sessions/`, a renamed Claude Code project directory, a `.orphaned-…` set-aside copy, the same session on a second machine. Before, each of these uploaded every byte again and the projector showed the conversation twice.
+- The client no longer resumes on an offset alone. After `state.db` is lost, and whenever the server answers 409 "I am ahead", it verifies the server's prefix against its own bytes first: identical → continue at the server's end; local is an older copy → send nothing; different bytes (the file was rewritten while nobody was watching) → a new generation, with the old one left intact. The old behaviour spliced a rewritten file onto the previous history without a word.
+- Two machines appending to one session now append to one generation; the second machine's identical bytes are verified and skipped.
+- New migration `20261127000001_capture_generation_adoptions.sql` (table `capture_generation_adoptions`, view `capture_current_generations`). Append-only; `ON DELETE CASCADE` so purge is unaffected.
+- Not covered: conversations that were already duplicated before this change stay duplicated in the archive until a repair pass is run.
+
 ### Capture CLI
 
 - `cormex login --print-key` prints the stored device key — the only copy of this machine's identity, since the server keeps its sha256 and cannot re-issue it. The key goes to stdout alone, so `cormex login --print-key > key.txt` is a working backup; the "where it came from" line goes to stderr. Restore after a reinstall with `cormex login --key`, and the server sees the same device and merges rather than capturing every file again under a new `device_id` — which duplicates the projected events, because the event id derives from the generation.

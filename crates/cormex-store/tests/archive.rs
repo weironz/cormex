@@ -655,3 +655,163 @@ fn the_archive_tables_are_disjoint_from_the_synced_ones() {
         "table::ARCHIVE is empty -- the disjointness assertion above is then vacuous"
     );
 }
+
+async fn register_in(s: &Store, device: &str, path: &str, native: &str) -> (String, String) {
+    let new = NewCaptureFile {
+        id: Id::new(),
+        native_session_id: native.to_owned(),
+        parent_native_session_id: None,
+        device_id: device.to_owned(),
+        agent: "claude_code".to_owned(),
+        logical_path: path.to_owned(),
+        role: FileRole::Transcript,
+        framing: Framing::Append,
+        cwd: None,
+        project_key: None,
+    };
+    s.archive_txn(async |t| t.register_capture_file(&new).await)
+        .await
+        .expect("registering a file should succeed")
+        .into_ids()
+}
+
+/// A second identity for the same stream (new device key, moved file, second
+/// machine) follows the archived generation instead of growing its own copy.
+#[tokio::test]
+async fn adoption_makes_two_files_one_stream() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let (old_device, new_device) = (device(), device());
+    let (_old_file, old_gen) = register(s, &old_device, "projects/a/s1.jsonl").await;
+    s.archive_txn(async |t| t.append_chunk(&chunk(&old_gen, 0, 100, &fake_sha(1))).await)
+        .await
+        .expect("append");
+
+    // The reinstalled machine registers the same session under a new device
+    let (new_file, own_gen) = register(s, &new_device, "projects/a/s1.jsonl").await;
+    let candidates = s.adoption_candidates(&new_file).await.expect("candidates");
+    let may_write_before = s
+        .device_may_write_generation(&new_device, &old_gen)
+        .await
+        .expect("query");
+
+    let (adopted, end) = s
+        .archive_txn(async |t| t.adopt_generation(&new_file, &old_gen, 100).await)
+        .await
+        .expect("adopting a generation of the same session and role should succeed");
+    let current = s
+        .latest_generation(&new_file)
+        .await
+        .expect("query")
+        .expect("a current generation");
+    let may_write_after = s
+        .device_may_write_generation(&new_device, &old_gen)
+        .await
+        .expect("query");
+    // Appending through the adopted generation continues the one stream
+    let appended = s
+        .archive_txn(async |t| {
+            t.append_chunk(&chunk(&old_gen, 100, 20, &fake_sha(2)))
+                .await
+        })
+        .await
+        .expect("append");
+    db.cleanup().await;
+
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|(g, e)| (g.id.clone(), *e))
+            .collect::<Vec<_>>(),
+        vec![(old_gen.clone(), 100)],
+        "the archived copy must be offered to the new file, and its own empty generation must not be"
+    );
+    assert!(
+        !may_write_before,
+        "before adopting, the new device has no business in that generation"
+    );
+    assert_eq!((adopted.id.as_str(), end), (old_gen.as_str(), 100));
+    assert_eq!(
+        current.0.id, old_gen,
+        "after adopting, the file's current generation is the adopted one, not its own {own_gen}"
+    );
+    assert!(
+        may_write_after,
+        "a device must be able to append to the stream its file follows"
+    );
+    assert!(matches!(
+        appended,
+        AppendOutcome::Appended { end_offset: 120 }
+    ));
+}
+
+/// Adoption never crosses a session: that would move one conversation's bytes
+/// under another, and nothing downstream would notice.
+#[tokio::test]
+async fn adoption_across_sessions_is_refused() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let d = device();
+    let (_a, gen_a) = register_in(s, &d, "projects/a/s1.jsonl", "session-a").await;
+    s.archive_txn(async |t| t.append_chunk(&chunk(&gen_a, 0, 10, &fake_sha(3))).await)
+        .await
+        .expect("append");
+    let (file_b, _gen_b) = register_in(s, &d, "projects/a/s2.jsonl", "session-b").await;
+
+    let candidates = s.adoption_candidates(&file_b).await.expect("candidates");
+    let refused = s
+        .archive_txn(async |t| t.adopt_generation(&file_b, &gen_a, 10).await)
+        .await;
+    db.cleanup().await;
+
+    assert!(
+        candidates.is_empty(),
+        "another session's generation must never be a candidate"
+    );
+    assert!(
+        matches!(refused, Err(cormex_store::StoreError::Invalid(_))),
+        "adopting another session's generation must be refused, got {refused:?}"
+    );
+}
+
+/// A file that adopted and then diverged opens its own generation, and that
+/// one — the newest — is current again.
+#[tokio::test]
+async fn a_new_own_generation_supersedes_an_adoption() {
+    let Some(db) = common::setup().await else {
+        return;
+    };
+    let s = &db.store;
+
+    let (d1, d2) = (device(), device());
+    let (_f1, g1) = register(s, &d1, "projects/a/s1.jsonl").await;
+    s.archive_txn(async |t| t.append_chunk(&chunk(&g1, 0, 10, &fake_sha(4))).await)
+        .await
+        .expect("append");
+    let (f2, _) = register(s, &d2, "projects/a/s1.jsonl").await;
+    s.archive_txn(async |t| t.adopt_generation(&f2, &g1, 10).await)
+        .await
+        .expect("adopt");
+    let fresh = s
+        .archive_txn(async |t| t.open_generation(&f2, GenerationReason::Rewrite).await)
+        .await
+        .expect("open");
+    let current = s
+        .latest_generation(&f2)
+        .await
+        .expect("query")
+        .expect("current");
+    db.cleanup().await;
+
+    assert_eq!(
+        current.0.id, fresh.id,
+        "after diverging, the file must write to its own new generation, not keep appending to \
+         the stream it no longer matches"
+    );
+}

@@ -9,9 +9,11 @@
 //! responses, and getting either wrong is silent:
 //!
 //! - **`expected` > local offset** — the server already has more than the client
-//!   recorded. That happens when a previous run's 200 was lost on the way back.
-//!   The client must **skip ahead**; re-sending would be a replay the server
-//!   accepts, but the local state would never converge.
+//!   recorded. That happens when a previous run's 200 was lost on the way back,
+//!   or when another machine appends to the same stream. The client **verifies
+//!   the server's prefix against its own bytes** (`reconcile::compare`) and then
+//!   skips ahead; bytes that disagree go into a new generation instead of being
+//!   skipped over.
 //! - **`expected` < local offset** — the client's state is ahead, which happens
 //!   after a state database restore from an older backup. The client must
 //!   **rewind** and re-send from `expected`.
@@ -61,6 +63,9 @@ pub async fn upload(
 ) -> Result<Uploaded> {
     let mut out = Uploaded::default();
     let mut offset = from;
+    // Owned: a divergence found mid-upload moves the rest of the file into a
+    // new generation
+    let mut generation_id = generation_id.to_owned();
 
     while offset < i64::try_from(reader.len()).unwrap_or(i64::MAX) {
         if budget.exhausted() {
@@ -82,7 +87,7 @@ pub async fn upload(
         let mut attempt = 0;
         let outcome = loop {
             match api
-                .put_chunk(generation_id, offset, body.clone(), &sha, &observed_at)
+                .put_chunk(&generation_id, offset, body.clone(), &sha, &observed_at)
                 .await
             {
                 Ok(o) => break o,
@@ -117,16 +122,54 @@ pub async fn upload(
             PutOutcome::OffsetMismatch { expected } => {
                 if expected > offset {
                     // The server has more than we recorded: a previous 200 was
-                    // lost. Skip ahead rather than re-sending.
-                    tracing::debug!(
-                        from = offset,
-                        to = expected,
-                        "the server is ahead; skipping"
-                    );
-                    offset = expected;
-                    state.uploaded_offset = offset;
-                    state.tail_sha256 = reader.tail_hash(u64::try_from(offset).unwrap_or(0))?;
-                    db.put_file(state)?;
+                    // lost, or another machine appended to the same stream.
+                    // **Which bytes** is the question an offset cannot answer,
+                    // so ask with a prefix hash before skipping over them
+                    match crate::sync::reconcile::compare(api, reader, &generation_id, expected)
+                        .await?
+                    {
+                        crate::sync::reconcile::Verdict::Extends { end } => {
+                            tracing::debug!(
+                                from = offset,
+                                to = end,
+                                "the server is ahead; skipping"
+                            );
+                            offset = end;
+                            state.uploaded_offset = offset;
+                            state.tail_sha256 =
+                                reader.tail_hash(u64::try_from(offset).unwrap_or(0))?;
+                            db.put_file(state)?;
+                        }
+                        crate::sync::reconcile::Verdict::Behind => {
+                            // Everything on this disk is already there; the
+                            // rest of the stream came from elsewhere
+                            let local = i64::try_from(reader.len()).unwrap_or(i64::MAX);
+                            state.uploaded_offset = local;
+                            state.tail_sha256 =
+                                reader.tail_hash(u64::try_from(local).unwrap_or(0))?;
+                            db.put_file(state)?;
+                            break;
+                        }
+                        crate::sync::reconcile::Verdict::Diverged => {
+                            let file_id = state.file_id.clone().ok_or_else(|| {
+                                anyhow::anyhow!("the state has no file to open a generation on")
+                            })?;
+                            let fresh = api.open_generation(&file_id, "rewrite").await?;
+                            tracing::info!(
+                                old = %generation_id,
+                                new = %fresh.id,
+                                "the server's bytes are not this file's; continuing in a new \
+                                 generation"
+                            );
+                            generation_id = fresh.id;
+                            state.generation_id = Some(generation_id.clone());
+                            state.generation_ordinal = Some(fresh.ordinal);
+                            offset = 0;
+                            state.uploaded_offset = 0;
+                            state.tail_sha256 = None;
+                            db.put_file(state)?;
+                        }
+                    }
                 } else {
                     // The client is ahead: rewind and re-send from where the
                     // server actually is

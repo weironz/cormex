@@ -144,7 +144,8 @@ impl Store {
         limit: i64,
         retry_failed_secs: i32,
     ) -> Result<Vec<(String, String)>> {
-        // The projector reads the latest generation of each file; earlier
+        // The projector reads the generation each file currently follows
+        // (its own newest, or an adopted one — `capture_current_generations`); earlier
         // generations remain archived but must not keep re-entering its queue.
         // `through` is a JSON map from generation id to a **record**
         // — `{offset, parser}` — not a bare number: the offset alone cannot
@@ -157,11 +158,8 @@ impl Store {
             "SELECT DISTINCT s.id, s.agent
                FROM capture_sessions s
                JOIN capture_files f ON f.session_id = s.id
-               JOIN LATERAL (
-                    SELECT g0.id FROM capture_generations g0
-                     WHERE g0.file_id = f.id
-                     ORDER BY g0.ordinal DESC LIMIT 1
-               ) g ON true
+               JOIN capture_current_generations cg ON cg.file_id = f.id
+               JOIN capture_generations g ON g.id = cg.generation_id
                JOIN capture_chunks c ON c.generation_id = g.id
                LEFT JOIN LATERAL (
                     SELECT p.through, p.status, p.created_at
@@ -913,11 +911,16 @@ impl Store {
     /// `None` means the file has no generation at all, which the registration
     /// path guarantees cannot happen — but the signature must not claim what it
     /// cannot know.
+    ///
+    /// "Newest" means the generation the file currently **follows**: its own
+    /// newest one, or one it adopted from another file of the same stream
+    /// (`capture_current_generations`).
     pub async fn latest_generation(&self, file_id: &str) -> Result<Option<(Generation, i64)>> {
         let row = sqlx::query_as::<_, Generation>(
-            "SELECT id, file_id, ordinal, reason, created_at
-               FROM capture_generations WHERE file_id = $1
-              ORDER BY ordinal DESC LIMIT 1",
+            "SELECT g.id, g.file_id, g.ordinal, g.reason, g.created_at
+               FROM capture_current_generations c
+               JOIN capture_generations g ON g.id = c.generation_id
+              WHERE c.file_id = $1",
         )
         .bind(file_id)
         .fetch_optional(self.pool())
@@ -1424,6 +1427,97 @@ impl Store {
     /// either side of the range it asked for — slicing them is the caller's
     /// job, because only the caller knows whether it wants the surrounding
     /// context.
+    /// Generations a newly seen file might really be a copy of.
+    ///
+    /// The current generation of every **other** file of the same session and
+    /// role, non-empty, newest first. Capped: the client hashes its local file
+    /// once per candidate, and a session rarely has more than a handful of
+    /// copies (one per machine, one per host-side move).
+    pub async fn adoption_candidates(&self, file_id: &str) -> Result<Vec<(Generation, i64)>> {
+        let rows = sqlx::query_as::<_, Generation>(
+            "SELECT DISTINCT ON (g.id) g.id, g.file_id, g.ordinal, g.reason, g.created_at
+               FROM capture_files me
+               JOIN capture_files other
+                 ON other.session_id = me.session_id
+                AND other.role = me.role
+                AND other.id <> me.id
+               JOIN capture_current_generations cg ON cg.file_id = other.id
+               JOIN capture_generations g ON g.id = cg.generation_id
+              WHERE me.id = $1
+                AND g.id NOT IN (
+                    SELECT generation_id FROM capture_current_generations WHERE file_id = $1)
+                AND EXISTS (SELECT 1 FROM capture_chunks c WHERE c.generation_id = g.id)
+              ORDER BY g.id",
+        )
+        .bind(file_id)
+        .fetch_all(self.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for g in rows {
+            let end = self.generation_end(&g.id).await?;
+            out.push((g, end));
+        }
+        // Longest first: if a local file matches several copies, following the
+        // most complete one means the fewest bytes still to send
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.id.cmp(&a.0.id)));
+        out.truncate(8);
+        Ok(out)
+    }
+
+    /// May this device append to this generation?
+    ///
+    /// Yes when the generation belongs to one of its files, or one of its
+    /// files currently follows it. The second half is what lets two machines
+    /// carrying the same session keep appending to one stream.
+    pub async fn device_may_write_generation(
+        &self,
+        device_id: &str,
+        generation_id: &str,
+    ) -> Result<bool> {
+        let (ok,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM capture_generations g
+                   JOIN capture_files f ON f.id = g.file_id
+                  WHERE g.id = $2 AND f.device_id = $1
+             ) OR EXISTS (
+                 SELECT 1 FROM capture_current_generations c
+                   JOIN capture_files f ON f.id = c.file_id
+                  WHERE c.generation_id = $2 AND f.device_id = $1
+             )",
+        )
+        .bind(device_id)
+        .bind(generation_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(ok)
+    }
+
+    /// May this device ask for prefix hashes of this generation?
+    ///
+    /// When it has any file in the same session. That covers every generation
+    /// the server offers it as a candidate, and nothing beyond: a hash oracle
+    /// over files in sessions this machine never saw would leak whether a
+    /// guessed content is in somebody's history.
+    pub async fn device_may_verify_generation(
+        &self,
+        device_id: &str,
+        generation_id: &str,
+    ) -> Result<bool> {
+        let (ok,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM capture_generations g
+                   JOIN capture_files owner ON owner.id = g.file_id
+                   JOIN capture_files mine ON mine.session_id = owner.session_id
+                  WHERE g.id = $2 AND mine.device_id = $1
+             )",
+        )
+        .bind(device_id)
+        .bind(generation_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(ok)
+    }
+
     pub async fn chunks_overlapping(
         &self,
         generation_id: &str,

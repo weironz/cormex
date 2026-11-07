@@ -38,10 +38,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use cormex_core::Id;
 use cormex_proto::capture::{
-    ChunkAck, FileClassification, FileEventOp, FileRole, Framing, GenerationReason,
-    HEADER_CONTENT_SHA256, HEADER_OBSERVED_AT, NewGenerationRequest, OffsetMismatchBody,
-    RegisterFileRequest, RegisterFileResponse, SnapshotBatchResponse, SnapshotEntry,
-    SnapshotResult, SnapshotStatus,
+    AdoptGenerationRequest, ChunkAck, FileClassification, FileEventOp, FileRole, Framing,
+    GenerationReason, HEADER_CONTENT_SHA256, HEADER_OBSERVED_AT, NewGenerationRequest,
+    OffsetMismatchBody, RegisterFileRequest, RegisterFileResponse, SnapshotBatchResponse,
+    SnapshotEntry, SnapshotResult, SnapshotStatus, VerifyPrefixRequest, VerifyPrefixResponse,
 };
 use cormex_store::{
     AppendOutcome, ChunkEncoding, GenerationReason as StoreReason, NewCaptureChunk, NewCaptureFile,
@@ -128,6 +128,26 @@ pub async fn register_file(
         .await
         .map_err(store_err)?;
 
+    // Only a file that holds nothing yet is offered candidates: one that
+    // already has bytes is either resuming (the client verifies against its own
+    // generation) or has diverged (it opens a new one). Offering copies to it
+    // would invite following a stream it is not part of
+    let candidates = if registered.end_offset == 0 {
+        store
+            .adoption_candidates(&registered.file.id)
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|(g, end)| cormex_proto::capture::GenerationDto {
+                id: g.id,
+                ordinal: g.ordinal,
+                end_offset: end,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(axum::Json(RegisterFileResponse {
         file_id: registered.file.id,
         session_id: registered.session.id,
@@ -136,6 +156,143 @@ pub async fn register_file(
             ordinal: registered.generation.ordinal,
             end_offset: registered.end_offset,
         },
+        candidates,
+    }))
+}
+
+/// `POST /capture/generations/{id}/verify` — do the first `length` bytes of
+/// this generation hash to `sha256`?
+///
+/// The other half of every idempotency decision the client makes without
+/// local state: resuming after `state.db` was lost, adopting a copy, skipping
+/// ahead when another machine already appended. Each of those used to trust an
+/// offset alone, and an offset says nothing about whether the bytes before it
+/// are the ones on this disk — a file rewritten while the CLI was uninstalled
+/// would have been spliced onto the old history without a word.
+///
+/// Hashes chunk by chunk rather than assembling the prefix, so memory stays at
+/// one chunk however long the generation is.
+///
+/// # Errors
+/// The caller is not a capture device (403), the generation does not exist
+/// (404), or a chunk cannot be read back (500).
+pub async fn verify_prefix(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(generation_id): Path<String>,
+    axum::Json(req): axum::Json<VerifyPrefixRequest>,
+) -> Result<axum::Json<VerifyPrefixResponse>, ApiError> {
+    use sha2::{Digest as _, Sha256};
+
+    let (tenant, device_id) = capture_caller(&st, &principal).await?;
+    let store = tenant
+        .store()
+        .map_err(|e| ApiError::unsupported(e.to_string()))?;
+    store
+        .generation_by_id(&generation_id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::not_found("no such generation"))?;
+    // Answering hashes for a generation this device cannot reach would turn the
+    // endpoint into an oracle over other machines' files. The candidates the
+    // server offered are reachable by construction: same session, and the
+    // device has a file in it
+    if !store
+        .device_may_verify_generation(&device_id, &generation_id)
+        .await
+        .map_err(store_err)?
+    {
+        return Err(ApiError::forbidden(
+            "this device has no file in that generation's session",
+        ));
+    }
+
+    let end = store
+        .generation_end(&generation_id)
+        .await
+        .map_err(store_err)?;
+    if req.length < 0 || req.length > end {
+        return Ok(axum::Json(VerifyPrefixResponse {
+            matches: false,
+            end_offset: end,
+        }));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut covered: i64 = 0;
+    if req.length > 0 {
+        let chunks = store
+            .chunks_overlapping(&generation_id, 0, req.length)
+            .await
+            .map_err(store_err)?;
+        for chunk in chunks {
+            // Contiguity is the store's invariant; a gap here means the prefix
+            // cannot be reconstructed, which is "does not match", not a guess
+            if chunk.byte_offset != covered {
+                return Ok(axum::Json(VerifyPrefixResponse {
+                    matches: false,
+                    end_offset: end,
+                }));
+            }
+            let bytes = crate::archive_workers::read_chunk_logical(&st, store, &chunk)
+                .await
+                .map_err(|e| ApiError::internal(format!("could not read a chunk back: {e}")))?;
+            let take = usize::try_from((req.length - covered).min(chunk.byte_length))
+                .unwrap_or(0)
+                .min(bytes.len());
+            hasher.update(&bytes[..take]);
+            covered += i64::try_from(take).unwrap_or(0);
+        }
+    }
+
+    let matches = covered == req.length && hex::encode(hasher.finalize()) == req.sha256;
+    Ok(axum::Json(VerifyPrefixResponse {
+        matches,
+        end_offset: end,
+    }))
+}
+
+/// `POST /capture/files/{id}/adopt` — make this device's file follow an
+/// existing generation of the same session and role.
+///
+/// # Errors
+/// The file is not this device's (403), either row is missing or the two are
+/// not the same stream (400).
+pub async fn adopt_generation(
+    State(st): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path(file_id): Path<String>,
+    axum::Json(req): axum::Json<AdoptGenerationRequest>,
+) -> Result<axum::Json<cormex_proto::capture::GenerationDto>, ApiError> {
+    let (tenant, device_id) = capture_caller(&st, &principal).await?;
+    let store = tenant
+        .store()
+        .map_err(|e| ApiError::unsupported(e.to_string()))?;
+
+    let file = store
+        .capture_file_by_id(&file_id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::not_found("no such capture file"))?;
+    if file.device_id != device_id {
+        return Err(ApiError::forbidden("this file belongs to another device"));
+    }
+
+    let (generation, end) = store
+        .archive_txn(async |t| {
+            t.adopt_generation(&file_id, &req.generation_id, req.verified_through)
+                .await
+        })
+        .await
+        .map_err(|e| match e {
+            cormex_store::StoreError::Invalid(msg) => ApiError::bad_request(msg),
+            other => store_err(other),
+        })?;
+
+    Ok(axum::Json(cormex_proto::capture::GenerationDto {
+        id: generation.id,
+        ordinal: generation.ordinal,
+        end_offset: end,
     }))
 }
 
@@ -543,7 +700,16 @@ pub async fn put_chunk(
         .await
         .map_err(store_err)?
         .ok_or_else(|| ApiError::not_found("no such capture file"))?;
-    if file.device_id != device_id {
+    // Its own generation, or one of its files follows it (an adoption): two
+    // machines carrying one session append to one stream. The encryption key
+    // below stays the generation owner's, so every chunk of a generation is
+    // under the same key whoever sent it
+    if file.device_id != device_id
+        && !store
+            .device_may_write_generation(&device_id, &generation_id)
+            .await
+            .map_err(store_err)?
+    {
         return Err(ApiError::forbidden(
             "this generation belongs to another device",
         ));
@@ -834,6 +1000,207 @@ mod tests {
     // ══════════════════════════════════════════════════════════
 
     use axum::http::Method;
+
+    /// The idempotency path end to end over HTTP: a second device key (a
+    /// reinstall) verifies its bytes against the archived generation, adopts
+    /// it, and continues appending there — while a device with no file in the
+    /// session cannot use `verify` as a hash oracle.
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn a_second_device_verifies_adopts_and_appends_to_one_stream() {
+        let Some(base) = crate::test_support::database_url() else {
+            eprintln!("skipped: DATABASE_URL is not set");
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let user = st
+            .create_account("adopt-user", "correct horse battery")
+            .await
+            .expect("create the account");
+        let app = crate::routes::router(st.clone());
+        let token = st
+            .access_book()
+            .issue_for_test(&user, std::time::Duration::from_secs(600));
+
+        let mut keys = Vec::new();
+        for label in ["old", "reinstalled", "stranger"] {
+            let (status, issued) = crate::test_support::call(
+                &app,
+                Method::POST,
+                "/devices",
+                Some(&token),
+                Some(serde_json::json!({"label": label, "scopes": ["capture:write"]})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "minting {label}: {issued}");
+            keys.push(issued["key"].as_str().expect("a key").to_owned());
+        }
+        let (old_key, new_key, stranger_key) = (&keys[0], &keys[1], &keys[2]);
+
+        let register_body = serde_json::json!({
+            "agent": "claude_code",
+            "native_session_id": "native-1",
+            "logical_path": "projects/-home-u-proj/s1.jsonl",
+            "role": "transcript",
+            "framing": "append"
+        });
+        let sha = |b: &[u8]| cormex_blob::hash::sha256_hex(b);
+        let headers = |b: &[u8]| {
+            vec![
+                ("x-content-sha256", sha(b)),
+                ("x-observed-at", "2026-11-07T00:00:00Z".to_owned()),
+            ]
+        };
+
+        // ── The original machine archives the history ──
+        let history = br#"{"type":"user","text":"which object store?"}"#.to_vec();
+        let (_, old) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/capture/files",
+            Some(old_key),
+            Some(register_body.clone()),
+        )
+        .await;
+        let archived = old["generation"]["id"]
+            .as_str()
+            .expect("generation")
+            .to_owned();
+        let (status, _) = crate::test_support::call_bytes(
+            &app,
+            Method::PUT,
+            &format!("/capture/generations/{archived}/chunks/0"),
+            old_key,
+            &headers(&history),
+            history.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ── The reinstalled machine is offered the archived stream ──
+        let (_, new) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/capture/files",
+            Some(new_key),
+            Some(register_body.clone()),
+        )
+        .await;
+        let offered: Vec<String> = new["candidates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            offered,
+            vec![archived.clone()],
+            "the new file must be offered the archived generation: {new}"
+        );
+
+        let verify_path = format!("/capture/generations/{archived}/verify");
+        for (length, digest, expected) in [
+            (history.len(), sha(&history), true),
+            // Any prefix length verifies, not only chunk boundaries
+            (5, sha(&history[..5]), true),
+            (5, sha(b"XXXXX"), false),
+            // Past the end there is no such prefix
+            (history.len() + 1, sha(&history), false),
+        ] {
+            let (status, answer) = crate::test_support::call(
+                &app,
+                Method::POST,
+                &verify_path,
+                Some(new_key),
+                Some(serde_json::json!({"length": length, "sha256": digest})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "verify: {answer}");
+            assert_eq!(
+                answer["matches"], expected,
+                "verifying {length} bytes should say {expected}: {answer}"
+            );
+        }
+        let (status, _) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &verify_path,
+            Some(stranger_key),
+            Some(serde_json::json!({"length": history.len(), "sha256": sha(&history)})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "verify must not answer for a session this device has never seen"
+        );
+
+        // ── Adopt, then keep appending to the one stream ──
+        let new_file = new["file_id"].as_str().expect("file").to_owned();
+        let (status, adopted) = crate::test_support::call(
+            &app,
+            Method::POST,
+            &format!("/capture/files/{new_file}/adopt"),
+            Some(new_key),
+            Some(serde_json::json!({"generation_id": archived, "verified_through": history.len()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "adopt: {adopted}");
+        assert_eq!(adopted["id"], archived.as_str());
+
+        let more = b"\n{\"n\":2}".to_vec();
+        let (status, _) = crate::test_support::call_bytes(
+            &app,
+            Method::PUT,
+            &format!("/capture/generations/{archived}/chunks/{}", history.len()),
+            new_key,
+            &headers(&more),
+            more.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the adopting device must be able to append to the stream it follows"
+        );
+        let (status, _) = crate::test_support::call_bytes(
+            &app,
+            Method::PUT,
+            &format!("/capture/generations/{archived}/chunks/0"),
+            stranger_key,
+            &headers(&history),
+            history.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a device that follows nothing here must still be refused"
+        );
+
+        // Registering again reports the adopted stream as current
+        let (_, again) = crate::test_support::call(
+            &app,
+            Method::POST,
+            "/capture/files",
+            Some(new_key),
+            Some(register_body),
+        )
+        .await;
+        assert_eq!(again["generation"]["id"], archived.as_str());
+
+        let store = st.public_store().expect("store");
+        let (chunks,): (i64,) = sqlx::query_as("SELECT count(*) FROM capture_chunks")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(
+            chunks, 2,
+            "the history once plus the new turn — not the history twice"
+        );
+    }
 
     /// The whole capture flow, including every way it can go wrong.
     ///

@@ -70,6 +70,7 @@ cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Po
 | **D21** | `cormex-proto` 的 `llm` 模块放进默认开启的 feature；CLI 关掉它，不把 goose-providers 拖进客户端 | 本文 §3 |
 | **D22** | CLI 本机状态用 SQLite（rusqlite，bundled），不用 JSON 文件：多个 hook 进程会并发写状态 | 本文 §5.4 |
 | **D23** | 归档表走新的 `Store::archive_txn`：**不拿 sync 的 advisory lock、不写 sync_log**，只开放归档表的写方法；`write_txn` 的纪律对同步表不变 | 本文 §4.4 |
+| **D24** | **录入幂等不依赖本地状态、设备身份或路径**：服务端是唯一事实来源。客户端没有记录时（`state.db` 丢了、重装换了设备密钥、宿主挪了文件、第二台机器），一律先用**前缀哈希**向服务端求证（`POST /capture/generations/{id}/verify`），再决定接着追加、什么都不传、开新一代，或**跟随**同一会话同一角色里已归档的那一代（`POST /capture/files/{id}/adopt`，表 `capture_generation_adoptions`，视图 `capture_current_generations`）。同一段内容只存、只投影一次 | 本文 §5.3、§7.1；2026-11-07 所有者要求「任何情况下都幂等」 |
 
 ---
 
@@ -504,6 +505,18 @@ home = [ { env = "CODEX_HOME" }, { path = "~/.codex" } ]
 
 ### 5.3 采集算法（`sync`）
 
+> **D24 修订（2026-11-07）**：下面第 4 步里「从未见过 → 注册 → 从 0 上传」和「409 → 以服务端的 expected 为准」都**不再只信偏移**。注册时服务端已有字节（本地状态丢失），或服务端说它领先（另一台机器追加过、或丢了 ack），客户端先算本地文件前 n 字节的 sha256，请服务端对自己那一代的前 n 字节做同样的计算比对：
+>
+> | 比对结果 | 含义 | 动作 |
+> |---|---|---|
+> | 一致，且本地不短于服务端 | 同一条流，本地更长或一样长 | 从服务端末尾接着传 |
+> | 一致，且本地更短 | 本地是旧副本 | 什么都不传；以后长出来再比 |
+> | 不一致 | 本地被改写过，或根本是另一段对话 | 开新一代，旧的一代原样保留 |
+>
+> 一个**全新注册**的文件（服务端在这个设备、这个路径下从没见过它），服务端会附上同一会话、同一角色里其他文件当前所在的代作为候选；客户端逐个比对，第一个「一致」的就**跟随**（adopt），之后的追加都写进那一代。这一条覆盖了：卸载后换了新设备密钥重装、Codex 把会话挪进 `archived_sessions/`、Claude Code 项目目录改名、`.orphaned-…` 另存的副本、同一会话出现在第二台机器上。
+>
+> 前缀哈希而不是分块清单：分块边界取决于当初怎么上传，一个更短的本地副本通常结束在服务端某个分块的中间，而分块的哈希对它的一部分什么也说明不了。服务端能对自己字节的任意前缀算哈希，客户端也能，这个比较对任何长度都精确。
+
 对每个逻辑文件：
 
 ```
@@ -658,7 +671,8 @@ POST /capture/files
     "logical_path": "projects/-home-u-proj/…jsonl", "role": "transcript", "framing": "append",
     "cwd": "/home/u/proj", "project_key": "github.com/u/proj" }
   200 { "file_id": "…", "session_id": "…",
-        "generation": { "id": "…", "ordinal": 0, "end_offset": 12345 } }   // 幂等：已注册则返回当前最新一代
+        "generation": { "id": "…", "ordinal": 0, "end_offset": 12345 },   // 幂等：已注册则返回当前所在的一代（自己的最新一代，或跟随的那一代）
+        "candidates": [ { "id": "…", "ordinal": 0, "end_offset": 23456 } ] }  // 仅当这个文件还空着：同会话同角色的已归档副本（D24）
 
 POST /capture/files/{file_id}/generations
   { "reason": "rewrite" | "truncate" | "snapshot" }
@@ -673,6 +687,16 @@ PUT  /capture/generations/{generation_id}/chunks/{offset}
   200 { "end_offset": 23456, "already_present": false }
   409 { "error": "offset_mismatch", "expected_offset": 20000 }
   422 { "error": "sha256_mismatch" }
+
+POST /capture/generations/{generation_id}/verify            // D24
+  { "length": 12345, "sha256": "<本地文件前 length 字节的 sha256>" }
+  200 { "matches": true, "end_offset": 23456 }       // length 超过末尾时 matches=false
+  403                                                // 本设备在这一代所属的会话里没有任何文件（防止当哈希预言机用）
+
+POST /capture/files/{file_id}/adopt                          // D24
+  { "generation_id": "…", "verified_through": 12345 }
+  200 { "id": "…", "ordinal": 0, "end_offset": 23456 }
+  400                                                // 两个文件不是同一会话、同一角色
 
 POST /capture/files/{file_id}/events
   { "op": "missing" | "reappeared" | "excluded" | "included", "detail": null }

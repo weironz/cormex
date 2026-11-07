@@ -128,6 +128,49 @@ impl Harness {
         issued.key
     }
 
+    /// Mint `n` device keys for **one** user: the same person reinstalling,
+    /// or carrying the same sessions on several machines.
+    async fn device_keys_for(&self, username: &str, n: usize) -> Vec<String> {
+        let user = self
+            .st
+            .create_account(username, "correct horse battery")
+            .await
+            .expect("create the account");
+        let token = self
+            .st
+            .access_book()
+            .issue_for_test(&user, std::time::Duration::from_secs(600));
+        let client = cormex::ApiClient::new(&self.base_url, &token).expect("client");
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let issued: cormex_proto::devices::DeviceKeyIssued = client
+                .post_json(
+                    "/devices",
+                    &cormex_proto::devices::NewDeviceRequest {
+                        label: format!("{username}-{i}"),
+                        scopes: vec!["capture:write".into()],
+                        platform: None,
+                    },
+                )
+                .await
+                .expect("mint a device key");
+            keys.push(issued.key);
+        }
+        keys
+    }
+
+    /// Total logical bytes the server stores for a device's tenant — the
+    /// number that must not grow when nothing new was said.
+    async fn stored_bytes(&self, device_id: &str) -> i64 {
+        let store = self.store_for_device(device_id).await;
+        let (sum,): (Option<i64>,) =
+            sqlx::query_as("SELECT sum(byte_length)::bigint FROM capture_chunks")
+                .fetch_one(store.pool())
+                .await
+                .expect("sum");
+        sum.unwrap_or(0)
+    }
+
     /// Reassemble a generation's logical bytes from the server's chunks.
     ///
     /// This is the acceptance criterion: read every chunk's object, decompress
@@ -698,4 +741,95 @@ async fn every_agent_layout_round_trips() {
     }
 
     h.db.drop().await;
+}
+
+/// The user's worry, end to end: uninstall and reinstall with a new device
+/// key, keep chatting, have the host move the file — and the archive holds the
+/// conversation exactly once, with every byte in the one stream.
+#[tokio::test]
+#[ignore = "needs a database; run with just test-db"]
+async fn a_reinstall_and_a_host_move_never_archive_the_history_twice() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let keys = h.device_keys_for("solo", 2).await;
+    let (first_key, reinstall_key) = (&keys[0], &keys[1]);
+
+    let mut body = br#"{"type":"user","message":{"role":"user","content":"which object store?"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"RustFS"}]}}
+"#
+    .to_vec();
+    let home = home_with(&body);
+    let first_data = tempfile::tempdir().expect("data");
+    let report = sync(home.path(), first_data.path(), first_key, &h.base_url).await;
+    assert_eq!(report.errors, 0, "first sync: {:?}", report.last_error);
+    let first_device = h.device_id(first_key).await;
+    let archived = h.stored_bytes(&first_device).await;
+    assert_eq!(archived, i64::try_from(body.len()).expect("small"));
+
+    // ── Uninstall, wipe the data directory, log in again: a new device ──
+    let reinstall_data = tempfile::tempdir().expect("data");
+    let report = sync(
+        home.path(),
+        reinstall_data.path(),
+        reinstall_key,
+        &h.base_url,
+    )
+    .await;
+    assert_eq!(report.errors, 0, "reinstall sync: {:?}", report.last_error);
+    assert_eq!(
+        h.stored_bytes(&first_device).await,
+        archived,
+        "a reinstall with a new device key uploaded the history a second time"
+    );
+
+    // ── Keep chatting: only the new turn is sent ──
+    let more = br#"{"type":"user","message":{"role":"user","content":"and backups?"}}
+"#;
+    body.extend_from_slice(more);
+    std::fs::write(home.path().join("projects/-home-u-proj/s1.jsonl"), &body).expect("write");
+    sync(
+        home.path(),
+        reinstall_data.path(),
+        reinstall_key,
+        &h.base_url,
+    )
+    .await;
+    assert_eq!(
+        h.stored_bytes(&first_device).await,
+        archived + i64::try_from(more.len()).expect("small"),
+        "after the reinstall, an appended turn must be the only new bytes"
+    );
+
+    // ── The host moves the file (a renamed project directory) ──
+    let projects = home.path().join("projects");
+    std::fs::rename(
+        projects.join("-home-u-proj"),
+        projects.join("-home-u-renamed"),
+    )
+    .expect("rename");
+    let report = sync(
+        home.path(),
+        reinstall_data.path(),
+        reinstall_key,
+        &h.base_url,
+    )
+    .await;
+    assert_eq!(report.errors, 0, "post-move sync: {:?}", report.last_error);
+    assert_eq!(
+        h.stored_bytes(&first_device).await,
+        archived + i64::try_from(more.len()).expect("small"),
+        "a moved file was uploaded again under its new path"
+    );
+
+    // And the one stream reassembles to exactly the file on disk
+    let reinstall_device = h.device_id(reinstall_key).await;
+    let generation = h
+        .generation_of(&reinstall_device, "projects/-home-u-renamed/s1.jsonl")
+        .await;
+    assert_eq!(
+        sha256_hex(&h.reassemble(&generation).await),
+        sha256_hex(&body),
+        "the stream the moved file follows must hold every byte of it, once"
+    );
 }

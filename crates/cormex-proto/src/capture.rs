@@ -127,6 +127,49 @@ pub struct RegisterFileResponse {
     pub file_id: String,
     pub session_id: String,
     pub generation: GenerationDto,
+    /// Generations of **other** files of the same session and role that this
+    /// file may be a copy of, longest first.
+    ///
+    /// Present so that a file the archive has already seen under another name
+    /// — a reinstall with a new device key, a host-side move, a second machine
+    /// — is not uploaded and projected a second time. The client proves which
+    /// one its bytes match with [`VerifyPrefixRequest`] and then adopts it.
+    /// `#[serde(default)]` so an older server's response still parses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<GenerationDto>,
+}
+
+/// `POST /capture/generations/{id}/verify` request: "are the first `length`
+/// logical bytes of this generation the ones whose sha256 is `sha256`?"
+///
+/// A prefix hash rather than a chunk manifest: chunk boundaries depend on how
+/// the bytes were uploaded, so a shorter local copy usually ends inside a
+/// server chunk, and a chunk's hash says nothing about part of it. The server
+/// can hash any prefix of its own bytes; the client can hash any prefix of its
+/// file. That comparison is exact for every length.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyPrefixRequest {
+    pub length: i64,
+    pub sha256: String,
+}
+
+/// `POST /capture/generations/{id}/verify` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyPrefixResponse {
+    /// `false` also when `length` is past the generation's end: there is no
+    /// prefix of that length to agree with.
+    pub matches: bool,
+    pub end_offset: i64,
+}
+
+/// `POST /capture/files/{id}/adopt` request: follow this generation instead of
+/// the file's own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptGenerationRequest {
+    pub generation_id: String,
+    /// How many bytes the client verified before deciding. Recorded for audit;
+    /// the server re-checks only that the two files are the same stream.
+    pub verified_through: i64,
 }
 
 /// Display metadata from the host, independent from transcript bytes.
