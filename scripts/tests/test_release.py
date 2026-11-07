@@ -539,6 +539,9 @@ class LocalBuildTargetTests(unittest.TestCase):
         self.assertEqual(release.cli_builder("x86_64-unknown-linux-musl"), (["zigbuild"], "cargo-zigbuild"))
         self.assertEqual(release.cli_builder("aarch64-pc-windows-msvc"), (["xwin", "build"], "cargo-xwin"))
         self.assertEqual(release.cli_builder("x86_64-apple-darwin"), (["build"], None))
+        self.assertEqual(release.cli_builder("x86_64-pc-windows-msvc", "win32"), (["build"], None),
+                         "the Windows Actions runner builds MSVC natively and has no cargo-xwin")
+        self.assertEqual(release.cli_builder("x86_64-pc-windows-msvc", "linux"), (["xwin", "build"], "cargo-xwin"))
 
     def test_default_local_targets_stay_x86_64(self):
         for platform, expected in release.DEFAULT_LOCAL_TARGETS.items():

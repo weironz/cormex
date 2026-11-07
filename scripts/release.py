@@ -156,16 +156,19 @@ def ensure_new(path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def cli_builder(target):
+def cli_builder(target, host=None):
     """Cargo subcommand that produces `target` without a native toolchain on this host.
 
     musl goes through cargo-zigbuild; the MSVC targets go through cargo-xwin, which
-    downloads the CRT and Windows SDK from Microsoft's CDN. Every other target links
-    against the platform's own SDK, so it is only buildable on that platform.
+    downloads the CRT and Windows SDK from Microsoft's CDN -- but only when this host is
+    not Windows, because the Actions matrix builds those targets natively and has no
+    cargo-xwin. Every other target links against the platform's own SDK, so it is only
+    buildable on that platform.
     """
+    host = host or sys.platform
     if target.endswith("-unknown-linux-musl"):
         return ["zigbuild"], "cargo-zigbuild"
-    if target.endswith("-pc-windows-msvc"):
+    if target.endswith("-pc-windows-msvc") and host != "win32":
         return ["xwin", "build"], "cargo-xwin"
     return ["build"], None
 
