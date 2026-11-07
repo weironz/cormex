@@ -70,7 +70,7 @@ cormex CLI ──(设备密钥, HTTPS)──▶ R 原始层（RustFS 字节 + Po
 | **D21** | `cormex-proto` 的 `llm` 模块放进默认开启的 feature；CLI 关掉它，不把 goose-providers 拖进客户端 | 本文 §3 |
 | **D22** | CLI 本机状态用 SQLite（rusqlite，bundled），不用 JSON 文件：多个 hook 进程会并发写状态 | 本文 §5.4 |
 | **D23** | 归档表走新的 `Store::archive_txn`：**不拿 sync 的 advisory lock、不写 sync_log**，只开放归档表的写方法；`write_txn` 的纪律对同步表不变 | 本文 §4.4 |
-| **D24** | **录入幂等不依赖本地状态、设备身份或路径**：服务端是唯一事实来源。客户端没有记录时（`state.db` 丢了、重装换了设备密钥、宿主挪了文件、第二台机器），一律先用**前缀哈希**向服务端求证（`POST /capture/generations/{id}/verify`），再决定接着追加、什么都不传、开新一代，或**跟随**同一会话同一角色里已归档的那一代（`POST /capture/files/{id}/adopt`，表 `capture_generation_adoptions`，视图 `capture_current_generations`）。同一段内容只存、只投影一次 | 本文 §5.3、§7.1；2026-11-07 所有者要求「任何情况下都幂等」 |
+| **D24** | **录入幂等不依赖本地状态、设备身份或路径**：服务端是唯一事实来源。客户端没有记录时（`state.db` 丢了、重装换了设备密钥、宿主挪了文件、第二台机器），一律先用**前缀哈希**向服务端求证（`POST /capture/generations/{id}/verify`），再决定接着追加、什么都不传、开新一代，或**跟随**同一会话同一角色里已归档的那一代（`POST /capture/files/{id}/adopt`，表 `capture_generation_adoptions`，视图 `capture_current_generations`）。同一段内容只存、只投影一次 | 本文 §5.3、§7.1；完整说明见 [capture-idempotency.md](capture-idempotency.md)；2026-11-07 所有者要求「任何情况下都幂等」 |
 
 ---
 

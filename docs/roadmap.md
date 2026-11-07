@@ -178,7 +178,8 @@ type "ulid" does not exist
 | | |
 |---|---|
 | 为什么做、评审结论 | [research/2026-10-agent-memory-survey.md](research/2026-10-agent-memory-survey.md) §7–§10 |
-| 技术选型与架构（唯一设计权威，D1–D23） | [design/session-archive-architecture.md](design/session-archive-architecture.md) |
+| 技术选型与架构（唯一设计权威，D1–D24） | [design/session-archive-architecture.md](design/session-archive-architecture.md) |
+| 采集幂等：重装 / 改名 / 多机都只录一次（D24 展开） | [design/capture-idempotency.md](design/capture-idempotency.md) |
 | 代码级阶段开发计划（任务卡 P0-1 … P7-3） | [plan/session-archive-plan.md](plan/session-archive-plan.md) |
 
 阶段 0 的 P0-1 就是上面 A 节的「全新数据库上起不来」，修法已定（D20）。P0-2 修的是委托令牌会落进 1 号用户租户的隔离问题，多用户部署下应优先处理。
