@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.18 — 2026-11-08
+
+### 发布：本地构建也产出 Windows CLI
+
+- `just build-local` 默认产出两个 x86_64 CLI：`x86_64-unknown-linux-musl` 与
+  `x86_64-pc-windows-msvc`。Windows 目标在 Linux 上用 cargo-xwin 交叉编译，三元组与
+  Actions 完全一致；需要 `clang-cl` 与 `llvm-lib`，首次构建从微软 CDN 取 CRT 与
+  Windows SDK。二进制在 Linux 上不能执行，所以只做编译、打包与格式校验，**没有版本烟测**。
+- aarch64 与 Apple 目标默认不再构建。`CORMEX_CLI_TARGETS` 是启用入口；单个目标可用
+  `just build-cli-windows`、`just build-cli-windows-arm64`、`just build-cli`。macOS 目标
+  仍需要 macOS 宿主 —— zig 只带 libc stub，不带 `Security` / `CoreFoundation`，
+  Linux 上交叉构建会在链接期失败。
+
+### 发布：镜像身份校验不再绑定经典 image store
+
+- Docker 29 默认的 containerd 镜像存储下，镜像 ID 是 manifest digest，`docker save`
+  会把 config 重写成 Docker schema，registry 侧又是第三个 digest。旧的
+  `config digest == image_id` 两处等式只在经典 store 成立，于是本地构建能出候选却
+  发不出去（`Docker config differs from reviewed image ID`）。
+- 现在只比对两种 store 下都稳定的镜像 ID：载入后必须报出候选记录的 ID；推送前后各
+  删除本地 tag、重拉 registry 副本再比对。归档字节仍由 `SHA256SUMS` 与
+  `BUNDLE_SHA256` 钉住。
+
 ## 0.1.17 — 2026-11-07
 
 ### Capture: the same conversation is archived once, whatever happens
