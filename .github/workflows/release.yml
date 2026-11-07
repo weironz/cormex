@@ -1,496 +1,55 @@
-name: Release
-
-# ══════════════════════════════════════════════════════════
-#  Release pipeline -- server/Web images and capture CLI archives.
-#
-#  Triggers: a manual workflow_dispatch, which requires a tag.
-#
-#  The `push: tags` trigger remains commented out. Publishing is explicitly
-#  requested through workflow_dispatch against an existing release tag.
-#  The CLI platform matrix below is independent of the two Linux images.
-#
-#  ── The version line is independent of Cormex's ───────────
-#  Cormex and its companion release their own versions, sharing no tags and not aligning
-#  with each other. What is checked below is the `[workspace.package] version` in **this
-#  repository's** Cargo.toml, which has nothing to do with any other project's version
-#  number.
-# ══════════════════════════════════════════════════════════
+name: Publish candidate
 
 on:
-  # push:
-  #   tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: The tag to use for a manual release (of the form v0.1.0)
+        description: Existing draft candidate tag (vX.Y.Z)
         required: true
+        type: string
+      checksum:
+        description: Approved SHA-256 of the candidate SHA256SUMS file
+        required: true
+        type: string
 
-# Default to read-only; only cli-release can write GitHub Release assets.
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: candidate-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  # ══════════════════════════════════════════════════════════
-  #  The preflight gate -- before anything gets compiled
-  #
-  #  The image has to compile an entire Rust dependency tree, which on a cold cache runs
-  #  to a quarter of an hour. Something like a mismatched version number, which takes a
-  #  second to check, has no business being discovered after all that.
-  # ══════════════════════════════════════════════════════════
-  preflight:
-    name: Preflight checks
+  publish:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      version: ${{ steps.resolve.outputs.version }}
-      commit: ${{ steps.source.outputs.commit }}
-    steps:
-      # The tag is resolved once, here. `github.ref_name || inputs.tag` is deliberately not
-      # used: on a workflow_dispatch, ref_name is the **branch name** and therefore always
-      # truthy, so the right-hand side of `||` can never be reached, and a manual release
-      # would push things like `cormex:vmain`
-      - name: Resolve the tag
-        id: resolve
-        env:
-          REQUESTED_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="$REQUESTED_TAG"
-          fi
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "::error::tag '$tag' is not valid, it must be vX.Y.Z"; exit 1; }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v5
-        with:
-          ref: refs/tags/${{ steps.resolve.outputs.tag }}
-
-      - name: Pin the release source
-        id: source
-        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      # Parsed with tomllib rather than grep: `version = ` appears a dozen times in
-      # Cargo.toml (once per workspace dependency), which line grep catches depends on the
-      # order of the file, and when it catches the wrong one it does not complain -- it
-      # quietly compares an unrelated number
-      - name: Version number matches the tag
-        run: |
-          python3 - <<'PY'
-          import sys, tomllib
-          want = "${{ steps.resolve.outputs.version }}"
-          got = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-          if got != want:
-              print(f"::error::the tag is v{want}, but Cargo.toml's workspace version is {got}")
-              print("The image tag and `cormexd --version` would each state a different number, and both would compile.")
-              sys.exit(1)
-          print(f"OK, versions agree: {got}")
-          PY
-
-      # ── The lock-file gate ────────────────────────────────
-      #
-      # Fail before compiling if Cargo.lock disagrees with the manifests.
-      # The Dockerfile and CLI builds also use --locked to preserve this resolution.
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cargo.lock is consistent with the manifests
-        run: cargo metadata --locked --format-version 1 > /dev/null
-
-  # ══════════════════════════════════════════════════════════
-  #  The docker image -- one image, pushed to two registries
-  #
-  #  ACR is the one production actually pulls from (the nodes are in China, where Docker
-  #  Hub is either slow or has to go through a third-party mirror -- and mirrors of that
-  #  kind cache tag→digest, which is the trap of "you pulled an old image and cannot even
-  #  tell"). The Docker Hub copy is the off-site replica.
-  #
-  #  linux/amd64 only. arm64 would have to be built under QEMU emulation, and compiling a
-  #  whole Rust dependency tree that way runs into hours -- besides which nobody has
-  #  verified this image on arm64, and shipping an arm64 image that has never once been
-  #  started is exactly what this pipeline exists to avoid.
-  # ══════════════════════════════════════════════════════════
-  image:
-    name: Image cormex
-    needs: preflight
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.preflight.outputs.commit }}
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/login-action@v3
-        with:
-          registry: registry.cn-shenzhen.aliyuncs.com
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          # The build context is the repository root: the Dockerfile has to COPY crates/,
-          # evals/, migrations/ and migrations-global/, and the last two are the
-          # directories the **compile-time** macro `sqlx::migrate!` reads -- leave them out
-          # of the context and it blows up at compile time, while a local build stays green
-          context: .
-          file: scripts/docker/Dockerfile.cormexd
-          platforms: linux/amd64
-          push: true
-          # ★ **Must be turned off.** buildx by default attaches a provenance attestation to
-          # the image, which turns the result into an OCI index containing an empty
-          # descriptor of type `application/vnd.oci.empty.v1+json` -- and Aliyun ACR does
-          # not recognize that media type, so the push fails outright with
-          # `denied: unknown manifest class`.
-          #
-          # A local `docker build` going green all the way proves nothing: it never pushes
-          provenance: false
-          # Only the specific version is tagged, **never latest**. Production pins a
-          # version and has to come back to the same one after a restart; a tag that drifts
-          # turns "which version is running in production" into a question nobody can
-          # settle.
-          #
-          # The image is called cormex (not cormexd) -- that is the product name, while the
-          # binary inside is still called cormexd
-          tags: |
-            willdockerhub/cormex:v${{ needs.preflight.outputs.version }}
-            registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v${{ needs.preflight.outputs.version }}
-          cache-from: type=gha,scope=cormex
-          cache-to: type=gha,mode=max,scope=cormex
-
-      # The image has to be genuinely started once. Discovering after the push that it does
-      # not come up leaves no fix but releasing the next version -- and by then it is
-      # already sitting in the registry.
-      #
-      # What gets pulled is the ACR copy rather than the one built locally: the local one
-      # has never made the push/pull round trip, so manifest-level problems (exactly the
-      # provenance kind above) are invisible on it
-      - name: Smoke test
-        run: |
-          set -euo pipefail
-          v="${{ needs.preflight.outputs.version }}"
-          img="registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v$v"
-          docker pull "$img"
-          # `--version` is the only real code path that can be executed in CI with no
-          # dependencies: clap answers it before anything connects to a database, so no
-          # Postgres is required.
-          # What it proves is that **dynamic linking works** -- problems of the mismatched
-          # glibc version kind (the build base and the runtime base being different
-          # releases) blow up right here, instead of waiting to report
-          # `GLIBC_2.xx not found` when the container starts in production
-          docker run --rm "$img" --version | tee /tmp/v.txt
-          grep -qF "$v" /tmp/v.txt \
-            || { echo "::error::the version inside the image is not $v"; exit 1; }
-          # The migrations travel with the image (the deployment machine has no Rust
-          # toolchain, and `just prod-migrate` runs them inside the container). Both sets
-          # have to be present; the symptom of the global one missing is a new tenant
-          # failing halfway through account creation
-          docker run --rm --entrypoint /bin/sh "$img" -c \
-            'test -d /opt/cormex/migrations && test -d /opt/cormex/migrations-global' \
-            || { echo "::error::the migration directories are missing from the image"; exit 1; }
-
-  # ══════════════════════════════════════════════════════════
-  #  The capture CLI -- one static binary per platform
-  #
-  #  A separate job from the images because it shares nothing with them: a
-  #  different target set, a different toolchain (musl for Linux, so the binary
-  #  runs on any distribution regardless of its glibc), and a failure here says
-  #  nothing about the server.
-  #
-  #  ★ **`--locked` is mandatory.** `Cargo.lock` is what makes the released
-  #    binary reproducible; without it a dependency that floated between the tag
-  #    and the build would be compiled in silently.
-  #
-  #  ★ **The Linux targets are musl, built with `cargo-zigbuild`.** A glibc
-  #    binary built on `ubuntu-latest` refuses to start on an older
-  #    distribution with `GLIBC_2.xx not found` -- and that is the failure a
-  #    user meets on the first run, with no way to tell it from "the binary is
-  #    corrupt".
-  # ══════════════════════════════════════════════════════════
-  cli:
-    name: CLI ${{ matrix.target }}
-    needs: preflight
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # One platform failing must not cancel the others: a Windows-only
-      # breakage should still ship the Linux binaries
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-            zigbuild: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-            zigbuild: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            zigbuild: false
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            zigbuild: false
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-            zigbuild: false
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-            zigbuild: false
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.preflight.outputs.commit }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # The repository toolchain file pins a version independently of the
-      # action's bootstrap toolchain. Add std for the active pinned toolchain.
-      - name: Install the pinned toolchain target
-        shell: bash
-        run: rustup target add ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: cli-${{ matrix.target }}
-
-      - name: Install cargo-zigbuild
-        if: matrix.zigbuild
-        run: |
-          pip install ziglang
-          cargo install cargo-zigbuild --locked
-
-      - name: Build
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            cargo zigbuild --release --locked -p cormex --target ${{ matrix.target }}
-          else
-            cargo build --release --locked -p cormex --target ${{ matrix.target }}
-          fi
-
-      # Execute only a native binary; cross targets require a matching host.
-      - name: Smoke test
-        if: ${{ !matrix.zigbuild }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          host=$(rustc -vV | sed -n 's/^host: //p')
-          if [ "${{ matrix.target }}" != "$host" ]; then
-            echo "Skipping execution of ${{ matrix.target }} on $host"
-            exit 0
-          fi
-          v="${{ needs.preflight.outputs.version }}"
-          bin="target/${{ matrix.target }}/release/cormex"
-          [ -f "$bin.exe" ] && bin="$bin.exe"
-          out=$("$bin" --version)
-          echo "$out"
-          echo "$out" | grep -qF "$v" \
-            || { echo "::error::the version in the binary is not $v"; exit 1; }
-
-      - name: Package
-        shell: bash
-        run: |
-          set -euo pipefail
-          v="${{ needs.preflight.outputs.version }}"
-          name="cormex-$v-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          bin="target/${{ matrix.target }}/release/cormex"
-          [ -f "$bin.exe" ] && bin="$bin.exe"
-          cp "$bin" "dist/$name/"
-          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
-          cd dist
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            # `zip` is on every GitHub runner; `7z` is not
-            (command -v zip >/dev/null && zip -qr "$name.zip" "$name") \
-              || powershell -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-          else
-            tar -czf "$name.tar.gz" "$name"
-          fi
-          ls -l
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-${{ matrix.target }}
-          path: dist/cormex-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
-          if-no-files-found: error
-
-  # ══════════════════════════════════════════════════════════
-  #  Publishing the CLI -- checksums, the Release, and npm
-  #
-  #  Its own job, `needs: cli`, because the checksums cover **all** the
-  #  artefacts: computing them per matrix entry would produce six files that
-  #  each list one binary.
-  # ══════════════════════════════════════════════════════════
-  cli-release:
-    name: Publish the CLI
-    needs: [preflight, cli, image, web-image]
-    runs-on: ubuntu-latest
+    # Configure required reviewers here. This job never builds or deploys.
+    environment: production
     permissions:
       contents: write
     env:
-      # Job-level, not step-level: a step's own `env` is not visible to its own
-      # `if`, so `if: env.NPM_TOKEN != ''` with `env:` on the same step is
-      # always false. The step then skips every time and the release looks fine
-      # -- a skipped step in a green run is indistinguishable from a successful
-      # one. See the note on the publish step.
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUNDLE_SHA256: ${{ inputs.checksum }}
+      CORMEX_REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      # Use the workflow ref's reviewed publisher, not executable code from an asset.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.preflight.outputs.commit }}
-      - uses: actions/download-artifact@v4
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
         with:
-          path: dist
-          pattern: cli-*
-          merge-multiple: true
-
-      - name: Checksums
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Upload to the Release
-        uses: softprops/action-gh-release@v2
+          python-version: '3.12'
+      - uses: extractions/setup-just@v3
+      - uses: actions/setup-node@v4
+        if: vars.PUBLISH_NPM == 'true'
         with:
-          tag_name: ${{ needs.preflight.outputs.tag }}
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/SHA256SUMS
-          fail_on_unmatched_files: true
-
-      # ── npm: currently off, by a switch rather than by absence ──
-      #
-      # The step is skipped because `vars.PUBLISH_NPM` does not exist, not because
-      # a secret happens to be missing. That difference matters: `cormex` has never
-      # been published to npm (the registry answers 404), so for two releases the
-      # gate below was `env.NPM_TOKEN != ''` and the step was skipped every time --
-      # which reads identically to "published successfully" in a green run. An
-      # explicit variable says "off on purpose" and can be flipped without touching
-      # this file: Settings -> Variables -> `PUBLISH_NPM` = true, plus an `NPM_TOKEN`
-      # secret, and the next release publishes.
-      #
-      # Still optional even when switched on: a missing token skips the step and the
-      # release succeeds. A missing secret must not turn "the binaries shipped" into
-      # "the release failed" -- npm is a convenience, `install.sh` is the primary path.
-      #
-      # **The token is on the job, not the step.** A step's own `env` is not
-      # visible to its own `if`, so `if: env.NPM_TOKEN != ''` with a step-level
-      # `env:` is always false -- the step is skipped every time and the release
-      # looks fine.
-      - name: Publish to npm
-        if: ${{ vars.PUBLISH_NPM == 'true' && env.NPM_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
-          cd npm
-          node ./publish.mjs "${{ needs.preflight.outputs.version }}" ../dist
-
-  # ══════════════════════════════════════════════════════════
-  #  The web image -- the memory browser, static files behind nginx
-  #
-  #  It is a separate job, not a second step of the one above, for one reason: it shares
-  #  nothing with it. Different builder (Flutter, not Rust), different cache scope, and a
-  #  failure in one says nothing about the other. Running them in parallel also keeps the
-  #  wall clock at max(rust, flutter) instead of their sum.
-  #
-  #  ★ This image carries **no domain name**. The API base compiled into it is the relative
-  #    prefix `/api`, which the browser resolves against whatever origin the page was served
-  #    from. That is what makes one published image usable by anyone -- see the long comment
-  #    in Dockerfile.web, and `CormexApi.resolveBase` on the client side.
-  # ══════════════════════════════════════════════════════════
-  web-image:
-    name: Image cormex-web
-    needs: preflight
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.preflight.outputs.commit }}
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/login-action@v3
-        with:
-          registry: registry.cn-shenzhen.aliyuncs.com
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: scripts/docker/Dockerfile.web
-          platforms: linux/amd64
-          push: true
-          # Same reason as the job above: ACR rejects the OCI index buildx produces when
-          # provenance attestation is on, with `denied: unknown manifest class`
-          provenance: false
-          tags: |
-            willdockerhub/cormex-web:v${{ needs.preflight.outputs.version }}
-            registry.cn-shenzhen.aliyuncs.com/willspace/cormex-web:v${{ needs.preflight.outputs.version }}
-          # A cache scope of its own. Sharing one with the Rust image would have the two
-          # jobs evicting each other's layers on every single release
-          cache-from: type=gha,scope=cormex-web
-          cache-to: type=gha,mode=max,scope=cormex-web
-
-      # Serving static files is a low bar, and precisely for that reason the failures here
-      # are the quiet ones: nginx comes up fine while the document root is empty, or the
-      # build produced a bundle that has lost the API prefix. Both look like a healthy
-      # container, and both are only noticed by a human opening the page.
-      - name: Smoke test
-        run: |
-          set -euo pipefail
-          v="${{ needs.preflight.outputs.version }}"
-          img="registry.cn-shenzhen.aliyuncs.com/willspace/cormex-web:v$v"
-          docker pull "$img"
-          docker run -d --name web -p 8099:80 "$img"
-          for _ in $(seq 1 30); do
-            [ "$(docker inspect -f '{{.State.Health.Status}}' web)" = healthy ] && break
-            sleep 2
-          done
-          [ "$(docker inspect -f '{{.State.Health.Status}}' web)" = healthy ] \
-            || { docker logs web; echo "::error::the container never became healthy"; exit 1; }
-
-          # The document root is actually populated. `try_files ... /index.html` means an
-          # empty root still answers every request -- with a 404 from nginx's own page,
-          # which is a 404 that looks like a routing problem rather than an empty image
-          curl -fsS http://127.0.0.1:8099/ | grep -qi '<title>' \
-            || { echo "::error::/ did not return an HTML document"; exit 1; }
-
-          # ★ The API prefix survived the compile. If it did not, every request from the
-          #   browser lands on the SPA fallback and comes back as a 200 carrying
-          #   index.html -- the client then reports a JSON parse error, which reads
-          #   nothing like "the routing prefix is missing".
-          #
-          #   Grep for the quoted literal, not the bare value: `/api` is four characters
-          #   and will collide by chance somewhere in a multi-megabyte bundle, so a bare
-          #   grep stays green in exactly the case this is meant to catch
-          curl -fsS http://127.0.0.1:8099/main.dart.js -o /tmp/main.js
-          grep -qF '"/api"' /tmp/main.js || grep -qF "'/api'" /tmp/main.js \
-            || { echo "::error::the API prefix /api is not in the bundle"; exit 1; }
-
-          docker rm -f web
+          node-version: '22'
+      - name: Verify, load, smoke-test, push, and publish the existing candidate
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          PUBLISH_NPM: ${{ vars.PUBLISH_NPM }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: just _publish "$RELEASE_TAG" "$BUNDLE_SHA256"

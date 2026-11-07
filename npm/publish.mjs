@@ -18,7 +18,8 @@
 // that does not exist yet.
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -45,10 +46,46 @@ const TARGETS = {
 
 const artefacts = readdirSync(distDir);
 
+function registryIntegrity(name, version) {
+  try {
+    const value = JSON.parse(execFileSync('npm', ['view', `${name}@${version}`, 'dist.integrity', '--json'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    if (typeof value !== 'string' || !value.startsWith('sha512-')) {
+      throw new Error(`registry has no supported integrity for ${name}@${version}`);
+    }
+    return value;
+  } catch (error) {
+    // An unavailable registry or bad token is not evidence that a version is free.
+    let body;
+    try { body = JSON.parse(String(error.stdout)); } catch { /* fail closed below */ }
+    if (body?.error?.code === 'E404') return null;
+    throw error;
+  }
+}
+
 function publish(dir) {
-  // `--access public`: scoped packages are private by default, and a private
-  // package cannot be installed by anyone
-  execFileSync('npm', ['publish', '--access', 'public'], { cwd: dir, stdio: 'inherit' });
+  const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+  // Publish the same tarball whose integrity was checked, not a second npm pack.
+  const packed = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts'], {
+    cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  if (packed.length !== 1 || packed[0].filename.includes('/') || packed[0].filename.includes('\\')) {
+    throw new Error('npm pack returned an unexpected tarball');
+  }
+  const tarball = join(dir, packed[0].filename);
+  const integrity = 'sha512-' + createHash('sha512').update(readFileSync(tarball)).digest('base64');
+  const existing = registryIntegrity(pkg.name, pkg.version);
+  if (existing !== null) {
+    if (existing !== integrity) throw new Error(`refusing to replace different bytes at ${pkg.name}@${pkg.version}`);
+    console.log(`already published with matching integrity: ${pkg.name}@${pkg.version}`);
+    return;
+  }
+  // `--access public`: scoped packages otherwise default to private.
+  execFileSync('npm', ['publish', tarball, '--access', 'public', '--ignore-scripts'], { cwd: dir, stdio: 'inherit' });
+  if (registryIntegrity(pkg.name, pkg.version) !== integrity) {
+    throw new Error(`published integrity differs for ${pkg.name}@${pkg.version}; inspect the registry before retrying`);
+  }
 }
 
 const published = [];
@@ -114,9 +151,7 @@ rmSync(main, { recursive: true, force: true });
 mkdirSync(main, { recursive: true });
 cpSync(join(here, 'bin'), join(main, 'bin'), { recursive: true });
 
-const pkg = JSON.parse(
-  execFileSync('cat', [join(here, 'package.json')], { encoding: 'utf8' })
-);
+const pkg = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
 pkg.version = npmVersion;
 for (const dep of Object.keys(pkg.optionalDependencies ?? {})) {
   pkg.optionalDependencies[dep] = npmVersion;

@@ -172,75 +172,67 @@ python scripts/injection-drift.py ../cormex/crates/cormex-core/src/injection.rs
 ## 开发
 
 ```bash
-just up            # 起 postgres + rustfs（**不含 cormexd**：开发时它跑宿主进程，
-                   #   改一行重启只要一秒。整栈容器化见 just serve）
-just db-migrate    # 两套 migration，顺序不能反
-just run           # 跑 cormexd
-just ci            # fmt-check + lint + test（不需要数据库）
-just ci-full       # 上面这些 + test-db + flutter analyze/test —— **这才是全绿**
-just test-db       # 只跑要数据库的那些集成测试
-just release 0.1.14  # 本地发版：check → CLI 归档 → 两个镜像 + 烟测 → 推镜像 → 传 Release → npm
+just up              # postgres + rustfs；cormexd 开发时跑宿主进程
+just db-migrate      # 两套 migration，顺序不能反
+just run
+just ci              # fmt / clippy / rustdoc / 单测 / capture / evals / pipeline
+just ci-full         # 上面全部 + 数据库集成测试 + Flutter analyze/test
+just test-db         # 启动开发依赖、迁移，再跑 include-ignored
+just test-db-ready   # 只跑 include-ignored；已有数据库的 CI 使用
 ```
 
-**`just ci` 不等于全绿。** 它跑的是 `cargo test --workspace`，而要数据库的
-那批默认是 `#[ignore]` 的 —— 「跳过」在输出里和「通过」长得一模一样。
-要验全，跑 **`just ci-full`**：它带 `--include-ignored`，也跑 Flutter。
+**`just ci` 不等于全绿。** 数据库测试默认 ignored，只有 `just ci-full` 才覆盖它们
+和 Flutter。数据库测试用开发/临时数据库，绝不能把 `DATABASE_URL` 指向生产。
+本地需配置 `DATABASE_URL`、sqlx-cli 和 Postgres 17 客户端；后者用于备份恢复演练。
 
-⚠️ **GitHub Actions 额度已用光，两个 workflow 都改成只能手动触发**
-（`workflow_dispatch`）。原来的 `push` / `pull_request` / `push: tags` 触发器
-是**注释掉**的，不是删掉 —— 额度恢复后去掉注释符即可。在那之前：
+三个 workflow 都没有 push / pull_request / tag 自动触发：CI 支持手动或被 build
+复用，build 和 release 只支持手动触发。Actions 额度不足时走本地路径。
+`.github/workflows/ci.yml` 调用 justfile 的共享配方，不再复制另一套检查命令；
+新增检查应放入共享配方，保证本地与 Actions 使用同一道门。
 
-- 提交前跑 `just ci-full`，它是唯一的门
-- 发版走下面的「两条路径」中的本地那条
+## 构建和生产发布：各自两条路径
 
-`just ci-full` 里的每一步都和 `.github/workflows/ci.yml` 的 job 对应。
-**改了一边记得改另一边** —— 一个只写在 YAML 里的检查，在额度用光期间等于没人跑。
-
-CI 三个 job：`lint`（fmt / clippy / rustdoc 死链）、`test`（带 pgvector 的
-Postgres + 两套 migration）、`app`（flutter analyze + test）。
-
-## 发版：两条路径，同一套顺序
-
-两条路径做的事完全一样，差在「在几台机器上跑」：
-
-```
-release-check → release-cli → release-images（含烟测）→ release-push → release-assets → release-npm
+```text
+build-local  ─ Check → Test → Build → Package ─┐
+                                              ├─ draft candidate + BUNDLE_SHA256
+build-github ─ Check → Test → Build → Package ─┘
+                                                        │
+                              ┌─────────────────────────┴───────────────────┐
+                         release-local                                 release-github
+                              └─ 下载并校验同一候选 → 推已有镜像 → 发布 Release ─┘
 ```
 
-| 路径 | 什么时候用 | 构建范围 | 触发 |
-|---|---|---|---|
-| **Actions** `.github/workflows/release.yml` | 额度正常时 | 六个平台各在自己的 runner 上原生构建 | 手动 `workflow_dispatch`，输入 `tag`（`push: tags` 触发器留着但注释掉了） |
-| **本地** `just release <version>` | 额度用光，或想立刻发 | 只有这台机器能构建的目标 | 本地命令，需要 `docker` + `gh` |
+四个独立入口，**构建地点不决定发布地点**：
 
-**归档必须进 Release，这是两条路径共同的硬约束。** `cormex update` 和
-`install.sh` 只读 Release 资产（`cormex-<version>-<target>.tar.gz|zip` +
-`SHA256SUMS`）；只推镜像不发归档的「发版」，镜像看起来是新的，却更新不到任何一台
-CLI。所以 `just release` 里有 `release-assets` 这一步，而且它会拒绝：
+```bash
+just build-local vX.Y.Z
+just build-github vX.Y.Z
+just release-local vX.Y.Z <BUNDLE_SHA256>
+just release-github vX.Y.Z <BUNDLE_SHA256>
+```
 
-- tag 不在 origin 上 —— `gh release create` 遇到不存在的 tag 会**在默认分支头新建**一个，
-  Release 就挂到了没人构建过的提交上
-- tag 指向的提交不是 HEAD —— `dist/` 里的归档来自当前工作树，挂到别的提交上就是谎报来源
+构建只上传 draft，不登录 registry、不推镜像、不公开 Release。候选统一存放在
+`dist/<tag>/`，包含 CLI 归档、两个 linux/amd64 Docker 镜像归档、`manifest.json`
+和 `SHA256SUMS`。`BUNDLE_SHA256` 是 **SHA256SUMS 文件本身的 SHA-256**；发布必须
+显式传入这个值，不能在发布时重新读取远端摘要作为审批依据。
 
-**本地路径的固有短板**：一台机器通常只能构建 4 个（Linux musl 两个靠
-`cargo-zigbuild`，Windows 两个要在 Windows 上）；macOS 两个需要 Apple SDK。
-`just release` 会打印少了哪几个，并且**照发**——镜像是产品主线，CLI 是接入手段，
-因为笔记本发不了 macOS 就卡住服务端没有道理。代价是被漏掉的平台上
-`cormex update` 会回「release publishes no archive for this platform」。
+Actions 构建等六个 CLI target 和两个镜像全部成功后只聚合一次。本地仅构建宿主可用
+目标，manifest 记录缺失项并明确警告；目标缺失的平台无法通过该版本更新 CLI。
+两个镜像始终必须齐全。候选上传拒绝覆盖已有 Release/资产，发布失败后可校验同一
+候选重试，不能悄悄换包。
 
-**npm 渠道默认关闭。** 包从未真正发布过（registry 上是 404），开关是仓库变量
-`PUBLISH_NPM`（本地跑则看同名环境变量）加 `NPM_TOKEN`，两个都齐才会发。代码
-（`npm/`、`publish.mjs`、`tests/npm_package.rs`）都在，接通不需要改代码。
+发布只下载和校验候选、载入并烟测已有镜像、推 ACR 和 Docker Hub 的版本 tag，
+然后公开 GitHub Release；**不编译、不重打包候选、不部署**。Actions 发布使用
+`production` environment，须在仓库设置中配置 required reviewers；本地发布是另一个
+独立的、由操作者控制凭据的入口。两条路径共用 `scripts/release.py`。
 
-**两个镜像都先烟测再推**：`cormex` 要 `--version` 报得出版本、两套 migration 目录都在
-（部署机没有 Rust 工具链，迁移是进容器跑的）；`cormex-web` 要健康检查通过、`/` 返回
-真的 HTML、bundle 里还留着 `"/api"` 前缀（丢了它每个 API 请求都会拿回一份 200 的
-index.html，客户端报「JSON 解析失败」）。推两个 registry：ACR 是生产真的拉的那个
-（节点在国内，Docker Hub 走第三方镜像会缓存 tag→digest），Docker Hub 是异地副本。
-只打版本 tag，**从不打 `latest`** —— 生产钉版本、重启后要回到同一个，漂移的 tag
-会让「跑的是哪个版本」变成没人能回答的问题。
+旧的 `just release <version>` 只报迁移提示；旧 release-push / release-assets / release-npm
+旁路已移除。npm 默认关闭；只有 PUBLISH_NPM=true、NPM_TOKEN 和完整六平台候选齐备
+才会在校验通过后的发布流程中运行，使用候选提交中的包装脚本，不重新编译 CLI。
 
-**没有 CI 部署。** 部署是手工 ssh + `docker compose up -d`。节点侧的部署策略
-脚本目前没有 —— 要做的话见 roadmap。
+完整操作、凭据边界、跨平台限制和失败恢复见 [docs/release.md](docs/release.md)。
+
+**没有 CI 部署。** 发布只是提供版本资产；生产升级仍是另行授权的手工操作。
 
 ## 部署的形状
 

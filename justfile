@@ -4,12 +4,14 @@
 #   just db-migrate  apply the migrations
 #   just run         run cormexd in a host process
 #   just serve       run the whole stack in containers (cormexd included)
-#   just ci          run every check CI runs, locally
+#   just ci          run the checks that need no database
 #   just ci-full     the same, plus the tests that need a database
-#   just release     build and publish a release, locally (needs docker + gh + the tag)
+#   just build-local stage a candidate; just release-local publishes that candidate
 
 set shell := ["bash", "-uc"]
+set windows-shell := ["bash", "-uc"]
 set dotenv-load := true
+set positional-arguments := true
 
 default:
     @just --list
@@ -75,13 +77,7 @@ serve:
     docker compose up -d --build
     @echo "cormexd http://127.0.0.1:${CORMEXD_PORT:-8080}"
 
-# ── Checks ──────────────────────────────────────────────
-#
-# ★ **These are the CI jobs, not an approximation of them.** GitHub Actions minutes are
-#   exhausted (see the header of .github/workflows/ci.yml), so until the quota is restored
-#   these recipes are the gate. That makes "just ci is green" the claim that matters, and
-#   it means the two have to stay in step: a check added to the workflow and not here is a
-#   check nobody runs.
+# ── Checks: shared by local builds and Actions ───────────
 
 fmt:
     cargo fmt --all
@@ -92,306 +88,110 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
+doc-check:
+    RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps --locked
+
 test:
     cargo test --workspace --locked
 
-# The tests that need a database, with `--include-ignored`.
+# Keep the no-database capture coverage explicit, including the nonempty-test gate.
+capture-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unset DATABASE_URL
+    for package in cormex-transcript cormex; do
+      out=$(cargo test -p "$package" --lib --locked 2>&1) || { echo "$out"; exit 1; }
+      echo "$out"
+      grep -qE 'test result: ok\. [1-9][0-9]* passed' <<< "$out"
+    done
+
+eval-check:
+    cargo run -p cormex-evals --locked -- validate
+    cargo run -p cormex-evals --locked -- validate --sessions
+
+pipeline-test:
+    python3 -m unittest discover -s scripts/tests -v
+
+# An already provisioned pgvector database. CI must not start a second compose stack.
+test-db-ready:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${DATABASE_URL:?DATABASE_URL is not set}"
+    export CORMEX_SECRET_KEY="${CORMEX_SECRET_KEY:-0000000000000000000000000000000000000000000000000000000000000001}"
+    cargo test --workspace --locked -- --include-ignored --test-threads=4
+
 test-db: up
     #!/usr/bin/env bash
     set -euo pipefail
-    sleep 2
-    just db-migrate
-    cargo test --workspace --locked -- --include-ignored --test-threads=4
-
-# The pure-logic half: fmt, clippy, unit tests. Fast, no database needed.
-ci: fmt-check lint test
-
-# Everything CI runs: fmt, clippy, the database tests, and the Flutter client.
-ci-full: fmt-check lint test-db app-check
-    @echo "# --include-ignored is the whole point: without it the database tests show"
-    @echo "# 'ignored' where they would show 'ok', and the two look alike at a glance"
-    @echo
-    @echo "ci-full: everything green"
-
-# The Flutter client: analyze and test.
-app-check:
-    cd app && flutter analyze && flutter test
-
-# ── Releasing ───────────────────────────────────────────
-#
-# ★ **Two release paths, one sequence.** The workflow in
-#   .github/workflows/release.yml and the recipes below do the same six things:
-#
-#     check → CLI archives → images + smoke → push images → publish archives → npm
-#
-#   The workflow runs it on six machines at once (each platform builds natively) and its
-#   `push: tags` trigger is commented out while the Actions quota is exhausted. These
-#   recipes are the same pipeline on one machine, so a release is possible with the quota
-#   at zero -- at the cost of building only the platforms this host can target.
-#
-#   ★ **Whichever path is used, the archives have to reach the Release.** They are the
-#   only thing `cormex update` and `install.sh` read; images alone update no CLI. That is
-#   why `release-assets` is in the sequence rather than being an optional extra.
-#
-#   The preflight comes first in both: a version mismatch or an inconsistent lock file is
-#   a second to check and a quarter of an hour to discover at the end of a build.
-
-# Check that the version, the tag and the lock file agree. No build.
-release-check version:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    v="{{version}}"
-    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-      || { echo "version '$v' is not X.Y.Z" >&2; exit 1; }
-    python3 - "$v" <<'PY'
-    import sys, tomllib
-    want = sys.argv[1]
-    got = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-    if got != want:
-        sys.exit(f"the tag is v{want}, but Cargo.toml's workspace version is {got}")
-    print(f"versions agree: {got}")
-    PY
-    cargo metadata --locked --format-version 1 > /dev/null
-    echo "Cargo.lock is consistent with the manifests"
-
-# Build the CLI binaries into dist/. Linux targets always; the rest only on their own OS.
-release-cli version:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    v="{{version}}"
-    rm -rf dist && mkdir -p dist
-    # ★ **This produces the Linux binaries on any machine, and the other four only on
-    #   their own OS.** Cross-compiling to macOS needs the Apple SDK and to Windows needs
-    #   MSVC; neither is a thing you install by accident, and a recipe that silently
-    #   produced four of six artefacts would make a release look complete when it is not.
-    #   So the skips are printed, and `release` warns loudly if the set is incomplete.
-    built=0
-    # The two Linux targets are musl: a glibc binary built here refuses to start on an
-    # older distribution with `GLIBC_2.xx not found`, which the user meets on first run
-    # with no way to tell it from a corrupt download
-    for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-      rustup target add "$target" 2>/dev/null || true
-      cargo zigbuild --release --locked -p cormex --target "$target"
-      name="cormex-$v-$target"
-      mkdir -p "dist/$name"
-      cp "target/$target/release/cormex" "dist/$name/"
-      cp README.md LICENSE "dist/$name/" 2>/dev/null || true
-      tar -czf "dist/$name.tar.gz" -C dist "$name"
-      rm -rf "dist/$name"
-      built=$((built + 1))
-    done
-    # The native targets build with the host toolchain
-    host=$(uname -s)
-    for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-      # ★ `case`, not `[ "$host" = MINGW64_NT-* ]`. A glob is not expanded inside
-      #   test brackets, so that spelling compares against the literal string and
-      #   matches nothing -- which skipped **both Windows targets on Windows**, with
-      #   a message that reads like a correct decision. The build then reported
-      #   "2 of 6" on the one host that can make four.
-      case "$target" in
-        *darwin*) [ "$host" = Darwin ] || { echo "skipping $target: not on macOS" >&2; continue; } ;;
-        *windows*) case "$host" in
-                     MINGW*|MSYS*|CYGWIN*) ;;
-                     *) echo "skipping $target: not on Windows" >&2; continue ;;
-                   esac ;;
-      esac
-      rustup target add "$target" 2>/dev/null || true
-      cargo build --release --locked -p cormex --target "$target"
-      name="cormex-$v-$target"
-      mkdir -p "dist/$name"
-      bin="target/$target/release/cormex"
-      [ -f "$bin.exe" ] && bin="$bin.exe"
-      cp "$bin" "dist/$name/"
-      cp README.md LICENSE "dist/$name/" 2>/dev/null || true
-      case "$target" in
-        *windows*)
-          # Git for Windows ships no `zip` binary, so a Windows host could build the
-          # archives and then fail to pack them. Python is already a prerequisite of
-          # `release-check`; its zipfile writes `/` entry names, which the updater
-          # accepts (it splits on either separator).
-          if command -v zip >/dev/null 2>&1; then
-            (cd dist && zip -qr "$name.zip" "$name")
-          else
-            python -m zipfile -c "dist/$name.zip" "dist/$name"
-          fi ;;
-        *) tar -czf "dist/$name.tar.gz" -C dist "$name" ;;
-      esac
-      rm -rf "dist/$name"
-      built=$((built + 1))
-    done
-    echo "built $built of 6 targets"
-    # The binary has to answer `--version` on the platform it was built for. On a host
-    # that cross-builds, that is this host's own target: a musl ELF does not execute on
-    # Windows or macOS, so naming it unconditionally turned the smoke test into the one
-    # step that fails *after* a successful build.
-    case "$host" in
-      Linux)  smoke="target/x86_64-unknown-linux-musl/release/cormex" ;;
-      Darwin) smoke="target/x86_64-apple-darwin/release/cormex" ;;
-      *)      smoke="target/x86_64-pc-windows-msvc/release/cormex.exe" ;;
-    esac
-    out=$("$smoke" --version)
-    echo "$out"
-    echo "$out" | grep -qF "$v" \
-      || { echo "the binary reports a different version than $v" >&2; exit 1; }
-    (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
-
-# Build both images and smoke-test them before pushing.
-release-images version:
-    #!/usr/bin/env bash
-    # The smoke tests run **before** the push, because a broken image that is already in
-    # the registry cannot be withdrawn.
-    set -euo pipefail
-    v="{{version}}"
-    docker build -f scripts/docker/Dockerfile.cormexd -t "cormex:$v" .
-    docker build -f scripts/docker/Dockerfile.web -t "cormex-web:$v" .
-    # `--version` is the one code path that runs with no dependencies, and what it proves
-    # is that dynamic linking works -- the glibc-mismatch kind of failure blows up here
-    # instead of when the container starts in production
-    out=$(docker run --rm "cormex:$v" --version)
-    echo "$out"
-    echo "$out" | grep -qF "$v" || { echo "the image reports a different version" >&2; exit 1; }
-    # Both migration sets travel with the image: the deployment machine has no Rust
-    # toolchain, and `just prod-migrate` runs them inside the container
-    docker run --rm --entrypoint /bin/sh "cormex:$v" -c \
-      'test -d /opt/cormex/migrations && test -d /opt/cormex/migrations-global' \
-      || { echo "the migration directories are missing from the image" >&2; exit 1; }
-    # The web image: healthy, a real document at /, and the API prefix survived the compile
-    docker run -d --name cormex-web-smoke -p 8099:80 "cormex-web:$v"
-    trap 'docker rm -f cormex-web-smoke >/dev/null 2>&1 || true' EXIT
-    for _ in $(seq 1 30); do
-      [ "$(docker inspect -f '{{{{.State.Health.Status}}}}' cormex-web-smoke)" = healthy ] && break
+    for attempt in {1..30}; do
+      if docker compose exec -T postgres pg_isready; then break; fi
       sleep 2
     done
-    [ "$(docker inspect -f '{{{{.State.Health.Status}}}}' cormex-web-smoke)" = healthy ] \
-      || { docker logs cormex-web-smoke; echo "the web container never became healthy" >&2; exit 1; }
-    curl -fsS http://127.0.0.1:8099/ | grep -qi '<title>' \
-      || { echo "/ did not return an HTML document" >&2; exit 1; }
-    curl -fsS http://127.0.0.1:8099/main.dart.js -o /tmp/main.js
-    grep -qF '"/api"' /tmp/main.js || grep -qF "'/api'" /tmp/main.js \
-      || { echo "the API prefix /api is not in the bundle" >&2; exit 1; }
+    docker compose exec -T postgres pg_isready
+    just db-migrate
+    just test-db-ready
 
-# Tag both images for both registries and push them.
-release-push version:
+ci: fmt-check lint doc-check test capture-check eval-check pipeline-test
+
+ci-full: ci test-db app-check
+    @echo "ci-full: all checks passed, including database and Flutter tests"
+
+app-check:
+    cd app && flutter pub get && flutter analyze && flutter test
+
+# ── Build and publish are independent choices ────────────
+# Parameters are positional, never pasted into shell source. See docs/release.md.
+
+# Build locally, then upload an immutable draft candidate (no registry credentials).
+build-local tag:
     #!/usr/bin/env bash
-    # ★ `--provenance=false` is required, not a preference: buildx attaches a provenance
-    #   attestation by default, which makes the result an OCI index containing an empty
-    #   descriptor of type `application/vnd.oci.empty.v1+json`. ACR does not recognise
-    #   that media type and rejects the push with `denied: unknown manifest class`.
     set -euo pipefail
-    v="{{version}}"
-    : "${ACR_USERNAME:?ACR_USERNAME is not set}"
-    : "${ACR_PASSWORD:?ACR_PASSWORD is not set}"
-    : "${DOCKERHUB_USERNAME:?DOCKERHUB_USERNAME is not set}"
-    : "${DOCKERHUB_TOKEN:?DOCKERHUB_TOKEN is not set}"
-    echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-    echo "$ACR_PASSWORD" | docker login -u "$ACR_USERNAME" --password-stdin \
-      registry.cn-shenzhen.aliyuncs.com
-    # Only the version is tagged, never `latest`: production pins a version and has to
-    # come back to the same one after a restart, and a drifting tag turns "which version
-    # is running" into a question nobody can settle
-    for img in cormex cormex-web; do
-      docker tag "$img:$v" "willdockerhub/$img:v$v"
-      docker tag "$img:$v" "registry.cn-shenzhen.aliyuncs.com/willspace/$img:v$v"
-      docker push "willdockerhub/$img:v$v"
-      docker push "registry.cn-shenzhen.aliyuncs.com/willspace/$img:v$v"
-    done
-    # What gets pulled back is the ACR copy, not the local one: the local image has never
-    # made the push/pull round trip, so manifest-level problems are invisible on it
-    docker pull "registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v$v"
-    docker run --rm "registry.cn-shenzhen.aliyuncs.com/willspace/cormex:v$v" --version \
-      | grep -qF "$v" || { echo "the pushed image reports a different version" >&2; exit 1; }
+    just _build "$1"
+    just _stage "$1"
 
-# Upload dist/ to the GitHub Release for the tag. Needs `gh`.
-release-assets version:
-    #!/usr/bin/env bash
-    # ★ The gate is the tag, and it is not a formality. `gh release create` given a tag that
-    #   does not exist on the remote **creates it at the default branch's head**, so the
-    #   Release silently attaches to whatever `main` happens to be -- and the assets were
-    #   built from a working tree, not from that commit. Both of the checks below exist to
-    #   make that impossible: the tag has to be pushed, and it has to point at HEAD.
-    #
-    #   The assets are the only channel `cormex update` and `install.sh` read. A release
-    #   that pushed images but no archives looks complete in the registry and updates
-    #   nobody -- which is why this runs in `just release`, not as an optional extra.
-    set -euo pipefail
-    v="{{version}}"
-    tag="v$v"
-    command -v gh >/dev/null \
-      || { echo "gh is not on PATH: it is what talks to the Release API" >&2; exit 1; }
-    [ -f dist/SHA256SUMS ] \
-      || { echo "dist/SHA256SUMS is missing: run \`just release-cli $v\` first" >&2; exit 1; }
-    remote=$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)
-    if [ -z "$remote" ]; then
-      echo "tag $tag is not on origin. Tag the commit that was actually built, then push it:" >&2
-      echo "  git tag -a $tag -m \"$tag\" && git push origin $tag" >&2
-      exit 1
-    fi
-    head=$(git rev-parse HEAD)
-    tagged=$(git rev-parse "$tag^{commit}")
-    if [ "$head" != "$tagged" ]; then
-      echo "tag $tag points at $tagged, but HEAD is $head." >&2
-      echo "dist/ was built from this working tree, so publishing it under that tag would" >&2
-      echo "describe a commit the archives did not come from." >&2
-      exit 1
-    fi
-    shopt -s nullglob
-    files=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
-    [ ${#files[@]} -gt 0 ] || { echo "dist/ holds no archives" >&2; exit 1; }
-    if gh release view "$tag" >/dev/null 2>&1; then
-      # A second run is normal -- a partial set being completed, or a rebuild after a bad
-      # archive. Replacing by name rather than failing keeps that possible.
-      gh release upload "$tag" "${files[@]}" --clobber
-    else
-      gh release create "$tag" "${files[@]}" --title "$tag" --notes "Release $tag"
-    fi
-    gh release view "$tag" --json assets --jq '.assets[] | "  \(.name)  \(.size)"'
+# Start the six-target Actions build. Does not publish.
+build-github tag:
+    python3 scripts/release.py dispatch-build "$1"
 
-# Publish the CLI artefacts to npm. Off unless PUBLISH_NPM=true *and* NPM_TOKEN is set.
-release-npm version:
-    #!/usr/bin/env bash
-    # Two keys, the same pair the workflow uses: the repository variable says the channel
-    # is open, the token says this machine may write to it. The channel has never been
-    # published, so `off by default` is the accurate default -- see release.yml.
-    set -euo pipefail
-    if [ "${PUBLISH_NPM:-}" != "true" ]; then
-      echo "PUBLISH_NPM is not 'true': the npm channel is off. Skipping"
-      echo "  (the package is not on npm at all; install.sh and the Release are the paths)"
-      exit 0
-    fi
-    if [ -z "${NPM_TOKEN:-}" ]; then
-      echo "NPM_TOKEN is not set: skipping the npm publish (install.sh is the primary path)"
-      exit 0
-    fi
-    echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
-    node npm/publish.mjs "{{version}}" dist
+# Publish only the existing draft pinned by the SHA256SUMS digest. Never compiles.
+release-local tag checksum:
+    just _publish "$1" "$2"
 
-# The whole release: preflight, CLI, images, smoke tests, push, npm.
+release-github tag checksum:
+    python3 scripts/release.py dispatch-release "$1" "$2"
+
+# The old one-command build-and-publish path is intentionally unavailable.
 release version:
+    @echo 'Use just build-local vX.Y.Z (or build-github), then just release-local vX.Y.Z BUNDLE_SHA256 (or release-github).' >&2
+    @exit 1
+
+_preflight tag:
+    python3 scripts/release.py preflight "$1"
+
+_build tag:
     #!/usr/bin/env bash
-    # Everything is built and smoke-tested **before anything is pushed**: a release that
-    # fails halfway leaves the registry with an image nobody can withdraw.
     set -euo pipefail
-    just release-check {{version}}
-    just release-cli {{version}}
-    # ★ A partial CLI set is a **warning, not a stop**, and the distinction is deliberate.
-    #   The images are the product; the CLI is how capture agents are installed. A Linux
-    #   machine can build two of the six binaries, and refusing to release the server
-    #   because a laptop cannot cross-compile to macOS would block the thing that matters
-    #   on the thing that does not. What must not happen is a *silent* partial set -- so
-    #   it says so, loudly, and names what is missing.
-    n=$(ls dist/*.tar.gz dist/*.zip 2>/dev/null | wc -l)
-    if [ "$n" -lt 6 ]; then
-      echo
-      echo "WARNING: only $n of 6 CLI binaries were built on this machine."
-      echo "  The Release will carry a partial set: on the platforms left out, \`cormex update\`"
-      echo "  answers 'release publishes no archive for this platform', and install.sh fails."
-      echo "  To get all six, either run \`just release-cli\` on macOS and Windows too, or"
-      echo "  restore the tag trigger in .github/workflows/release.yml and let CI build them."
-      echo
-    fi
-    just release-images {{version}}
-    just release-push {{version}}
-    just release-assets {{version}}
-    just release-npm {{version}}
-    echo
-    echo "released v{{version}}"
+    just _preflight "$1"
+    just ci-full
+    python3 scripts/release.py build-cli-local "$1"
+    just _build-images "$1"
+    python3 scripts/release.py bundle "$1"
+
+_build-cli tag target:
+    python3 scripts/release.py build-cli "$1" "$2"
+
+_build-images tag:
+    python3 scripts/release.py build-images "$1"
+
+# Actions requires all six CLI platforms; local bundling records its partial set.
+_bundle tag:
+    python3 scripts/release.py bundle "$1" --require-all-targets
+
+_stage tag:
+    python3 scripts/release.py stage "$1"
+
+_verify tag checksum directory:
+    python3 scripts/release.py verify "$1" "$2" "$3"
+
+_publish tag checksum:
+    python3 scripts/release.py publish "$1" "$2"

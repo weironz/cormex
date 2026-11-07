@@ -17,6 +17,10 @@ dist/
 .next/
 *.tsbuildinfo
 
+# Python release tooling
+__pycache__/
+*.py[cod]
+
 # 环境与密钥 —— 绝不入库
 #
 # 用后缀而不是逐个文件名列举：`.env` / `.env.*` 两条都匹配不到
