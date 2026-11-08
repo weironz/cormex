@@ -19,6 +19,7 @@ class MemoryExtractionStatus {
     this.lastError,
     this.updatedAt,
     this.trial,
+    this.since,
   });
   final bool enabled, useServerModel, keyConfigured, modelConfigured;
   final String provider, model, phase;
@@ -27,6 +28,18 @@ class MemoryExtractionStatus {
   final int totalChats, processedChats, pendingChats, factsCreated;
   final int? memoryCount, summaryCount;
   final Map<String, dynamic>? trial;
+
+  /// 提取范围：只处理这个时间之后有过对话的聊天（RFC 3339）。`null` 是全部。
+  final String? since;
+
+  /// 「2026-11-01 之后」，或 `null`（全部聊天）。
+  String? get sinceLabel {
+    final t = since == null ? null : DateTime.tryParse(since!)?.toLocal();
+    if (t == null) return null;
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${t.year}-${two(t.month)}-${two(t.day)} 之后';
+  }
+
   bool get trialRunning => trial?['status'] == 'running';
   bool get hasAnalyzedChats =>
       processedChats > 0 ||
@@ -72,6 +85,7 @@ class MemoryExtractionStatus {
         lastError: j['last_error'] as String?,
         updatedAt: j['updated_at'] as String?,
         trial: (j['trial'] as Map?)?.cast<String, dynamic>(),
+        since: j['since'] as String?,
       );
   String get label => switch (phase) {
     'paused' => '全量未开启',
@@ -83,11 +97,15 @@ class MemoryExtractionStatus {
     'trial_running' => '小样本提取中',
     _ => '状态未知',
   };
+
+  /// 保存请求。范围必须原样带上：服务端把「没带 since」读作「全部聊天」，
+  /// 只拨一下开关就会悄悄把用户选的范围放宽成全量。
   Map<String, Object?> settings({bool? enabled}) => {
     'enabled': enabled ?? this.enabled,
     'use_server_model': useServerModel,
     'provider': provider,
     'model': model,
     'base_url': baseUrl,
+    'since': since,
   };
 }

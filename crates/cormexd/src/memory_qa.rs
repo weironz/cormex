@@ -410,7 +410,10 @@ pub async fn normal_round(
         settings.model,
         settings.base_url.as_deref().unwrap_or_default()
     );
-    for (session, cursor) in store.qa_pending(dialogue::RULE_VERSION, 3).await? {
+    for (session, cursor) in store
+        .qa_pending(dialogue::RULE_VERSION, 3, settings.since)
+        .await?
+    {
         let current = store.memory_extraction_settings().await?;
         if current
             .as_ref()

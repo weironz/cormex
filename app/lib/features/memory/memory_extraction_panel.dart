@@ -163,7 +163,8 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
                             runSpacing: 8,
                             children: [
                               Text(
-                                '已检查 ${s.processedChats} / ${s.totalChats} 个聊天',
+                                '已检查 ${s.processedChats} / ${s.totalChats} 个聊天'
+                                '${s.sinceLabel == null ? '' : '（${s.sinceLabel}）'}',
                               ),
                               Text('待处理 ${s.pendingChats} 个'),
                             ],

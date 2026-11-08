@@ -379,7 +379,10 @@ mod tests {
         let job = store.latest_memory_trial().await.unwrap().unwrap();
         assert_eq!(job.processed_messages, 4);
         assert_eq!(job.processed_chats, 2);
-        assert_eq!(store.memory_extraction_totals().await.unwrap(), (3, 2, 0));
+        assert_eq!(
+            store.memory_extraction_totals(None).await.unwrap(),
+            (3, 2, 0)
+        );
         assert_eq!(job.summary_count, 2);
         assert_eq!(job.confirmed_count, 0);
         assert_eq!(store.qa_counts().await.unwrap(), (0, 0, 0, 2, 0));
@@ -483,7 +486,7 @@ mod tests {
             seed_projected_session(&st, &store, body).await;
         }
         let newest = store
-            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 3)
+            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 3, None)
             .await
             .unwrap();
         for (chat, _) in &newest {
@@ -493,7 +496,7 @@ mod tests {
                 .unwrap();
         }
         let pending = store
-            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 3)
+            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 3, None)
             .await
             .unwrap();
         assert_eq!(

@@ -39,6 +39,9 @@ pub struct ExtractionStatus {
     pub model_configured: bool,
     pub providers: Vec<String>,
     pub phase: String,
+    /// The extraction scope: only conversations active at or after this time.
+    /// `None` is every conversation.
+    pub since: Option<String>,
     pub total_chats: i64,
     pub processed_chats: i64,
     pub pending_chats: i64,
@@ -66,6 +69,9 @@ pub struct SaveExtractionSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub clear_api_key: bool,
+    /// RFC 3339. Absent or null: no boundary, every conversation.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<Utc>>,
 }
 
 pub(crate) fn defaults(st: &AppState) -> MemoryExtractionSettings {
@@ -79,6 +85,7 @@ pub(crate) fn defaults(st: &AppState) -> MemoryExtractionSettings {
         base_url: cfg.base_url.clone(),
         ciphertext: None,
         key_tail: None,
+        since: None,
     }
 }
 
@@ -126,7 +133,10 @@ pub async fn get(
         s.base_url = d.base_url;
     }
     let ready = client(&st, &s).is_ok();
-    let (total, done, facts) = store.memory_extraction_totals().await.map_err(db_error)?;
+    let (total, done, facts) = store
+        .memory_extraction_totals(s.since)
+        .await
+        .map_err(db_error)?;
     let (active_facts, suggestion_count, temporary_count, summary_count, legacy_count) =
         store.qa_counts().await.map_err(db_error)?;
     let work = store.memory_extraction_work().await.map_err(db_error)?;
@@ -165,6 +175,7 @@ pub async fn get(
         model_configured: ready,
         providers: cormex_llm::provider::available(),
         phase: phase.into(),
+        since: s.since.map(|t| t.to_rfc3339()),
         total_chats: total,
         processed_chats: done,
         pending_chats: (total - done).max(0),
@@ -232,6 +243,7 @@ pub async fn put(
         base_url,
         ciphertext: None,
         key_tail: None,
+        since: req.since,
     };
     if !s.use_server_model {
         if !cormex_llm::provider::available().contains(&s.provider)
@@ -364,6 +376,7 @@ mod tests {
             base_url: Some(url.into()),
             api_key: key.map(str::to_owned),
             clear_api_key: false,
+            since: None,
         };
         let Json(status) = put(
             State(st.clone()),
@@ -412,11 +425,38 @@ mod tests {
         )
         .await;
         assert!(bad.is_err());
-        let Json(restored) = get(State(st.clone()), Extension(p)).await.unwrap();
+        let Json(restored) = get(State(st.clone()), Extension(p.clone())).await.unwrap();
         assert!(!restored.enabled);
         assert_eq!(
             restored.base_url.as_deref(),
             Some("http://127.0.0.1:9/another")
+        );
+        assert_eq!(restored.since, None, "no scope unless one is chosen");
+
+        // A scope is a setting like any other: saved, returned, and dropped
+        // again by a save without one
+        let week = chrono::Utc::now() - chrono::Duration::days(7);
+        let mut scoped = request("http://127.0.0.1:9/another", None);
+        scoped.since = Some(week);
+        let Json(saved) = put(State(st.clone()), Extension(p.clone()), Json(scoped))
+            .await
+            .unwrap();
+        let back = saved
+            .since
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .expect("the scope is returned as RFC 3339");
+        assert_eq!(back.timestamp(), week.timestamp());
+        let Json(widened) = put(
+            State(st.clone()),
+            Extension(p.clone()),
+            Json(request("http://127.0.0.1:9/another", None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            widened.since, None,
+            "saving without a scope widens to everything"
         );
         db.drop().await;
     }

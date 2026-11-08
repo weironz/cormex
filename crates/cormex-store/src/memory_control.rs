@@ -34,6 +34,9 @@ pub struct MemoryExtractionSettings {
     pub base_url: Option<String>,
     pub ciphertext: Option<Vec<u8>>,
     pub key_tail: Option<String>,
+    /// Full extraction only takes sessions whose conversation was active at or
+    /// after this time. `None` is no boundary.
+    pub since: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -89,15 +92,15 @@ impl Store {
         Ok(())
     }
     pub async fn memory_extraction_settings(&self) -> Result<Option<MemoryExtractionSettings>> {
-        Ok(sqlx::query_as("SELECT id,enabled,use_server_model,provider,model,base_url,ciphertext,key_tail FROM memory_extraction_settings ORDER BY created_at DESC,id DESC LIMIT 1").fetch_optional(self.pool()).await?)
+        Ok(sqlx::query_as("SELECT id,enabled,use_server_model,provider,model,base_url,ciphertext,key_tail,since FROM memory_extraction_settings ORDER BY created_at DESC,id DESC LIMIT 1").fetch_optional(self.pool()).await?)
     }
 
     pub async fn save_memory_extraction_settings(
         &self,
         s: &MemoryExtractionSettings,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO memory_extraction_settings(id,enabled,use_server_model,provider,model,base_url,ciphertext,key_tail) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
-            .bind(&s.id).bind(s.enabled).bind(s.use_server_model).bind(&s.provider).bind(&s.model).bind(&s.base_url).bind(&s.ciphertext).bind(&s.key_tail).execute(self.pool()).await?;
+        sqlx::query("INSERT INTO memory_extraction_settings(id,enabled,use_server_model,provider,model,base_url,ciphertext,key_tail,since) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            .bind(&s.id).bind(s.enabled).bind(s.use_server_model).bind(&s.provider).bind(&s.model).bind(&s.base_url).bind(&s.ciphertext).bind(&s.key_tail).bind(s.since).execute(self.pool()).await?;
         // Saving is also an explicit retry; it releases the failure backoff.
         self.set_memory_extraction_work(false, None).await
     }
@@ -122,8 +125,14 @@ impl Store {
 
     /// Totals use index lookups for last seq, not a scan of every transcript.
     /// A chat with no usable text can finish without producing any facts.
-    pub async fn memory_extraction_totals(&self) -> Result<(i64, i64, i64)> {
-        let (total,done): (i64,i64)=sqlx::query_as("SELECT count(*),count(*) FILTER(WHERE coalesce(p.through_seq,-1)>=e.seq) FROM capture_sessions s JOIN LATERAL(SELECT seq FROM transcript_events WHERE session_id=s.id ORDER BY seq DESC LIMIT 1) e ON true LEFT JOIN memory_qa_progress p ON p.session_id=s.id::text AND p.rule_version='qa@4'").fetch_one(self.pool()).await?;
+    ///
+    /// With `since`, only sessions inside the extraction scope count: "3 of 40
+    /// checked" for the last week is the honest progress, "3 of 4510" is not.
+    pub async fn memory_extraction_totals(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<(i64, i64, i64)> {
+        let (total,done): (i64,i64)=sqlx::query_as("SELECT count(*),count(*) FILTER(WHERE coalesce(p.through_seq,-1)>=e.seq) FROM capture_sessions s JOIN LATERAL(SELECT seq,coalesce(occurred_at,created_at) AS at FROM transcript_events WHERE session_id=s.id ORDER BY seq DESC LIMIT 1) e ON true LEFT JOIN memory_qa_progress p ON p.session_id=s.id::text AND p.rule_version='qa@4' WHERE $1::timestamptz IS NULL OR e.at>=$1").bind(since).fetch_one(self.pool()).await?;
         let facts: i64 = sqlx::query_scalar("SELECT count(*) FROM facts")
             .fetch_one(self.pool())
             .await?;

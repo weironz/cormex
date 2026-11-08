@@ -92,9 +92,20 @@ impl Store {
    .bind(session).bind(version).bind(through).execute(self.pool()).await?;
         Ok(())
     }
-    pub async fn qa_pending(&self, version: &str, limit: i64) -> Result<Vec<(String, i64)>> {
-        Ok(sqlx::query_as("SELECT s.id::text,coalesce(p.through_seq,-1) FROM capture_sessions s JOIN LATERAL(SELECT seq,created_at FROM transcript_events WHERE session_id=s.id ORDER BY seq DESC LIMIT 1)e ON true LEFT JOIN memory_qa_progress p ON p.session_id=s.id::text AND p.rule_version=$1 WHERE coalesce(p.through_seq,-1)<e.seq AND (p.retry_after IS NULL OR p.retry_after<clock_timestamp() OR e.created_at>p.updated_at) ORDER BY e.created_at DESC LIMIT $2")
-   .bind(version).bind(limit.clamp(1,20)).fetch_all(self.pool()).await?)
+    /// Sessions with turns not yet analysed, most recently captured first.
+    ///
+    /// `since` is the extraction scope: a session is in it when its last event
+    /// happened at or after that time. Conversation time (`occurred_at`), not
+    /// capture time: an export imported today holds conversations from years
+    /// ago, and they are not "recent" for having arrived this week.
+    pub async fn qa_pending(
+        &self,
+        version: &str,
+        limit: i64,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as("SELECT s.id::text,coalesce(p.through_seq,-1) FROM capture_sessions s JOIN LATERAL(SELECT seq,created_at,coalesce(occurred_at,created_at) AS at FROM transcript_events WHERE session_id=s.id ORDER BY seq DESC LIMIT 1)e ON true LEFT JOIN memory_qa_progress p ON p.session_id=s.id::text AND p.rule_version=$1 WHERE coalesce(p.through_seq,-1)<e.seq AND (p.retry_after IS NULL OR p.retry_after<clock_timestamp() OR e.created_at>p.updated_at) AND ($3::timestamptz IS NULL OR e.at>=$3) ORDER BY e.created_at DESC LIMIT $2")
+   .bind(version).bind(limit.clamp(1,20)).bind(since).fetch_all(self.pool()).await?)
     }
     pub async fn defer_qa_progress(&self, session: &str, version: &str) -> Result<()> {
         sqlx::query("INSERT INTO memory_qa_progress(session_id,rule_version,through_seq,retry_after) VALUES($1,$2,-1,clock_timestamp()+interval '60 seconds') ON CONFLICT(session_id,rule_version) DO UPDATE SET retry_after=clock_timestamp()+interval '60 seconds',updated_at=clock_timestamp()")

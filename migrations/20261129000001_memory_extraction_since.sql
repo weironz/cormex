@@ -1,0 +1,16 @@
+-- How far back full extraction reaches.
+--
+-- Full extraction used to be one switch: on meant every archived session, and
+-- an archive holds years of them (one production tenant: 4510 sessions, plus
+-- thousands more in a single vendor export). Nobody can know what that costs,
+-- or whether what it extracts is any good, before paying for all of it. With a
+-- boundary it can be turned on for the last week first and widened later.
+--
+-- NULL means no boundary, which is what every row written before this column
+-- existed already meant. The boundary is compared with the time the
+-- conversation happened (the last event's occurred_at), not with when it was
+-- captured: an export imported today is years old, and "the last week" must
+-- not mean "everything imported this week".
+--
+-- Settings rows stay append-only: widening the scope is a new row.
+ALTER TABLE memory_extraction_settings ADD COLUMN since TIMESTAMPTZ;

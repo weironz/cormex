@@ -2491,7 +2491,10 @@ pub(crate) mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
         assert!(promote_round(&st, &tenant, &sink).await.is_err());
-        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 0, 1));
+        assert_eq!(
+            store.memory_extraction_totals(None).await.unwrap(),
+            (1, 0, 1)
+        );
         assert_eq!(
             store.sessions_needing_promotion(10).await.unwrap(),
             vec![(session.clone(), 0)],
@@ -2512,13 +2515,16 @@ pub(crate) mod tests {
         // that memory_extraction_totals uses for completed chats.
         assert_eq!(
             store
-                .qa_pending(cormex_memory::dialogue::RULE_VERSION, 10)
+                .qa_pending(cormex_memory::dialogue::RULE_VERSION, 10, None)
                 .await
                 .unwrap(),
             vec![(session, -1)],
             "legacy promotion must not mark QA analysis as complete"
         );
-        assert_eq!(store.memory_extraction_totals().await.unwrap(), (1, 0, 2));
+        assert_eq!(
+            store.memory_extraction_totals(None).await.unwrap(),
+            (1, 0, 2)
+        );
         assert_eq!(promote_round(&st, &tenant, &retry).await.unwrap(), 0);
         assert_eq!(
             retry.calls(),
@@ -3151,6 +3157,62 @@ pub(crate) mod tests {
         };
         project_tick(st, &tenant).await.expect("project tick");
         (session, tenant)
+    }
+
+    /// The extraction scope is conversation time, not capture time: an old
+    /// conversation imported a minute ago is outside "the last week".
+    #[tokio::test]
+    #[ignore = "needs a database; run with just test-db"]
+    async fn the_extraction_scope_is_by_conversation_time() {
+        let Some(base) = crate::test_support::database_url() else {
+            return;
+        };
+        let db = crate::test_support::FreshDb::create(&base).await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().expect("a live backend");
+        let old_at = (chrono::Utc::now() - chrono::Duration::days(730)).to_rfc3339();
+        let recent_at = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let line = |at: &str, text: &str| {
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{at}\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n"
+            )
+        };
+        let (old, _) =
+            seed_projected_session(&st, &store, line(&old_at, "two years ago").as_bytes()).await;
+        let (recent, _) =
+            seed_projected_session(&st, &store, line(&recent_at, "yesterday").as_bytes()).await;
+        let week = Some(chrono::Utc::now() - chrono::Duration::days(7));
+
+        let everything: Vec<String> = store
+            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 10, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            everything.contains(&old) && everything.contains(&recent),
+            "no scope: both sessions are pending ({everything:?})"
+        );
+        let scoped: Vec<String> = store
+            .qa_pending(cormex_memory::dialogue::RULE_VERSION, 10, week)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            scoped,
+            vec![recent.clone()],
+            "the last week holds only the conversation from yesterday, although both were \
+             captured just now"
+        );
+        assert_eq!(
+            store.memory_extraction_totals(week).await.unwrap().0,
+            1,
+            "progress counts only the sessions inside the scope"
+        );
+        assert_eq!(store.memory_extraction_totals(None).await.unwrap().0, 2);
     }
 
     /// An idle session produces a summary with a `transcript_event` edge.

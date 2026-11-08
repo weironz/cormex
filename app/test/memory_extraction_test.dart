@@ -501,4 +501,80 @@ void main() {
     expect(find.text('全量未开启'), findsOneWidget);
     await dispose(tester);
   });
+
+  testWidgets('the panel switch keeps the saved extraction scope', (
+    tester,
+  ) async {
+    Map<String, dynamic>? saved;
+    // Midday UTC, so the date reads the same in any test machine's zone
+    const since = '2026-11-01T12:00:00Z';
+    final api = CormexApi(
+      baseUrl: 'http://localhost',
+      client: MockClient((r) async {
+        if (r.url.path == '/memory/search') return json({'facts': []});
+        if (r.method == 'PUT') {
+          saved = (jsonDecode(r.body) as Map).cast<String, dynamic>();
+        }
+        return json({
+          ...status(enabled: saved?['enabled'] == true, done: 3),
+          'total_chats': 40,
+          'pending_chats': 37,
+          'since': since,
+        });
+      }),
+    );
+    await tester.pumpWidget(settingsApp(api));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('已检查 3 / 40 个聊天（2026-11-01 之后）'),
+      findsOneWidget,
+      reason: 'progress says it counts only the chats inside the scope',
+    );
+    await tester.tap(find.byType(Switch));
+    await tester.pumpAndSettle();
+    expect(saved?['enabled'], isTrue);
+    expect(
+      saved?['since'],
+      since,
+      reason:
+          'the server reads a save without since as "every chat": flipping the switch '
+          'must not quietly widen the scope to the whole archive',
+    );
+    await dispose(tester);
+  });
+
+  testWidgets('choosing the last 7 days saves that date as the scope', (
+    tester,
+  ) async {
+    Map<String, dynamic>? saved;
+    final api = CormexApi(
+      baseUrl: 'http://localhost',
+      client: MockClient((r) async {
+        if (r.method == 'PUT') {
+          saved = (jsonDecode(r.body) as Map).cast<String, dynamic>();
+        }
+        return json(status());
+      }),
+    );
+    await tester.pumpWidget(app(api, settings: true));
+    await tester.pumpAndSettle();
+    expect(find.text('全部聊天'), findsOneWidget, reason: 'no scope saved yet');
+    await tester.tap(find.byKey(const ValueKey('extraction-scope')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('最近 7 天').last);
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('保存设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存设置'));
+    await tester.pumpAndSettle();
+    final since = DateTime.parse(saved!['since'] as String);
+    final expected = DateTime.now().toUtc().subtract(const Duration(days: 7));
+    expect(
+      since.difference(expected).inMinutes.abs(),
+      lessThan(2),
+      reason: 'a fixed start date seven days back, worked out when saving',
+    );
+    await tester.pump(const Duration(seconds: 5));
+    await dispose(tester);
+  });
 }

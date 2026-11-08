@@ -41,6 +41,21 @@ class _ExtractionFormState extends ConsumerState<_ExtractionForm> {
   late final _url = TextEditingController(text: widget.initial.baseUrl ?? '');
   final _key = TextEditingController();
   bool _clearKey = false, _saving = false, _testing = false, _dirty = false;
+
+  /// 提取范围的选择：'keep' 保留已保存的日期，'all' 全部，数字是最近 N 天。
+  late String _scope = widget.initial.since == null ? 'all' : 'keep';
+
+  /// 保存时才把「最近 N 天」换算成日期：范围是一个固定起点，之后的新聊天
+  /// 自然都在里面；存成「N 天」反而会让早先已经提取过的聊天滑出范围。
+  String? get _since => switch (_scope) {
+    'keep' => widget.initial.since,
+    'all' => null,
+    final days =>
+      DateTime.now()
+          .toUtc()
+          .subtract(Duration(days: int.parse(days)))
+          .toIso8601String(),
+  };
   String? _error, _testResult;
   @override
   void dispose() {
@@ -65,6 +80,7 @@ class _ExtractionFormState extends ConsumerState<_ExtractionForm> {
         'base_url': _url.text.trim(),
         if (_key.text.isNotEmpty) 'api_key': _key.text,
         'clear_api_key': _clearKey,
+        'since': _since,
       });
       _key.clear();
       _dirty = false;
@@ -114,12 +130,39 @@ class _ExtractionFormState extends ConsumerState<_ExtractionForm> {
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('全量自动提取'),
-              subtitle: const Text('开启后会处理所有已有和新增聊天。小样本验证阶段请保持关闭。'),
+              subtitle: const Text('开启后处理下面「提取范围」里的已有聊天和所有新增聊天。小样本验证阶段请保持关闭。'),
               value: _enabled,
               onChanged: _saving
                   ? null
                   : (v) => setState(() {
                       _enabled = v;
+                      _dirty = true;
+                    }),
+            ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              key: const ValueKey('extraction-scope'),
+              initialValue: _scope,
+              decoration: const InputDecoration(
+                labelText: '提取范围',
+                helperText: '按对话发生的时间算，不按导入时间：今天导入的旧聊天不算「最近」。先开小范围，看过效果和用量再放大。',
+                helperMaxLines: 3,
+              ),
+              items: [
+                if (s.sinceLabel != null)
+                  DropdownMenuItem(
+                    value: 'keep',
+                    child: Text('${s.sinceLabel}（当前）'),
+                  ),
+                const DropdownMenuItem(value: '7', child: Text('最近 7 天')),
+                const DropdownMenuItem(value: '30', child: Text('最近 30 天')),
+                const DropdownMenuItem(value: '90', child: Text('最近 90 天')),
+                const DropdownMenuItem(value: 'all', child: Text('全部聊天')),
+              ],
+              onChanged: _saving
+                  ? null
+                  : (v) => setState(() {
+                      _scope = v ?? _scope;
                       _dirty = true;
                     }),
             ),

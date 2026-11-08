@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Memory: turn full extraction on for a recent stretch first
+
+- Full extraction has a scope: the last 7, 30 or 90 days, or every chat (Settings → 模型与记忆提取 → 提取范围). Before, it was one switch that meant the whole archive (4510 sessions on our production tenant, plus thousands in one vendor export), so nobody could know the cost or the quality of what it extracted before paying for all of it.
+- The scope is conversation time (the last event's `occurred_at`), not capture time: an export imported today is years old and is not "the last week". It is saved as a fixed start date, so new chats are always inside it. The progress line counts only chats inside the scope ("已检查 3 / 40 个聊天（2026-11-01 之后）").
+- Migration `20261129000001` adds a nullable `since` to `memory_extraction_settings`. Existing rows read as "every chat", which is what they meant. The panel's on/off switch carries the saved scope, because a save without it means every chat.
+
 ### App: select across messages, copy a message or the whole conversation
 
 - A mouse drag in a conversation now selects across paragraphs and messages. Each paragraph used to be its own selectable text (`MarkdownBody(selectable: true)`), so a drag stopped at every paragraph end. The text is now plain, and one `SelectionArea` around the conversation handles selection.
