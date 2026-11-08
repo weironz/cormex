@@ -116,7 +116,10 @@
         status_code: 200
         return_content: true
       register: health
-      until: health.status == 200
+      # 200 is not enough: while cormex is still starting, the edge routes /api to the
+      # web image, whose SPA fallback answers 200 with a page. Only JSON means the
+      # request reached the server, so that is the condition to wait on.
+      until: health.status == 200 and 'json' in (health.content_type | default(''))
       # Five minutes, not two: a release that carries a migration can spend that long
       # building an index on transcript_events (1.4 M rows / 2.3 GB on the production
       # node) before the port answers, and timing out there would report a failure for
@@ -124,17 +127,6 @@
       retries: 150
       delay: 2
       changed_when: false
-
-    - name: /api must reach the server, not the web image
-      ansible.builtin.assert:
-        that:
-          - health.content_type is defined
-          - "'json' in health.content_type"
-        fail_msg: >-
-          /api/health answered {{ health.content_type | default('no content type') }}.
-          A 200 carrying HTML means the edge proxy is sending /api to the web image;
-          the client then fails to parse a page.
-        quiet: true
 
     - name: The running version must be the deployed one
       ansible.builtin.assert:
