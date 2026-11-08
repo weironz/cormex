@@ -6,26 +6,26 @@
 #   * a maintainer's machine feeds them from deploy/ansible/deploy.env (gitignored)
 #     or from the shell.
 #
-#   CORMEX_DEPLOY_HOST        required, the node (never committed)
-#   CORMEX_DEPLOY_USER        default deploy
-#   CORMEX_DEPLOY_PORT        default 22
-#   CORMEX_DEPLOY_KEY         path to the private key on the machine running this
+#   DEPLOY_HOST        required, the node (never committed)
+#   DEPLOY_USER        default deploy
+#   DEPLOY_PORT        default 22
+#   DEPLOY_SSH_KEY         path to the private key on the machine running this
 #                             (default ~/.ssh/id_ed25519)
-#   CORMEX_DEPLOY_DIR         deployment directory on the target (compose file + .env)
-#   CORMEX_DEPLOY_API         loopback base URL the stack answers on *the target*
-#   CORMEX_DEPLOY_PROJECT     compose project, only when it differs from `name:`
-#   CORMEX_DEPLOY_CONNECTION  ssh (default) or local for a rehearsal on this machine
+#   DEPLOY_DIR         deployment directory on the target (compose file + .env)
+#   DEPLOY_API         loopback base URL the stack answers on *the target*
+#   DEPLOY_PROJECT     compose project, only when it differs from `name:`
+#   DEPLOY_CONNECTION  ssh (default) or local for a rehearsal on this machine
 all:
   hosts:
     cormex:
-      ansible_host: "{{ lookup('env', 'CORMEX_DEPLOY_HOST') }}"
-      ansible_user: "{{ lookup('env', 'CORMEX_DEPLOY_USER') | default('deploy', true) }}"
-      ansible_port: "{{ lookup('env', 'CORMEX_DEPLOY_PORT') | default('22', true) }}"
-      ansible_connection: "{{ lookup('env', 'CORMEX_DEPLOY_CONNECTION') | default('ssh', true) }}"
-      ansible_ssh_private_key_file: "{{ lookup('env', 'CORMEX_DEPLOY_KEY') | default('~/.ssh/id_ed25519', true) }}"
-      cormex_dir: "{{ lookup('env', 'CORMEX_DEPLOY_DIR') | default('/srv/cormex/deploy', true) }}"
-      cormex_api_base: "{{ lookup('env', 'CORMEX_DEPLOY_API') | default('http://127.0.0.1:8080', true) }}"
-      cormex_project: "{{ lookup('env', 'CORMEX_DEPLOY_PROJECT') | default('', true) }}"
+      ansible_host: "{{ lookup('env', 'DEPLOY_HOST') }}"
+      ansible_user: "{{ lookup('env', 'DEPLOY_USER') | default('deploy', true) }}"
+      ansible_port: "{{ lookup('env', 'DEPLOY_PORT') | default('22', true) }}"
+      ansible_connection: "{{ lookup('env', 'DEPLOY_CONNECTION') | default('ssh', true) }}"
+      ansible_ssh_private_key_file: "{{ lookup('env', 'DEPLOY_SSH_KEY') | default('~/.ssh/id_ed25519', true) }}"
+      cormex_dir: "{{ lookup('env', 'DEPLOY_DIR') | default('/srv/cormex/deploy', true) }}"
+      cormex_api_base: "{{ lookup('env', 'DEPLOY_API') | default('http://127.0.0.1:8080', true) }}"
+      cormex_project: "{{ lookup('env', 'DEPLOY_PROJECT') | default('', true) }}"
       # false for hosts that take their images from the release archives (docker load)
       # instead of a registry.
-      cormex_pull: "{{ lookup('env', 'CORMEX_DEPLOY_PULL') | default('true', true) }}"
+      cormex_pull: "{{ lookup('env', 'DEPLOY_PULL') | default('true', true) }}"

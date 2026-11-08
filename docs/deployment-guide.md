@@ -343,16 +343,16 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 ```bash
 cp deploy/ansible/deploy.env.example deploy/ansible/deploy.env   # 已被 *.env 规则 gitignore
 chmod 600 deploy/ansible/deploy.env
-$EDITOR deploy/ansible/deploy.env        # CORMEX_DEPLOY_HOST / _DIR / _KEY 等
+$EDITOR deploy/ansible/deploy.env        # DEPLOY_HOST / _DIR / _KEY 等
 just deploy vX.Y.Z                       # 部署 + 验收
 just deploy-check                        # 只做 playbook 语法检查
 ```
 
-变量：`CORMEX_DEPLOY_HOST`（必填）、`CORMEX_DEPLOY_USER`（默认 `deploy`）、
-`CORMEX_DEPLOY_PORT`（22）、`CORMEX_DEPLOY_KEY`（本机私钥路径，默认 `~/.ssh/id_ed25519`）、
-`CORMEX_DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
-`CORMEX_DEPLOY_API`（目标主机回环地址，默认 `http://127.0.0.1:8080`）、
-`CORMEX_DEPLOY_KNOWN_HOSTS`（可选）、`CORMEX_DEPLOY_CONNECTION`（演练时设 `local`）、`CORMEX_DEPLOY_PULL`（用 Release 里的镜像归档 `docker load` 之后设 `false`，跳过拉取）。
+变量：`DEPLOY_HOST`（必填）、`DEPLOY_USER`（默认 `deploy`）、
+`DEPLOY_PORT`（22）、`DEPLOY_SSH_KEY`（本机私钥路径，默认 `~/.ssh/id_ed25519`）、
+`DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
+`DEPLOY_API`（目标主机回环地址，默认 `http://127.0.0.1:8080`）、
+`DEPLOY_KNOWN_HOSTS`（可选）、`DEPLOY_CONNECTION`（演练时设 `local`）、`DEPLOY_PULL`（用 Release 里的镜像归档 `docker load` 之后设 `false`，跳过拉取）。
 目标目录里两种 override 都会被**显式**带上：`docker-compose.override.yml` 与
 `compose.override.yaml` —— 显式 `-f` 会关掉 compose 对默认 override 的自动加载，
 把主密钥留在 override 里的部署不会因为漏了这一点而丢配置。
@@ -367,11 +367,11 @@ Actions 侧用 `.github/workflows/deploy.yml`（手动触发，`environment: pro
 
 | 名字 | 类型 | 内容 |
 |---|---|---|
-| `CORMEX_DEPLOY_HOST` | secret | 节点地址 |
-| `CORMEX_DEPLOY_USER` | secret | 部署用户 |
-| `CORMEX_DEPLOY_SSH_KEY` | secret | 私钥全文（job 写入 `$RUNNER_TEMP`，0600） |
-| `CORMEX_DEPLOY_KNOWN_HOSTS` | secret | 主机公钥行（缺失即失败，不允许 TOFU） |
-| `CORMEX_DEPLOY_DIR` / `CORMEX_DEPLOY_API` | variable | 非敏感位置；留空用默认值 |
+| `DEPLOY_HOST` | secret | 节点地址 |
+| `DEPLOY_USER` | secret | 部署用户 |
+| `DEPLOY_SSH_KEY` | secret | 私钥全文（job 写入 `$RUNNER_TEMP`，0600） |
+| `DEPLOY_KNOWN_HOSTS` | secret | 主机公钥行（缺失即失败，不允许 TOFU） |
+| `DEPLOY_DIR` / `DEPLOY_API` | variable | 非敏感位置；留空用默认值 |
 
 workflow 只部署**已公开的 Release**（先 `gh release view` 查 draft），不构建、不打 tag，
 跑完就是 `just deploy` 的同一份断言。同一 tag 的两次部署串行执行，取消中的部署不会留下
@@ -392,10 +392,10 @@ Web 镜像），Web 根必须是 HTML。
 本机自测（不需要远端）：
 
 ```bash
-CORMEX_DEPLOY_CONNECTION=local \
-CORMEX_DEPLOY_DIR=$PWD/.deploy-rehearsal \
-CORMEX_DEPLOY_API=http://127.0.0.1:18080 \
-CORMEX_DEPLOY_PROJECT=cormex-rehearsal \
+DEPLOY_CONNECTION=local \
+DEPLOY_DIR=$PWD/.deploy-rehearsal \
+DEPLOY_API=http://127.0.0.1:18080 \
+DEPLOY_PROJECT=cormex-rehearsal \
 just deploy vX.Y.Z
 ```
 

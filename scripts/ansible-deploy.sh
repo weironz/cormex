@@ -47,7 +47,7 @@ expand_tilde() {
 
 # Local, gitignored values. Explicit path wins, so a second environment (a rehearsal
 # box, a different operator) can keep its own file.
-values_file=${CORMEX_DEPLOY_ENV_FILE:-deploy/ansible/deploy.env}
+values_file=${DEPLOY_ENV_FILE:-deploy/ansible/deploy.env}
 [[ $values_file == /* ]] || values_file=$repo/$values_file
 [[ -f $values_file ]] && load_env_file "$values_file"
 
@@ -77,17 +77,17 @@ case "$inventory" in
 esac
 [[ -f "$inventory_path" ]] || die "inventory not found: $inventory_path"
 
-connection=${CORMEX_DEPLOY_CONNECTION:-ssh}
-if [[ -z ${CORMEX_DEPLOY_HOST:-} && $connection != local && ${#goal[@]} -eq 0 ]]; then
-  die "CORMEX_DEPLOY_HOST is empty; set it in the environment or in $values_file (copy deploy/ansible/deploy.env.example)"
+connection=${DEPLOY_CONNECTION:-ssh}
+if [[ -z ${DEPLOY_HOST:-} && $connection != local && ${#goal[@]} -eq 0 ]]; then
+  die "DEPLOY_HOST is empty; set it in the environment or in $values_file (copy deploy/ansible/deploy.env.example)"
 fi
 
 args=(-i "$inventory" deploy/ansible/deploy.yml)
 [[ ${#goal[@]} -gt 0 ]] && args+=("${goal[@]}")
 [[ -n "$tag" ]] && args+=(-e "cormex_version=$tag")
 
-if [[ -n ${CORMEX_DEPLOY_KNOWN_HOSTS:-} ]]; then
-  export ANSIBLE_SSH_COMMON_ARGS="-o UserKnownHostsFile=$(expand_tilde "$CORMEX_DEPLOY_KNOWN_HOSTS") -o StrictHostKeyChecking=yes"
+if [[ -n ${DEPLOY_KNOWN_HOSTS:-} ]]; then
+  export ANSIBLE_SSH_COMMON_ARGS="-o UserKnownHostsFile=$(expand_tilde "$DEPLOY_KNOWN_HOSTS") -o StrictHostKeyChecking=yes"
 fi
 
 if command -v ansible-playbook >/dev/null 2>&1; then
@@ -106,24 +106,24 @@ fi
 mounts=(-v "$repo:/repo")
 [[ -d $HOME/.ssh ]] && mounts+=(-v "$HOME/.ssh:/root/.ssh:ro")
 environment=()
-for key in CORMEX_DEPLOY_HOST CORMEX_DEPLOY_USER CORMEX_DEPLOY_PORT CORMEX_DEPLOY_DIR \
-           CORMEX_DEPLOY_API CORMEX_DEPLOY_PROJECT CORMEX_DEPLOY_CONNECTION; do
+for key in DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_DIR \
+           DEPLOY_API DEPLOY_PROJECT DEPLOY_CONNECTION; do
   [[ -n ${!key:-} ]] && environment+=(-e "$key=${!key}")
 done
-if [[ -n ${CORMEX_DEPLOY_KEY:-} ]]; then
-  key_file=$(expand_tilde "$CORMEX_DEPLOY_KEY")
+if [[ -n ${DEPLOY_SSH_KEY:-} ]]; then
+  key_file=$(expand_tilde "$DEPLOY_SSH_KEY")
   [[ -f $key_file ]] || die "private key not found: $key_file"
   mounts+=(-v "$key_file:/root/.ssh/deploy_key:ro")
-  environment+=(-e CORMEX_DEPLOY_KEY=/root/.ssh/deploy_key)
+  environment+=(-e DEPLOY_SSH_KEY=/root/.ssh/deploy_key)
 fi
-if [[ -n ${CORMEX_DEPLOY_KNOWN_HOSTS:-} ]]; then
-  known_hosts=$(expand_tilde "$CORMEX_DEPLOY_KNOWN_HOSTS")
+if [[ -n ${DEPLOY_KNOWN_HOSTS:-} ]]; then
+  known_hosts=$(expand_tilde "$DEPLOY_KNOWN_HOSTS")
   [[ -f $known_hosts ]] || die "known_hosts not found: $known_hosts"
   mounts+=(-v "$known_hosts:/root/.ssh/known_hosts_deploy:ro")
   environment+=(-e "ANSIBLE_SSH_COMMON_ARGS=-o UserKnownHostsFile=/root/.ssh/known_hosts_deploy -o StrictHostKeyChecking=yes")
 fi
 
-image=${CORMEX_ANSIBLE_IMAGE:-cormex-ansible:control}
+image=${DEPLOY_ANSIBLE_IMAGE:-cormex-ansible:control}
 docker build -q -t "$image" "$repo/deploy/ansible" >/dev/null
 exec docker run --rm --workdir /repo \
   "${mounts[@]}" \

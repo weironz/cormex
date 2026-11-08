@@ -47,26 +47,28 @@ jobs:
 
       - name: Materialize the deploy key and known_hosts
         env:
-          DEPLOY_KEY: ${{ secrets.CORMEX_DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.CORMEX_DEPLOY_KNOWN_HOSTS }}
+          # The secrets carry the *contents*; ansible is handed paths, so both land in
+          # $RUNNER_TEMP and the same names afterwards point at the files.
+          KEY_CONTENT: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS_CONTENT: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ -n "$DEPLOY_KEY" ]] || { echo "::error::CORMEX_DEPLOY_SSH_KEY is not set"; exit 1; }
-          [[ -n "$KNOWN_HOSTS" ]] || { echo "::error::CORMEX_DEPLOY_KNOWN_HOSTS is not set (host key checking stays on)"; exit 1; }
+          [[ -n "$KEY_CONTENT" ]] || { echo "::error::DEPLOY_SSH_KEY is not set"; exit 1; }
+          [[ -n "$KNOWN_HOSTS_CONTENT" ]] || { echo "::error::DEPLOY_KNOWN_HOSTS is not set (host key checking stays on)"; exit 1; }
           umask 077
-          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/deploy_key"
-          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
-          echo "CORMEX_DEPLOY_KEY=$RUNNER_TEMP/deploy_key" >> "$GITHUB_ENV"
-          echo "CORMEX_DEPLOY_KNOWN_HOSTS=$RUNNER_TEMP/known_hosts" >> "$GITHUB_ENV"
+          printf '%s\n' "$KEY_CONTENT" > "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS_CONTENT" > "$RUNNER_TEMP/known_hosts"
+          echo "DEPLOY_SSH_KEY=$RUNNER_TEMP/deploy_key" >> "$GITHUB_ENV"
+          echo "DEPLOY_KNOWN_HOSTS=$RUNNER_TEMP/known_hosts" >> "$GITHUB_ENV"
 
       - name: Deploy and verify
         env:
-          CORMEX_DEPLOY_HOST: ${{ secrets.CORMEX_DEPLOY_HOST }}
-          CORMEX_DEPLOY_USER: ${{ secrets.CORMEX_DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           # These two are not credentials, but a repository *variable* is readable by
           # anyone who can read a public repository, and the directory and the public
           # URL name the deployment. Secrets are the smaller surface; blank values fall
           # back to the defaults in deploy/ansible/inventory.yml.
-          CORMEX_DEPLOY_DIR: ${{ secrets.CORMEX_DEPLOY_DIR }}
-          CORMEX_DEPLOY_API: ${{ secrets.CORMEX_DEPLOY_API }}
+          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+          DEPLOY_API: ${{ secrets.DEPLOY_API }}
         run: just deploy "${{ inputs.tag }}"
