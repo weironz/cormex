@@ -15,7 +15,7 @@ use cormex_evals::harness::{CrossLinkOptions, ExtractMode, JudgeKind, RetrievalC
 use cormex_evals::report::render_text;
 use cormex_evals::runner::{RunOptions, run};
 use cormex_evals::suite::Suite;
-use cormex_evals::{DEFAULT_SESSION_SUITE, DEFAULT_SUITE};
+use cormex_evals::{DEFAULT_EXTRACTION_SUITE, DEFAULT_SESSION_SUITE, DEFAULT_SUITE};
 use cormex_memory::retrieval::RecencyMode;
 
 #[derive(Parser)]
@@ -46,6 +46,30 @@ enum Command {
         /// Validate the session-retrieval suite instead of the memory one.
         #[arg(long)]
         sessions: bool,
+        /// Validate the extraction suite instead of the memory one.
+        #[arg(long, conflicts_with = "sessions")]
+        extraction: bool,
+    },
+    /// Score the production extractor (qa@4) on the extraction suite.
+    ///
+    /// Calls the model configured by `CORMEX_LLM_*` and the provider's key:
+    /// numbers drift with the model, so this is a by-hand comparison against a
+    /// baseline, not a CI gate (CI runs `validate --extraction`).
+    Extract {
+        #[arg(long, default_value = DEFAULT_EXTRACTION_SUITE)]
+        suite: PathBuf,
+        /// Only cases whose id starts with this, to work on one.
+        #[arg(long)]
+        only: Option<String>,
+        /// Also write the full report, every retained memory included, as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Exit non-zero if recall falls below this (0..1).
+        #[arg(long)]
+        min_recall: Option<f64>,
+        /// Exit non-zero if the leak rate rises above this (0..1).
+        #[arg(long)]
+        max_leak: Option<f64>,
     },
 }
 
@@ -266,7 +290,25 @@ async fn real_main() -> Result<ExitCode> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { suite, sessions } => {
+        Command::Validate {
+            suite,
+            sessions,
+            extraction,
+        } => {
+            if extraction {
+                let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_EXTRACTION_SUITE));
+                let s = cormex_evals::extraction::ExtractionSuite::load(&path)?;
+                s.validate()?;
+                println!(
+                    "extraction suite {} validated: {} cases",
+                    s.name,
+                    s.cases.len()
+                );
+                for (category, n) in s.count_by_category() {
+                    println!("  {category:<22} {n}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             if sessions {
                 let path = suite.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSION_SUITE));
                 let s = cormex_evals::sessions::SessionSuite::load(&path)?;
@@ -297,6 +339,49 @@ async fn real_main() -> Result<ExitCode> {
                 println!("  {:<10} {n} questions", lang.label());
             }
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Extract {
+            suite,
+            only,
+            json,
+            min_recall,
+            max_leak,
+        } => {
+            use cormex_evals::extraction;
+            let s = extraction::ExtractionSuite::load(&suite)?;
+            s.validate()?;
+            let llm = cormex_llm::LlmClient::from_env().map_err(|e| {
+                anyhow::anyhow!(
+                    "extract needs a provider API key in .env (e.g. DEEPSEEK_API_KEY): {e}"
+                )
+            })?;
+            let model = format!("{}:{}", llm.provider_id(), llm.cheap_model().model_name);
+            let analyzer = cormex_memory::dialogue::ModelDialogueAnalyzer(llm);
+            let report = extraction::run(&analyzer, &s, &model, only.as_deref()).await;
+            print!("{}", extraction::render(&report));
+            if let Some(path) = json {
+                std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
+                println!("\nreport written to {}", path.display());
+            }
+            let t = &report.totals;
+            let mut ok = t.errors == 0;
+            if let (Some(min), Some(r)) = (min_recall, t.recall())
+                && r < min
+            {
+                eprintln!("recall {r:.3} is below --min-recall {min}");
+                ok = false;
+            }
+            if let (Some(max), Some(l)) = (max_leak, t.leak_rate())
+                && l > max
+            {
+                eprintln!("leak rate {l:.3} is above --max-leak {max}");
+                ok = false;
+            }
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Command::Run(args) => run_command(*args).await,
     }

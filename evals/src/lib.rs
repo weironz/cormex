@@ -31,6 +31,7 @@
 //!   INSERTed)
 //! - [`report`] the report (why both JSON and text are needed)
 
+pub mod extraction;
 pub mod harness;
 pub mod longmemeval;
 pub mod matcher;
@@ -47,3 +48,7 @@ pub const DEFAULT_SUITE: &str = "evals/suites/cormex-zh-en-v1.json";
 /// it measures the archive's two indexes, which share no table and no ranking
 /// with the memory side's four recall legs.
 pub const DEFAULT_SESSION_SUITE: &str = "evals/suites/sessions-zh-en-v1.json";
+
+/// The production-path extraction suite: what one QA turn must and must never
+/// leave behind as memory. See [`extraction`].
+pub const DEFAULT_EXTRACTION_SUITE: &str = "evals/suites/extraction-zh-en-v1.json";

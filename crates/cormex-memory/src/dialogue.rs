@@ -210,14 +210,44 @@ pub fn validate_analysis(mut analysis: TurnAnalysis, input: &TurnInput) -> TurnA
                     .unwrap_or_default()
                     .contains(p)
             });
+        // Adoption is read in both languages the archive holds. Chinese-only
+        // markers dropped every decision a user adopted in English ("Agreed,
+        // we adopt absolute dates") as an unadopted suggestion: found by the
+        // extraction suite (evals, case x06). Refusals are checked first, so
+        // "disagree" never counts as "agree".
         let adopted = item.evidence.iter().filter(|e| e.role == "user").any(|e| {
             let q = e.quote.to_lowercase();
-            !["不同意", "暂不", "未采纳", "不要", "?", "？"]
+            ![
+                "不同意",
+                "暂不",
+                "未采纳",
+                "不要",
+                "?",
+                "？",
+                "disagree",
+                "don't",
+                "do not",
+                "not now",
+                "won't",
+                "rather not",
+            ]
+            .iter()
+            .any(|p| q.contains(p))
+                && [
+                    "同意",
+                    "采用",
+                    "就按",
+                    "按这个",
+                    "选择",
+                    "agree",
+                    "adopt",
+                    "go with",
+                    "let's do",
+                    "approved",
+                    "sounds good",
+                ]
                 .iter()
                 .any(|p| q.contains(p))
-                && ["同意", "采用", "就按", "按这个", "选择"]
-                    .iter()
-                    .any(|p| q.contains(p))
         });
         let statement = item
             .fact
@@ -511,6 +541,32 @@ mod tests {
         assert_eq!(
             assess(item("assistant", "a", "建议采用另一种数据库"), &i).status,
             "discard"
+        );
+    }
+    #[test]
+    fn a_suggestion_adopted_in_english_is_kept_and_one_refused_is_not() {
+        let mut i = input();
+        i.messages = vec![
+            m("a", "assistant", "I recommend absolute dates everywhere."),
+            m("u", "user", "Agreed, we adopt absolute dates."),
+        ];
+        let mut proposal = item("assistant", "a", "I recommend absolute dates");
+        proposal.evidence.push(Evidence {
+            message_id: "u".into(),
+            role: "user".into(),
+            quote: "Agreed, we adopt absolute dates".into(),
+        });
+        assert_eq!(
+            assess(proposal.clone(), &i).status,
+            "retain",
+            "an English adoption is an adoption"
+        );
+        i.messages[1].text = "I disagree, we do not adopt that.".into();
+        proposal.evidence[1].quote = "I disagree, we do not adopt that".into();
+        assert_eq!(
+            assess(proposal, &i).status,
+            "discard",
+            "\"disagree\" contains \"agree\" and must still read as a refusal"
         );
     }
     #[test]

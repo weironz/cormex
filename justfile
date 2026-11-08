@@ -108,6 +108,7 @@ capture-check:
 eval-check:
     cargo run -p cormex-evals --locked -- validate
     cargo run -p cormex-evals --locked -- validate --sessions
+    cargo run -p cormex-evals --locked -- validate --extraction
 
 pipeline-test:
     python3 -m unittest discover -s scripts/tests -v

@@ -546,3 +546,26 @@ fn question_ids_are_sorted_and_dense() {
          compared"
     );
 }
+
+/// The extraction suite passes its own static checks, the ones that keep every
+/// expect and avoid fragment present in the source it is asked about.
+#[test]
+fn the_extraction_suite_is_honest() {
+    let suite = cormex_evals::extraction::ExtractionSuite::load(&PathBuf::from(
+        "suites/extraction-zh-en-v1.json",
+    ))
+    .expect("the extraction suite must load");
+    suite
+        .validate()
+        .expect("the extraction suite must pass static validation");
+    let categories = suite.count_by_category();
+    for category in cormex_evals::extraction::CATEGORIES {
+        assert!(
+            categories.contains_key(category),
+            "category {category} has no case: a category nobody tests is a promise \
+             the numbers do not keep"
+        );
+    }
+    let langs: HashSet<&str> = suite.cases.iter().map(|c| c.lang.as_str()).collect();
+    assert_eq!(langs.len(), 2, "both languages are covered");
+}

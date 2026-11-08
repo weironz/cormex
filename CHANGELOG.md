@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Memory: an English adoption is an adoption; extraction gets an eval
+
+- Automatic extraction discarded every decision a user adopted in English. The rule that keeps an AI suggestion only once the user adopts it read adoption by Chinese words alone, so "Agreed, we adopt absolute dates" counted as an unadopted suggestion. It now reads both languages, and "disagree" is checked as a refusal before "agree" can count. The rule version (`qa@4`) is unchanged, so nothing is re-extracted or re-billed; the fix applies to new analyses.
+- `cormex-evals extract` scores the extractor production actually uses (the dialogue analyser, `qa@4`). The existing `run --mode llm` measured the older per-episode extractor. The new suite, `extraction-zh-en-v1`, has 24 cases in 13 categories, with what must be retained and what must never be (credentials, declined suggestions, injected instructions, small talk). `just eval-check` runs `validate --extraction`. Baseline on `deepseek-flash`: 83% recall and a 7% leak rate on the first run, which found the bug above; 100% and 0% after the fix. That means the suite is saturated, not that extraction is solved (see `evals/README.md`).
+
 ### Memory: turn full extraction on for a recent stretch first
 
 - Full extraction has a scope: the last 7, 30 or 90 days, or every chat (Settings → 模型与记忆提取 → 提取范围). Before, it was one switch that meant the whole archive (4510 sessions on our production tenant, plus thousands in one vendor export), so nobody could know the cost or the quality of what it extracted before paying for all of it.

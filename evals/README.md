@@ -143,6 +143,73 @@ of the extraction side.
 
 ---
 
+## Extraction quality on the production path
+
+```bash
+cargo run -p cormex-evals -- validate --extraction       # the cases themselves, no model: in `just ci`
+cargo run -p cormex-evals -- extract                     # calls the model in CORMEX_LLM_* / .env
+cargo run -p cormex-evals -- extract --only x06 --json r.json --min-recall 0.9 --max-leak 0.1
+```
+
+**Why this exists.** `run --mode llm` feeds turns to `Extractor::ingest`, the per-episode
+extractor. Automatic memory from archived chats no longer goes through it: it goes through the
+dialogue analyser (`cormex_memory::dialogue`, rule version `qa@4`), which sees a whole question
+and its answer, quotes evidence, and is filtered by rules no other path has (declined
+suggestions, one-off assignments, weaker reports overwriting stronger ones). So until this
+suite, **nothing measured the extractor that actually writes memory.**
+
+`extract` runs each case exactly as production does (analyse → `validate_analysis` → verify →
+`validate_analysis` → the credential scan that blocks a whole analysis) and scores what is
+retained against `evals/suites/extraction-zh-en-v1.json`:
+
+| field | meaning | metric |
+|---|---|---|
+| `expect` | groups of alternatives; a group is met when some retained memory contains one | **recall** = met groups / groups |
+| `avoid` | fragments no retained memory may contain | **leak rate** = cases that leaked / cases with an avoid |
+
+Two rules keep the cases honest, enforced by `validate --extraction`:
+
+- **The fragments are in the source.** A group's first alternative, and every avoid
+  fragment, appear verbatim in the conversation. The other alternatives are renderings a
+  correct memory may use instead: the extractor writes Chinese, so an English conversation
+  about "absolute dates" comes back as 绝对日期.
+- **An avoid is a detail a correct memory has no reason to repeat**: the declined value
+  (`top_k` 120), the secret, the progress percentage. Never the name of a declined thing:
+  substring matching cannot tell "use Elasticsearch" from "do not add Elasticsearch", and the
+  second is a correct memory (an early version of x07 scored exactly that as a leak).
+
+**Not a regression gate**, for the same reason as `--mode llm`: the numbers drift with the
+model. `validate --extraction` is the CI part; `extract` is for comparing a prompt or rule
+change against the baseline by hand.
+
+### Baseline
+
+2026-11-08, `deepseek:deepseek-flash` (the model production extraction uses), 24 cases in 13
+categories, zh and en:
+
+| | recall | leak rate | retained |
+|---|---:|---:|---:|
+| first run | 83% (10/12) | 7% (1/14) | 14 |
+| after the fix and label corrections below, two runs | **100%** (12/12) | **0%** (0/13) | 14 |
+
+What the first run found:
+
+- **A real bug (fixed):** `validate_analysis` recognised a user adopting a suggestion only by
+  Chinese words (同意 / 采用 / 就按 …). "Agreed, we adopt absolute dates" was discarded as an
+  unadopted AI suggestion, so **no decision adopted in English was ever kept**. English
+  adoption and refusal markers were added ("disagree" is checked as a refusal before "agree"
+  can count). `qa@4` was not bumped: that would re-run, and re-bill, every analysed chat;
+  the fix applies to new analyses.
+- **Two wrong labels:** an English-only expect against a memory written in Chinese (x04),
+  and an avoid that a correct negative constraint repeats (x07). Both rules above come from
+  these.
+
+**Read 100% as "the suite is saturated", not "extraction is solved."** Twenty-four short, clean
+turns are the easy end. The suite earns its keep by growing from real misses: a memory in
+production that should not exist, or a decision that never became one, is the next case.
+
+---
+
 ## The session-retrieval target (P7-2)
 
 ```bash
