@@ -89,6 +89,18 @@ class AnsibleWrapperTests(unittest.TestCase):
         self.assertIn("HOST=from-file.example", self.calls()[0])
         self.assertIn("DIR=/srv/cormex", self.calls()[0], "values from the gitignored env file must be exported")
 
+    def test_an_exported_value_beats_the_env_file(self):
+        self.fake("ansible-playbook",
+                  f'printf "%s HOST=%s\\n" "$*" "$DEPLOY_HOST" >> "{self.log}"\n')
+        values = Path(self.temp.name) / "deploy.env"
+        values.write_text("DEPLOY_HOST=from-file.example\n", encoding="utf-8")
+        result = self.run_wrapper("v0.1.18", str(self.inventory),
+                                  env={"DEPLOY_ENV_FILE": str(values),
+                                       "DEPLOY_HOST": "from-shell.example"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HOST=from-shell.example", self.calls()[0],
+                      "the shell must win over the file, or a one-off override is impossible")
+
     def test_syntax_check_needs_no_inventory_variables(self):
         self.fake("ansible-playbook")
         result = self.run_wrapper("--syntax-check")

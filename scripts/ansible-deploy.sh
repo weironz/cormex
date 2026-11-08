@@ -34,6 +34,8 @@ load_env_file() {
     # A matching pair of quotes is the only quoting supported; anything else would be
     # shell syntax, and this file is data -- it is never sourced.
     if [[ $value == \"*\" || $value == \'*\' ]]; then value=${value:1:${#value}-2}; fi
+    # An exported variable wins: the file is the default, the shell is the instruction.
+    [[ -n ${!key+set} ]] && continue
     export "$key=$value"
   done < "$file"
 }

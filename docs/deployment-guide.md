@@ -348,6 +348,8 @@ just deploy vX.Y.Z                       # 部署 + 验收
 just deploy-check                        # 只做 playbook 语法检查
 ```
 
+取值优先级：shell 里已导出的变量 > `deploy.env` > 清单里的默认值。
+
 变量：`DEPLOY_HOST`（必填）、`DEPLOY_USER`（默认 `deploy`）、
 `DEPLOY_PORT`（22）、`DEPLOY_SSH_KEY`（本机私钥路径，默认 `~/.ssh/id_ed25519`）、
 `DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
