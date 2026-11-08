@@ -144,6 +144,34 @@ curl -X POST "https://<域名>/api/episodes/<episode_id>/redact?confirm=<episode
 > 凭据从**正在跑的容器自己的环境**里读，不是手输 —— 用另一套凭据跑的演练，演练
 > 的不是那个部署。
 
+### 对着生产库的演练（2026-11-08）
+
+上面两个演练都只证明「流程」：它们备份、恢复的是自己造的数据。**这个部署的备份能不能恢复**，
+是另一个问题：
+
+```bash
+scripts/pg-restore-drill.sh                     # 在数据库所在的节点上跑
+DUMP=/data/cormex-drill/xxx.dump scripts/pg-restore-drill.sh   # 恢复一份已有的 dump
+```
+
+只读 `pg_dump` 生产库（一个快照）→ 用**同一个镜像**起一个无网络、无端口的一次性容器 →
+`pg_restore --no-owner --no-acl` → 逐表对行数（实时库只会多不会少：归档表只追加）。
+
+**2026-11-08 第一次跑，结果分两段：**
+
+- **生产记忆库此前没有任何备份。** 节点上的备份容器备份的是另一个 13 MB 的库，备份目录里的
+  base backup 全是那个库的（`meta.env` 的 `SYSTEM_ID` 与 `pg_control_system()` 对不上）。
+  看起来有备份，其实没有。核对方法：
+
+  ```sql
+  SELECT system_identifier FROM pg_control_system();   -- 与备份 meta.env 的 SYSTEM_ID 比
+  ```
+- **演练本身通过。** dump 1.3 GB（库 4 GB），627 s；恢复 716 s，`pg_restore` 0 错误；
+  57 张表、2,059,224 行恢复回来，与实时库的差异只有快照之后新写入的 491 行（5 张只追加的表）。
+  那份 dump 留在节点的 `/data/cormex-drill/`，附 sha256 —— **目前它是唯一的备份，且与库在同一台机器上**
+
+还欠：定时备份 + 异地副本 + 定期跑这个演练。前两件要改生产配置，需要人拍板。
+
 ### 备份
 
 ```bash
