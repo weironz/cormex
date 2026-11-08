@@ -227,15 +227,32 @@ curl -fsS http://127.0.0.1:8080/api/health
 5. 一台客户端可登录、同步一条测试会话；Web 可读其正文，MCP 可搜索该会话。
 6. 开启提取时，账号模型连接测试成功，处理状态能够前进。
 
-### 对象存储在另一个 compose 项目时
+### 对象存储属于本项目
 
-`depends_on` 只能引用同一个 compose 项目里的服务，管不了「S3 在隔壁那一栈」的情形；
-而 cormexd 只在**启动那一刻**决定用 S3 还是本地文件系统，S3 不可达时仅打一条 warning
-就回落。两者叠加的结果是：容器起来了、版本也对，但上传全落在容器里。
+`deploy/docker-compose.yml` 里 `rustfs` 服务、它自己的卷（`rustfs_data`）和
+`${S3_DOMAIN}` 这条 traefik 路由都在同一个 compose 项目里。**不要借用另一个栈的
+对象存储**：两边的 `container_name` / `Host(...)` 规则会撞，撞名的症状是 `up -d`
+半途报错，撞路由的症状更糟 —— traefik 会把同一个域名的请求轮询到两个存储上。
 
-硬保证放在启动路径上（示例见生产那份 `docker-compose.override.yml`）：把 `cormex`
-服务的 entrypoint 换成一个先等存储可达、再 `exec /usr/local/bin/cormexd` 的脚本。
-判定「可达」看 HTTP 状态码不是 2xx —— S3 根路径对匿名请求回 403，那已经证明服务在。
+浏览器取 blob 走**预签名 URL**，签名里包含 host，所以每个栈的对象存储必须有自己的
+域名（本部署是 `s3.<CORMEX_DOMAIN 的父域>`，如 `s3.cormex.example.com`）。没有这个
+记录就只能继续共用别人的存储，而那等于两个产品写同一个桶。
+
+历史部署若曾共用过存储，迁移顺序是「新服务 → 新卷 → 复制数据 → 新域名 → 切换」：
+
+```bash
+# 1) 新服务先起在空卷上
+docker volume create cormex_rustfs_data
+# 2) 复制（写侧先停：docker compose stop cormex）
+docker run --rm -v cortex_cortex-prod-rustfs:/from:ro -v cormex_rustfs_data:/to \
+  pgvector/pgvector:pg17 sh -c 'cp -a /from/. /to/'
+# 3) 把 cormex 的 S3_ENDPOINT 指到本项目服务、S3_PUBLIC_ENDPOINT 指到新域名，再 up
+```
+
+`depends_on` 只能引用同一个 compose 项目里的服务，而且 `service_started` 不等于
+「可读」。cormexd 只在启动那一刻决定用 S3 还是本地文件系统，不可达时仅打一条 warning
+就回落，所以 entrypoint 里加一道等待（下面这段来自生产那份 override），让「回落」
+不可能发生：
 
 ```yaml
 services:
@@ -247,8 +264,9 @@ services:
         exec /usr/local/bin/cormexd
 ```
 
+判定「可达」看状态码不是 2xx —— S3 根路径对匿名请求回 403，那已经证明服务在。
 `just deploy` 另外断言 `/api/health` 的 `blob_backend == s3`，所以即使等待失效，
-回落到本地文件系统的部署也会被判失败，而不是静默通过。
+回落到本地文件系统的部署也会被判失败。
 
 ### 迁移约束
 
