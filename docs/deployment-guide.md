@@ -330,31 +330,71 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 变成会被检查的断言。**发布不等于部署**：这些配方不构建、不打 tag、不碰候选，只拉已发布
 的镜像。
 
-部署通过 **Ansible over SSH** 完成，入口仍是 `just`。主机清单不进仓库（公开仓库，节点地址
-与账号只留在维护机上）：
+部署通过 **Ansible over SSH** 完成，入口仍是 `just`。**清单本身入库，值不入库**：
+`deploy/ansible/inventory.yml` 是仓库里唯一的一份清单，主机、用户、密钥路径、目标目录
+全部从环境变量读出来。于是同一份文件同时服务三处：
+
+| 场景 | 值从哪来 |
+|---|---|
+| GitHub Actions | 仓库 secrets / variables（见下表） |
+| 本地 Linux / macOS / WSL | `deploy/ansible/deploy.env`（gitignored）或 shell |
+| Windows（Git Bash） | 同一个 `deploy.env`；playbook 在容器里跑 |
 
 ```bash
-cp deploy/ansible/inventory.example.ini deploy/ansible/inventory.ini   # 已被 gitignore
-$EDITOR deploy/ansible/inventory.ini                                   # 主机、用户、cormex_dir
-just deploy vX.Y.Z                                                     # 部署 + 验收
-just deploy-check                                                      # 只做 playbook 语法检查
+cp deploy/ansible/deploy.env.example deploy/ansible/deploy.env   # 已被 *.env 规则 gitignore
+chmod 600 deploy/ansible/deploy.env
+$EDITOR deploy/ansible/deploy.env        # CORMEX_DEPLOY_HOST / _DIR / _KEY 等
+just deploy vX.Y.Z                       # 部署 + 验收
+just deploy-check                        # 只做 playbook 语法检查
 ```
 
-`inventory.ini` 里的 `cormex_dir` 指向**目标主机上**那份部署目录（`docker-compose.yml`、
-`.env`、可选的 `compose.override.yaml`）。playbook 会先比对 `.env` 里的 `CORMEX_VERSION`
-与传入的 tag，不一致就停 —— 不让文件和正在跑的栈各说各话；随后 `pull cormex web`、
-`up -d`，最后向 `/api/health` 要答案：`role` 必须是 `cormexd`，`version` 必须等于部署的
-版本（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），`/api/health` 必须返回 JSON（拿到 HTML
-说明 `/api` 被送到了 Web 镜像），Web 根必须是 HTML。
+变量：`CORMEX_DEPLOY_HOST`（必填）、`CORMEX_DEPLOY_USER`（默认 `deploy`）、
+`CORMEX_DEPLOY_PORT`（22）、`CORMEX_DEPLOY_KEY`（本机私钥路径，默认 `~/.ssh/id_ed25519`）、
+`CORMEX_DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
+`CORMEX_DEPLOY_API`（目标主机回环地址，默认 `http://127.0.0.1:8080`）、
+`CORMEX_DEPLOY_KNOWN_HOSTS`（可选）、`CORMEX_DEPLOY_CONNECTION`（演练时设 `local`）、`CORMEX_DEPLOY_PULL`（用 Release 里的镜像归档 `docker load` 之后设 `false`，跳过拉取）。
+清单里没有地址，因此公开仓库里也不会有。
+
+**密钥只留在机器上。** 本地路径直接交给 `ansible_ssh_private_key_file`；Windows 走容器时，
+那把私钥以只读方式挂进 `/root/.ssh/deploy_key`，`known_hosts` 同样以只读挂载并通过
+`ANSIBLE_SSH_COMMON_ARGS` 指过去 —— 镜像里没有任何凭据，容器退出后也不留副本。
+`host_key_checking` 保持开启。
+
+Actions 侧用 `.github/workflows/deploy.yml`（手动触发，`environment: production`）：
+
+| 名字 | 类型 | 内容 |
+|---|---|---|
+| `CORMEX_DEPLOY_HOST` | secret | 节点地址 |
+| `CORMEX_DEPLOY_USER` | secret | 部署用户 |
+| `CORMEX_DEPLOY_SSH_KEY` | secret | 私钥全文（job 写入 `$RUNNER_TEMP`，0600） |
+| `CORMEX_DEPLOY_KNOWN_HOSTS` | secret | 主机公钥行（缺失即失败，不允许 TOFU） |
+| `CORMEX_DEPLOY_DIR` / `CORMEX_DEPLOY_API` | variable | 非敏感位置；留空用默认值 |
+
+workflow 只部署**已公开的 Release**（先 `gh release view` 查 draft），不构建、不打 tag，
+跑完就是 `just deploy` 的同一份断言。同一 tag 的两次部署串行执行，取消中的部署不会留下
+半个状态。
+
+playbook 的第一步是比对目标 `.env` 里的 `CORMEX_VERSION` 与传入 tag，不一致就停 —— 不让
+文件和正在跑的栈各说各话；随后 `pull cormex web`（注册表抖动会重试）、`up -d`，最后向
+`/api/health` 要答案：`role` 必须是 `cormexd`，`version` 必须等于部署的版本（健康信息里是
+`0.1.18`，pin 是 `v0.1.18`），`/api/health` 必须返回 JSON（拿到 HTML 说明 `/api` 被送到了
+Web 镜像），Web 根必须是 HTML。
 
 **Windows 不能直接当 Ansible 控制节点。** `ansible-playbook` 只在 POSIX 上运行，Windows
-只是被管理端（走 WinRM，与本项目无关）。因此 `just deploy` 在 Windows 上会用
+只是被管理端（走 WinRM，与本项目无关）。因此 `just deploy` 在 Windows 上用
 `deploy/ansible/Dockerfile` 构一个固定版本的 ansible-core 容器来执行（Docker Desktop 本来
-就是为了部署而要装的），在 Linux / macOS / WSL 上直接调用本机的 `ansible-playbook`。两条
-路径的入口、参数和验收完全一致；WSL 里装 ansible-core 是另一种可用方案。
+就是为了部署而要装的），Linux / macOS / WSL 上直接调用本机的 `ansible-playbook`。两条路径
+的入口、参数与验收完全一致。
 
-本机自测（不需要远端）：`inventory` 里给 `localhost ansible_connection=local`，指向
-`.deploy-rehearsal`，即可把整个 playbook 跑在隔离演练栈上。
+本机自测（不需要远端）：
+
+```bash
+CORMEX_DEPLOY_CONNECTION=local \
+CORMEX_DEPLOY_DIR=$PWD/.deploy-rehearsal \
+CORMEX_DEPLOY_API=http://127.0.0.1:18080 \
+CORMEX_DEPLOY_PROJECT=cormex-rehearsal \
+just deploy vX.Y.Z
+```
 
 ### 本地演练
 

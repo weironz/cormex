@@ -215,12 +215,13 @@ _publish tag checksum:
 # ── Deploy: release ≠ deploy ─────────────────────────────
 # Deploys the published images with the host's deploy/docker-compose.yml (plus
 # compose.override.yaml when present). Never builds, tags or uploads anything.
-# The host list lives in deploy/ansible/inventory.ini (gitignored); the playbook is
+# The inventory in deploy/ansible/ is committed and reads the host from the
+# environment (deploy/ansible/deploy.env locally, repository secrets in Actions); the playbook is
 # POSIX, so on Windows the wrapper runs it in the pinned control-node container.
 
 # Deploy a published version to the hosts in the inventory.
-deploy tag inventory="deploy/ansible/inventory.ini":
-    scripts/ansible-deploy.sh "$1" "${2:-deploy/ansible/inventory.ini}"
+deploy tag inventory="deploy/ansible/inventory.yml":
+    scripts/ansible-deploy.sh "$1" "${2:-deploy/ansible/inventory.yml}"
 
 # Lint the playbook; needs no host and no credentials.
 deploy-check:

@@ -232,7 +232,9 @@ Actions 构建等六个 CLI target 和两个镜像全部成功后只聚合一次
 
 完整操作、凭据边界、跨平台限制和失败恢复见 [docs/release.md](docs/release.md)。
 
-**没有 CI 部署。** 发布只是提供版本资产；生产升级仍是另行授权的手工操作。
+**没有自动部署。** 发布只是提供版本资产。生产升级走 `just deploy`（Ansible，清单在
+`deploy/ansible/`，节点地址与私钥只从环境变量 / secrets 进来），或手动触发的
+`deploy.yml`（`environment: production` 审批）。两者都只拉已发布镜像，不构建、不打 tag。
 
 ## 部署的形状
 

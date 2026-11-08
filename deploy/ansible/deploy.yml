@@ -15,6 +15,7 @@
 #     cormex_dir      deployment directory holding docker-compose.yml and .env
 #     cormex_api_base loopback base URL the stack answers on *that host*
 #     cormex_project  compose project, only when it differs from `name:` in the file
+#     cormex_pull     false when the images came from the release archives (docker load)
 #
 # The assertions here mirror `scripts/deploy.py verify`, which is what the local
 # rehearsal uses. Keep the two in step: they answer the same question, and a deploy
@@ -80,9 +81,15 @@
              + (['-f', 'compose.override.yaml'] if deployment_files.results[2].stat.exists else []) }}
 
     - name: Pull the published images
+      when: cormex_pull | default(true) | bool
       ansible.builtin.command:
         argv: "{{ compose_args + ['pull', 'cormex', 'web'] }}"
         chdir: "{{ cormex_dir }}"
+      register: compose_pull
+      # A registry blip is not a deploy: retry before failing, and say so in the log.
+      retries: 3
+      delay: 5
+      until: compose_pull.rc == 0
       changed_when: false
 
     - name: Start the stack

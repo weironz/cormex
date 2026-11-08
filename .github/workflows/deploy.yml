@@ -1,0 +1,70 @@
+name: Deploy
+
+# Manual only, and never a build: this job runs the same `just deploy` a maintainer
+# runs, against a version that is already published. See docs/deployment-guide.md.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published version to deploy, for example v0.1.18'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Two deploys of the same host must not interleave; a cancelled deploy is a host in
+# an unknown state, so this queue waits instead of replacing.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy the published version
+    runs-on: ubuntu-latest
+    # Required reviewers belong on this environment in Settings. The job reads the
+    # node address and the key from its secrets, so it cannot run without approval.
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: extractions/setup-just@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the pinned control node
+        run: python3 -m pip install --disable-pip-version-check ansible-core==2.21.3
+
+      - name: Refuse to deploy something that is not a published Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          [[ "$draft" == "false" ]] || { echo "::error::$TAG is not a published Release"; exit 1; }
+          echo "deploying the assets and images published as $TAG"
+
+      - name: Materialize the deploy key and known_hosts
+        env:
+          DEPLOY_KEY: ${{ secrets.CORMEX_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CORMEX_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DEPLOY_KEY" ]] || { echo "::error::CORMEX_DEPLOY_SSH_KEY is not set"; exit 1; }
+          [[ -n "$KNOWN_HOSTS" ]] || { echo "::error::CORMEX_DEPLOY_KNOWN_HOSTS is not set (host key checking stays on)"; exit 1; }
+          umask 077
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+          echo "CORMEX_DEPLOY_KEY=$RUNNER_TEMP/deploy_key" >> "$GITHUB_ENV"
+          echo "CORMEX_DEPLOY_KNOWN_HOSTS=$RUNNER_TEMP/known_hosts" >> "$GITHUB_ENV"
+
+      - name: Deploy and verify
+        env:
+          CORMEX_DEPLOY_HOST: ${{ secrets.CORMEX_DEPLOY_HOST }}
+          CORMEX_DEPLOY_USER: ${{ secrets.CORMEX_DEPLOY_USER }}
+          # Non-secret settings live as repository variables; blank ones fall back
+          # to the defaults in deploy/ansible/inventory.yml.
+          CORMEX_DEPLOY_DIR: ${{ vars.CORMEX_DEPLOY_DIR }}
+          CORMEX_DEPLOY_API: ${{ vars.CORMEX_DEPLOY_API }}
+        run: just deploy "${{ inputs.tag }}"
