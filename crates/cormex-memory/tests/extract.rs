@@ -28,6 +28,65 @@ async fn active_objects(store: &cormex_store::Store, subject: Id, predicate: &st
         .collect()
 }
 
+/// A same-day update whose event time is only a date still supersedes.
+///
+/// The README's `as_of` walkthrough, as the extractor wrote it: the first
+/// statement got no event time, the update four seconds later got today's
+/// date, which parses to midnight. Ordering by the raw midnight put the update
+/// before the original, and both stayed current.
+#[tokio::test]
+async fn a_same_day_update_with_a_date_only_event_time_supersedes() {
+    let Some(db) = setup().await else { return };
+    let store = db.store.clone();
+    let extractor = offline_extractor();
+    // Real time, not fixed dates: a stored fact without an event time orders
+    // by its created_at, which is when this test runs
+    let now = chrono::Utc::now();
+    let today = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_utc();
+
+    let ep1 = seed_episode(&store, "The cormex project uses MinIO for object storage.").await;
+    let first = extractor
+        .write_candidates(
+            &store,
+            vec![candidate("cormex", "project", "uses", "MinIO", None)],
+            &ctx(ep1, now),
+        )
+        .await
+        .expect("the first fact should be persisted");
+    let subject = first.new_entities[0];
+
+    let ep2 = seed_episode(&store, "It now uses RustFS for object storage instead.").await;
+    let second = extractor
+        .write_candidates(
+            &store,
+            vec![candidate(
+                "cormex",
+                "project",
+                "uses",
+                "RustFS",
+                Some(today),
+            )],
+            &ctx(ep2, now + chrono::Duration::seconds(4)),
+        )
+        .await
+        .expect("the update should be persisted");
+
+    assert_eq!(
+        second.superseded, first.written,
+        "an update said after the original, dated only 'today', supersedes it"
+    );
+    assert_eq!(
+        active_objects(&store, subject, "uses").await,
+        vec!["RustFS".to_string()],
+        "only the update is current"
+    );
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn superseding_fact_invalidates_the_old_one() {
     let Some(db) = setup().await else { return };

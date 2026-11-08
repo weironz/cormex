@@ -57,6 +57,48 @@ contain text that was extracted from an untrusted source; the framing is the
 first fence against memory poisoning, and it is applied on the tool path and the
 injection path by the same function.
 
+## Replay: what did it know then?
+
+`memory_search` takes `as_of` (RFC 3339) and answers from what Cormex knew at that
+moment. Nothing is deleted: a fact that stops being true gets an `invalidate` event
+appended, so the old picture can always be put back together.
+
+A real run over MCP, against a local server (v0.1.19, 2026-11-08). Two `remember`
+calls a few seconds apart, then the same question asked twice:
+
+```text
+remember  "The cormex project uses MinIO for object storage."          17:10:40
+          ── T1 = 17:10:42 ──
+remember  "The cormex project now uses RustFS for object storage
+           instead of MinIO."                                           17:10:47
+
+memory_search  "What does cormex use for object storage?"
+- [01M6Y288Q1MCSGQT52SPDZ72YE] cormex 项目的对象存储现在使用 RustFS，已不再使用 MinIO。
+  （2026-11-08T17:10:47.269287+00:00 获知） ⟨出处 01M6Y286060G4MMBMEFQPTPH4J⟩
+
+memory_search  "What does cormex use for object storage?"  as_of=2026-11-08T17:10:42Z
+- [01M6Y281T7SXMWCVTD3TAFT6EB] cormex 项目使用 MinIO 作为对象存储。
+  （2026-11-08T17:10:40.204249+00:00 获知） ⟨出处 01M6Y27Z2K81M0CZZM6GF11J8W⟩
+```
+
+(The extractor writes memories in Chinese. "获知" is when Cormex learned it, "出处" the
+episode it came from. Both results are shown without the framing block that wraps them.)
+
+The present answer is RustFS. Asked as of T1, the answer is MinIO, because that was
+everything known at 17:10:42. The MinIO fact is still in the table, with an
+`invalidate` event pointing at the RustFS fact that replaced it.
+
+Two things this depends on, stated plainly:
+
+- **Superseding needs the same predicate.** `uses` is single-valued, so a new value
+  replaces the old one. If the extractor names the first fact `stores_uploaded_objects_in`
+  and the second `uses`, nothing conflicts and both stay current. We hit exactly that on
+  a first attempt with different wording. Predicate drift is a known extraction weakness
+  (see the roadmap).
+- **Two time axes, two parameters.** `as_of` is when Cormex *knew* something. When it
+  *was true* is the fact's `valid_at`, and a backfilled history ("we used MinIO until
+  June") orders by that, not by when it was told.
+
 ## Delegated credentials
 
 Cormex can mint a **scoped, short-lived key** for an untrusted caller — bound to

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Memory: a same-day update dated only "today" supersedes again
+
+- When the extractor wrote an update's event time as a bare date ("now" becomes `2026-11-08`, which parses to midnight), contradiction resolution ordered the update *before* the statement it replaced. That statement had been made earlier the same day and ordered by the moment it was said. The update was filed as backfilled history, superseded nothing, and both values stayed current, so replay showed stale answers as present. A date-only event time within a day of when it was said now orders at the moment it was said. A date further back is still a real event time, so backfills keep their place. Found while recording the README's `as_of` walkthrough.
+- README: a real `as_of` run over MCP (MinIO, then RustFS a few seconds later; asked now and as of the moment between), with what it depends on: superseding needs the extractor to name both facts with the same predicate.
+
 ### Memory: an English adoption is an adoption; extraction gets an eval
 
 - Automatic extraction discarded every decision a user adopted in English. The rule that keeps an AI suggestion only once the user adopts it read adoption by Chinese words alone, so "Agreed, we adopt absolute dates" counted as an unadopted suggestion. It now reads both languages, and "disagree" is checked as a refusal before "agree" can count. The rule version (`qa@4`) is unchanged, so nothing is re-extracted or re-billed; the fix applies to new analyses.

@@ -768,6 +768,37 @@ pub fn decide(
     }
 }
 
+/// The moment a fact's event time stands for, for ordering it against rivals.
+///
+/// `said_at` is when the statement was made (an episode's time, or a stored
+/// fact's `created_at`). A `valid_at` that is exactly midnight is a date with
+/// no time of day: the extractor writes "now" or "today" as `2026-11-08`, and
+/// that parses to 00:00. Within a day of the statement, the moment it was said
+/// is the best precise time there is, so ordering uses that.
+///
+/// Comparing the raw midnight instead filed a same-day update as history:
+/// "uses MinIO" said at 17:10:02 (no event time, so it orders at 17:10:02)
+/// and "now uses RustFS instead" said four seconds later with `valid_at`
+/// 2026-11-08 ordered RustFS at 00:00, *before* MinIO. `decide` read that as
+/// a backfill, superseded nothing, and both stayed current. Found running the
+/// `as_of` walkthrough for the README, 2026-11-08.
+///
+/// A date more than a day from the statement is a real event time ("we
+/// switched on 1 November") and is kept, so backfilled history still orders by
+/// when it happened.
+#[must_use]
+pub fn effective_time(valid_at: Option<DateTime<Utc>>, said_at: DateTime<Utc>) -> DateTime<Utc> {
+    match valid_at {
+        Some(v)
+            if v.time() == chrono::NaiveTime::MIN && (said_at - v).num_seconds().abs() < 86_400 =>
+        {
+            said_at
+        }
+        Some(v) => v,
+        None => said_at,
+    }
+}
+
 /// The normalized object key. Entity objects compare by id; literals compare
 /// lowercased with whitespace squeezed out.
 fn object_key(literal: Option<&str>, entity_id: Option<&str>) -> String {
@@ -1232,7 +1263,7 @@ impl Extractor {
             // When event time is unknown, fall back to when this turn happened:
             // that is the latest lower bound for when this fact became true, and
             // the only timestamp available without another database round trip.
-            let effective_at = candidate.valid_at.unwrap_or(ctx.occurred_at);
+            let effective_at = effective_time(candidate.valid_at, ctx.occurred_at);
 
             let slot = (subject_id, candidate.predicate.clone());
             let mut rivals = self.rivals(store, subject_id, &candidate.predicate).await?;
@@ -1467,7 +1498,7 @@ impl Extractor {
             out.push(Rival {
                 fact_id,
                 object_key: object_key(f.object_text.as_deref(), f.object_entity_id.as_deref()),
-                effective_at: f.valid_at.unwrap_or(f.created_at),
+                effective_at: effective_time(f.valid_at, f.created_at),
             });
         }
         Ok(out)
@@ -1769,6 +1800,30 @@ mod tests {
         assert!(
             matches!(&v, Verdict::Write { supersede, flag, .. } if supersede.is_empty() && flag.is_empty()),
             "backfilling last year's history must not mark a fact that is still true today as invalidated: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_date_only_event_time_orders_at_the_moment_it_was_said() {
+        let said = "2026-11-08T17:10:06Z".parse::<DateTime<Utc>>().unwrap();
+        let today = "2026-11-08T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            effective_time(Some(today), said),
+            said,
+            "\"now\" written as today's date is the moment it was said"
+        );
+        assert_eq!(effective_time(None, said), said);
+        let precise = "2026-11-08T09:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            effective_time(Some(precise), said),
+            precise,
+            "an event time with a time of day is taken as given"
+        );
+        let first_of_month = "2026-11-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            effective_time(Some(first_of_month), said),
+            first_of_month,
+            "a date a week back is a real event time: backfilled history keeps its place"
         );
     }
 
