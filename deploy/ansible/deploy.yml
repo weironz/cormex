@@ -98,8 +98,12 @@
       changed_when: false
 
     - name: Start the stack
+      # Only the services this playbook deployed: a bare `up -d` also reconciles
+      # postgres and rustfs, and one deployment's project had a rustfs service whose
+      # container name belonged to another stack -- the whole `up` aborted on the
+      # conflict, half-way through a release.
       ansible.builtin.command:
-        argv: "{{ compose_args + ['up', '-d'] }}"
+        argv: "{{ compose_args + ['up', '-d', 'cormex', 'web'] }}"
         chdir: "{{ cormex_dir }}"
       register: compose_up
       changed_when: >-
