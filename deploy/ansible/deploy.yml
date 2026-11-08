@@ -113,7 +113,11 @@
         return_content: true
       register: health
       until: health.status == 200
-      retries: 60
+      # Five minutes, not two: a release that carries a migration can spend that long
+      # building an index on transcript_events (1.4 M rows / 2.3 GB on the production
+      # node) before the port answers, and timing out there would report a failure for
+      # a deploy that is merely still migrating.
+      retries: 150
       delay: 2
       changed_when: false
 
