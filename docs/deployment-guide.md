@@ -227,6 +227,29 @@ curl -fsS http://127.0.0.1:8080/api/health
 5. 一台客户端可登录、同步一条测试会话；Web 可读其正文，MCP 可搜索该会话。
 6. 开启提取时，账号模型连接测试成功，处理状态能够前进。
 
+### 对象存储在另一个 compose 项目时
+
+`depends_on` 只能引用同一个 compose 项目里的服务，管不了「S3 在隔壁那一栈」的情形；
+而 cormexd 只在**启动那一刻**决定用 S3 还是本地文件系统，S3 不可达时仅打一条 warning
+就回落。两者叠加的结果是：容器起来了、版本也对，但上传全落在容器里。
+
+硬保证放在启动路径上（示例见生产那份 `docker-compose.override.yml`）：把 `cormex`
+服务的 entrypoint 换成一个先等存储可达、再 `exec /usr/local/bin/cormexd` 的脚本。
+判定「可达」看 HTTP 状态码不是 2xx —— S3 根路径对匿名请求回 403，那已经证明服务在。
+
+```yaml
+services:
+  cormex:
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until code=$$(curl -s -o /dev/null -w "%{http_code}" "$${S3_ENDPOINT}"); [ "$$code" != "000" ]; do sleep 2; done
+        exec /usr/local/bin/cormexd
+```
+
+`just deploy` 另外断言 `/api/health` 的 `blob_backend == s3`，所以即使等待失效，
+回落到本地文件系统的部署也会被判失败，而不是静默通过。
+
 ### 迁移约束
 
 - `migrations/` 与 `migrations-global/` 有各自版本表；全局认证 schema 和租户 schema 不应合并。

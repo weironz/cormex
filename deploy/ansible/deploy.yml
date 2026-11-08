@@ -107,7 +107,7 @@
         chdir: "{{ cormex_dir }}"
       register: compose_up
       changed_when: >-
-        ('Created' in compose_up.stdout) or ('Recreated' in compose_up.stdout)
+        ('Created' in compose_up.stdout) or ('Recreate' in compose_up.stdout)
         or ('Started' in compose_up.stdout)
 
     - name: Ask the running service what it is
