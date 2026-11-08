@@ -324,7 +324,48 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 
 备份是否有效，以恢复演练为准。自动化数据库恢复测试和 RustFS 卷演练入口见 [运维手册](operations.md)。
 
-## 9. 常见故障
+## 9. 用 Justfile 部署、验收与演练
+
+前面的步骤都可以手工执行；仓库还提供了一组配方，做的是同一件事，只是把「版本对不对」
+变成会被检查的断言。**发布不等于部署**：这些配方不构建、不打 tag、不碰候选，只拉已发布
+的镜像。
+
+在目标主机上（仓库目录、`deploy/.env` 和可选的 `deploy/compose.override.yaml` 都在那儿）
+执行：
+
+```bash
+just deploy vX.Y.Z          # docker compose pull cormex web → up -d → 等 /api/health
+just deploy-verify          # 只读：role、版本、Web 根、/api 是否真的到服务端
+just deploy-down            # 停栈，卷保留
+```
+
+`deploy` 会先核对 `.env` 里的 `CORMEX_VERSION` 与传入的 tag 一致，缺凭据直接失败，然后再
+拉起栈。验收不是「容器起来了」：脚本拉 `/api/health`，要求 `role=cormexd`、`version` 与
+部署的版本一致（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），并确认 `/api/health` 返回
+JSON —— 拿到 HTML 就说明 `/api` 被送到了 Web 镜像。`capture_encryption=plaintext` 与缺失
+的 embedding 模型会打成警告，不会让部署「看起来成功」。
+
+不要在其他机器上对生产 `just deploy`：配方只操作本机的 Docker 守护进程和本地目录。要升级
+远程主机就 ssh 上去执行，或按第 7 节手工的 compose 命令。
+
+### 本地演练
+
+`deploy-rehearsal` 用同一份 `deploy/docker-compose.yml`、同两个镜像，在**隔离的 compose
+项目**上跑一遍：独立的卷（`cormex-rehearsal_*`）、自己的容器名、端口 18080 与 19000，
+凭据随机生成并写入 `.deploy-rehearsal/.env`（0600，已 gitignore）。它验证的是真实镜像 +
+真实 compose 文件 + 全新数据库的迁移路径，不会碰开发栈或任何已有数据。
+
+```bash
+just deploy-rehearsal vX.Y.Z   # 生成凭据、拉镜像、起栈、验收（与 deploy 同一条代码路径）
+just deploy-verify .deploy-rehearsal
+just deploy-rehearsal-down     # 停栈；卷和凭据保留，再跑同一版本会复用
+```
+
+演练只保存 token 的 **SHA-256**，不落明文（登录用生成的 `CORMEX_ADMIN_USERNAME` /
+`CORMEX_ADMIN_PASSWORD`）。它不能替代生产验收：HTTPS、域名、对象存储 CORS、真实客户端
+同步与提取状态仍要在目标环境核对。
+
+## 10. 常见故障
 
 | 现象 | 优先检查 |
 | --- | --- |
@@ -338,7 +379,7 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 | 升级后数据似乎全部消失 | 项目名、卷挂载、数据库名、账号租户是否改变 |
 | 旧加密会话突然不可读 | 原主密钥是否丢失或被替换，数据库与对象备份是否对应 |
 
-## 10. 配置与实现入口
+## 11. 配置与实现入口
 
 - [自足部署模板](../deploy/docker-compose.yml) 与 [环境变量模板](../deploy/.env.example)
 - [服务配置解析](../crates/cormex-core/src/config.rs)

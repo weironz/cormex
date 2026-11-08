@@ -211,3 +211,27 @@ _verify tag checksum directory:
 
 _publish tag checksum:
     python3 scripts/release.py publish "$1" "$2"
+
+# ── Deploy: release ≠ deploy ─────────────────────────────
+# Deploys the published images from deploy/ with its docker-compose.yml (plus
+# compose.override.yaml when present). Never builds, tags or uploads anything.
+
+# Pull the pinned version, start the stack, then verify what actually answered.
+deploy tag dir="deploy":
+    python3 scripts/deploy.py up "$1" "${2:-deploy}"
+
+# Check a running stack: role, version, web root, and that /api reaches the server.
+deploy-verify dir="deploy":
+    python3 scripts/deploy.py verify "${1:-deploy}"
+
+# Stop the stack; its volumes stay.
+deploy-down dir="deploy":
+    python3 scripts/deploy.py down "${1:-deploy}"
+
+# Same stack on an isolated project: generated credentials, fresh volumes, own ports.
+deploy-rehearsal tag:
+    python3 scripts/deploy.py rehearsal "$1"
+
+# Stop the isolated rehearsal and keep its volumes and credentials.
+deploy-rehearsal-down:
+    python3 scripts/deploy.py rehearsal-down
