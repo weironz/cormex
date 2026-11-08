@@ -40,7 +40,11 @@
     - name: Look for the deployment files
       ansible.builtin.stat:
         path: "{{ cormex_dir }}/{{ item }}"
-      loop: [docker-compose.yml, .env, compose.override.yaml]
+      # Both override names are checked on purpose: `compose.override.yaml` is what this
+      # repository's template uses, and `docker-compose.override.yml` is what compose
+      # auto-loads by default -- which an explicit `-f` turns off. A host that keeps the
+      # master key in that file would otherwise be deployed without it.
+      loop: [docker-compose.yml, .env, docker-compose.override.yml, compose.override.yaml]
       register: deployment_files
 
     - name: The deployment directory must hold the stack
@@ -78,7 +82,8 @@
           {{ ['docker', 'compose']
              + (['-p', cormex_project] if (cormex_project | default('') | length) > 0 else [])
              + ['-f', 'docker-compose.yml']
-             + (['-f', 'compose.override.yaml'] if deployment_files.results[2].stat.exists else []) }}
+             + (['-f', 'docker-compose.override.yml'] if deployment_files.results[2].stat.exists else [])
+             + (['-f', 'compose.override.yaml'] if deployment_files.results[3].stat.exists else []) }}
 
     - name: Pull the published images
       when: cormex_pull | default(true) | bool

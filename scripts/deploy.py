@@ -96,8 +96,12 @@ def compose(directory, *args, project=None, capture=False):
     if project:
         command += ["-p", project]
     command += ["-f", "docker-compose.yml"]
-    if (directory / "compose.override.yaml").is_file():
-        command += ["-f", "compose.override.yaml"]
+    # Both override names, because an explicit -f switches off compose's own
+    # auto-loading of docker-compose.override.yml. A host that keeps the master key
+    # there must not be started without it.
+    for override in ("docker-compose.override.yml", "compose.override.yaml"):
+        if (directory / override).is_file():
+            command += ["-f", override]
     shadowed = set(load_env(directory)) if (directory / ".env").is_file() else set()
     environment = {key: value for key, value in os.environ.items() if key not in shadowed}
     return run(*command, *args, cwd=directory, capture=capture, env=environment)

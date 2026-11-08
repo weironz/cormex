@@ -77,15 +77,20 @@ class DeployComposeTests(unittest.TestCase):
                          "an exported pin must not override the .env the operator wrote")
         self.assertEqual(environment["OTHER"], "kept")
 
-    def test_compose_includes_the_override_when_one_exists(self):
+    def test_compose_includes_both_override_names(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             (directory / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (directory / "docker-compose.override.yml").write_text("services: {}\n", encoding="utf-8")
             (directory / "compose.override.yaml").write_text("services: {}\n", encoding="utf-8")
             with mock.patch.object(deploy, "run") as runner:
                 deploy.compose(directory, "up", "-d")
-        self.assertEqual(list(runner.call_args.args[1:5]),
-                         ["compose", "-f", "docker-compose.yml", "-f"])
+        args = list(runner.call_args.args[1:])
+        self.assertEqual(args, ["compose", "-f", "docker-compose.yml",
+                                "-f", "docker-compose.override.yml", "-f", "compose.override.yaml",
+                                "up", "-d"],
+                         "an explicit -f turns off compose's own override auto-loading, so both "
+                         "names have to be listed")
 
 
 class DeployVerifyTests(unittest.TestCase):

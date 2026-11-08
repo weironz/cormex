@@ -353,6 +353,9 @@ just deploy-check                        # 只做 playbook 语法检查
 `CORMEX_DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
 `CORMEX_DEPLOY_API`（目标主机回环地址，默认 `http://127.0.0.1:8080`）、
 `CORMEX_DEPLOY_KNOWN_HOSTS`（可选）、`CORMEX_DEPLOY_CONNECTION`（演练时设 `local`）、`CORMEX_DEPLOY_PULL`（用 Release 里的镜像归档 `docker load` 之后设 `false`，跳过拉取）。
+目标目录里两种 override 都会被**显式**带上：`docker-compose.override.yml` 与
+`compose.override.yaml` —— 显式 `-f` 会关掉 compose 对默认 override 的自动加载，
+把主密钥留在 override 里的部署不会因为漏了这一点而丢配置。
 清单里没有地址，因此公开仓库里也不会有。
 
 **密钥只留在机器上。** 本地路径直接交给 `ansible_ssh_private_key_file`；Windows 走容器时，
