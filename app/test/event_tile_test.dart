@@ -1,6 +1,8 @@
 import 'package:cormex_app/features/sessions/widgets/event_tile.dart';
 import 'package:cormex_app/models/transcript_event.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
@@ -155,7 +157,9 @@ void main() {
       findsNothing,
     );
   });
-  testWidgets('对话以可选择的 Markdown 展示并不自动加载远程图片', (tester) async {
+  testWidgets('对话以 Markdown 展示、文字交给外层 SelectionArea 选择，并不自动加载远程图片', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       _wrap(
         const EventTile(
@@ -173,7 +177,13 @@ void main() {
       ),
     );
     final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
-    expect(markdown.selectable, isTrue);
+    expect(
+      markdown.selectable,
+      isFalse,
+      reason:
+          'selectable: true makes every paragraph its own SelectableText, and a drag '
+          'stops at the end of each one; selection belongs to the page\'s SelectionArea',
+    );
     expect(find.text('[图片: 示例]'), findsOneWidget);
     expect(find.byType(Image), findsNothing);
   });
@@ -296,5 +306,102 @@ void main() {
           '绝对日期，不用「3 分钟前」：聊天可以被回放到任意时点，而相对时间的'
           '基准点是「现在」',
     );
+  });
+
+  testWidgets('鼠标拖选能跨段落、跨消息', (tester) async {
+    String? selected;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SelectionArea(
+            onSelectionChanged: (content) => selected = content?.plainText,
+            child: const Column(
+              children: [
+                EventTile(
+                  event: TranscriptEvent(
+                    id: 'q',
+                    seq: 0,
+                    kind: TranscriptKind.userMessage,
+                    content: [TextBlock('第一段提问\n\n第二段提问')],
+                  ),
+                ),
+                EventTile(
+                  event: TranscriptEvent(
+                    id: 'a',
+                    seq: 1,
+                    kind: TranscriptKind.agentMessage,
+                    content: [TextBlock('这是回答')],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    final start = tester.getTopLeft(find.textContaining('第一段提问'));
+    final end = tester.getBottomRight(find.textContaining('这是回答'));
+    final gesture = await tester.startGesture(
+      start + const Offset(1, 4),
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump();
+    await gesture.moveTo(end - const Offset(1, 2));
+    await tester.pump();
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(selected, isNotNull, reason: 'a mouse drag selects text');
+    expect(selected, contains('第一段提问'));
+    expect(
+      selected,
+      contains('第二段提问'),
+      reason: 'the selection crosses the paragraph break',
+    );
+    expect(selected, contains('这是回答'), reason: 'and the next message');
+    expect(
+      selected,
+      isNot(contains('复制这条消息')),
+      reason: 'the copy button is not part of the copied text',
+    );
+  });
+
+  testWidgets('每条消息的复制按钮复制它的原文', (tester) async {
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await tester.pumpWidget(
+      _wrap(
+        const EventTile(
+          event: TranscriptEvent(
+            id: 'a',
+            seq: 0,
+            kind: TranscriptKind.agentMessage,
+            content: [TextBlock('**加粗**\n\n```sh\nls\n```')],
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byTooltip('复制这条消息'));
+    await tester.pump();
+    expect(
+      copied,
+      '**加粗**\n\n```sh\nls\n```',
+      reason: 'the Markdown source, so code blocks survive the paste',
+    );
+    expect(find.text('已复制这条消息'), findsOneWidget);
   });
 }

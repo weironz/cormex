@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../../../core/agents.dart';
@@ -50,6 +51,13 @@ bool isConversationEvent(TranscriptEvent event, {String? agent}) {
 ///
 /// 全用同一种卡片会让一段聊天变成一堵墙 —— 而工具调用和工具结果占了真实
 /// 聊天的一半以上。折叠它们，把注意力留给对话本身；需要时点开看原文。
+///
+/// # 文字自己不可选，选择交给外层的 SelectionArea
+///
+/// `MarkdownBody(selectable: true)` 会把每一段变成各自独立的 `SelectableText`：
+/// 鼠标拖选到段尾就停住，跨段、跨消息都选不了。这里的文字一律是普通文本，
+/// 由聊天页包在整个列表外的一个 `SelectionArea` 统一处理，拖选才能一路跨过
+/// 段落和消息。每条消息另有一个复制按钮，复制的是它的原文（Markdown）。
 class EventTile extends StatelessWidget {
   const EventTile({super.key, required this.event, this.agent});
 
@@ -122,7 +130,6 @@ class EventTile extends StatelessWidget {
               if (result != null)
                 MarkdownBody(
                   data: result,
-                  selectable: true,
                   softLineBreak: true,
                   imageBuilder: (uri, title, alt) =>
                       Text('[图片${alt == null || alt.isEmpty ? '' : ': $alt'}]'),
@@ -218,7 +225,7 @@ class EventTile extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _header(theme),
+              _header(context),
               const SizedBox(height: 12),
               ...event.content.map((b) => _block(context, b)),
             ],
@@ -228,7 +235,8 @@ class EventTile extends StatelessWidget {
     );
   }
 
-  Widget _header(ThemeData theme) {
+  Widget _header(BuildContext context) {
+    final theme = Theme.of(context);
     final label = switch (event.kind) {
       TranscriptKind.userMessage => '你',
       TranscriptKind.agentMessage => Agents.speaker(agent),
@@ -276,6 +284,21 @@ class EventTile extends StatelessWidget {
             ),
           ),
         ],
+        if (event.kind == TranscriptKind.userMessage ||
+            event.kind == TranscriptKind.agentMessage) ...[
+          const Spacer(),
+          // 按钮不进拖选：否则跨消息复制出来的文字里夹着按钮的提示文本
+          SelectionContainer.disabled(
+            child: IconButton(
+              tooltip: '复制这条消息',
+              visualDensity: VisualDensity.compact,
+              iconSize: 16,
+              icon: const Icon(Icons.content_copy_outlined),
+              onPressed: () =>
+                  copyToClipboard(context, event.plainText, done: '已复制这条消息'),
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -285,7 +308,6 @@ class EventTile extends StatelessWidget {
     return switch (block) {
       TextBlock(:final text) => MarkdownBody(
         data: text,
-        selectable: true,
         softLineBreak: true,
         styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
           p: theme.textTheme.bodyMedium?.copyWith(height: 1.7),
@@ -388,7 +410,7 @@ class EventTile extends StatelessWidget {
         children: [
           Align(
             alignment: Alignment.centerLeft,
-            child: SelectableText(
+            child: Text(
               body,
               style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
             ),
@@ -397,4 +419,19 @@ class EventTile extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 把文字放进剪贴板，并在页面底部说一声。
+Future<void> copyToClipboard(
+  BuildContext context,
+  String text, {
+  required String done,
+}) async {
+  await Clipboard.setData(ClipboardData(text: text));
+  if (!context.mounted) return;
+  ScaffoldMessenger.maybeOf(context)
+    ?..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(content: Text(done), duration: const Duration(seconds: 2)),
+    );
 }

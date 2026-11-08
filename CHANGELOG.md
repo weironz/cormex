@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### App: select across messages, copy a message or the whole conversation
+
+- A mouse drag in a conversation now selects across paragraphs and messages. Each paragraph used to be its own selectable text (`MarkdownBody(selectable: true)`), so a drag stopped at every paragraph end. The text is now plain, and one `SelectionArea` around the conversation handles selection.
+- Each question and answer has a copy button that copies its original Markdown, so code blocks survive the paste. The top bar has "复制整段对话", which first fetches the pages not yet scrolled to and then copies the title and every message with speaker and absolute time. It copies what is shown: only the dialogue, or the whole process when "查看过程" is on.
+
 ### Import: pick the vendor's whole zip
 
 - The browser now takes the zip exactly as the vendor mailed it. Before uploading it copies out only the conversation files, as their compressed bytes with nothing decompressed, and leaves images and attachments on the machine. A real ChatGPT export of 275 MB, over the 256 MB upload ceiling, uploads as 21 MB. A zip with no conversations is refused with the names it holds, before anything is sent.

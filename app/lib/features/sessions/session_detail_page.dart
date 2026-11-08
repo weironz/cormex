@@ -132,6 +132,55 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
     }
   }
 
+  /// 把剩下的页都取回来：复制整段对话要的是整段，不是已经滚到的那一截。
+  Future<bool> _loadAll() async {
+    for (var guard = 0; _cursor != null && guard < 10000; guard++) {
+      if (_loadingMore) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        continue;
+      }
+      final before = _cursor;
+      await _loadMore();
+      if (!mounted || _cursor == before) return false;
+    }
+    return _cursor == null;
+  }
+
+  /// 复制整段对话：标题，然后每条消息带上说话人和时间，原文是 Markdown。
+  ///
+  /// 复制的是当前看到的内容：「只看对话」时只有提问和回答，「查看过程」时
+  /// 连同思考、工具调用一起。
+  Future<void> _copyAll() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_cursor != null) {
+      messenger.showSnackBar(const SnackBar(content: Text('正在取回整段对话…')));
+    }
+    final complete = await _loadAll();
+    if (!mounted) return;
+    final agent = _detail?.session.agent;
+    final events = _events
+        .where(
+          (e) => _showProcess
+              ? e.kind != TranscriptKind.meta &&
+                    e.kind != TranscriptKind.unknown &&
+                    e.plainText.trim().isNotEmpty
+              : isConversationEvent(e, agent: agent),
+        )
+        .toList();
+    final text = conversationAsText(
+      title: _detail?.session.displayTitle,
+      events: events,
+      agent: agent,
+    );
+    await copyToClipboard(
+      context,
+      text,
+      done: complete
+          ? '已复制整段对话（${events.length} 条）'
+          : '只复制了已取回的 ${events.length} 条：后面的没有取回来',
+    );
+  }
+
   void _maybeLoadMore() {
     if (!_scroll.hasClients) return;
     final remaining =
@@ -225,6 +274,11 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
             label: Text(_showProcess ? '只看对话' : '查看过程'),
           ),
           IconButton(
+            tooltip: '复制整段对话',
+            icon: const Icon(Icons.copy_all_outlined),
+            onPressed: _loading || _events.isEmpty ? null : _copyAll,
+          ),
+          IconButton(
             tooltip: _digest ? '显示完整内容' : '只看摘要',
             icon: Icon(_digest ? Icons.unfold_more : Icons.unfold_less),
             onPressed: () {
@@ -256,56 +310,62 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
                 constraints: BoxConstraints(
                   maxWidth: ref.watch(readingPreferencesProvider),
                 ),
-                child: ListView.builder(
-                  controller: _scroll,
-                  padding: const EdgeInsets.only(bottom: 32),
-                  itemCount:
-                      1 +
-                      remaining.length +
-                      (preparation.isNotEmpty ? 1 : 0) +
-                      (_loadingMore ? 1 : 0),
-                  itemBuilder: (context, index) {
-                    if (index == 0) {
-                      return _SessionHeader(
-                        detail: detail,
-                        label: ref.watch(sessionsControllerProvider).sourceName,
-                      );
-                    }
-                    final i = index - 1;
-                    if (preparation.isNotEmpty && i == 0) {
-                      return Theme(
-                        data: Theme.of(
-                          context,
-                        ).copyWith(dividerColor: Colors.transparent),
-                        child: ExpansionTile(
-                          key: const ValueKey('session-preparation'),
-                          leading: const Icon(Icons.layers_outlined),
-                          title: const Text('聊天准备信息'),
-                          subtitle: Text(
-                            '提问前注入的指令和环境信息 · ${preparation.length} 项',
+                // 一个 SelectionArea 包住整个列表：鼠标拖选能跨段落、跨消息，
+                // 而不是停在每一段的末尾（见 EventTile 的说明）
+                child: SelectionArea(
+                  child: ListView.builder(
+                    controller: _scroll,
+                    padding: const EdgeInsets.only(bottom: 32),
+                    itemCount:
+                        1 +
+                        remaining.length +
+                        (preparation.isNotEmpty ? 1 : 0) +
+                        (_loadingMore ? 1 : 0),
+                    itemBuilder: (context, index) {
+                      if (index == 0) {
+                        return _SessionHeader(
+                          detail: detail,
+                          label: ref
+                              .watch(sessionsControllerProvider)
+                              .sourceName,
+                        );
+                      }
+                      final i = index - 1;
+                      if (preparation.isNotEmpty && i == 0) {
+                        return Theme(
+                          data: Theme.of(
+                            context,
+                          ).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            key: const ValueKey('session-preparation'),
+                            leading: const Icon(Icons.layers_outlined),
+                            title: const Text('聊天准备信息'),
+                            subtitle: Text(
+                              '提问前注入的指令和环境信息 · ${preparation.length} 项',
+                            ),
+                            children: [
+                              for (final event in preparation)
+                                EventTile(
+                                  event: event,
+                                  agent: detail?.session.agent,
+                                ),
+                            ],
                           ),
-                          children: [
-                            for (final event in preparation)
-                              EventTile(
-                                event: event,
-                                agent: detail?.session.agent,
-                              ),
-                          ],
-                        ),
+                        );
+                      }
+                      final eventIndex = i - (preparation.isNotEmpty ? 1 : 0);
+                      if (eventIndex >= remaining.length) {
+                        return const Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Center(child: CircularProgressIndicator()),
+                        );
+                      }
+                      return EventTile(
+                        event: remaining[eventIndex],
+                        agent: detail?.session.agent,
                       );
-                    }
-                    final eventIndex = i - (preparation.isNotEmpty ? 1 : 0);
-                    if (eventIndex >= remaining.length) {
-                      return const Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Center(child: CircularProgressIndicator()),
-                      );
-                    }
-                    return EventTile(
-                      event: remaining[eventIndex],
-                      agent: detail?.session.agent,
-                    );
-                  },
+                    },
+                  ),
                 ),
               ),
             ),
@@ -366,7 +426,7 @@ class _SessionHeader extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 10),
-          SelectableText(
+          Text(
             session.displayTitle,
             style: theme.textTheme.headlineSmall?.copyWith(
               fontSize: 22,
@@ -392,4 +452,41 @@ class _SessionHeader extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 一段对话的纯文本：标题，然后每条消息一节，说话人、绝对时间、原文。
+String conversationAsText({
+  required String? title,
+  required List<TranscriptEvent> events,
+  required String? agent,
+}) {
+  final out = StringBuffer();
+  if (title != null && title.trim().isNotEmpty) {
+    out
+      ..writeln('# ${title.trim()}')
+      ..writeln();
+  }
+  for (final (i, e) in events.indexed) {
+    if (i > 0) {
+      out
+        ..writeln()
+        ..writeln('---')
+        ..writeln();
+    }
+    final who = switch (e.kind) {
+      TranscriptKind.userMessage => '你',
+      TranscriptKind.agentMessage => Agents.speaker(agent),
+      TranscriptKind.agentThought => '思考',
+      TranscriptKind.toolCall => '调用 ${e.toolName ?? ''}'.trim(),
+      TranscriptKind.toolResult => '工具结果',
+      TranscriptKind.plan => '计划',
+      _ => '系统',
+    };
+    final at = e.occurredAt == null ? '' : ' · ${formatAbsolute(e.occurredAt)}';
+    out
+      ..writeln('**$who**$at')
+      ..writeln()
+      ..writeln(e.plainText.trim());
+  }
+  return out.toString();
 }
