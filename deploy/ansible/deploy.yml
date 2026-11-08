@@ -138,6 +138,22 @@
           expected cormexd {{ expected_version }} (pin {{ cormex_version }})
         quiet: true
 
+    - name: The object store must be the one in use
+      # cormexd falls back to the local filesystem when S3 is unreachable at startup,
+      # with a warning in the log and nothing else -- uploads would then live inside
+      # the container and never reach the bucket. The health endpoint says which
+      # backend it actually attached to, so a deploy that landed on the fallback is a
+      # failed deploy even though the version is right.
+      ansible.builtin.assert:
+        that:
+          - health.json.blob_backend == 's3'
+        fail_msg: >-
+          cormexd started with blob_backend={{ health.json.blob_backend }}, not s3:
+          the object store was unreachable when it started. Start the store, then
+          `docker compose restart cormex` -- `up -d` does not recreate an unchanged
+          container, so a plain redeploy would leave the fallback in place.
+        quiet: true
+
     - name: The web root must be a page
       ansible.builtin.uri:
         url: "{{ cormex_api_base | default('http://127.0.0.1:8080') }}/"
