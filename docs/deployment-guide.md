@@ -324,29 +324,37 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 
 备份是否有效，以恢复演练为准。自动化数据库恢复测试和 RustFS 卷演练入口见 [运维手册](operations.md)。
 
-## 9. 用 Justfile 部署、验收与演练
+## 9. 用 Justfile + Ansible 部署、验收与演练
 
 前面的步骤都可以手工执行；仓库还提供了一组配方，做的是同一件事，只是把「版本对不对」
 变成会被检查的断言。**发布不等于部署**：这些配方不构建、不打 tag、不碰候选，只拉已发布
 的镜像。
 
-在目标主机上（仓库目录、`deploy/.env` 和可选的 `deploy/compose.override.yaml` 都在那儿）
-执行：
+部署通过 **Ansible over SSH** 完成，入口仍是 `just`。主机清单不进仓库（公开仓库，节点地址
+与账号只留在维护机上）：
 
 ```bash
-just deploy vX.Y.Z          # docker compose pull cormex web → up -d → 等 /api/health
-just deploy-verify          # 只读：role、版本、Web 根、/api 是否真的到服务端
-just deploy-down            # 停栈，卷保留
+cp deploy/ansible/inventory.example.ini deploy/ansible/inventory.ini   # 已被 gitignore
+$EDITOR deploy/ansible/inventory.ini                                   # 主机、用户、cormex_dir
+just deploy vX.Y.Z                                                     # 部署 + 验收
+just deploy-check                                                      # 只做 playbook 语法检查
 ```
 
-`deploy` 会先核对 `.env` 里的 `CORMEX_VERSION` 与传入的 tag 一致，缺凭据直接失败，然后再
-拉起栈。验收不是「容器起来了」：脚本拉 `/api/health`，要求 `role=cormexd`、`version` 与
-部署的版本一致（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），并确认 `/api/health` 返回
-JSON —— 拿到 HTML 就说明 `/api` 被送到了 Web 镜像。`capture_encryption=plaintext` 与缺失
-的 embedding 模型会打成警告，不会让部署「看起来成功」。
+`inventory.ini` 里的 `cormex_dir` 指向**目标主机上**那份部署目录（`docker-compose.yml`、
+`.env`、可选的 `compose.override.yaml`）。playbook 会先比对 `.env` 里的 `CORMEX_VERSION`
+与传入的 tag，不一致就停 —— 不让文件和正在跑的栈各说各话；随后 `pull cormex web`、
+`up -d`，最后向 `/api/health` 要答案：`role` 必须是 `cormexd`，`version` 必须等于部署的
+版本（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），`/api/health` 必须返回 JSON（拿到 HTML
+说明 `/api` 被送到了 Web 镜像），Web 根必须是 HTML。
 
-不要在其他机器上对生产 `just deploy`：配方只操作本机的 Docker 守护进程和本地目录。要升级
-远程主机就 ssh 上去执行，或按第 7 节手工的 compose 命令。
+**Windows 不能直接当 Ansible 控制节点。** `ansible-playbook` 只在 POSIX 上运行，Windows
+只是被管理端（走 WinRM，与本项目无关）。因此 `just deploy` 在 Windows 上会用
+`deploy/ansible/Dockerfile` 构一个固定版本的 ansible-core 容器来执行（Docker Desktop 本来
+就是为了部署而要装的），在 Linux / macOS / WSL 上直接调用本机的 `ansible-playbook`。两条
+路径的入口、参数和验收完全一致；WSL 里装 ansible-core 是另一种可用方案。
+
+本机自测（不需要远端）：`inventory` 里给 `localhost ansible_connection=local`，指向
+`.deploy-rehearsal`，即可把整个 playbook 跑在隔离演练栈上。
 
 ### 本地演练
 
@@ -356,7 +364,7 @@ JSON —— 拿到 HTML 就说明 `/api` 被送到了 Web 镜像。`capture_encr
 真实 compose 文件 + 全新数据库的迁移路径，不会碰开发栈或任何已有数据。
 
 ```bash
-just deploy-rehearsal vX.Y.Z   # 生成凭据、拉镜像、起栈、验收（与 deploy 同一条代码路径）
+just deploy-rehearsal vX.Y.Z   # 生成凭据、拉镜像、起栈、验收
 just deploy-verify .deploy-rehearsal
 just deploy-rehearsal-down     # 停栈；卷和凭据保留，再跑同一版本会复用
 ```
@@ -377,6 +385,7 @@ just deploy-rehearsal-down     # 停栈；卷和凭据保留，再跑同一版�
 | 向量化失败 | endpoint、密钥、模型维度是否为 1024 |
 | 附件加载失败 | 对象公开地址、HTTPS、CORS、预签名地址是否被改写 |
 | 升级后数据似乎全部消失 | 项目名、卷挂载、数据库名、账号租户是否改变 |
+| `Bind for 127.0.0.1:18080 failed: port is already allocated`，但 `docker ps` 里没有占端口的容器 | 上一次失败的 `up` 留下的 `docker-proxy`：`sudo ss -ltnp 'sport = :18080'`，确认是 docker-proxy 后 `sudo kill <pid>`；先 `just deploy-rehearsal-down` 清掉半启动的容器再重试 |
 | 旧加密会话突然不可读 | 原主密钥是否丢失或被替换，数据库与对象备份是否对应 |
 
 ## 11. 配置与实现入口

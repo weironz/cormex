@@ -213,14 +213,20 @@ _publish tag checksum:
     python3 scripts/release.py publish "$1" "$2"
 
 # ── Deploy: release ≠ deploy ─────────────────────────────
-# Deploys the published images from deploy/ with its docker-compose.yml (plus
+# Deploys the published images with the host's deploy/docker-compose.yml (plus
 # compose.override.yaml when present). Never builds, tags or uploads anything.
+# The host list lives in deploy/ansible/inventory.ini (gitignored); the playbook is
+# POSIX, so on Windows the wrapper runs it in the pinned control-node container.
 
-# Pull the pinned version, start the stack, then verify what actually answered.
-deploy tag dir="deploy":
-    python3 scripts/deploy.py up "$1" "${2:-deploy}"
+# Deploy a published version to the hosts in the inventory.
+deploy tag inventory="deploy/ansible/inventory.ini":
+    scripts/ansible-deploy.sh "$1" "${2:-deploy/ansible/inventory.ini}"
 
-# Check a running stack: role, version, web root, and that /api reaches the server.
+# Lint the playbook; needs no host and no credentials.
+deploy-check:
+    scripts/ansible-deploy.sh --syntax-check
+
+# Check a stack on this machine by directory: role, version, web root, /api split.
 deploy-verify dir="deploy":
     python3 scripts/deploy.py verify "${1:-deploy}"
 

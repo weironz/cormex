@@ -1,0 +1,152 @@
+---
+# Deploy one published Cormex version, then make the running service say what it is.
+#
+# Release and deploy are separate: nothing here builds, tags or uploads. It pulls the
+# images the Release already published, restarts the stack from the deployment
+# directory on the host, and fails unless /api/health answers with the version that
+# was asked for.
+#
+# Usage (through just):
+#     just deploy vX.Y.Z
+#     just deploy-check          # --syntax-check, no host needed
+#
+# Variables (inventory group `cormex`, or -e):
+#     cormex_version  required, vX.Y.Z
+#     cormex_dir      deployment directory holding docker-compose.yml and .env
+#     cormex_api_base loopback base URL the stack answers on *that host*
+#     cormex_project  compose project, only when it differs from `name:` in the file
+#
+# The assertions here mirror `scripts/deploy.py verify`, which is what the local
+# rehearsal uses. Keep the two in step: they answer the same question, and a deploy
+# that passes one while failing the other is a gate nobody can trust.
+- name: Deploy Cormex
+  hosts: cormex
+  gather_facts: false
+  vars:
+    # Only what the run itself derives. Defaults for the rest are applied with
+    # `| default(...)` at the use site: a play-level `vars` entry outranks the
+    # inventory, so a default written here would silently ignore the host's settings.
+    expected_version: "{{ cormex_version[1:] }}"
+  tasks:
+    - name: A pinned version is required
+      ansible.builtin.assert:
+        that:
+          - cormex_version is defined
+          - cormex_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: "pass -e cormex_version=vX.Y.Z"
+        quiet: true
+
+    - name: Look for the deployment files
+      ansible.builtin.stat:
+        path: "{{ cormex_dir }}/{{ item }}"
+      loop: [docker-compose.yml, .env, compose.override.yaml]
+      register: deployment_files
+
+    - name: The deployment directory must hold the stack
+      ansible.builtin.assert:
+        that:
+          - deployment_files.results[0].stat.exists
+          - deployment_files.results[1].stat.exists
+        fail_msg: "{{ cormex_dir }} must contain docker-compose.yml and .env (from deploy/.env.example)"
+        quiet: true
+
+    - name: Read the version the stack is pinned to
+      ansible.builtin.slurp:
+        src: "{{ cormex_dir }}/.env"
+      register: env_file
+
+    - name: The host must already pin this version
+      ansible.builtin.set_fact:
+        pinned_version: >-
+          {{ (env_file.content | b64decode | regex_findall('(?m)^CORMEX_VERSION=(.+)$'))
+             | first | default('') | trim }}
+
+    - name: Refuse to deploy over a different pin
+      ansible.builtin.assert:
+        that:
+          - pinned_version == cormex_version
+        fail_msg: >-
+          {{ cormex_dir }}/.env pins {{ pinned_version | default('nothing') }}, not {{ cormex_version }}.
+          Change the pin deliberately; the playbook will not leave the file and the running
+          stack disagreeing about which version is deployed.
+        quiet: true
+
+    - name: Build the compose command
+      ansible.builtin.set_fact:
+        compose_args: >-
+          {{ ['docker', 'compose']
+             + (['-p', cormex_project] if (cormex_project | default('') | length) > 0 else [])
+             + ['-f', 'docker-compose.yml']
+             + (['-f', 'compose.override.yaml'] if deployment_files.results[2].stat.exists else []) }}
+
+    - name: Pull the published images
+      ansible.builtin.command:
+        argv: "{{ compose_args + ['pull', 'cormex', 'web'] }}"
+        chdir: "{{ cormex_dir }}"
+      changed_when: false
+
+    - name: Start the stack
+      ansible.builtin.command:
+        argv: "{{ compose_args + ['up', '-d'] }}"
+        chdir: "{{ cormex_dir }}"
+      register: compose_up
+      changed_when: >-
+        ('Created' in compose_up.stdout) or ('Recreated' in compose_up.stdout)
+        or ('Started' in compose_up.stdout)
+
+    - name: Ask the running service what it is
+      ansible.builtin.uri:
+        url: "{{ cormex_api_base | default('http://127.0.0.1:8080') }}/api/health"
+        status_code: 200
+        return_content: true
+      register: health
+      until: health.status == 200
+      retries: 60
+      delay: 2
+      changed_when: false
+
+    - name: /api must reach the server, not the web image
+      ansible.builtin.assert:
+        that:
+          - health.content_type is defined
+          - "'json' in health.content_type"
+        fail_msg: >-
+          /api/health answered {{ health.content_type | default('no content type') }}.
+          A 200 carrying HTML means the edge proxy is sending /api to the web image;
+          the client then fails to parse a page.
+        quiet: true
+
+    - name: The running version must be the deployed one
+      ansible.builtin.assert:
+        that:
+          - health.json.role == 'cormexd'
+          - health.json.version == expected_version
+        fail_msg: >-
+          running {{ health.json.role }} {{ health.json.version }},
+          expected cormexd {{ expected_version }} (pin {{ cormex_version }})
+        quiet: true
+
+    - name: The web root must be a page
+      ansible.builtin.uri:
+        url: "{{ cormex_api_base | default('http://127.0.0.1:8080') }}/"
+        status_code: 200
+        return_content: true
+      register: web
+      changed_when: false
+
+    - name: The web root must return HTML
+      ansible.builtin.assert:
+        that:
+          - "'<title>' in (web.content | lower)"
+        fail_msg: "the web root did not return an HTML document"
+        quiet: true
+
+    - name: Report what is running
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: cormexd {{ health.json.version }} on {{ cormex_api_base | default('http://127.0.0.1:8080') }}"
+          - "database {{ health.json.database }} · blobs {{ health.json.blob_backend }} · auth {{ health.json.auth }}"
+          - "capture {{ health.json.capture_encryption | default('unknown') }} · embedding {{ health.json.embedding.model | default('none') }}"
+          - >-
+            {{ 'WARNING: capture is plaintext -- CORMEX_SECRET_KEY is not reaching cormexd'
+               if health.json.capture_encryption == 'plaintext' else 'capture encryption configured' }}

@@ -17,6 +17,9 @@ dist/
 
 # 本地部署演练目录（生成的凭据与卷映射）—— 绝不入库
 .deploy-rehearsal/
+
+# 部署清单里有节点地址与账号 —— 只留在维护机上
+deploy/ansible/inventory.ini
 .next/
 *.tsbuildinfo
 
