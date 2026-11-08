@@ -59,7 +59,7 @@ class AnsibleWrapperTests(unittest.TestCase):
     def run_wrapper(self, *args, env=None):
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("DEPLOY_") and key != "ANSIBLE_SSH_COMMON_ARGS"}
-        environment["PATH"] = ":".join([str(self.bin), str(self.shell_tools("bash", "dirname"))])
+        environment["PATH"] = ":".join([str(self.bin), str(self.shell_tools("bash", "dirname", "mktemp", "rm"))])
         environment.update(env or {})
         return subprocess.run([str(WRAPPER), *args], cwd=ROOT, env=environment,
                               text=True, capture_output=True, check=False)
@@ -101,6 +101,30 @@ class AnsibleWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--syntax-check", self.calls()[0])
         self.assertNotIn("cormex_version", self.calls()[0])
+
+    def test_syntax_check_ignores_inherited_upgrade_inputs(self):
+        self.fake("ansible-playbook")
+        result = self.run_wrapper("--syntax-check", env={"DEPLOY_FROM_VERSION": "bad", "DEPLOY_BUNDLE_SHA256": "bad"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--syntax-check", self.calls()[0])
+
+    def test_upgrade_requires_both_approval_inputs_before_ansible(self):
+        self.fake("ansible-playbook")
+        for extra in ({"DEPLOY_FROM_VERSION": "v0.1.18"}, {"DEPLOY_BUNDLE_SHA256": "a" * 64}):
+            result = self.run_wrapper("v0.1.19", str(self.inventory), env={**REQUIRED, **extra})
+            self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [], "incomplete approval must never reach the host")
+
+    def test_upgrade_uses_private_extra_vars_and_cleans_up_after_ansible(self):
+        self.fake("python3", 'for argument do output="$argument"; done\nprintf \'{"cormex_expectations":{}}\\n\' > "$output"\n')
+        self.fake("ansible-playbook")
+        result = self.run_wrapper("v0.1.19", str(self.inventory), env={
+            **REQUIRED, "DEPLOY_FROM_VERSION": "v0.1.18", "DEPLOY_BUNDLE_SHA256": "a" * 64})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call = self.calls()[0]
+        self.assertIn("cormex_from_version=v0.1.18", call)
+        extra_vars = next(part[1:] for part in call.split() if part.startswith("@.deploy-expectations."))
+        self.assertFalse((ROOT / extra_vars).exists(), "approval parameter file must be cleaned up after use")
 
     def test_container_path_mounts_the_key_read_only(self):
         self.fake("docker")

@@ -146,11 +146,29 @@ app-check:
 # with cargo-xwin) and apple-darwin on macOS. CORMEX_CLI_TARGETS is the opt-in for the
 # aarch64 and second Apple targets; the Apple ones need a macOS host with the SDK.
 
+# Inspect tools, the selected Docker runtime and the local development database.
+doctor:
+    python3 scripts/release.py doctor
+
+doctor-deploy:
+    python3 scripts/release.py doctor --deployment
+
+# Prepare version files only; review and commit/tag them explicitly afterwards.
+prepare-version tag:
+    python3 scripts/release.py prepare-version "$1"
+
 # Build locally, then upload an immutable draft candidate (no registry credentials).
 build-local tag:
     #!/usr/bin/env bash
     set -euo pipefail
-    just _build "$1"
+    python3 scripts/release.py build-local "$1"
+    just _stage "$1"
+
+# Revalidate reusable build artifacts; the full CI gate still runs every time.
+build-resume tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 scripts/release.py build-local "$1" --resume
     just _stage "$1"
 
 # Windows CLI (x86_64 MSVC), cross-compiled here and not smoke-tested.
@@ -187,11 +205,7 @@ _preflight tag:
 _build tag:
     #!/usr/bin/env bash
     set -euo pipefail
-    just _preflight "$1"
-    just ci-full
-    python3 scripts/release.py build-cli-local "$1"
-    just _build-images "$1"
-    python3 scripts/release.py bundle "$1"
+    python3 scripts/release.py build-local "$1"
 
 _build-cli tag target:
     python3 scripts/release.py build-cli "$1" "$2"
@@ -222,6 +236,10 @@ _publish tag checksum:
 # Deploy a published version to the hosts in the inventory.
 deploy tag inventory="deploy/ansible/inventory.yml":
     scripts/ansible-deploy.sh "$1" "${2:-deploy/ansible/inventory.yml}"
+
+# Back up the old deployment and upgrade only to the explicitly approved bundle.
+deploy-upgrade previous tag checksum inventory="deploy/ansible/inventory.yml":
+    DEPLOY_FROM_VERSION="$1" DEPLOY_BUNDLE_SHA256="$3" scripts/ansible-deploy.sh "$2" "${4:-deploy/ansible/inventory.yml}"
 
 # Lint the playbook; needs no host and no credentials.
 deploy-check:

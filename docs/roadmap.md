@@ -2,7 +2,7 @@
 
 ## 现在在哪
 
-**v0.1.12。生产在跑，仓库已公开，两个镜像在发。**
+**v0.1.19 源码基线。仓库已公开，两个镜像在发；生产运行版本独立验收。**
 
 对外只有 HTTP 契约，没有代码依赖 —— 任何 agent 走的都是同一组公开接口。
 
@@ -44,7 +44,7 @@
 
 ```console
 $ cd deploy && docker compose up -d
-external volume "cormex_cormex-prod-postgres" not found
+external volume "REPLACE_WITH_EXISTING_VOLUME" not found
 ```
 
 现在 `deploy/` 里是三份职责分明的东西：
@@ -147,8 +147,7 @@ type "ulid" does not exist
 - **evals 不在 CI 里。** 它是 workspace member，所以 `cargo test` 会编它，
   但 `cargo run -p cormex-evals -- validate` 这条几秒就跑完的题集校验没有接上。
   它的价值恰恰是「给每一次『优化』一个可对照的数字」—— 不跑就等于没有
-- **备份只写了没验过恢复。** `data/backup` 有东西，但没有一次「从备份起一个空库
-  并对上记录数」的演练
+- **目标环境的恢复能力仍需实测。** 仓库已有数据库恢复与对象卷演练入口（见 [运维手册](operations.md)），自动升级也会先 dump；这些入口存在或备份目录可读，都不等于已在目标环境恢复过数据库、对象和密钥。
 
 ## D. 产品与 API
 
@@ -163,11 +162,10 @@ type "ulid" does not exist
 
 ## E. 运维
 
-- **没有 CI 部署。** 现在是手工 ssh + `docker compose up -d`。节点侧的部署策略
-  脚本目前没有 —— 要不要做取决于发布频率。**在有之前，别把手工步骤写进文档
-  当成流程**，写清楚它就是手工的
-- **升级路径没有验证过。** 从 v0.1.9 升到 v0.1.11 走的是「pull + up」，
-  中间没有 schema 变更所以顺利。第一次带 migration 的升级需要一份先 dump 的退路
+- **发布与部署入口已分开。** 本地 / Actions 构建同一候选协议，显式摘要批准后发布；发布不自动部署。操作顺序统一见 [发布手册](release.md)，不再依赖私有机器笔记。
+- **本地构建支持诊断、版本准备和恢复。** `doctor` 不需要 tag；`prepare-version` 只改版本文件；`build-resume` 校验已有产物且每次重跑 `ci-full`。构建、发布阶段和耗时留在候选之外的回执，Docker 编译缓存可跨版本复用。
+- **升级有明确入口与失败边界。** `deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256` 校验已公开候选，目标侧数据库备份后更新 pin / digest overlay，仅启动服务端与 Web，再做共享严格验收。尝试启动后不自动回滚 schema；`deploy TAG` 只重应用已 pin 版本，`deploy-check` 只查语法。详见 [部署指南](deployment-guide.md#9-用-justfile--ansible-部署验收与演练)。
+- **仍需目标环境实测。** 跨 Docker store 的内容身份、带 migration 的升级、HTTPS / CDN 返回的 Web 脚本、真实客户端和备份恢复需在相应环境验收。自动 dump 的 `pg_restore --list` 不等于恢复演练，表行数估计也不能证明数据无损；不得把脚本单测通过写成生产升级已验证。
 
 ---
 

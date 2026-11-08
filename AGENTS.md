@@ -193,25 +193,29 @@ just test-db-ready   # 只跑 include-ignored；已有数据库的 CI 使用
 ## 构建和生产发布：各自两条路径
 
 ```text
-build-local  ─ Check → Test → Build → Package ─┐
-                                              ├─ draft candidate + BUNDLE_SHA256
-build-github ─ Check → Test → Build → Package ─┘
+build-local  ─ ci-full → Build → Package → stage ─────┐
+                                                     ├─ draft candidate + BUNDLE_SHA256
+build-github ─ Check → Test → Build → Package → stage ─┘
                                                         │
                               ┌─────────────────────────┴───────────────────┐
                          release-local                                 release-github
                               └─ 下载并校验同一候选 → 推已有镜像 → 发布 Release ─┘
 ```
 
-四个独立入口，**构建地点不决定发布地点**：
+**构建地点不决定发布地点**。本地操作先检查环境、准备版本，再构建并上传候选：
 
 ```bash
-just build-local vX.Y.Z
-just build-github vX.Y.Z
-just release-local vX.Y.Z <BUNDLE_SHA256>
-just release-github vX.Y.Z <BUNDLE_SHA256>
+just doctor
+just prepare-version vX.Y.Z       # 更新版本、lock 与 changelog；不 commit/tag/push
+# 审阅、提交并推送 tag 后：
+just build-local vX.Y.Z           # 每次都执行 ci-full，打包后上传 draft
+just build-resume vX.Y.Z          # 中断恢复；仍重跑 ci-full，校验产物后上传 draft
+just build-github vX.Y.Z          # 或由 Actions 构建并上传
+just release-local vX.Y.Z BUNDLE_SHA256
+just release-github vX.Y.Z BUNDLE_SHA256
 ```
 
-构建只上传 draft，不登录 registry、不推镜像、不公开 Release。候选统一存放在
+构建不登录 registry、不推镜像、不公开 Release。Python `build-local` 只生成候选，Justfile 随后调用独立 stage 上传 draft；诊断时可单独运行两个阶段。候选统一存放在
 `dist/<tag>/`，包含 CLI 归档、两个 linux/amd64 Docker 镜像归档、`manifest.json`
 和 `SHA256SUMS`。`BUNDLE_SHA256` 是 **SHA256SUMS 文件本身的 SHA-256**；发布必须
 显式传入这个值，不能在发布时重新读取远端摘要作为审批依据。
@@ -230,32 +234,30 @@ Actions 构建等六个 CLI target 和两个镜像全部成功后只聚合一次
 旁路已移除。npm 默认关闭；只有 PUBLISH_NPM=true、NPM_TOKEN 和完整六平台候选齐备
 才会在校验通过后的发布流程中运行，使用候选提交中的包装脚本，不重新编译 CLI。
 
+跨 Docker store 的镜像身份由 `scripts/image_identity.py` 统一计算：平台、规范化运行配置与有序 rootfs `diff_ids` 的内容指纹。不要假定 image ID、config digest、registry digest 相等。manifest 保持 schema 1，新指纹字段可选；旧候选从批准归档计算，不改资产。构建与发布回执存于 `dist/.<tag>.{build,publish}-receipt.json`，在候选目录之外。
+
 完整操作、凭据边界、跨平台限制和失败恢复见 [docs/release.md](docs/release.md)。
 
-**没有自动部署。** 发布只是提供版本资产。生产升级走 `just deploy`（Ansible，清单在
-`deploy/ansible/`，节点地址与私钥只从环境变量 / secrets 进来），或手动触发的
-`deploy.yml`（`environment: production` 审批）。两者都只拉已发布镜像，不构建、不打 tag。
+**发布不触发部署。** 生产升级使用 `just doctor-deploy` 后执行 `just deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256 [inventory]`。控制端校验已公开候选与显式批准摘要，目标侧先备份，再原子更新 pin 与 digest overlay，只启动 cormex/web，执行共享严格验收并保存私有阶段回执。只有尝试启动前的失败会恢复旧配置；启动可能执行 migration，不自动回滚 schema。
+
+`just deploy TAG` 只重应用目标已经 pin 的版本；`just deploy-check` 只查语法。手动 `deploy.yml` 使用 `production` environment。节点、用户、目录、API 必须从环境变量 / secrets 显式给出，无本地值回落。完整升级、验收与备份边界见 [docs/deployment-guide.md](docs/deployment-guide.md#9-用-justfile--ansible-部署验收与演练)。
 
 ## 部署的形状
 
-两个 compose 栈：这一份（记忆 + 它的库 + 对象存储 + Web）与 agent 编排那一份。
-agent 循环不在这个仓库里（见上文「agent 怎么接进来」），所以它有自己的栈；
-放一份文件里就等于「发 agent」与「发记忆服务」共用一次 `up`。
+记忆服务、数据库、对象存储与 Web 属于本仓库的部署边界。agent 循环由调用方独立部署（见上文「agent 怎么接进来」），两者的升级生命周期应独立。具体节点与拓扑不写进公开文档。
 
 三件在生产上会咬人的事：
 
-- **卷是 `external` 且写死了名字**（`cormex_cormex-prod-postgres` 这种历史名，
-  compose 项目前缀留下的）。去掉 external 或改项目名，compose 会**新建空卷**，
+- **生产参考模板的卷是 `external` 且固定名字**（实际历史卷名以目标机器为准）。去掉 external 或改项目名，compose 会**新建空卷**，
   而症状不是报错，是「数据库突然空了」。
 - **同一个域名下 `/api` 走服务端、其余走 Web**，靠边缘的 PathPrefix + StripPrefix。
   优先级显式写死，不靠 traefik「规则越长越优先」的默认 —— 那个默认变了的症状是
   API 请求拿回一份 200 的 index.html，客户端报「JSON 解析失败」。
-- **`CORMEX_VERSION` 与 Cormex 的 `CORMEX_VERSION` 是两个变量**，独立升级。
+- **不同产品的版本 pin 各自独立**。升级本服务不能顺带改动其他产品的配置。
 
-具体的节点地址、域名、账号**不写在被跟踪的文件里**（这是公开仓库）。
-维护这个部署的机器上有一份 `deploy/PRODUCTION.local.md`（`.gitignore` 的
-`*.local.md` 拦着），里面是节点、两个栈、卷的历史名字、手工部署步骤与验证命令。
-**没有那个文件就说明你不是在维护这个部署** —— 那么这一节对你只是形状参考。
+具体的节点地址、域名、账号**不写在被跟踪的文件里**（这是公开仓库）。操作契约以入库的发布与部署指南为准，部署值来自环境变量 / secrets，目标当前状态来自 Compose 配置与运行时验收。可选的 `deploy/PRODUCTION.local.md` 仅作私有备注，不是维护部署的前置条件，也不作为配置回落或另一份操作手册。
+
+升级自动备份只覆盖数据库与配置，`pg_restore --list` 仅证明备份目录可读，不是恢复演练或对象存储快照。回执中的 `pg_stat_user_tables.n_live_tup` 是同方法采集的前后估计，不能证明数据无损。主密钥、对象副本与隔离恢复演练仍需单独管理。
 
 ## 依赖上的两个已知雷
 

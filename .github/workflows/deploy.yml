@@ -9,6 +9,14 @@ on:
         description: 'Published version to deploy, for example v0.1.18'
         type: string
         required: true
+      from_tag:
+        description: 'Current deployed version; provide together with checksum for an upgrade'
+        type: string
+        required: false
+      checksum:
+        description: 'Approved BUNDLE_SHA256; required together with from_tag'
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -67,8 +75,20 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           # These two are not credentials, but a repository *variable* is readable by
           # anyone who can read a public repository, and the directory and the public
-          # URL name the deployment. Secrets are the smaller surface; blank values fall
-          # back to the defaults in deploy/ansible/inventory.yml.
+          # URL identify the deployment. Both values are required; the inventory
+          # never guesses a production target.
           DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
           DEPLOY_API: ${{ secrets.DEPLOY_API }}
-        run: just deploy "${{ inputs.tag }}"
+          GH_TOKEN: ${{ github.token }}
+          CORMEX_REPOSITORY: ${{ github.repository }}
+          TARGET_TAG: ${{ inputs.tag }}
+          FROM_TAG: ${{ inputs.from_tag }}
+          BUNDLE_SHA256: ${{ inputs.checksum }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$FROM_TAG" || -n "$BUNDLE_SHA256" ]]; then
+            [[ -n "$FROM_TAG" && -n "$BUNDLE_SHA256" ]] || { echo "::error::from_tag and checksum must be provided together"; exit 1; }
+            just deploy-upgrade "$FROM_TAG" "$TARGET_TAG" "$BUNDLE_SHA256"
+          else
+            just deploy "$TARGET_TAG"
+          fi

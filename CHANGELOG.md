@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Operations: validated local builds and explicit deployment upgrades
+
+- Add `just doctor`, `just doctor-deploy` and `just prepare-version` to check the selected runtime and prepare consistent release metadata before building. `just build-resume` revalidates reusable artifacts and always reruns the complete CI gate; build and publish operations write stage receipts outside the immutable candidate.
+- Preserve Cargo download and compilation caches across release version changes. Verify approved image content across Docker image stores instead of comparing machine-specific image IDs, and record published registry digests.
+- Add `just deploy-upgrade FROM TAG BUNDLE_SHA256`: back up the database and configuration, verify approved image content, pin registry digests and run shared server/Web checks. Receipts distinguish estimated row counts, readable backups and restore rehearsals; configuration is restored automatically only before a start attempt.
+
 ## 0.1.19 — 2026-11-08
 
 ### App: memory extraction moved to Settings
