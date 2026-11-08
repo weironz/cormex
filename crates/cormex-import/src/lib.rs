@@ -288,54 +288,162 @@ pub fn parse(bytes: &[u8], platform: Option<Platform>) -> Result<(Platform, Vec<
 }
 
 /// The export JSON inside what the user handed over: the file itself, or the
-/// right member of the zip the vendor sent.
+/// right member(s) of the zip the vendor sent.
 ///
-/// The member is chosen by name, most specific first: `conversations.json`
-/// (ChatGPT, Claude), `prod-grok-backend.json` (Grok), and a `MyActivity.json`
-/// under a Gemini directory (Takeout). Any other zip is refused with the names
-/// it holds, so the user can see what they picked.
+/// Members are chosen by name, most specific first:
+///
+/// | vendor | what the zip holds |
+/// |---|---|
+/// | ChatGPT (before 2026-11), Claude | one `conversations.json` |
+/// | ChatGPT (2026-11 on) | `conversations-000.json` … `conversations-NNN.json`, 100 conversations each |
+/// | Claude (2026-11 on), wrapped | `conversations-000.zip`, itself holding `conversations.json` |
+/// | Grok | `prod-grok-backend.json` |
+/// | Gemini (Takeout) | a `MyActivity.json` under a Gemini directory |
+///
+/// Split parts are one export cut into pages, so they are joined into the one
+/// array the parsers expect. That join is textual (strip each part's brackets,
+/// join with commas) rather than parse-and-reserialize: the parts are over a
+/// hundred megabytes together, and they are parsed once anyway, right after.
+///
+/// Any other zip is refused with the names it holds, so the user can see what
+/// they picked.
 ///
 /// # Errors
-/// A zip that cannot be read or holds none of those files.
+/// A zip that cannot be read, holds none of those files, or holds a part that
+/// is not a JSON array.
 pub fn export_json(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
-    use std::io::Read as _;
     if !bytes.starts_with(b"PK\x03\x04") {
         return Ok(std::borrow::Cow::Borrowed(bytes));
     }
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("this zip cannot be read")?;
     let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
-    let wanted = |n: &str| -> u8 {
-        let lower = n.to_ascii_lowercase();
-        let base = lower.rsplit('/').next().unwrap_or(&lower);
-        match base {
-            "conversations.json" => 1,
-            "prod-grok-backend.json" => 2,
-            "myactivity.json" if lower.contains("gemini") || lower.contains("bard") => 3,
-            _ => 0,
+    let base = |n: &str| n.rsplit('/').next().unwrap_or(n).to_ascii_lowercase();
+    let shortest = |picked: Vec<&String>| picked.into_iter().min_by_key(|n| (n.len(), *n)).cloned();
+
+    let single = shortest(
+        names
+            .iter()
+            .filter(|n| base(n) == "conversations.json")
+            .collect(),
+    )
+    .or_else(|| {
+        shortest(
+            names
+                .iter()
+                .filter(|n| base(n) == "prod-grok-backend.json")
+                .collect(),
+        )
+    })
+    .or_else(|| {
+        shortest(
+            names
+                .iter()
+                .filter(|n| {
+                    let lower = n.to_ascii_lowercase();
+                    base(n) == "myactivity.json"
+                        && (lower.contains("gemini") || lower.contains("bard"))
+                })
+                .collect(),
+        )
+    });
+    if let Some(name) = single {
+        return Ok(std::borrow::Cow::Owned(read_member(&mut archive, &name)?));
+    }
+
+    // Pages of one export, in page order, from one directory only: two exports
+    // zipped together must not be merged into one
+    let parts = |suffix: &str| -> Vec<String> {
+        let mut found: Vec<&String> = names.iter().filter(|n| is_part(&base(n), suffix)).collect();
+        let Some(dir) = found
+            .iter()
+            .min_by_key(|n| n.len())
+            .map(|n| n.rsplit_once('/').map_or("", |(d, _)| d).to_owned())
+        else {
+            return Vec::new();
+        };
+        found.retain(|n| n.rsplit_once('/').map_or("", |(d, _)| d) == dir);
+        found.sort();
+        found.into_iter().cloned().collect()
+    };
+    let json_parts = parts(".json");
+    if !json_parts.is_empty() {
+        let pages = json_parts
+            .iter()
+            .map(|name| read_member(&mut archive, name))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(std::borrow::Cow::Owned(join_arrays(&json_parts, &pages)?));
+    }
+    let zip_parts = parts(".zip");
+    if !zip_parts.is_empty() {
+        let mut pages = Vec::with_capacity(zip_parts.len());
+        for name in &zip_parts {
+            let inner = read_member(&mut archive, name)?;
+            pages.push(
+                export_json(&inner)
+                    .with_context(|| format!("in {name}"))?
+                    .into_owned(),
+            );
         }
-    };
-    let Some(name) = names
-        .iter()
-        .filter(|n| wanted(n) > 0)
-        .min_by_key(|n| (wanted(n), n.len()))
-        .cloned()
-    else {
-        let shown: Vec<&str> = names.iter().map(String::as_str).take(20).collect();
-        bail!(
-            "this zip holds no conversations.json, prod-grok-backend.json or Gemini \
-             MyActivity.json; it holds: {}",
-            shown.join(", ")
-        );
-    };
+        return Ok(std::borrow::Cow::Owned(join_arrays(&zip_parts, &pages)?));
+    }
+
+    let shown: Vec<&str> = names.iter().map(String::as_str).take(20).collect();
+    bail!(
+        "this zip holds no conversations.json (or conversations-NNN.json pages), \
+         prod-grok-backend.json or Gemini MyActivity.json; it holds: {}",
+        shown.join(", ")
+    );
+}
+
+/// `conversations-<digits><suffix>`: one page of a split export.
+fn is_part(base: &str, suffix: &str) -> bool {
+    base.strip_prefix("conversations-")
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn read_member(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
     let mut member = archive
-        .by_name(&name)
+        .by_name(name)
         .with_context(|| format!("could not open {name} in the zip"))?;
     let mut out = Vec::with_capacity(usize::try_from(member.size()).unwrap_or(0));
     member
         .read_to_end(&mut out)
         .with_context(|| format!("could not read {name} from the zip"))?;
-    Ok(std::borrow::Cow::Owned(out))
+    Ok(out)
+}
+
+/// Join JSON arrays into one, without parsing them.
+fn join_arrays(names: &[String], pages: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(pages.iter().map(Vec::len).sum::<usize>() + 2);
+    out.push(b'[');
+    let mut first = true;
+    for (name, page) in names.iter().zip(pages) {
+        let page = page.strip_prefix("\u{feff}".as_bytes()).unwrap_or(page);
+        let trimmed = page.trim_ascii();
+        let inner = trimmed
+            .strip_prefix(b"[")
+            .and_then(|t| t.strip_suffix(b"]"))
+            .with_context(|| {
+                format!("{name} is not a JSON array, so it cannot be one page of an export")
+            })?
+            .trim_ascii();
+        if inner.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push(b',');
+        }
+        out.extend_from_slice(inner);
+        first = false;
+    }
+    out.push(b']');
+    Ok(out)
 }
 
 /// The conversation records of an export file.
@@ -471,6 +579,62 @@ mod tests {
             b"[3]",
             "a JSON file is passed through"
         );
+    }
+
+    /// ChatGPT since 2026-11: the export is cut into pages of 100.
+    #[test]
+    fn split_pages_are_joined_in_page_order() {
+        let zipped = zip_of(&[
+            ("conversations-001.json", b"[{\"n\":3}]\n"),
+            ("export_manifest.json", b"{}"),
+            ("conversations-000.json", b" [{\"n\":1},{\"n\":2}] "),
+            ("conversations-002.json", b"[]"),
+            ("file-abc.dat", b"binary"),
+        ]);
+        let json = export_json(&zipped).expect("found");
+        let joined: serde_json::Value = serde_json::from_slice(&json).expect("one valid array");
+        assert_eq!(
+            joined,
+            serde_json::json!([{"n":1},{"n":2},{"n":3}]),
+            "pages joined in page order; an empty page adds nothing"
+        );
+    }
+
+    #[test]
+    fn a_page_that_is_not_an_array_is_refused_by_name() {
+        let zipped = zip_of(&[
+            ("conversations-000.json", b"[1]"),
+            ("conversations-001.json", b"{\"oops\":1}"),
+        ]);
+        let err = export_json(&zipped).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("conversations-001.json"),
+            "{err:#}"
+        );
+    }
+
+    /// Claude since 2026-11 mails several zips; wrapped in one, the
+    /// conversations are one level down.
+    #[test]
+    fn a_wrapped_conversations_zip_is_opened() {
+        let inner = zip_of(&[("conversations.json", b"[{\"uuid\":\"a\"}]")]);
+        let outer = zip_of(&[
+            ("memories-000.zip", b"PK"),
+            ("conversations-000.zip", &inner),
+        ]);
+        assert_eq!(
+            export_json(&outer).expect("found").as_ref(),
+            br#"[{"uuid":"a"}]"#
+        );
+    }
+
+    #[test]
+    fn a_single_conversations_json_wins_over_anything_else() {
+        let zipped = zip_of(&[
+            ("conversations-000.json", b"[9]"),
+            ("conversations.json", b"[1]"),
+        ]);
+        assert_eq!(export_json(&zipped).expect("found").as_ref(), b"[1]");
     }
 
     #[test]

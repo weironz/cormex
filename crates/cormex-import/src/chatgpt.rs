@@ -208,9 +208,13 @@ fn message_of(node: &serde_json::Map<String, Value>) -> Option<Message> {
 /// Dig plain text out of `content`.
 ///
 /// Three shapes have been observed: `{parts: [...]}` (most common),
-/// `{text: "..."}`, and a bare string. Besides strings, `parts` may also hold
-/// objects (placeholders for images and attachments); those are skipped — v1
-/// does not handle attachments.
+/// `{text: "..."}`, and a bare string. Besides strings, `parts` may hold
+/// objects. Placeholders for images, audio files and attachments are skipped
+/// (attachments are not imported), but an `audio_transcription` object **is**
+/// the message: in voice mode, `multimodal_text` content carries what was said
+/// only there, as `{content_type: "audio_transcription", text, direction}`.
+/// Skipping it dropped every voice turn: counted on a real export (2026-11),
+/// 1704 transcriptions, and 21 conversations left with no message at all.
 fn text_of(content: &Value) -> Option<String> {
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -218,7 +222,15 @@ fn text_of(content: &Value) -> Option<String> {
     if let Some(parts) = content.get("parts").and_then(Value::as_array) {
         let joined = parts
             .iter()
-            .filter_map(Value::as_str)
+            .filter_map(|part| {
+                part.as_str().or_else(|| {
+                    (part.get("content_type").and_then(Value::as_str)
+                        == Some("audio_transcription"))
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+                })
+            })
+            .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         return Some(joined);
@@ -230,6 +242,56 @@ fn text_of(content: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Voice mode: what was said is only in the `audio_transcription` parts.
+    #[test]
+    fn a_voice_conversation_keeps_its_transcriptions() {
+        let raw = json!([{
+            "conversation_id": "v1",
+            "title": "语音",
+            "create_time": 1_762_000_000.0,
+            "current_node": "a",
+            "mapping": {
+                "u": {"id": "u", "parent": null, "children": ["a"], "message": {
+                    "id": "mu", "author": {"role": "user"}, "create_time": 1_762_000_001.0,
+                    "content": {"content_type": "multimodal_text", "parts": [
+                        {"content_type": "real_time_user_audio_video_asset_pointer", "asset_pointer": "x"},
+                        {"content_type": "audio_transcription", "text": "明天几点开会", "direction": "in", "decoding_id": null}
+                    ]}
+                }},
+                "a": {"id": "a", "parent": "u", "children": [], "message": {
+                    "id": "ma", "author": {"role": "assistant"}, "create_time": 1_762_000_002.0,
+                    "content": {"content_type": "multimodal_text", "parts": [
+                        {"content_type": "audio_transcription", "text": "十点。", "direction": "out", "decoding_id": null},
+                        {"content_type": "audio_asset_pointer", "asset_pointer": "y"}
+                    ]}
+                }}
+            }
+        }]);
+        let items = raw.as_array().expect("array");
+        let conversations =
+            parse(items).expect("a voice conversation is not an unrecognised format");
+        let texts: Vec<&str> = conversations[0]
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["明天几点开会", "十点。"],
+            "the transcriptions are the messages"
+        );
+    }
+
+    /// An image placeholder next to the typed text adds nothing to the text.
+    #[test]
+    fn an_image_placeholder_is_skipped_beside_text() {
+        let content = json!({"content_type": "multimodal_text", "parts": [
+            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://x"},
+            "这张图是什么"
+        ]});
+        assert_eq!(text_of(&content).as_deref(), Some("这张图是什么"));
+    }
 
     /// A tree **with a branch**: the user regenerated once.
     ///

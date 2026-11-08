@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -5,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../api/api_exception.dart';
 import '../../models/archive_session.dart';
 import '../../state/connection_controller.dart';
+import 'export_slimmer.dart';
 
 /// 选中的一份导出文件。
 class PickedExport {
@@ -55,6 +58,9 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
   ArchiveImportSummary? _summary;
   String? _error;
 
+  /// 从整包 zip 里取出了什么，上传时显示，让人知道附件没有被传上去。
+  String? _slimNote;
+
   Future<void> _choose() async {
     setState(() => _error = null);
     final PickedExport? maybe;
@@ -70,13 +76,29 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
     // see a promotion of a variable assigned inside `try`
     final picked = maybe;
     if (picked == null || !mounted) return;
+    final raw = picked.bytes is Uint8List
+        ? picked.bytes as Uint8List
+        : Uint8List.fromList(picked.bytes);
+    // 厂商的整包 zip 连附件一起寄来；只上传聊天文件。认不出的 zip 原样上传，
+    // 由服务端去读，它的报错会列出包里有什么
+    final SlimmedExport? slim;
+    try {
+      slim = slimExportZip(raw);
+    } on NoConversationsInZip catch (e) {
+      setState(() => _error = '$e');
+      return;
+    }
     setState(() {
       _fileName = picked.name;
+      _slimNote = slim == null
+          ? null
+          : '从 ${slim.total} 个文件里取出 ${slim.kept.length} 个聊天文件'
+                '（${_mb(slim.bytes.length)}，原包 ${_mb(raw.length)}；附件不上传）';
       _step = _Step.uploading;
     });
     try {
       final api = ref.read(apiProvider);
-      final handle = await api.uploadExport(picked.bytes);
+      final handle = await api.uploadExport(slim?.bytes ?? raw);
       final summary = await api.archiveImport(handle, run: false);
       if (!mounted) return;
       setState(() {
@@ -135,7 +157,10 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
               ),
               const SizedBox(height: 14),
               const _Where(name: 'ChatGPT', how: '设置 › 数据控制 › 导出数据，邮件里的 zip'),
-              const _Where(name: 'Claude', how: '设置 › 隐私 › 导出数据，邮件里的 zip'),
+              const _Where(
+                name: 'Claude',
+                how: '设置 › 隐私 › 导出数据；邮件里分成多个 zip 时选 conversations-000.zip',
+              ),
               const _Where(name: 'Grok', how: 'accounts.x.ai/data 下载账户数据的 zip'),
               const _Where(
                 name: 'Gemini',
@@ -143,6 +168,7 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
               ),
               const SizedBox(height: 12),
               Text(
+                '直接选邮件里下载的整个 zip 即可：只会取出聊天记录上传，图片和附件留在本机。'
                 '重复导入只写入新增和有变化的对话，已有的原样保留。'
                 'Gemini 的导出不记录哪几问属于同一段对话，每一问会是一段单独的聊天。',
                 style: theme.textTheme.bodySmall,
@@ -150,6 +176,10 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
             ],
             if (busy) ...[
               Text(_step == _Step.uploading ? '正在上传并读取 $_fileName …' : '正在导入…'),
+              if (_step == _Step.uploading && _slimNote != null) ...[
+                const SizedBox(height: 6),
+                Text(_slimNote!, style: theme.textTheme.bodySmall),
+              ],
               const SizedBox(height: 12),
               const LinearProgressIndicator(),
             ],
@@ -218,6 +248,8 @@ class _ImportArchiveDialogState extends ConsumerState<ImportArchiveDialog> {
     );
   }
 }
+
+String _mb(int bytes) => '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
 
 class _Where extends StatelessWidget {
   const _Where({required this.name, required this.how});

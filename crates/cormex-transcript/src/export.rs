@@ -110,7 +110,8 @@ impl ExportParser {
 impl Parser for ExportParser {
     fn version(&self) -> &'static str {
         match self.platform {
-            ExportPlatform::ChatGpt => "chatgpt_export@2",
+            // @3: voice-mode transcriptions are messages (they were dropped)
+            ExportPlatform::ChatGpt => "chatgpt_export@3",
             ExportPlatform::Claude => "claude_export@2",
             ExportPlatform::Grok => "grok_export@1",
             ExportPlatform::Gemini => "gemini_takeout@1",

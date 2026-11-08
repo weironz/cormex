@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Import: pick the vendor's whole zip
+
+- The browser now takes the zip exactly as the vendor mailed it. Before uploading it copies out only the conversation files, as their compressed bytes with nothing decompressed, and leaves images and attachments on the machine. A real ChatGPT export of 275 MB, over the 256 MB upload ceiling, uploads as 21 MB. A zip with no conversations is refused with the names it holds, before anything is sent.
+- ChatGPT exports since 2026-11 cut `conversations.json` into `conversations-000.json` … `conversations-NNN.json` (100 conversations each). The import now joins the pages, both in the browser import and in `cormex import`. A Claude export wrapped in one zip (`conversations-000.zip` inside) is opened too.
+- ChatGPT voice-mode turns are imported. Their text lives only in `audio_transcription` parts, which were skipped: on a real export, 1704 transcriptions were dropped and 21 conversations came out empty. The parser is now `chatgpt_export@3`, so ChatGPT conversations imported earlier are projected again beside the old projection; nothing is deleted.
 ## 0.1.19 — 2026-11-08
 
 ### App: memory extraction moved to Settings
