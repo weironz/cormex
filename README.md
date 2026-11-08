@@ -246,7 +246,7 @@ args = ["mcp"]
 ```
 
 Either way the agent gets `memory_search`, `remember`, `session_search` and
-`session_get`, plus the `cortex://profile` resource. The session tools are the
+`session_get`, plus the `cormex://profile` resource. The session tools are the
 reason to connect: they let an agent answer "what did we decide last week, and
 why" from the actual conversation rather than from a summary of it.
 
