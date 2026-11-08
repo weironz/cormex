@@ -108,8 +108,8 @@ fi
 mounts=(-v "$repo:/repo")
 [[ -d $HOME/.ssh ]] && mounts+=(-v "$HOME/.ssh:/root/.ssh:ro")
 environment=()
-for key in DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_DIR \
-           DEPLOY_API DEPLOY_PROJECT DEPLOY_CONNECTION; do
+for key in DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_DIR DEPLOY_API \
+           DEPLOY_PROJECT DEPLOY_CONNECTION DEPLOY_PULL; do
   [[ -n ${!key:-} ]] && environment+=(-e "$key=${!key}")
 done
 if [[ -n ${DEPLOY_SSH_KEY:-} ]]; then

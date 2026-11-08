@@ -116,6 +116,7 @@ class AnsibleWrapperTests(unittest.TestCase):
             "DEPLOY_HOST": "node.example",
             "DEPLOY_SSH_KEY": str(self.key),
             "DEPLOY_KNOWN_HOSTS": str(known_hosts),
+            "DEPLOY_PULL": "false",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
@@ -127,6 +128,7 @@ class AnsibleWrapperTests(unittest.TestCase):
         self.assertIn(f"-v {known_hosts}:/root/.ssh/known_hosts_deploy:ro", run_call)
         self.assertIn("UserKnownHostsFile=/root/.ssh/known_hosts_deploy", run_call)
         self.assertIn("-e DEPLOY_HOST=node.example", run_call)
+        self.assertIn("-e DEPLOY_PULL=false", run_call, "every DEPLOY_* knob has to cross into the container")
         self.assertIn(PLAYBOOK, run_call)
         self.assertIn("cormex_version=v0.1.18", run_call)
 
