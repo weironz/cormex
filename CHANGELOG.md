@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.19 — 2026-11-08
+
 ### App: memory extraction moved to Settings
 
 - The memory extraction panel (status, the full-extraction switch, progress, errors and retry, the model in use) is now at the top of **Settings**, above "模型配置", instead of taking the top of the memory page. The memory page opens on the categories and the search box; when it is empty, its centre still says extraction is off and where to turn it on.
@@ -11,6 +13,11 @@
 
 - `state.db` remembers file ids by agent and path, not by which device key registered them. A machine that switched key and switched back kept ids the server refuses as another device's: in production, 38 Codex sessions got a 404 on their metadata on every sync, and an append to any of them would have been refused the same way.
 - Such a refusal (404 "no such file for this device", 403 "belongs to another device", recognised by the server's own reason so an older server's missing route does not count) now forgets that file's local state. The transcript pass registers it again in the same run; the metadata pass on the next. Registering again verifies the archived bytes by prefix hash and adopts them, so nothing is uploaded twice.
+
+### Deployment: local and Actions deployment share the same checks
+
+- `just deploy` runs the Ansible deployment over SSH using connection details from environment variables. It deploys published images and verifies the running version, API routing, Web page and S3 backend.
+- The production reference keeps the object store in its own stack and passes through the master encryption key and automatic-memory switches. Startup waits for the object store so an unavailable S3 service cannot silently leave uploads on the local filesystem.
 
 ## 0.1.18 — 2026-11-08
 
