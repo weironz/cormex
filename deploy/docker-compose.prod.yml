@@ -310,6 +310,12 @@ services:
       # （服务叫 cormex，镜像里的二进制仍叫 cormexd —— 这两个名字还没统一）
       # 服务端只放**摘要**；明文 token 给客户端，不要也留在这台机器上
       CORMEX_AUTH_TOKEN_SHA256: ${CORMEX_AUTH_TOKEN_SHA256:?必填，用 cormexd --generate-token 生成}
+      # 主加密密钥与两个开关此前只写在这台机器的 compose.override.yml 里 ——
+      # 换一台机器从仓库铺一遍就丢了，症状是 capture_encryption 变回 plaintext。
+      # 这里显式列进白名单；.env 里设了 CORMEX_SECRET_KEY 就会生效。
+      CORMEX_SECRET_KEY: ${CORMEX_SECRET_KEY:-}
+      CORMEX_PROMOTE_ENABLED: ${CORMEX_PROMOTE_ENABLED:-false}
+      CORMEX_ARCHIVE_DISTILL_ENABLED: ${CORMEX_ARCHIVE_DISTILL_ENABLED:-false}
       # 高风险工具确认的超时（秒）。超时按**拒绝**处理 ——
       # 没人回答意味着没人看见，而「关掉笔记本盖子等于把 shell 交出去」
       # 是不可挽回的错误方向
