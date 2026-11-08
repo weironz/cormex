@@ -50,6 +50,31 @@ async fn register(s: &Store, device: &str, path: &str) -> (String, String) {
         .into_ids()
 }
 
+/// A file as it was captured **before** an upgrade, written with SQL against
+/// the columns of the first capture migration.
+///
+/// Not [`register`]: that is today's code, and it reads today's schema (the
+/// adoption-aware `capture_current_generations` view, 2026-11-27). A migration
+/// test seeds an old schema, so seeding it through the current code fails as
+/// soon as the code depends on anything newer than the version under test,
+/// which is exactly when the test matters least to have stopped running.
+async fn seed_old_file(db: &common::TestDb, device: &str, path: &str, cwd: &str) -> String {
+    let (session, file, generation) = (Id::new(), Id::new(), Id::new());
+    let quote = |v: &str| v.replace('\'', "''");
+    db.exec_raw(format!(
+        "INSERT INTO capture_sessions (id, agent, native_session_id) \
+         VALUES ('{session}', 'claude_code', 'native-{file}'); \
+         INSERT INTO capture_files (id, session_id, device_id, agent, logical_path, role, framing, cwd) \
+         VALUES ('{file}', '{session}', '{device}', 'claude_code', '{}', 'transcript', 'append', '{}'); \
+         INSERT INTO capture_generations (id, file_id, ordinal, reason) \
+         VALUES ('{generation}', '{file}', 0, 'initial');",
+        quote(path),
+        quote(cwd),
+    ))
+    .await;
+    file.to_string()
+}
+
 /// A small extension so tests can destructure the registration result without
 /// repeating the two field names.
 trait IntoIds {
@@ -373,7 +398,7 @@ async fn ui_metadata_migration_preserves_existing_capture_files() {
         return;
     };
     let owner = device();
-    let (file, _) = register(&db.store, &owner, "before-metadata.jsonl").await;
+    let file = seed_old_file(&db, &owner, "before-metadata.jsonl", "/home/user/project-a").await;
     db.store
         .migrate()
         .await
@@ -572,26 +597,20 @@ async fn classification_migration_backfills_existing_cwds_without_changing_ids()
         return;
     };
     let owner = device();
-    let (local_file, _) = register(&db.store, &owner, "local-before-upgrade.jsonl").await;
-    let unc = NewCaptureFile {
-        id: Id::new(),
-        native_session_id: "native-unc".into(),
-        parent_native_session_id: None,
-        device_id: owner.clone(),
-        agent: "claude_code".into(),
-        logical_path: "unc-before-upgrade.jsonl".into(),
-        role: FileRole::Transcript,
-        framing: Framing::Append,
-        cwd: Some(r"\\?\UNC\server\share\project".into()),
-        project_key: None,
-    };
-    let unc_file = db
-        .store
-        .archive_txn(async |tx| tx.register_capture_file(&unc).await)
-        .await
-        .expect("register UNC file")
-        .file
-        .id;
+    let local_file = seed_old_file(
+        &db,
+        &owner,
+        "local-before-upgrade.jsonl",
+        "/home/user/project-a",
+    )
+    .await;
+    let unc_file = seed_old_file(
+        &db,
+        &owner,
+        "unc-before-upgrade.jsonl",
+        r"\\?\UNC\server\share\project",
+    )
+    .await;
 
     db.store
         .migrate()
