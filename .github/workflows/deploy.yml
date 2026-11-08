@@ -63,8 +63,10 @@ jobs:
         env:
           CORMEX_DEPLOY_HOST: ${{ secrets.CORMEX_DEPLOY_HOST }}
           CORMEX_DEPLOY_USER: ${{ secrets.CORMEX_DEPLOY_USER }}
-          # Non-secret settings live as repository variables; blank ones fall back
-          # to the defaults in deploy/ansible/inventory.yml.
-          CORMEX_DEPLOY_DIR: ${{ vars.CORMEX_DEPLOY_DIR }}
-          CORMEX_DEPLOY_API: ${{ vars.CORMEX_DEPLOY_API }}
+          # These two are not credentials, but a repository *variable* is readable by
+          # anyone who can read a public repository, and the directory and the public
+          # URL name the deployment. Secrets are the smaller surface; blank values fall
+          # back to the defaults in deploy/ansible/inventory.yml.
+          CORMEX_DEPLOY_DIR: ${{ secrets.CORMEX_DEPLOY_DIR }}
+          CORMEX_DEPLOY_API: ${{ secrets.CORMEX_DEPLOY_API }}
         run: just deploy "${{ inputs.tag }}"
