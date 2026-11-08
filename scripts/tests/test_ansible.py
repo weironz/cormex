@@ -9,6 +9,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "scripts" / "ansible-deploy.sh"
 PLAYBOOK = "deploy/ansible/deploy.yml"
+REQUIRED = {
+    "DEPLOY_HOST": "node.example",
+    "DEPLOY_USER": "root",
+    "DEPLOY_DIR": "/srv/cormex",
+    "DEPLOY_API": "https://memory.example",
+}
 
 
 class AnsibleWrapperTests(unittest.TestCase):
@@ -30,6 +36,12 @@ class AnsibleWrapperTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def fake_logging(self, *variables):
+        """ansible-playbook stand-in that records its argv and the named variables."""
+        fmt = " ".join(["%s"] + [f"{name.removeprefix('DEPLOY_')}=%s" for name in variables])
+        arguments = '"$*"' + "".join(f' "${name}"' for name in variables)
+        self.fake("ansible-playbook", f'printf "{fmt}\\n" {arguments} >> "{self.log}"\n')
+
     def shell_tools(self, *names):
         """A PATH with only what the wrapper itself executes.
 
@@ -46,9 +58,8 @@ class AnsibleWrapperTests(unittest.TestCase):
 
     def run_wrapper(self, *args, env=None):
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("CORMEX_") and key not in ("ANSIBLE_SSH_COMMON_ARGS",)}
+                       if not key.startswith("DEPLOY_") and key != "ANSIBLE_SSH_COMMON_ARGS"}
         environment["PATH"] = ":".join([str(self.bin), str(self.shell_tools("bash", "dirname"))])
-        environment["DEPLOY_ENV_FILE"] = str(Path(self.temp.name) / "no-such.env")
         environment.update(env or {})
         return subprocess.run([str(WRAPPER), *args], cwd=ROOT, env=environment,
                               text=True, capture_output=True, check=False)
@@ -56,69 +67,35 @@ class AnsibleWrapperTests(unittest.TestCase):
     def calls(self):
         return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
 
-    def test_runs_the_playbook_natively_when_ansible_is_installed(self):
-        self.fake("ansible-playbook")
-        result = self.run_wrapper("v0.1.18", str(self.inventory), env={"DEPLOY_HOST": "node.example"})
+    def test_all_required_values_reach_the_playbook(self):
+        self.fake_logging("DEPLOY_HOST", "DEPLOY_USER", "DEPLOY_DIR", "DEPLOY_API")
+        result = self.run_wrapper("v0.1.18", str(self.inventory), env=REQUIRED)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"-i {self.inventory}", calls[0])
-        self.assertIn(PLAYBOOK, calls[0])
-        self.assertIn("-e cormex_version=v0.1.18", calls[0])
+        call = self.calls()[0]
+        self.assertIn(f"-i {self.inventory}", call)
+        self.assertIn(PLAYBOOK, call)
+        self.assertIn("-e cormex_version=v0.1.18", call)
+        self.assertIn("HOST=node.example USER=root DIR=/srv/cormex API=https://memory.example", call,
+                      "the playbook reads them from the environment; nothing may be dropped")
 
-    def test_a_missing_host_is_refused_before_connecting(self):
+    def test_a_missing_value_is_named_before_connecting(self):
         self.fake("ansible-playbook")
         result = self.run_wrapper("v0.1.18", str(self.inventory))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("DEPLOY_HOST", result.stderr)
-        self.assertEqual(self.calls(), [], "nothing may reach ansible without a host")
+        for name in REQUIRED:
+            self.assertIn(name, result.stderr, f"{name} must be named in the error")
+        self.assertEqual(self.calls(), [], "nothing may reach ansible without its inputs")
 
-    def test_a_local_connection_needs_no_host(self):
+    def test_a_local_connection_needs_only_dir_and_api(self):
         self.fake("ansible-playbook")
-        result = self.run_wrapper("v0.1.18", str(self.inventory), env={"DEPLOY_CONNECTION": "local"})
+        result = self.run_wrapper("v0.1.18", str(self.inventory), env={
+            "DEPLOY_CONNECTION": "local",
+            "DEPLOY_DIR": "/srv/cormex",
+            "DEPLOY_API": "http://127.0.0.1:8080",
+        })
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_the_gitignored_env_file_supplies_the_host(self):
-        self.fake("ansible-playbook",
-                  f'printf "%s HOST=%s DIR=%s\\n" "$*" "$DEPLOY_HOST" "$DEPLOY_DIR" >> "{self.log}"\n')
-        values = Path(self.temp.name) / "deploy.env"
-        values.write_text("DEPLOY_HOST=from-file.example\nDEPLOY_DIR=/srv/cormex\n", encoding="utf-8")
-        result = self.run_wrapper("v0.1.18", str(self.inventory),
-                                  env={"DEPLOY_ENV_FILE": str(values)})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("HOST=from-file.example", self.calls()[0])
-        self.assertIn("DIR=/srv/cormex", self.calls()[0], "values from the gitignored env file must be exported")
-
-    def test_an_exported_value_beats_the_env_file(self):
-        self.fake("ansible-playbook",
-                  f'printf "%s HOST=%s\\n" "$*" "$DEPLOY_HOST" >> "{self.log}"\n')
-        values = Path(self.temp.name) / "deploy.env"
-        values.write_text("DEPLOY_HOST=from-file.example\n", encoding="utf-8")
-        result = self.run_wrapper("v0.1.18", str(self.inventory),
-                                  env={"DEPLOY_ENV_FILE": str(values),
-                                       "DEPLOY_HOST": "from-shell.example"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("HOST=from-shell.example", self.calls()[0],
-                      "the shell must win over the file, or a one-off override is impossible")
-
-    def test_env_file_path_may_be_written_with_a_tilde(self):
-        self.fake("ansible-playbook",
-                  f'printf "%s HOST=%s\\n" "$*" "$DEPLOY_HOST" >> "{self.log}"\n')
-        values = Path(self.temp.name) / "home" / ".config" / "cormex" / "deploy.env"
-        values.parent.mkdir(parents=True)
-        values.write_text("DEPLOY_HOST=from-home.example\n", encoding="utf-8")
-        result = subprocess.run([str(WRAPPER), "v0.1.18", str(self.inventory)],
-                                cwd=ROOT, text=True, capture_output=True, check=False,
-                                env={**{k: v for k, v in os.environ.items()
-                                        if not k.startswith("DEPLOY_")},
-                                     "PATH": ":".join([str(self.bin),
-                                                       str(self.shell_tools("bash", "dirname"))]),
-                                     "HOME": str(Path(self.temp.name) / "home"),
-                                     "DEPLOY_ENV_FILE": "~/.config/cormex/deploy.env"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("from-home.example", " ".join(self.calls()) + result.stdout)
-
-    def test_syntax_check_needs_no_inventory_variables(self):
+    def test_syntax_check_needs_no_environment(self):
         self.fake("ansible-playbook")
         result = self.run_wrapper("--syntax-check")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -130,7 +107,7 @@ class AnsibleWrapperTests(unittest.TestCase):
         known_hosts = Path(self.temp.name) / "known_hosts"
         known_hosts.write_text("node.example ssh-ed25519 AAAA\n", encoding="utf-8")
         result = self.run_wrapper("v0.1.18", str(self.inventory), env={
-            "DEPLOY_HOST": "node.example",
+            **REQUIRED,
             "DEPLOY_SSH_KEY": str(self.key),
             "DEPLOY_KNOWN_HOSTS": str(known_hosts),
             "DEPLOY_PULL": "false",
@@ -152,7 +129,7 @@ class AnsibleWrapperTests(unittest.TestCase):
     def test_a_missing_key_is_reported_before_docker_runs(self):
         self.fake("docker")
         result = self.run_wrapper("v0.1.18", str(self.inventory), env={
-            "DEPLOY_HOST": "node.example",
+            **REQUIRED,
             "DEPLOY_SSH_KEY": str(Path(self.temp.name) / "absent-key"),
         })
         self.assertEqual(result.returncode, 1)
@@ -160,7 +137,7 @@ class AnsibleWrapperTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_without_ansible_or_docker_the_failure_names_both_options(self):
-        result = self.run_wrapper("v0.1.18", str(self.inventory), env={"DEPLOY_HOST": "node.example"})
+        result = self.run_wrapper("v0.1.18", str(self.inventory), env=REQUIRED)
         self.assertEqual(result.returncode, 1)
         self.assertIn("ansible-core", result.stderr)
         self.assertIn("Docker", result.stderr)

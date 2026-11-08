@@ -216,7 +216,7 @@ _publish tag checksum:
 # Deploys the published images with the host's deploy/docker-compose.yml (plus
 # compose.override.yaml when present). Never builds, tags or uploads anything.
 # The inventory in deploy/ansible/ is committed and reads the host from the
-# environment (deploy/ansible/deploy.env locally, repository secrets in Actions); the playbook is
+# environment (repository secrets in Actions, the shell locally); the playbook is
 # POSIX, so on Windows the wrapper runs it in the pinned control-node container.
 
 # Deploy a published version to the hosts in the inventory.

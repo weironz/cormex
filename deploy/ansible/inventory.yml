@@ -1,30 +1,32 @@
 # The deployment target. Committed on purpose -- this file holds no address, no user
 # and no credential; every value below is read from the environment.
 #
-# That is what lets the same file serve both places:
-#   * GitHub Actions feeds the values from repository secrets / variables,
-#   * a maintainer's machine feeds them from deploy/ansible/deploy.env (gitignored)
-#     or from the shell.
+# There is no local values file: the environment is the only source, so a missing
+# required value fails the run instead of falling back to a default nobody edited.
+# GitHub Actions feeds the environment from repository secrets; a workstation feeds
+# it from the shell or the system environment.
 #
 #   DEPLOY_HOST        required, the node (never committed)
-#   DEPLOY_USER        default deploy
+#   DEPLOY_USER        required, the login user on that node
+#   DEPLOY_DIR         required, deployment directory on the target (compose + .env)
+#   DEPLOY_API         required, base URL the stack answers on (the public edge is fine)
 #   DEPLOY_PORT        default 22
-#   DEPLOY_SSH_KEY         path to the private key on the machine running this
-#                             (default ~/.ssh/id_ed25519)
-#   DEPLOY_DIR         deployment directory on the target (compose file + .env)
-#   DEPLOY_API         loopback base URL the stack answers on *the target*
+#   DEPLOY_SSH_KEY     path to the private key on this machine; unset means ssh's own
+#                      default (~/.ssh/id_ed25519, agent and ssh_config included)
+#   DEPLOY_KNOWN_HOSTS path to known_hosts; unset means ssh's own default
 #   DEPLOY_PROJECT     compose project, only when it differs from `name:`
 #   DEPLOY_CONNECTION  ssh (default) or local for a rehearsal on this machine
+#   DEPLOY_PULL        false when the images came from the release archives
 all:
   hosts:
     cormex:
       ansible_host: "{{ lookup('env', 'DEPLOY_HOST') }}"
-      ansible_user: "{{ lookup('env', 'DEPLOY_USER') | default('deploy', true) }}"
+      ansible_user: "{{ lookup('env', 'DEPLOY_USER') }}"
       ansible_port: "{{ lookup('env', 'DEPLOY_PORT') | default('22', true) }}"
       ansible_connection: "{{ lookup('env', 'DEPLOY_CONNECTION') | default('ssh', true) }}"
       ansible_ssh_private_key_file: "{{ lookup('env', 'DEPLOY_SSH_KEY') | default('~/.ssh/id_ed25519', true) }}"
-      cormex_dir: "{{ lookup('env', 'DEPLOY_DIR') | default('/srv/cormex/deploy', true) }}"
-      cormex_api_base: "{{ lookup('env', 'DEPLOY_API') | default('http://127.0.0.1:8080', true) }}"
+      cormex_dir: "{{ lookup('env', 'DEPLOY_DIR') }}"
+      cormex_api_base: "{{ lookup('env', 'DEPLOY_API') }}"
       cormex_project: "{{ lookup('env', 'DEPLOY_PROJECT') | default('', true) }}"
       # false for hosts that take their images from the release archives (docker load)
       # instead of a registry.

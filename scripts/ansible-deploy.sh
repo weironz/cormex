@@ -2,9 +2,9 @@
 # Run the deployment playbook from wherever this repository is checked out.
 #
 # The inventory is committed (deploy/ansible/inventory.yml) and reads every host
-# detail from the environment, so the same file works for GitHub Actions (secrets),
-# a Linux maintainer (deploy/ansible/deploy.env or the shell) and Windows (the same
-# env file, executed inside a control-node container).
+# detail from the environment -- there is no local values file. The same variables
+# come from repository secrets in GitHub Actions and from the shell (or the system
+# environment) on a workstation; a missing required one is an error, not a default.
 #
 # Ansible has no Windows control node: `ansible-playbook` is POSIX-only. The wrapper
 # therefore runs it natively when present (Linux, macOS, WSL) and otherwise inside the
@@ -20,39 +20,12 @@ usage() {
 }
 die() { echo "deploy: $*" >&2; exit 1; }
 
-load_env_file() {
-  local file=$1 line key value
-  while IFS= read -r line || [[ -n $line ]]; do
-    line=${line%$'\r'}
-    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
-    [[ $line == *=* ]] || continue
-    key=${line%%=*}
-    value=${line#*=}
-    key=${key//[[:space:]]/}
-    value=${value#"${value%%[![:space:]]*}"}
-    [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    # A matching pair of quotes is the only quoting supported; anything else would be
-    # shell syntax, and this file is data -- it is never sourced.
-    if [[ $value == \"*\" || $value == \'*\' ]]; then value=${value:1:${#value}-2}; fi
-    # An exported variable wins: the file is the default, the shell is the instruction.
-    [[ -n ${!key+set} ]] && continue
-    export "$key=$value"
-  done < "$file"
-}
-
 expand_tilde() {
   case $1 in
     "~"/*) printf '%s\n' "$HOME/${1#\~/}" ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
-
-# Local, gitignored values. Explicit path wins, so a second environment (a rehearsal
-# box, a different operator) can keep its own file.
-values_file=${DEPLOY_ENV_FILE:-deploy/ansible/deploy.env}
-values_file=$(expand_tilde "$values_file")
-[[ $values_file == /* ]] || values_file=$repo/$values_file
-[[ -f $values_file ]] && load_env_file "$values_file"
 
 mode=${1:-}
 case "$mode" in
@@ -81,8 +54,19 @@ esac
 [[ -f "$inventory_path" ]] || die "inventory not found: $inventory_path"
 
 connection=${DEPLOY_CONNECTION:-ssh}
-if [[ -z ${DEPLOY_HOST:-} && $connection != local && ${#goal[@]} -eq 0 ]]; then
-  die "DEPLOY_HOST is empty; set it in the environment or in $values_file (copy deploy/ansible/deploy.env.example)"
+if [[ ${#goal[@]} -eq 0 ]]; then
+  # No file to fall back to: every value the connection needs must already be in the
+  # environment, and a missing one is named rather than silently defaulted.
+  missing=()
+  if [[ $connection != local ]]; then
+    [[ -n ${DEPLOY_HOST:-} ]] || missing+=(DEPLOY_HOST)
+    [[ -n ${DEPLOY_USER:-} ]] || missing+=(DEPLOY_USER)
+  fi
+  [[ -n ${DEPLOY_DIR:-} ]] || missing+=(DEPLOY_DIR)
+  [[ -n ${DEPLOY_API:-} ]] || missing+=(DEPLOY_API)
+  if (( ${#missing[@]} > 0 )); then
+    die "missing environment variable(s): ${missing[*]} -- export them (docs/deployment-guide.md, section 9)"
+  fi
 fi
 
 args=(-i "$inventory" deploy/ansible/deploy.yml)

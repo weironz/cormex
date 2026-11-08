@@ -330,40 +330,47 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 变成会被检查的断言。**发布不等于部署**：这些配方不构建、不打 tag、不碰候选，只拉已发布
 的镜像。
 
-部署通过 **Ansible over SSH** 完成，入口仍是 `just`。**清单本身入库，值不入库**：
-`deploy/ansible/inventory.yml` 是仓库里唯一的一份清单，主机、用户、密钥路径、目标目录
-全部从环境变量读出来。于是同一份文件同时服务三处：
+部署通过 **Ansible over SSH** 完成，入口仍是 `just`。**清单入库、值只从环境变量来**：
+`deploy/ansible/inventory.yml` 是仓库里唯一的一份清单，主机、用户、目录、密钥路径全部来自
+环境变量，没有本地 env 文件可回落——少一个必需项就直接失败，不会拿默认值猜。
 
 | 场景 | 值从哪来 |
 |---|---|
-| GitHub Actions | 仓库 secrets / variables（见下表） |
-| 本地 Linux / macOS / WSL | `deploy/ansible/deploy.env`（gitignored）或 shell |
-| Windows（Git Bash） | 同一个 `deploy.env`；playbook 在容器里跑 |
+| GitHub Actions | repository secrets（同名） |
+| 本地 Linux / macOS / WSL | shell 或系统环境变量 |
+| Windows（Git Bash） | 系统环境变量（`setx`），playbook 在容器里跑 |
 
 ```bash
-cp deploy/ansible/deploy.env.example deploy/ansible/deploy.env   # 已被 *.env 规则 gitignore
-chmod 600 deploy/ansible/deploy.env
-$EDITOR deploy/ansible/deploy.env        # DEPLOY_HOST / _DIR / _KEY 等
+export DEPLOY_HOST=120.79.61.68
+export DEPLOY_USER=root
+export DEPLOY_DIR=/data/cormex
+export DEPLOY_API=https://cormex.cloudcele.com
 just deploy vX.Y.Z                       # 部署 + 验收
 just deploy-check                        # 只做 playbook 语法检查
 ```
 
-取值优先级：shell 里已导出的变量 > `deploy.env` > 清单里的默认值。
+| 变量 | 必需 | 说明 |
+|---|---|---|
+| `DEPLOY_HOST` | ✅ | 节点地址 |
+| `DEPLOY_USER` | ✅ | 登录用户 |
+| `DEPLOY_DIR` | ✅ | 目标主机上的部署目录（compose + `.env`） |
+| `DEPLOY_API` | ✅ | 栈在该主机上的访问地址（公网入口也可以） |
+| `DEPLOY_PORT` | | 默认 22 |
+| `DEPLOY_SSH_KEY` | | 本机私钥**路径**；不设则用 ssh 自己的默认（`~/.ssh/id_ed25519`、agent、ssh_config） |
+| `DEPLOY_KNOWN_HOSTS` | | known_hosts **路径**；不设则用 ssh 默认的 `~/.ssh/known_hosts` |
+| `DEPLOY_PROJECT` | | compose 项目名，仅当与文件里的 `name:` 不同 |
+| `DEPLOY_CONNECTION` | | 默认 `ssh`；本机演练设 `local` |
+| `DEPLOY_PULL` | | 用 Release 里的镜像归档 `docker load` 之后设 `false` |
 
-变量：`DEPLOY_HOST`（必填）、`DEPLOY_USER`（默认 `deploy`）、
-`DEPLOY_PORT`（22）、`DEPLOY_SSH_KEY`（本机私钥路径，默认 `~/.ssh/id_ed25519`）、
-`DEPLOY_DIR`（目标主机上的部署目录，默认 `/srv/cormex/deploy`）、
-`DEPLOY_API`（目标主机回环地址，默认 `http://127.0.0.1:8080`）、
-`DEPLOY_KNOWN_HOSTS`（可选）、`DEPLOY_CONNECTION`（演练时设 `local`）、`DEPLOY_PULL`（用 Release 里的镜像归档 `docker load` 之后设 `false`，跳过拉取）。
-目标目录里两种 override 都会被**显式**带上：`docker-compose.override.yml` 与
-`compose.override.yaml` —— 显式 `-f` 会关掉 compose 对默认 override 的自动加载，
-把主密钥留在 override 里的部署不会因为漏了这一点而丢配置。
-清单里没有地址，因此公开仓库里也不会有。
+缺任何一个必需项时 wrapper 会直接报出缺的名字，例如：
+
+```text
+deploy: missing environment variable(s): DEPLOY_USER DEPLOY_DIR -- export them (docs/deployment-guide.md, section 9)
+```
 
 **密钥只留在机器上。** 本地路径直接交给 `ansible_ssh_private_key_file`；Windows 走容器时，
-那把私钥以只读方式挂进 `/root/.ssh/deploy_key`，`known_hosts` 同样以只读挂载并通过
-`ANSIBLE_SSH_COMMON_ARGS` 指过去 —— 镜像里没有任何凭据，容器退出后也不留副本。
-`host_key_checking` 保持开启。
+那把私钥以只读方式挂进 `/root/.ssh/deploy_key`，`known_hosts` 同样只读并挂载，镜像里
+没有任何凭据。`host_key_checking` 保持开启。
 
 Actions 侧用 `.github/workflows/deploy.yml`（手动触发，`environment: production`）：
 
@@ -373,23 +380,23 @@ Actions 侧用 `.github/workflows/deploy.yml`（手动触发，`environment: pro
 | `DEPLOY_USER` | secret | 部署用户 |
 | `DEPLOY_SSH_KEY` | secret | 私钥全文（job 写入 `$RUNNER_TEMP`，0600） |
 | `DEPLOY_KNOWN_HOSTS` | secret | 主机公钥行（缺失即失败，不允许 TOFU） |
-| `DEPLOY_DIR` / `DEPLOY_API` | variable | 非敏感位置；留空用默认值 |
+| `DEPLOY_DIR` / `DEPLOY_API` | secret | 部署目录与访问地址 |
+
+注意两边同名但形态不同：**secret 里放内容，环境变量里放路径**（`DEPLOY_SSH_KEY`、
+`DEPLOY_KNOWN_HOSTS`）。job 会把内容落成文件再把同名变量指过去。
 
 workflow 只部署**已公开的 Release**（先 `gh release view` 查 draft），不构建、不打 tag，
-跑完就是 `just deploy` 的同一份断言。同一 tag 的两次部署串行执行，取消中的部署不会留下
-半个状态。
+跑完就是 `just deploy` 的同一份断言。同一 tag 的两次部署串行执行。
 
-playbook 的第一步是比对目标 `.env` 里的 `CORMEX_VERSION` 与传入 tag，不一致就停 —— 不让
-文件和正在跑的栈各说各话；随后 `pull cormex web`（注册表抖动会重试）、`up -d`，最后向
-`/api/health` 要答案：`role` 必须是 `cormexd`，`version` 必须等于部署的版本（健康信息里是
-`0.1.18`，pin 是 `v0.1.18`），`/api/health` 必须返回 JSON（拿到 HTML 说明 `/api` 被送到了
-Web 镜像），Web 根必须是 HTML。
+playbook 的第一步是比对目标 `.env` 里的 `CORMEX_VERSION` 与传入 tag，不一致就停；随后
+`pull cormex web`（注册表抖动会重试）、`up -d`，最后向 `/api/health` 要答案：`role` 必须是
+`cormexd`，`version` 必须等于部署的版本（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），
+`/api/health` 必须返回 JSON（拿到 HTML 说明 `/api` 被送到了 Web 镜像），Web 根必须是 HTML。
 
 **Windows 不能直接当 Ansible 控制节点。** `ansible-playbook` 只在 POSIX 上运行，Windows
 只是被管理端（走 WinRM，与本项目无关）。因此 `just deploy` 在 Windows 上用
-`deploy/ansible/Dockerfile` 构一个固定版本的 ansible-core 容器来执行（Docker Desktop 本来
-就是为了部署而要装的），Linux / macOS / WSL 上直接调用本机的 `ansible-playbook`。两条路径
-的入口、参数与验收完全一致。
+`deploy/ansible/Dockerfile` 构一个固定版本的 ansible-core 容器来执行，Linux / macOS / WSL
+上直接调用本机的 `ansible-playbook`。两条路径的入口、参数与验收完全一致。
 
 本机自测（不需要远端）：
 
