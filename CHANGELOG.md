@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### App: memory extraction moved to Settings
+
+- The memory extraction panel (status, the full-extraction switch, progress, errors and retry, the model in use) is now at the top of **Settings**, above "模型配置", instead of taking the top of the memory page. The memory page opens on the categories and the search box; when it is empty, its centre still says extraction is off and where to turn it on.
+- The panel's own "前往设置" button is gone: it now lives on the settings page.
+
 ## 0.1.18 — 2026-11-08
 
 ### 发布：本地构建也产出 Windows CLI

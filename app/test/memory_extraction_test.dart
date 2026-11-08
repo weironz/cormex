@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:cormex_app/api/cormex_api.dart';
 import 'package:cormex_app/features/memory/memory_browser.dart';
 import 'package:cormex_app/features/settings/memory_extraction_settings_page.dart';
+import 'package:cormex_app/features/settings/settings_page.dart';
 import 'package:cormex_app/features/memory/widgets/fact_card.dart';
 import 'package:cormex_app/models/memory_fact.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
@@ -41,6 +42,12 @@ Widget app(CormexApi api, {bool settings = false}) => ProviderScope(
         ? const MemoryExtractionSettingsPage()
         : const MemoryBrowser(),
   ),
+);
+
+/// The settings page, where the extraction panel lives.
+Widget settingsApp(CormexApi api) => ProviderScope(
+  overrides: [apiProvider.overrideWithValue(api)],
+  child: const MaterialApp(home: SettingsPage()),
 );
 Future<void> dispose(WidgetTester tester) async {
   await tester.pumpWidget(const SizedBox());
@@ -183,7 +190,7 @@ void main() {
     );
     await tester.pumpWidget(app(api));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('前往设置'));
+    await tester.tap(find.byTooltip('设置'));
     await tester.pumpAndSettle();
     expect(find.text('设置'), findsWidgets);
     await tester.tap(find.text('模型配置'));
@@ -213,7 +220,7 @@ void main() {
                 }),
         ),
       );
-      await tester.pumpWidget(app(api));
+      await tester.pumpWidget(settingsApp(api));
       await tester.pumpAndSettle();
       expect(find.textContaining('小样本分析完成'), findsOneWidget);
       expect(tester.widget<Switch>(find.byType(Switch)).value, isFalse);
@@ -298,7 +305,7 @@ void main() {
               : http.Response('unavailable', 503),
         ),
       );
-      await tester.pumpWidget(app(api));
+      await tester.pumpWidget(settingsApp(api));
       await tester.pumpAndSettle();
       expect(find.text('无法读取记忆提取状态，请检查连接后重试。'), findsOneWidget);
       expect(find.text('全量未开启'), findsNothing);
@@ -346,10 +353,19 @@ void main() {
       );
       await tester.pumpWidget(app(api));
       await tester.pumpAndSettle();
+      expect(find.textContaining('但记忆提取尚未开启'), findsOneWidget);
+      expect(
+        find.text('全量未开启'),
+        findsNothing,
+        reason:
+            'the extraction panel is a setting and lives on the settings page',
+      );
+      await dispose(tester);
+      await tester.pumpWidget(settingsApp(api));
+      await tester.pumpAndSettle();
       expect(find.text('全量未开启'), findsOneWidget);
       expect(find.text('已检查 0 / 2300 个聊天'), findsOneWidget);
-      expect(find.textContaining('但记忆提取尚未开启'), findsOneWidget);
-      expect(find.text('前往设置'), findsOneWidget);
+      expect(find.text('模型配置'), findsOneWidget);
       await dispose(tester);
     },
   );
@@ -374,7 +390,7 @@ void main() {
           });
         }),
       );
-      await tester.pumpWidget(app(api));
+      await tester.pumpWidget(settingsApp(api));
       await tester.pumpAndSettle();
       await tester.tap(find.byType(Switch));
       await tester.pumpAndSettle();
@@ -479,7 +495,7 @@ void main() {
             : json(status()),
       ),
     );
-    await tester.pumpWidget(app(api));
+    await tester.pumpWidget(settingsApp(api));
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
     expect(find.text('全量未开启'), findsOneWidget);

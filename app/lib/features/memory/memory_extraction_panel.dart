@@ -5,7 +5,6 @@ import '../../api/api_exception.dart';
 import '../../models/memory_extraction_status.dart';
 import '../../state/connection_controller.dart';
 import '../../state/memory_extraction.dart';
-import '../settings/settings_page.dart';
 
 class MemoryExtractionPanel extends ConsumerStatefulWidget {
   const MemoryExtractionPanel({super.key});
@@ -57,9 +56,6 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
     }
   }
 
-  void _configure() => Navigator.of(
-    context,
-  ).push(MaterialPageRoute<void>(builder: (_) => const SettingsPage()));
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -68,7 +64,7 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1100),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 12, 20, 6),
+          padding: EdgeInsets.zero,
           child: ref
               .watch(memoryExtractionProvider)
               .when(
@@ -158,7 +154,7 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
                                 ? '按完整问答和有限上下文自动提取、校验和更新记忆，并整理会话摘要。'
                                 : s.hasAnalyzedChats || s.factsCreated > 0
                                 ? '全量自动提取已关闭，已有记忆与会话摘要可继续阅读和追溯。'
-                                : '聊天已保存。可先在设置中选择 2 个旧聊天验证，不必开启全量提取。',
+                                : '聊天已保存。可先在下方「模型配置」里选 2 个旧聊天验证，不必开启全量提取。',
                             style: theme.textTheme.bodySmall,
                           ),
                           const SizedBox(height: 14),
@@ -219,23 +215,13 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
                               ),
                             const SizedBox(height: 8),
                           ],
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  '${s.useServerModel ? '服务端默认' : '自定义模型'} · ${s.provider} / ${s.model}',
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.bodySmall,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              TextButton.icon(
-                                onPressed: _configure,
-                                icon: const Icon(Icons.tune_rounded, size: 18),
-                                label: const Text('前往设置'),
-                              ),
-                            ],
+                          // The model is changed under "模型配置", right below
+                          // this panel on the settings page
+                          Text(
+                            '${s.useServerModel ? '服务端默认' : '自定义模型'} · ${s.provider} / ${s.model}',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall,
                           ),
                           if (s.lastError != null) ...[
                             const SizedBox(height: 6),

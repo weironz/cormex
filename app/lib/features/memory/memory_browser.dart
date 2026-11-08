@@ -13,7 +13,6 @@ import '../../state/memory_context.dart';
 import '../../widgets/empty_state.dart';
 import '../settings/settings_page.dart';
 import 'widgets/fact_card.dart';
-import 'memory_extraction_panel.dart';
 import 'memory_artifacts_list.dart';
 
 /// 整页的记忆浏览器 —— 这个应用的全部。
@@ -211,7 +210,6 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
           SliverToBoxAdapter(
             child: Column(
               children: [
-                const MemoryExtractionPanel(),
                 _MemoryCategories(kind: _kind, onSelected: _selectKind),
                 if (_kind == null) ...[
                   Padding(

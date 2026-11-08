@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../state/reading_preferences.dart';
+import '../memory/memory_extraction_panel.dart';
 import 'memory_extraction_settings_page.dart';
 
 class SettingsPage extends ConsumerWidget {
@@ -18,6 +19,10 @@ class SettingsPage extends ConsumerWidget {
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              // 记忆提取的状态与开关放在这里，而不是记忆页顶部：它是一项设置，
+              // 不是记忆本身。记忆页为空时，页面中央的说明会指到这里
+              const MemoryExtractionPanel(),
+              const SizedBox(height: 8),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.psychology_outlined),

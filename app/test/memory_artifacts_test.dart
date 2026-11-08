@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:cormex_app/api/cormex_api.dart';
 import 'package:cormex_app/features/memory/memory_browser.dart';
+import 'package:cormex_app/features/settings/settings_page.dart';
 import 'package:cormex_app/features/memory/widgets/artifact_sheet.dart';
 import 'package:cormex_app/features/memory/widgets/fact_card.dart';
 import 'package:cormex_app/features/settings/memory_trial_section.dart';
@@ -346,7 +347,15 @@ void main() {
           },
         });
       });
+      // The memory page no longer carries the extraction panel at all
       await tester.pumpWidget(scoped(api, const MemoryBrowser()));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('本次保留 0 条记忆'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await disposePage(tester);
+
+      // The extraction panel, on the settings page
+      await tester.pumpWidget(scoped(api, const SettingsPage()));
       await tester.pumpAndSettle();
       expect(find.textContaining('本次保留 0 条记忆'), findsOneWidget);
       expect(find.text('自动保留记忆 0'), findsOneWidget);
@@ -356,6 +365,7 @@ void main() {
       expect(find.text('提取失败'), findsNothing);
       expect(tester.widget<Switch>(find.byType(Switch)).value, isFalse);
       expect(find.textContaining('旧策略'), findsNothing);
+      // Once in the full-extraction counts, once in the trial's
       expect(find.text('会话摘要 2'), findsNWidgets(2));
       expect(tester.takeException(), isNull);
       await disposePage(tester);
