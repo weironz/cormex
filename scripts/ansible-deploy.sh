@@ -50,6 +50,7 @@ expand_tilde() {
 # Local, gitignored values. Explicit path wins, so a second environment (a rehearsal
 # box, a different operator) can keep its own file.
 values_file=${DEPLOY_ENV_FILE:-deploy/ansible/deploy.env}
+values_file=$(expand_tilde "$values_file")
 [[ $values_file == /* ]] || values_file=$repo/$values_file
 [[ -f $values_file ]] && load_env_file "$values_file"
 

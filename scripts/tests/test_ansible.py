@@ -101,6 +101,23 @@ class AnsibleWrapperTests(unittest.TestCase):
         self.assertIn("HOST=from-shell.example", self.calls()[0],
                       "the shell must win over the file, or a one-off override is impossible")
 
+    def test_env_file_path_may_be_written_with_a_tilde(self):
+        self.fake("ansible-playbook",
+                  f'printf "%s HOST=%s\\n" "$*" "$DEPLOY_HOST" >> "{self.log}"\n')
+        values = Path(self.temp.name) / "home" / ".config" / "cormex" / "deploy.env"
+        values.parent.mkdir(parents=True)
+        values.write_text("DEPLOY_HOST=from-home.example\n", encoding="utf-8")
+        result = subprocess.run([str(WRAPPER), "v0.1.18", str(self.inventory)],
+                                cwd=ROOT, text=True, capture_output=True, check=False,
+                                env={**{k: v for k, v in os.environ.items()
+                                        if not k.startswith("DEPLOY_")},
+                                     "PATH": ":".join([str(self.bin),
+                                                       str(self.shell_tools("bash", "dirname"))]),
+                                     "HOME": str(Path(self.temp.name) / "home"),
+                                     "DEPLOY_ENV_FILE": "~/.config/cormex/deploy.env"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("from-home.example", " ".join(self.calls()) + result.stdout)
+
     def test_syntax_check_needs_no_inventory_variables(self):
         self.fake("ansible-playbook")
         result = self.run_wrapper("--syntax-check")
