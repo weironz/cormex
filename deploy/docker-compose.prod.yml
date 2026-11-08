@@ -229,6 +229,28 @@ services:
   cormex:
     image: ${CORMEX_IMAGE:-${CORMEX_REGISTRY:-registry.cn-shenzhen.aliyuncs.com/willspace}/cormex:${CORMEX_VERSION:?记忆服务的版本，与 CORMEX_VERSION 独立。过渡期可改用 CORMEX_IMAGE 指向旧的 cormexd 镜像}}
     container_name: cormex
+    # cormexd 只在启动那一刻决定用 S3 还是本地文件系统，不可达时仅打一条 warning 就
+    # 回落到容器本地 —— 上传留在容器里，且不会报错。等存储可达再启动，然后照原样
+    # exec 服务本体。`depends_on` 的 service_started 不等于「S3 可读」，所以这道
+    # 等待放在 entrypoint 里；判定「可达」看状态码不是 2xx（S3 根路径匿名请求回 403）。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        attempts=0
+        while :; do
+          code=$$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$${S3_ENDPOINT}" || echo 000)
+          if [ "$$code" != "000" ]; then
+            echo "object storage $${S3_ENDPOINT} answered $$code; starting cormexd"
+            break
+          fi
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 150 ]; then
+            echo "object storage $${S3_ENDPOINT} still unreachable after 300s" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        exec /usr/local/bin/cormexd
     restart: unless-stopped
     logging: *default-logging
     # 接进 sandbox 网段 ⇒ same_network=1 ⇒ 反代直连容器名。
@@ -271,7 +293,8 @@ services:
       #   解析不出歧义。2026-10-31 升级 v0.1.12 时实测撞到过，当时 cormexd
       #   静默回落到本地文件系统（`blob_backend: local_fs`），媒体文件因此
       #   落在容器里、不在备份范围内。
-      S3_ENDPOINT: http://cortex-rustfs:9000
+      # 本项目的 rustfs 服务（不是另一个 compose 项目的容器名）
+      S3_ENDPOINT: http://rustfs:9000
       S3_PUBLIC_ENDPOINT: https://${S3_DOMAIN}
       S3_BUCKET: ${S3_BUCKET:-cormex-blobs}
       S3_REGION: ${S3_REGION:-us-east-1}
@@ -352,14 +375,14 @@ services:
       # traefik 默认按规则长度算优先级，带 PathPrefix 的这条本来就比
       # 只有 Host 的那条长；但优先级这种东西不该靠「本来就」——
       # 显式写死，免得哪天 web 那条规则变长了就悄悄抢走 /api
-      traefik.http.routers.cormex-api.rule: Host(`${DOMAIN}`) && PathPrefix(`/api`)
-      traefik.http.routers.cormex-api.entrypoints: websecure
-      traefik.http.routers.cormex-api.tls: "true"
-      traefik.http.routers.cormex-api.tls.certresolver: letsencrypt
-      traefik.http.routers.cormex-api.priority: "100"
-      traefik.http.routers.cormex-api.middlewares: cormex-api-strip
-      traefik.http.middlewares.cormex-api-strip.stripprefix.prefixes: /api
-      traefik.http.services.cormex-api.loadbalancer.server.port: "8080"
+      traefik.http.routers.cortex-api.rule: Host(`${DOMAIN}`) && PathPrefix(`/api`)
+      traefik.http.routers.cortex-api.entrypoints: websecure
+      traefik.http.routers.cortex-api.tls: "true"
+      traefik.http.routers.cortex-api.tls.certresolver: letsencrypt
+      traefik.http.routers.cortex-api.priority: "100"
+      traefik.http.routers.cortex-api.middlewares: cortex-api-strip
+      traefik.http.middlewares.cortex-api-strip.stripprefix.prefixes: /api
+      traefik.http.services.cortex-api.loadbalancer.server.port: "8080"
       # ── 自己那个域名下的同一件事 ────────────────────────
       #
       # **同一个服务，第二个 router**（不是第二个 service）。`${DOMAIN}` 那条
@@ -367,7 +390,7 @@ services:
       # 这条是给下面那个 cormex-web 用的。
       #
       # `.service` 必须显式写：traefik 靠**同名**把 router 关联到 service，
-      # 而这个 router 叫 cormex-api、service 叫 cormex-api。不写的症状是
+      # 而这个 router 叫 cormex-api、service 叫 cortex-api。不写的症状是
       # 一条报「service cormex-api not found」的 500 —— 而它只在这一个域名上
       # 出现，另一个域名照常工作，于是看起来像 DNS 或证书的问题。
       traefik.http.routers.cormex-api.rule: Host(`${CORMEX_DOMAIN:?独立 Web 的域名，例如 cormex.example.com}`) && PathPrefix(`/api`)
@@ -375,8 +398,8 @@ services:
       traefik.http.routers.cormex-api.tls: "true"
       traefik.http.routers.cormex-api.tls.certresolver: letsencrypt
       traefik.http.routers.cormex-api.priority: "100"
-      traefik.http.routers.cormex-api.middlewares: cormex-api-strip
-      traefik.http.routers.cormex-api.service: cormex-api
+      traefik.http.routers.cormex-api.middlewares: cortex-api-strip
+      traefik.http.routers.cormex-api.service: cortex-api
 
   # ── Web 界面 ──────────────────────────────────────────
   #

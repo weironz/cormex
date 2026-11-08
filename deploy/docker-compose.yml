@@ -150,6 +150,27 @@ services:
   cormex:
     image: ${CORMEX_IMAGE:-${CORMEX_REGISTRY:-willdockerhub}/cormex:${CORMEX_VERSION:?pin a version in .env, for example v0.1.11}}
     container_name: cormex
+    # 与本文件里的 rustfs 同一项目，所以 depends_on 能保证它已启动；但
+    # `service_started` 不等于「S3 可读」，而 cormexd 不可达时会静默回落本地文件系统。
+    # 判定「可达」看状态码不是 2xx（S3 根路径匿名请求回 403）。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        attempts=0
+        while :; do
+          code=$$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$${S3_ENDPOINT}" || echo 000)
+          if [ "$$code" != "000" ]; then
+            echo "object storage $${S3_ENDPOINT} answered $$code; starting cormexd"
+            break
+          fi
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 150 ]; then
+            echo "object storage $${S3_ENDPOINT} still unreachable after 300s" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        exec /usr/local/bin/cormexd
     restart: unless-stopped
     logging: *default-logging
     # The server exits when the database is unreachable, so you will see a
