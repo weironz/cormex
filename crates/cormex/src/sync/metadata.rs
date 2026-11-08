@@ -103,6 +103,18 @@ pub async fn sync_codex(
                 db.put_metadata_sent(&local_key, &sha)?;
                 outcome.updated += 1;
             }
+            // The id is another device key's: forgetting it lets the next
+            // transcript pass register the file under this device, and the
+            // metadata follows on that run. Retrying the same id never would
+            Err(error) if crate::sync::api::is_not_this_devices_file(&error) => {
+                outcome.failed += 1;
+                db.forget_file(&local_key)?;
+                tracing::info!(
+                    path = %file.logical_path,
+                    %error,
+                    "a remembered file id belongs to another device key; registering it again next sync"
+                );
+            }
             Err(error) => {
                 outcome.failed += 1;
                 tracing::warn!(

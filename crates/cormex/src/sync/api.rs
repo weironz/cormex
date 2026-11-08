@@ -19,7 +19,71 @@ use cormex_proto::capture::{
     VerifyPrefixResponse,
 };
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, ClientError};
+
+/// The server does not know this file (or generation) as **this device's**.
+///
+/// `state.db` remembers file ids by agent and path, not by which device key
+/// registered them. When the machine changes key (`cormex login` again, a key
+/// minted for a test, a restore) and then changes back, the ids it remembers
+/// can belong to the other device, and every write to them is refused: 404
+/// "no such file for this device" on the file routes, 403 "belongs to another
+/// device" on a chunk. Retrying the same id never helps. Forgetting the file's
+/// state does: the next pass registers it under the current device and
+/// settles the bytes by prefix hash and adoption, the same path a lost
+/// `state.db` or a second machine takes, so nothing is uploaded twice.
+#[derive(Debug)]
+pub struct NotThisDevicesFile {
+    pub detail: String,
+}
+
+impl std::fmt::Display for NotThisDevicesFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server does not know this file as this device's ({})",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for NotThisDevicesFile {}
+
+/// Whether an error from a [`CaptureApi`] call is [`NotThisDevicesFile`].
+#[must_use]
+pub fn is_not_this_devices_file(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NotThisDevicesFile>().is_some()
+}
+
+/// Is this answer the server saying "not your file"?
+///
+/// By the server's own reason, not by the status alone: an older server
+/// without the metadata route also answers 404, and reading that as "not your
+/// file" would reset and re-register every Codex file on every run.
+fn owned_elsewhere(status: Option<reqwest::StatusCode>, detail: &str) -> bool {
+    match status {
+        Some(reqwest::StatusCode::NOT_FOUND) => [
+            "no such file for this device",
+            "no such capture file",
+            "no such generation",
+        ]
+        .iter()
+        .any(|reason| detail.contains(reason)),
+        Some(reqwest::StatusCode::FORBIDDEN) => detail.contains("belongs to another device"),
+        _ => false,
+    }
+}
+
+/// The error for a call on one file or generation.
+fn file_scoped(e: ClientError) -> anyhow::Error {
+    if owned_elsewhere(e.status, &e.detail) {
+        anyhow::Error::new(NotThisDevicesFile {
+            detail: e.detail.trim().to_owned(),
+        })
+    } else {
+        anyhow::anyhow!("{e}")
+    }
+}
 
 /// What the engine needs from the server.
 #[async_trait]
@@ -113,7 +177,7 @@ impl CaptureApi for HttpCaptureApi {
             )
             .await
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(file_scoped)
     }
 
     async fn update_metadata(
@@ -128,7 +192,7 @@ impl CaptureApi for HttpCaptureApi {
             )
             .await
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(file_scoped)
     }
 
     async fn open_generation(&self, file_id: &str, reason: &str) -> Result<GenerationDto> {
@@ -144,7 +208,7 @@ impl CaptureApi for HttpCaptureApi {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(file_scoped)
     }
 
     async fn put_chunk(
@@ -180,7 +244,11 @@ impl CaptureApi for HttpCaptureApi {
             });
         }
         if !status.is_success() {
-            anyhow::bail!("{path} returned {status}");
+            return Err(file_scoped(crate::client::status_error(
+                status,
+                &path,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )));
         }
         Ok(PutOutcome::Accepted(serde_json::from_slice(&bytes)?))
     }
@@ -190,7 +258,7 @@ impl CaptureApi for HttpCaptureApi {
             .post_json::<_, serde_json::Value>(&format!("/capture/files/{file_id}/events"), req)
             .await
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(file_scoped)
     }
 
     async fn verify_prefix(
@@ -227,5 +295,61 @@ impl CaptureApi for HttpCaptureApi {
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+#[cfg(test)]
+mod not_this_devices_file_tests {
+    use reqwest::StatusCode;
+
+    use super::owned_elsewhere;
+
+    #[test]
+    fn the_servers_own_refusals_are_recognised() {
+        for (status, body) in [
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"error":"no such file for this device"}"#,
+            ),
+            (StatusCode::NOT_FOUND, r#"{"error":"no such capture file"}"#),
+            (StatusCode::NOT_FOUND, r#"{"error":"no such generation"}"#),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"error":"this generation belongs to another device"}"#,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"error":"this file belongs to another device"}"#,
+            ),
+        ] {
+            assert!(
+                owned_elsewhere(Some(status), body),
+                "{status} {body} is the server saying the id is another device's"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_route_or_a_bad_key_is_not_a_reason_to_register_again() {
+        for (status, body) in [
+            // An older server without the metadata route: axum's empty 404
+            (StatusCode::NOT_FOUND, ""),
+            // A proxy's HTML page
+            (StatusCode::NOT_FOUND, "<html>404 Not Found</html>"),
+            // A key without capture:write: registering again would fail too
+            (StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#),
+            (StatusCode::UNAUTHORIZED, ""),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no such file for this device",
+            ),
+        ] {
+            assert!(
+                !owned_elsewhere(Some(status), body),
+                "{status} {body:?} must not reset local state: every run would re-register \
+                 every file"
+            );
+        }
+        assert!(!owned_elsewhere(None, "no such file for this device"));
     }
 }

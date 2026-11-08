@@ -25,7 +25,7 @@ use cormex_proto::capture::{
     RegisterFileRequest, RegisterFileResponse, VerifyPrefixResponse,
 };
 
-use crate::sync::api::{CaptureApi, PutOutcome};
+use crate::sync::api::{CaptureApi, NotThisDevicesFile, PutOutcome};
 
 /// One generation's chunks, keyed by offset.
 #[derive(Default, Clone)]
@@ -51,6 +51,8 @@ impl Generation {
 struct File {
     session: (String, String),
     role: FileRole,
+    /// The device that registered it: only it may write to the file
+    device: String,
 }
 
 /// The fake server.
@@ -93,6 +95,37 @@ impl Inner {
         } else {
             self.device.clone()
         }
+    }
+
+    /// The real server's ownership rule for the file routes: 404 "no such file
+    /// for this device" unless the caller registered it.
+    fn own(&self, file_id: &str) -> Result<()> {
+        if self
+            .file_meta
+            .get(file_id)
+            .is_some_and(|f| f.device == self.device())
+        {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(NotThisDevicesFile {
+                detail: "no such file for this device".into(),
+            }))
+        }
+    }
+
+    /// The real server's rule for chunks: the generation is one of the
+    /// caller's files' own, or one a file of the caller's follows (adopted).
+    fn may_write(&self, generation_id: &str) -> bool {
+        let device = self.device();
+        let owner = self
+            .generations
+            .iter()
+            .find(|(_, gens)| gens.iter().any(|g| g == generation_id))
+            .map(|(f, _)| f.as_str());
+        owner.is_some_and(|f| self.file_meta.get(f).is_some_and(|m| m.device == device))
+            || self.current.iter().any(|(f, g)| {
+                g == generation_id && self.file_meta.get(f).is_some_and(|m| m.device == device)
+            })
     }
 
     fn fresh_id(&mut self, prefix: &str) -> String {
@@ -230,7 +263,7 @@ impl CaptureApi for FakeCaptureApi {
         let mut inner = self.inner.lock().unwrap();
         inner.registrations.push(req.clone());
         let device = inner.device();
-        let key = (device, req.agent.clone(), req.logical_path.clone());
+        let key = (device.clone(), req.agent.clone(), req.logical_path.clone());
         let session = (req.agent.clone(), req.native_session_id.clone());
 
         let file_id = if let Some(id) = inner.files.get(&key) {
@@ -244,6 +277,7 @@ impl CaptureApi for FakeCaptureApi {
                 File {
                     session: session.clone(),
                     role: req.role,
+                    device,
                 },
             );
             inner.generations.insert(file_id.clone(), vec![gid.clone()]);
@@ -285,9 +319,9 @@ impl CaptureApi for FakeCaptureApi {
     }
 
     async fn update_classification(&self, file_id: &str, req: &FileClassification) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
+        let mut inner = self.inner.lock().unwrap();
+        inner.own(file_id)?;
+        inner
             .classifications
             .push((file_id.to_owned(), req.clone()));
         Ok(())
@@ -298,16 +332,15 @@ impl CaptureApi for FakeCaptureApi {
         file_id: &str,
         metadata: &cormex_proto::capture::SessionUiMetadata,
     ) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .metadata
-            .push((file_id.to_owned(), metadata.clone()));
+        let mut inner = self.inner.lock().unwrap();
+        inner.own(file_id)?;
+        inner.metadata.push((file_id.to_owned(), metadata.clone()));
         Ok(())
     }
 
     async fn open_generation(&self, file_id: &str, _reason: &str) -> Result<GenerationDto> {
         let mut inner = self.inner.lock().unwrap();
+        inner.own(file_id)?;
         let gid = inner.fresh_id("01GEN");
         let gens = inner.generations.entry(file_id.to_owned()).or_default();
         gens.push(gid.clone());
@@ -394,6 +427,11 @@ impl CaptureApi for FakeCaptureApi {
             inner.fail_next -= 1;
             anyhow::bail!("simulated network failure");
         }
+        if inner.generations_by_id.contains_key(generation_id) && !inner.may_write(generation_id) {
+            return Err(anyhow::Error::new(NotThisDevicesFile {
+                detail: "this generation belongs to another device".into(),
+            }));
+        }
         inner.puts += 1;
         let len = i64::try_from(body.len()).unwrap_or(0);
 
@@ -432,11 +470,9 @@ impl CaptureApi for FakeCaptureApi {
     }
 
     async fn file_event(&self, file_id: &str, req: &FileEventRequest) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .events
-            .push((file_id.to_owned(), req.op));
+        let mut inner = self.inner.lock().unwrap();
+        inner.own(file_id)?;
+        inner.events.push((file_id.to_owned(), req.op));
         Ok(())
     }
 }

@@ -7,6 +7,11 @@
 - The memory extraction panel (status, the full-extraction switch, progress, errors and retry, the model in use) is now at the top of **Settings**, above "模型配置", instead of taking the top of the memory page. The memory page opens on the categories and the search box; when it is empty, its centre still says extraction is off and where to turn it on.
 - The panel's own "前往设置" button is gone: it now lives on the settings page.
 
+### CLI: file ids left over from another device key heal themselves
+
+- `state.db` remembers file ids by agent and path, not by which device key registered them. A machine that switched key and switched back kept ids the server refuses as another device's: in production, 38 Codex sessions got a 404 on their metadata on every sync, and an append to any of them would have been refused the same way.
+- Such a refusal (404 "no such file for this device", 403 "belongs to another device", recognised by the server's own reason so an older server's missing route does not count) now forgets that file's local state. The transcript pass registers it again in the same run; the metadata pass on the next. Registering again verifies the archived bytes by prefix hash and adopts them, so nothing is uploaded twice.
+
 ## 0.1.18 — 2026-11-08
 
 ### 发布：本地构建也产出 Windows CLI

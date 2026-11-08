@@ -1165,3 +1165,133 @@ async fn a_configured_extra_home_is_captured() {
         "a non-default home's files carry its prefix and keep their session id: {registered:?}"
     );
 }
+
+// ── A state.db that outlived a device key ──
+//
+// `state.db` remembers file ids by agent and path, not by which device key
+// registered them. A machine that switched key and switched back holds ids the
+// server refuses as another device's, on every write and every run. Seen in
+// production: 38 Codex sessions whose metadata got a 404 on every sync.
+
+/// Run on the fixture's own `state.db`, but as another device key.
+async fn sync_as(
+    f: &Fixture,
+    catalog: &cormex_proto::catalog::Catalog,
+    device: &str,
+) -> cormex::sync::SyncReport {
+    f.api.set_device(device);
+    let report = run(
+        &f.api,
+        &f.db,
+        f.data.path(),
+        catalog,
+        &f.cfg,
+        device,
+        &SyncOptions::default(),
+    )
+    .await
+    .expect("the run itself should not fail");
+    f.api.set_device("device-1");
+    report
+}
+
+#[tokio::test]
+async fn an_append_under_a_changed_device_key_registers_again_instead_of_failing() {
+    let f = Fixture::new();
+    f.write("s1.jsonl", HISTORY);
+    // Registered under another key; the state stays in this machine's state.db
+    sync_as(&f, &f.catalog, "device-2").await;
+    let stale = f.state("s1.jsonl").file_id;
+
+    // Back on this device's key, and the conversation went on
+    let more = b"{\"type\":\"user\",\"n\":2}\n";
+    let mut grown = HISTORY.to_vec();
+    grown.extend_from_slice(more);
+    f.write("s1.jsonl", &grown);
+    let report = f.sync().await;
+
+    assert_eq!(
+        report.errors, 0,
+        "the refused id must be forgotten and the file registered again in the same run: {report:?}"
+    );
+    assert_ne!(
+        f.state("s1.jsonl").file_id,
+        stale,
+        "the file must now be this device's"
+    );
+    assert_eq!(
+        f.api.bytes_received(),
+        i64::try_from(grown.len()).expect("len"),
+        "registering again must adopt the archived bytes and send only the new turn"
+    );
+    assert_eq!(
+        f.api.adoptions(),
+        1,
+        "the new file follows the archived stream"
+    );
+    assert_eq!(
+        f.api.non_empty_generations(),
+        1,
+        "one conversation, one stream: no second copy of the history"
+    );
+
+    let again = f.sync().await;
+    assert_eq!(again.errors, 0);
+    assert_eq!(again.files_uploaded, 0, "and after that the file is quiet");
+}
+
+#[tokio::test]
+async fn codex_metadata_for_another_device_keys_file_heals_on_the_next_sync() {
+    let f = Fixture::new();
+    let (home, catalog) = codex_home("Named under the old key");
+    sync_as(&f, &catalog, "device-2").await;
+    let sent = f.api.bytes_received();
+    assert_eq!(f.api.metadata().len(), 1);
+
+    // Back on this device's key; the transcript is unchanged, so only the
+    // metadata pass touches the remembered id
+    rusqlite::Connection::open(home.path().join("state_5.sqlite"))
+        .expect("sqlite")
+        .execute("UPDATE threads SET name = 'Renamed'", [])
+        .expect("rename");
+    let refused = f
+        .sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+    assert_eq!(
+        refused.errors, 0,
+        "metadata failures never turn the sync red: {refused:?}"
+    );
+    assert_eq!(
+        f.api.metadata().len(),
+        1,
+        "the refused update was not recorded"
+    );
+
+    let healed = f
+        .sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+    assert_eq!(healed.errors, 0, "{healed:?}");
+    let metadata = f.api.metadata();
+    assert_eq!(
+        metadata.len(),
+        2,
+        "the next sync registers the file under this key and the rename arrives: {metadata:?}"
+    );
+    assert_eq!(metadata[1].1.title.as_deref(), Some("Renamed"));
+    assert_ne!(metadata[1].0, metadata[0].0, "sent to this device's file");
+    assert_eq!(
+        f.api.bytes_received(),
+        sent,
+        "registering again must not upload the transcript a second time"
+    );
+
+    let quiet = f
+        .sync_with_catalog_and_config(&catalog, &f.cfg, SyncOptions::default())
+        .await;
+    assert_eq!(quiet.errors, 0);
+    assert_eq!(
+        f.api.metadata().len(),
+        2,
+        "healed: no more retries of the same metadata"
+    );
+}

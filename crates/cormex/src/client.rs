@@ -43,6 +43,12 @@ impl ExitCode {
 pub struct ClientError {
     pub code: ExitCode,
     pub message: String,
+    /// The HTTP status, when the server answered at all.
+    pub status: Option<reqwest::StatusCode>,
+    /// The body of a failed answer, as far as it was read: the server's own
+    /// reason. A 404 from a route this server does not have and a 404 for a
+    /// file it does not know as this device's are only told apart here.
+    pub detail: String,
 }
 
 impl std::fmt::Display for ClientError {
@@ -266,10 +272,15 @@ impl ApiClient {
     async fn decode<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T, ClientError> {
         let status = resp.status();
         let path = resp.url().path().to_owned();
-        self.check_status(status, &path)?;
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(status_error(status, &path, detail));
+        }
         resp.json::<T>().await.map_err(|e| ClientError {
             code: ExitCode::PartialFailure,
             message: format!("the server's response to {path} does not parse: {e}"),
+            status: Some(status),
+            detail: String::new(),
         })
     }
 
@@ -277,20 +288,27 @@ impl ApiClient {
         if status.is_success() {
             return Ok(());
         }
-        // 401 and 403 are the credential's fault and no amount of retrying
-        // fixes them; everything else is either the server's problem or ours,
-        // and the caller decides
-        let code = if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
-            ExitCode::Unauthenticated
-        } else {
-            ExitCode::PartialFailure
-        };
-        Err(ClientError {
-            code,
-            message: format!("{path} returned {status}"),
-        })
+        Err(status_error(status, path, String::new()))
+    }
+}
+
+/// The error for a non-success answer. 401 and 403 are the credential's fault
+/// and no amount of retrying fixes them; everything else is either the
+/// server's problem or ours, and the caller decides.
+pub fn status_error(status: reqwest::StatusCode, path: &str, detail: String) -> ClientError {
+    let code = if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        ExitCode::Unauthenticated
+    } else {
+        ExitCode::PartialFailure
+    };
+    ClientError {
+        code,
+        message: format!("{path} returned {status}"),
+        status: Some(status),
+        // Enough to read the server's reason; never a whole page
+        detail: detail.chars().take(512).collect(),
     }
 }
 
@@ -298,6 +316,8 @@ fn unreachable(e: reqwest::Error) -> ClientError {
     ClientError {
         code: ExitCode::Unreachable,
         message: format!("could not reach the server: {e}"),
+        status: None,
+        detail: String::new(),
     }
 }
 

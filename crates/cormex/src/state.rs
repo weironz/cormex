@@ -275,6 +275,29 @@ impl StateDb {
         Ok(())
     }
 
+    /// Forget everything this machine remembers about one file, as if it had
+    /// never been seen: the next pass registers it again.
+    ///
+    /// For ids the server refuses as another device's
+    /// ([`crate::sync::api::NotThisDevicesFile`]). Not a loss: registering
+    /// again verifies the server's bytes by prefix hash and adopts them, so
+    /// nothing already archived is uploaded twice.
+    ///
+    /// # Errors
+    /// The write failed.
+    pub fn forget_file(&self, local_key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE local_key = ?1", [local_key])
+            .context("could not forget the file state")?;
+        self.conn
+            .execute(
+                "DELETE FROM metadata_sent WHERE local_key = ?1",
+                [local_key],
+            )
+            .context("could not forget the sent metadata")?;
+        Ok(())
+    }
+
     /// One file's state, or `None` if it has never been seen.
     ///
     /// # Errors

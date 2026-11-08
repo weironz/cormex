@@ -217,7 +217,7 @@ pub async fn run(
             continue;
         };
 
-        match sync_one(
+        let mut outcome = sync_one(
             api,
             db,
             file,
@@ -226,8 +226,33 @@ pub async fn run(
             opts,
             &mut budget,
         )
-        .await
+        .await;
+        // An id this machine remembers from another device key: forget it and
+        // go again in this run, now as a first sighting. Registering verifies
+        // the server's bytes and adopts them, so this re-sends nothing that is
+        // already archived. Once only: a second refusal is a real error
+        if let Err(e) = &outcome
+            && api::is_not_this_devices_file(e)
         {
+            tracing::info!(
+                agent = %file.agent,
+                path = %file.logical_path,
+                error = %e,
+                "a remembered file id belongs to another device key; registering this file again"
+            );
+            db.forget_file(&local_key)?;
+            outcome = sync_one(
+                api,
+                db,
+                file,
+                classification.as_ref(),
+                &local_key,
+                opts,
+                &mut budget,
+            )
+            .await;
+        }
+        match outcome {
             Ok(Some(uploaded)) => {
                 if uploaded > 0 {
                     report.files_uploaded += 1;
