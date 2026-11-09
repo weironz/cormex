@@ -147,7 +147,7 @@ impl CodexMcp {
 impl Installer for CodexMcp {
     fn plan(&self) -> Result<Vec<Change>> {
         let text = read_text(&self.config_path)?;
-        Ok(if text.contains("[mcp_servers.cormex]") {
+        Ok(if codex_registered_in(&text) {
             Vec::new()
         } else {
             vec![Change {
@@ -163,7 +163,7 @@ impl Installer for CodexMcp {
 
     fn apply(&self, db: &crate::state::StateDb) -> Result<Vec<Change>> {
         let text = read_text(&self.config_path)?;
-        if text.contains("[mcp_servers.cormex]") {
+        if codex_registered_in(&text) {
             return Ok(Vec::new());
         }
         let backup_path = backup::backup(&self.config_path)?;
@@ -208,11 +208,24 @@ impl Installer for CodexMcp {
     }
 }
 
-fn already_registered(settings: &Value) -> bool {
+/// Whether a Claude Code settings value already has the Cormex MCP entry.
+///
+/// Shared with `doctor`: a check that disagrees with the installer about what
+/// "registered" means would either cry wolf or, worse, stay quiet about a host
+/// that never got the server.
+pub(crate) fn already_registered(settings: &Value) -> bool {
     settings
         .get("mcpServers")
         .and_then(Value::as_object)
         .is_some_and(|s| s.contains_key(SERVER_NAME))
+}
+
+/// Whether a Codex `config.toml` already has the Cormex MCP table.
+///
+/// The installer appends the table as text rather than round-tripping TOML (the
+/// file holds the user's comments), so the check is the same textual match.
+pub(crate) fn codex_registered_in(text: &str) -> bool {
+    text.contains(&format!("[mcp_servers.{SERVER_NAME}]"))
 }
 
 fn read_json(path: &Path) -> Result<Value> {

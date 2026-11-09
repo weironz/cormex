@@ -16,6 +16,10 @@
 //! - no successful run for a week → the client is running and doing nothing
 //! - a source with no new data for a week → that agent is no longer being
 //!   captured, and nothing else notices
+//! - no agent has Cormex as an MCP server → conversations are captured and
+//!   distilled into memories that nothing ever reads back
+
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -270,6 +274,17 @@ pub async fn run(
         }),
     });
 
+    // ── MCP consumer ──
+    //
+    // Last, because it is the only check about reading memories back rather
+    // than writing them. Everything above can be green on a machine whose
+    // archive nobody has ever queried.
+    let home = directories::BaseDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    checks.push(mcp_check(&local_mcp_hosts(&home, &cwd)));
+
     Ok(Report { checks })
 }
 
@@ -341,6 +356,137 @@ pub fn homes_check(catalog: &cormex_proto::catalog::Catalog, cfg: &Config) -> Ch
                 "run `cormex init` to record these directories in config.toml".into()
             }
         }),
+    }
+}
+
+/// A file a host reads to find its MCP servers.
+#[derive(Debug, Clone)]
+pub(crate) struct McpHostConfig {
+    /// The host's name, for the report. Several files may belong to one host.
+    pub(crate) label: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) kind: McpConfigKind,
+}
+
+/// The two shapes `mcp_register` writes, so doctor and the installer agree on
+/// what "registered" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpConfigKind {
+    /// `{"mcpServers": {"cormex": ...}}`: `~/.claude.json`, a project's
+    /// `.mcp.json`, and the `settings.json` that `cormex init` writes.
+    ClaudeJson,
+    /// `[mcp_servers.cormex]` in Codex's `config.toml`.
+    CodexToml,
+}
+
+impl McpHostConfig {
+    fn registered(&self, text: &str) -> bool {
+        match self.kind {
+            McpConfigKind::ClaudeJson => serde_json::from_str::<serde_json::Value>(text)
+                .is_ok_and(|v| crate::install::mcp_register::already_registered(&v)),
+            McpConfigKind::CodexToml => crate::install::mcp_register::codex_registered_in(text),
+        }
+    }
+}
+
+/// The MCP configs on this machine. Both `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+/// are honoured: a host that was moved out of the home directory still exists,
+/// and a check that looked only at the defaults would report it as absent.
+fn local_mcp_hosts(home: &Path, cwd: &Path) -> Vec<McpHostConfig> {
+    let claude = |path: PathBuf| McpHostConfig {
+        label: "Claude Code",
+        path,
+        kind: McpConfigKind::ClaudeJson,
+    };
+    let codex = |path: PathBuf| McpHostConfig {
+        label: "Codex",
+        path,
+        kind: McpConfigKind::CodexToml,
+    };
+    let mut out = vec![
+        claude(home.join(".claude.json")),
+        claude(home.join(".claude").join("settings.json")),
+        claude(cwd.join(".mcp.json")),
+        codex(home.join(".codex").join("config.toml")),
+    ];
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        out.push(claude(PathBuf::from(dir).join("settings.json")));
+    }
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        out.push(codex(PathBuf::from(dir).join("config.toml")));
+    }
+    out
+}
+
+/// Whether any agent on this machine can read the archive back.
+///
+/// `cormex init` registers the MCP server, but the installers that do it are
+/// skipped entirely when no credential exists yet. A machine that set up its
+/// hooks before logging in will capture conversations, distil memories, and
+/// never surface one of them — and every other check in this report stays
+/// green. That silence is the bug this check exists to break.
+///
+/// A machine with no agent config at all is a capture-only host and passes:
+/// there is no consumer here to wire up.
+pub(crate) fn mcp_check(hosts: &[McpHostConfig]) -> Check {
+    let mut installed: Vec<&str> = Vec::new();
+    let mut connected: Vec<&str> = Vec::new();
+    let mut malformed = 0_usize;
+
+    for host in hosts {
+        // An unreadable file is not evidence that a host is absent; a missing
+        // one is. Both are non-fatal: this is a diagnostic, not a gate.
+        let Ok(text) = std::fs::read_to_string(&host.path) else {
+            continue;
+        };
+        if !installed.contains(&host.label) {
+            installed.push(host.label);
+        }
+        if host.registered(&text) {
+            if !connected.contains(&host.label) {
+                connected.push(host.label);
+            }
+        } else if host.kind == McpConfigKind::ClaudeJson
+            && serde_json::from_str::<serde_json::Value>(&text).is_err()
+        {
+            malformed += 1;
+        }
+    }
+
+    if !connected.is_empty() {
+        return Check {
+            name: "mcp".into(),
+            ok: true,
+            detail: format!("cormex MCP is registered in {}", connected.join(", ")),
+            fix: None,
+        };
+    }
+    if installed.is_empty() {
+        return Check {
+            name: "mcp".into(),
+            ok: true,
+            detail: "no agent MCP config on this machine (capture-only host)".into(),
+            fix: None,
+        };
+    }
+
+    let mut detail = format!(
+        "no cormex MCP server in {} - conversations are captured but no memory is ever read back",
+        installed.join(", ")
+    );
+    if malformed > 0 {
+        detail.push_str(&format!(" ({malformed} config file could not be parsed)"));
+    }
+    Check {
+        name: "mcp".into(),
+        ok: false,
+        detail,
+        fix: Some(
+            "run `cormex init` to register it (a credential is required), then reload the host \
+             and start a new session; see docs/agent-integration-guide.md. If this machine only \
+             captures and the MCP consumer lives on another host, this is expected"
+                .into(),
+        ),
     }
 }
 
@@ -478,5 +624,129 @@ mod tests {
         let text = render(&r);
         assert!(text.contains("FAIL"), "{text}");
         assert!(text.contains("cormex login"), "{text}");
+    }
+
+    fn claude(path: std::path::PathBuf) -> McpHostConfig {
+        McpHostConfig {
+            label: "Claude Code",
+            path,
+            kind: McpConfigKind::ClaudeJson,
+        }
+    }
+
+    fn codex(path: std::path::PathBuf) -> McpHostConfig {
+        McpHostConfig {
+            label: "Codex",
+            path,
+            kind: McpConfigKind::CodexToml,
+        }
+    }
+
+    /// A capture-only box has nothing to wire up, so it must not fail.
+    #[test]
+    fn a_host_with_no_agent_config_passes_the_mcp_check() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let check = mcp_check(&local_mcp_hosts(dir.path(), dir.path()));
+        assert!(check.ok, "{check:?}");
+        assert!(check.fix.is_none(), "{check:?}");
+    }
+
+    /// The three places Claude Code reads, and the one `cormex init` writes,
+    /// each count as connected.
+    #[test]
+    fn any_claude_config_with_the_entry_counts_as_connected() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let entry = r#"{"mcpServers":{"cormex":{"type":"http","url":"https://m.example/mcp"}}}"#;
+        std::fs::write(dir.path().join(".claude.json"), entry).expect("write");
+        std::fs::create_dir_all(dir.path().join(".claude")).expect("mkdir");
+        std::fs::write(dir.path().join(".claude/settings.json"), entry).expect("write");
+        std::fs::write(dir.path().join(".mcp.json"), entry).expect("write");
+
+        for path in [
+            dir.path().join(".claude.json"),
+            dir.path().join(".claude/settings.json"),
+            dir.path().join(".mcp.json"),
+        ] {
+            let check = mcp_check(&[claude(path.clone())]);
+            assert!(check.ok, "{path:?} should count as connected: {check:?}");
+            assert!(check.detail.contains("Claude Code"), "{check:?}");
+        }
+    }
+
+    /// Codex is TOML, and the installer appends text rather than serialising.
+    #[test]
+    fn a_codex_table_counts_as_connected() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# my own settings\nmodel = \"gpt-5.5\"\n[mcp_servers.cormex]\ncommand = \"/bin/cormex\"\n",
+        )
+        .expect("write");
+        let check = mcp_check(&[codex(path)]);
+        assert!(check.ok, "{check:?}");
+        assert!(check.detail.contains("Codex"), "{check:?}");
+    }
+
+    /// The real failure: hosts installed, other MCP servers configured, but no
+    /// Cormex. Every check above stays green in exactly this situation.
+    #[test]
+    fn hosts_without_cormex_fail_with_an_actionable_fix() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"mcpServers":{"github":{},"mica":{}}}"#,
+        )
+        .expect("write");
+        std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(".codex/config.toml"),
+            "[mcp_servers.github]\ncommand = \"gh\"\n",
+        )
+        .expect("write");
+
+        let check = mcp_check(&local_mcp_hosts(dir.path(), dir.path()));
+        assert!(!check.ok, "an unconnected host must not pass: {check:?}");
+        assert!(check.detail.contains("Claude Code"), "{check:?}");
+        assert!(check.detail.contains("Codex"), "{check:?}");
+        let fix = check.fix.as_deref().expect("a failing check needs a fix");
+        assert!(fix.contains("cormex init"), "{fix}");
+        assert!(fix.contains("new session"), "{fix}");
+        let text = render(&Report {
+            checks: vec![check],
+        });
+        assert!(text.contains("FAIL"), "{text}");
+    }
+
+    /// The word "cormex" in a project path is not an MCP entry. Grepping the
+    /// file instead of reading `mcpServers` reports a connected host that has
+    /// no connection at all — the exact mistake that hid this for months.
+    #[test]
+    fn a_project_path_named_cormex_is_not_a_registration() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"projects":{"D:/codes/cormex":{"allowedTools":[],"mcpServers":{}}},"mcpServers":{"github":{}}}"#,
+        )
+        .expect("write");
+        let check = mcp_check(&local_mcp_hosts(dir.path(), dir.path()));
+        assert!(
+            !check.ok,
+            "a path containing the word cormex is not an MCP server: {check:?}"
+        );
+    }
+
+    /// A broken config is a broken host, not an absent one, and the report
+    /// says so rather than silently treating the file as empty.
+    #[test]
+    fn an_unparseable_config_is_reported() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join(".claude.json"), "{ not json").expect("write");
+        let check = mcp_check(&local_mcp_hosts(dir.path(), dir.path()));
+        assert!(!check.ok, "{check:?}");
+        assert!(
+            check.detail.contains("could not be parsed"),
+            "the malformed file should be named: {check:?}"
+        );
     }
 }

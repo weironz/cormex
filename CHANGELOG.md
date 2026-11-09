@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Diagnostics: doctor notices a machine that never reads its memories
+
+- `cormex doctor` gains an `mcp` check. Previously every check could pass on a machine that captured conversations, distilled them into memories, and never surfaced one: registration as an MCP server is done by `cormex init`, but those installers are skipped when no credential exists yet, so setting up hooks before logging in silently leaves no consumer at all.
+- The check reads the files hosts actually use (`~/.claude.json`, `~/.claude/settings.json`, a project `.mcp.json`, `~/.codex/config.toml`, plus `CLAUDE_CONFIG_DIR` / `CODEX_HOME` overrides) and shares its notion of "registered" with the installers. A machine with no agent config is a capture-only host and passes. A failing check points at `cormex init`, reloading the host and starting a new session.
+- A project path containing the word "cormex" is not an MCP entry; the check reads `mcpServers` rather than searching the file. A config that cannot be parsed is named in the detail instead of being treated as empty.
+
 ## 0.1.21 — 2026-11-09
 
 ### Memories per session, and finding things by id
