@@ -5,7 +5,7 @@
 
 ## 现在在哪
 
-**v0.1.19。生产在跑（单节点），仓库公开，两个镜像 + 六平台 CLI 在发。**
+**v0.1.20 源码基线。生产在跑（单节点），仓库公开，两个镜像 + 六平台 CLI 在发；生产运行版本独立验收。**
 
 ```
                         ┌─────────────────────────────┐
@@ -55,6 +55,11 @@
 - 双镜像、六平台 CLI、`cormex update` 自更新（校验后原子替换）
 - 构建与发布各两条路径（本地 / Actions），共用 `scripts/release.py`；`BUNDLE_SHA256` 显式审批（[release.md](release.md)）
 - 部署：`just deploy`（Ansible）与手动触发的 `deploy.yml`，都只拉已发布镜像；`deploy-rehearsal` 演练栈
+- 本地构建有诊断、版本准备和续跑：`doctor` 不需要 tag，`prepare-version` 只改版本文件，`build-resume`
+  校验已有产物且每次重跑 `ci-full`；阶段与耗时写在候选之外的回执里，编译缓存跨版本复用
+- 升级有明确入口与失败边界：`deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256` 校验已公开候选，先备份
+  数据库再更新 pin / digest，只启动服务端与 Web，再做共享验收；尝试启动后不自动回滚 schema
+  （[部署指南](deployment-guide.md#9-用-justfile--ansible-部署验收与演练)）
 - `CHANGELOG.md`、README 的 MCP 接入片段与采集说明、`just ci` 里的 evals 题集校验
 
 ## 这一轮做了什么（2026-11-08）
@@ -92,6 +97,9 @@
 - **生产记忆库没有定时备份**（2026-11-08 演练发现；唯一一份是演练留下的 dump，与库同机）。
   要配定时备份 + 异地副本，并定期跑 `scripts/pg-restore-drill.sh` —— 这是现在最大的风险
 - 生产是单节点
+- **仍需目标环境实测**：跨 Docker store 的镜像内容身份、带 migration 的升级、HTTPS / CDN 返回的 Web
+  脚本、真实客户端。自动 dump 的 `pg_restore --list` 不等于恢复演练，表行数估计不能证明无损；
+  脚本单测通过不等于生产升级已验证
 
 **对外**
 - API 没冻结：`/health` 里有 `protocol: 1`，但没有文档说哪些端点算稳定

@@ -60,7 +60,7 @@ class DeployEnvTests(unittest.TestCase):
             deploy.up("v0.1.18", self.directory)
         self.assertEqual([call.args[1:] for call in compose.call_args_list],
                          [("pull", "cormex", "web"), ("up", "-d")])
-        verify.assert_called_once_with(self.directory, "v0.1.18")
+        verify.assert_called_once_with(self.directory, "v0.1.18", project=None)
 
 
 class DeployComposeTests(unittest.TestCase):
@@ -98,6 +98,9 @@ class DeployVerifyTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        runtime = mock.patch.object(deploy, "verify_runtime", return_value={})
+        runtime.start()
+        self.addCleanup(runtime.stop)
         (self.directory / ".env").write_text(
             "CORMEX_VERSION=v0.1.18\nCORMEX_PORT=18080\n", encoding="utf-8")
 
@@ -110,7 +113,7 @@ class DeployVerifyTests(unittest.TestCase):
 
     def healthy(self, **overrides):
         health = {"status": "ok", "role": "cormexd", "version": "0.1.18",
-                  "database": "postgres", "blob_backend": "s3", "auth": "token",
+                  "database": "ok", "blob_backend": "s3", "auth": "token",
                   "capture_encryption": "encrypted", "embedding": {"model": "api:bge-m3"}}
         health.update(overrides)
         return health
@@ -118,35 +121,42 @@ class DeployVerifyTests(unittest.TestCase):
     def test_verify_accepts_the_deployed_version(self):
         with mock.patch.object(deploy, "fetch", side_effect=self.responses(self.healthy())), \
                 mock.patch("builtins.print"):
-            status = deploy.verify(self.directory, "v0.1.18")
+            status = deploy.verify(self.directory, "v0.1.18", timeout=0)
         self.assertEqual(status["version"], "0.1.18")
+
+    def test_verify_rejects_failed_database_local_blobs_and_missing_encryption(self):
+        for overrides in ({"database": "error"}, {"blob_backend": "local"}, {"capture_encryption": "plaintext"}):
+            with self.subTest(overrides=overrides), mock.patch.object(
+                    deploy, "fetch", side_effect=self.responses(self.healthy(**overrides))):
+                with self.assertRaises(deploy.DeployError):
+                    deploy.verify(self.directory, "v0.1.18", timeout=0)
 
     def test_verify_rejects_a_different_running_version(self):
         with mock.patch.object(deploy, "fetch", side_effect=self.responses(self.healthy(version="0.1.17"))), \
                 mock.patch("builtins.print"):
             with self.assertRaises(deploy.DeployError) as caught:
-                deploy.verify(self.directory, "v0.1.18")
+                deploy.verify(self.directory, "v0.1.18", timeout=0)
         self.assertIn("running version", str(caught.exception))
 
     def test_verify_rejects_a_stack_that_is_not_cormexd(self):
         with mock.patch.object(deploy, "fetch", side_effect=self.responses(self.healthy(role="cormex"))), \
                 mock.patch("builtins.print"):
             with self.assertRaises(deploy.DeployError):
-                deploy.verify(self.directory, "v0.1.18")
+                deploy.verify(self.directory, "v0.1.18", timeout=0)
 
     def test_verify_rejects_api_answers_served_by_the_web_image(self):
         def fetch(url, timeout=10):
             return "text/html", b"<html><title>Cormex</title></html>"
         with mock.patch.object(deploy, "fetch", side_effect=fetch), mock.patch("builtins.print"):
             with self.assertRaises(deploy.DeployError) as caught:
-                deploy.verify(self.directory, "v0.1.18")
+                deploy.verify(self.directory, "v0.1.18", timeout=0)
         self.assertIn("proxy", str(caught.exception))
 
     def test_verify_rejects_a_root_that_is_not_html(self):
         with mock.patch.object(deploy, "fetch", side_effect=self.responses(
                 self.healthy(), root=(b'{"error":true}', "application/json"))), mock.patch("builtins.print"):
             with self.assertRaises(deploy.DeployError):
-                deploy.verify(self.directory, "v0.1.18")
+                deploy.verify(self.directory, "v0.1.18", timeout=0)
 
 
 class DeployRehearsalTests(unittest.TestCase):

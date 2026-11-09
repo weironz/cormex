@@ -73,13 +73,28 @@ args=(-i "$inventory" deploy/ansible/deploy.yml)
 [[ ${#goal[@]} -gt 0 ]] && args+=("${goal[@]}")
 [[ -n "$tag" ]] && args+=(-e "cormex_version=$tag")
 
+# Upgrade approval is explicit and remains independent from candidate publication.
+# The relative extra-vars path also works inside the mounted control-node image.
+expectations_file=""
+if (( ${#goal[@]} == 0 )) && [[ -n ${DEPLOY_FROM_VERSION:-} || -n ${DEPLOY_BUNDLE_SHA256:-} ]]; then
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid target tag"
+  [[ ${DEPLOY_FROM_VERSION:-} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "DEPLOY_FROM_VERSION must be vX.Y.Z"
+  [[ ${DEPLOY_BUNDLE_SHA256:-} =~ ^[0-9a-f]{64}$ ]] || die "DEPLOY_BUNDLE_SHA256 must be the approved checksum"
+  [[ ${DEPLOY_PULL:-true} != false ]] || die "deploy-upgrade requires registry verification (DEPLOY_PULL=true)"
+  expectations_file=$(mktemp "$repo/.deploy-expectations.XXXXXX.json")
+  trap 'rm -f "$expectations_file"' EXIT
+  python3 "$repo/scripts/deploy_candidate.py" "$tag" "$DEPLOY_BUNDLE_SHA256" --output "$expectations_file"
+  args+=(-e "cormex_from_version=$DEPLOY_FROM_VERSION" -e "@${expectations_file##*/}")
+fi
+
 if [[ -n ${DEPLOY_KNOWN_HOSTS:-} ]]; then
   export ANSIBLE_SSH_COMMON_ARGS="-o UserKnownHostsFile=$(expand_tilde "$DEPLOY_KNOWN_HOSTS") -o StrictHostKeyChecking=yes"
 fi
 
 if command -v ansible-playbook >/dev/null 2>&1; then
   cd "$repo"
-  exec ansible-playbook "${args[@]}"
+  ansible-playbook "${args[@]}"
+  exit $?
 fi
 
 command -v docker >/dev/null 2>&1 || die "no ansible-playbook and no docker on this host; install ansible-core (POSIX, WSL included) or Docker Desktop"
@@ -94,7 +109,7 @@ mounts=(-v "$repo:/repo")
 [[ -d $HOME/.ssh ]] && mounts+=(-v "$HOME/.ssh:/root/.ssh:ro")
 environment=()
 for key in DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_DIR DEPLOY_API \
-           DEPLOY_PROJECT DEPLOY_CONNECTION DEPLOY_PULL; do
+           DEPLOY_PROJECT DEPLOY_CONNECTION DEPLOY_PULL DEPLOY_REQUIRE_ENCRYPTION; do
   [[ -n ${!key:-} ]] && environment+=(-e "$key=${!key}")
 done
 if [[ -n ${DEPLOY_SSH_KEY:-} ]]; then
@@ -112,7 +127,7 @@ fi
 
 image=${DEPLOY_ANSIBLE_IMAGE:-cormex-ansible:control}
 docker build -q -t "$image" "$repo/deploy/ansible" >/dev/null
-exec docker run --rm --workdir /repo \
+docker run --rm --workdir /repo \
   "${mounts[@]}" \
   "${environment[@]}" \
   -e ANSIBLE_FORCE_COLOR=1 \

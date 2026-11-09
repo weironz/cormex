@@ -78,7 +78,8 @@ CORMEX_WEB_IMAGE=cormex-web-local:source
 
 ```bash
 # 将 VERSION 替换为选定的真实镜像标签。
-docker run --rm willdockerhub/cormex:VERSION --generate-token
+# 将 REGISTRY/NAMESPACE 替换为选定发布镜像的仓库。
+docker run --rm REGISTRY/NAMESPACE/cormex:VERSION --generate-token
 ```
 
 把输出的哈希填入 `CORMEX_AUTH_TOKEN_SHA256`；token 原文保存在客户端密钥管理工具中，不要写入文档、Git 或公开日志。这个 token 与账号登录后签发的设备密钥是不同的凭据。
@@ -229,30 +230,19 @@ curl -fsS http://127.0.0.1:8080/api/health
 
 ### 对象存储属于本项目
 
-`deploy/docker-compose.yml` 里 `rustfs` 服务、它自己的卷（`rustfs_data`）和
-`${S3_DOMAIN}` 这条 traefik 路由都在同一个 compose 项目里。**不要借用另一个栈的
-对象存储**：两边的 `container_name` / `Host(...)` 规则会撞，撞名的症状是 `up -d`
-半途报错，撞路由的症状更糟 —— traefik 会把同一个域名的请求轮询到两个存储上。
+自足模板把 `rustfs` 服务和 `rustfs_data` 卷放在同一个 Compose 项目中；生产参考模板另有 `${S3_DOMAIN}` 路由。部署前检查容器名、卷与路由归属，避免误用其他产品的数据或把同一域名指向两个独立对象存储。
 
-浏览器取 blob 走**预签名 URL**，签名里包含 host，所以每个栈的对象存储必须有自己的
-域名（本部署是 `s3.<CORMEX_DOMAIN 的父域>`，如 `s3.cormex.example.com`）。没有这个
-记录就只能继续共用别人的存储，而那等于两个产品写同一个桶。
+浏览器取 blob 走**预签名 URL**，签名里包含 host。为当前对象存储配置独立可达的入口，例如 `https://objects.example.com`，并核对其桶、权限和 CORS。
 
-历史部署若曾共用过存储，迁移顺序是「新服务 → 新卷 → 复制数据 → 新域名 → 切换」：
+历史部署迁移对象存储时，先确认源卷和目标卷，停写后复制并校验，再切换端点。下面两个卷名都是占位值，不可直接照抄；底层文件复制还需停止对应对象存储，完整步骤见第 8 节。
 
 ```bash
-# 1) 新服务先起在空卷上
-docker volume create cormex_rustfs_data
-# 2) 复制（写侧先停：docker compose stop cormex）
-docker run --rm -v cortex_cortex-prod-rustfs:/from:ro -v cormex_rustfs_data:/to \
+docker volume create REPLACE_WITH_TARGET_VOLUME
+docker run --rm -v REPLACE_WITH_SOURCE_VOLUME:/from:ro -v REPLACE_WITH_TARGET_VOLUME:/to \
   pgvector/pgvector:pg17 sh -c 'cp -a /from/. /to/'
-# 3) 把 cormex 的 S3_ENDPOINT 指到本项目服务、S3_PUBLIC_ENDPOINT 指到新域名，再 up
 ```
 
-`depends_on` 只能引用同一个 compose 项目里的服务，而且 `service_started` 不等于
-「可读」。cormexd 只在启动那一刻决定用 S3 还是本地文件系统，不可达时仅打一条 warning
-就回落，所以 entrypoint 里加一道等待（下面这段来自生产那份 override），让「回落」
-不可能发生：
+`depends_on` 只能引用同一个 Compose 项目里的服务，而且 `service_started` 不等于「可读」。cormexd 在启动时连接对象存储，不可达时可能 warning 后回落到本地文件系统。可以在本地 override 增加等待，减少启动时序问题：
 
 ```yaml
 services:
@@ -306,6 +296,10 @@ CORMEX_S3_PUBLIC_URL=https://objects.example.com
 
 ## 7. 升级与回退
 
+已按第 9 节接入 Ansible 的部署，统一使用 `just deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256`；备份、pin 更新和严格验收由该入口执行。`just deploy TAG` 只重应用目标机器已经 pin 的版本，不负责切换版本。完整构建、上传和发布顺序见 [发布手册](release.md#本地操作顺序)。
+
+独立维护的自足部署也可以手工升级，但需自行完成以下步骤与第 5 节验收：
+
 1. 记录当前服务、Web、CLI 版本和使用的 Compose 文件、卷名。
 2. 备份数据库、对象存储和主加密密钥，确认恢复流程可用。
 3. 阅读变更与 migration，选定已发布镜像或自行构建。
@@ -339,6 +333,8 @@ docker compose -f docker-compose.yml -f compose.override.yaml cp postgres:/tmp/c
 ```
 
 每次使用独立、带时间的宿主机备份目录，避免覆盖唯一副本。dump 包含用户数据，应受控存储。
+
+自动升级会生成数据库 dump、摘要与部署配置副本，并通过 `pg_restore --list` 验证备份目录可读。这不能证明数据已成功恢复，也不包含对象存储快照；对象的一致副本、主密钥保管、异机备份和第 8.2 节恢复演练仍须独立安排。
 
 对象存储可使用其支持的复制、备份工具；若直接归档 RustFS 的底层卷，应安排停写并取得一致快照，不能假设对活跃卷执行一次 `tar` 就有完整一致性。可在维护窗口停止 `cormex`，完成数据库备份后停止 RustFS，再归档其数据卷；备份完成后启动 RustFS 和 `cormex`。同时暂停外部写入对象存储的调用方。
 
@@ -382,26 +378,31 @@ docker inspect cormex-rustfs --format '{{json .Mounts}}'
 | Windows（Git Bash） | 系统环境变量（`setx`），playbook 在容器里跑 |
 
 ```bash
-export DEPLOY_HOST=120.79.61.68
-export DEPLOY_USER=root
-export DEPLOY_DIR=/data/cormex
-export DEPLOY_API=https://cormex.cloudcele.com
-just deploy vX.Y.Z                       # 部署 + 验收
-just deploy-check                        # 只做 playbook 语法检查
+export DEPLOY_HOST=REPLACE_WITH_HOST
+export DEPLOY_USER=REPLACE_WITH_SSH_USER
+export DEPLOY_DIR=/REPLACE_WITH_STACK_DIRECTORY
+export DEPLOY_API=https://memory.example.com
+export DEPLOY_SSH_KEY=/REPLACE_WITH_PRIVATE_KEY_PATH
+export DEPLOY_KNOWN_HOSTS=/REPLACE_WITH_KNOWN_HOSTS_PATH
+just doctor-deploy
+just deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256   # 备份、切版本、验收
+just deploy TO_TAG                                 # 重应用已经 pin 的版本
+just deploy-check                                  # 只做 playbook 语法检查
 ```
 
 | 变量 | 必需 | 说明 |
 |---|---|---|
-| `DEPLOY_HOST` | ✅ | 节点地址 |
-| `DEPLOY_USER` | ✅ | 登录用户 |
-| `DEPLOY_DIR` | ✅ | 目标主机上的部署目录（compose + `.env`） |
-| `DEPLOY_API` | ✅ | 栈在该主机上的访问地址（公网入口也可以） |
+| `DEPLOY_HOST` | 是 | 节点地址 |
+| `DEPLOY_USER` | 是 | 登录用户 |
+| `DEPLOY_DIR` | 是 | 目标主机上的部署目录（compose + `.env`） |
+| `DEPLOY_API` | 是 | 栈在该主机上的访问地址（公网入口也可以），不包含 `/api` 后缀 |
 | `DEPLOY_PORT` | | 默认 22 |
 | `DEPLOY_SSH_KEY` | | 本机私钥**路径**；不设则用 ssh 自己的默认（`~/.ssh/id_ed25519`、agent、ssh_config） |
 | `DEPLOY_KNOWN_HOSTS` | | known_hosts **路径**；不设则用 ssh 默认的 `~/.ssh/known_hosts` |
 | `DEPLOY_PROJECT` | | compose 项目名，仅当与文件里的 `name:` 不同 |
 | `DEPLOY_CONNECTION` | | 默认 `ssh`；本机演练设 `local` |
-| `DEPLOY_PULL` | | 用 Release 里的镜像归档 `docker load` 之后设 `false` |
+| `DEPLOY_PULL` | | 重应用模式用 Release 归档 `docker load` 后可设 `false`；升级模式必须保持拉取与校验 |
+| `DEPLOY_REQUIRE_ENCRYPTION` | | 默认 `true`；仅为明确保留明文的测试栈设 `false`，不会关闭其他验收 |
 
 缺任何一个必需项时 wrapper 会直接报出缺的名字，例如：
 
@@ -424,15 +425,37 @@ Actions 侧用 `.github/workflows/deploy.yml`（手动触发，`environment: pro
 | `DEPLOY_DIR` / `DEPLOY_API` | secret | 部署目录与访问地址 |
 
 注意两边同名但形态不同：**secret 里放内容，环境变量里放路径**（`DEPLOY_SSH_KEY`、
-`DEPLOY_KNOWN_HOSTS`）。job 会把内容落成文件再把同名变量指过去。
+`DEPLOY_KNOWN_HOSTS`）。job 会把内容落成文件再把同名变量指过去。本地 `doctor-deploy` 会检查这两个路径指向现存文件；部署 wrapper 的 SSH 默认路径行为仍按上表。
 
 workflow 只部署**已公开的 Release**（先 `gh release view` 查 draft），不构建、不打 tag，
-跑完就是 `just deploy` 的同一份断言。同一 tag 的两次部署串行执行。
+`tag` 为目标版本。可选输入 `from_tag` 和 `checksum` 均为空时，调用 `just deploy TAG` 重应用目标已经 pin 的版本；升级时须同时填写当前旧版本与构建时批准的 `BUNDLE_SHA256`，调用 `just deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256`。只填其中一项会失败，两种模式执行同一份严格验收。Actions 部署串行执行。
 
-playbook 的第一步是比对目标 `.env` 里的 `CORMEX_VERSION` 与传入 tag，不一致就停；随后
-`pull cormex web`（注册表抖动会重试）、`up -d`，最后向 `/api/health` 要答案：`role` 必须是
-`cormexd`，`version` 必须等于部署的版本（健康信息里是 `0.1.18`，pin 是 `v0.1.18`），
-`/api/health` 必须返回 JSON（拿到 HTML 说明 `/api` 被送到了 Web 镜像），Web 根必须是 HTML。
+### 受控升级与回执
+
+`just deploy-upgrade FROM_TAG TO_TAG BUNDLE_SHA256 [inventory]` 使用构建时记录并批准的摘要。`FROM_TAG` 与 `TO_TAG` 均是带 `v` 的真实版本；可选清单默认 `deploy/ansible/inventory.yml`。控制端先确认目标 Release 已公开，下载候选，校验明确传入的 `BUNDLE_SHA256`、全部资产、源提交和镜像内容，将批准内容指纹与允许的 registry 仓库交给目标主机。目标主机使用当前配置的 registry 拉取目标 tag，先核对内容指纹，再记录其 `RepoDigest` 并以 digest 固定启动；控制端无需同时连接各镜像 registry。不得从远端现读一个摘要作为批准值。
+
+Ansible 把仅依赖 Python 标准库的部署辅助脚本和校验后的预期值复制到目标机器，再执行以下阶段：
+
+1. 加部署锁，确认 `.env` pin 与运行版本均等于 `FROM_TAG`，记录当前挂载与数据库统计。
+2. 在栈目录的 `release-backups/` 下创建私有备份目录，保存部署配置、数据库 dump、摘要及 `pg_restore --list` 结果。
+3. 原子替换 `.env` 中的 `CORMEX_VERSION`，为目标 tag 准备配置，检查项目名、存储服务、卷及镜像之外的应用配置保持一致。
+4. 从现有配置指向且在允许范围内的 registry 拉取两个应用镜像，校验其可移植内容指纹，记录 `RepoDigest` 并原子写入 `compose.release.json`。按 digest 执行 `up -d --no-deps cormex web`，不重建数据库或对象存储容器。
+5. 使用与本地验收相同的严格检查，确认升级完成并记录前后挂载。
+
+每个阶段的开始、结束、耗时和状态写入备份目录内的 `deploy-receipt.json`；执行输出给出 `DEPLOY_RECEIPT` 路径。回执含主机侧状态，配置副本和 dump 含敏感信息，应私有保管，勿上传到公开 issue、Release 或仓库。
+
+只有**尚未尝试启动新容器**时的失败，才自动恢复旧 `.env` 和旧 digest overlay。开始调用 `up` 后，即使命令失败，也可能已经运行 migration；此时保留现场与失败回执，由操作者检查 schema 和备份后决定修复、重试或恢复。流程不自动回滚数据库，也不保证切回旧镜像即可恢复。涉及对象或密钥时还需第 8 节的对应副本。
+
+`just deploy TAG` 仍要求目标 `.env` 已经 pin 为该 tag，否则停止；它重应用已 pin 版本并执行共享验收，不替代上述升级入口。自动化 Compose 调用加载存在的 `docker-compose.override.yml`、`compose.override.yaml` 和 `compose.release.json`；日后手工操作也必须带齐，避免漏掉主密钥或 digest pin。
+
+### 共享验收的含义
+
+- `/api/health` 必须是 JSON，`role=cormexd`、版本匹配，服务及数据库状态均为 `ok`，`blob_backend=s3`，采集加密为 `encrypted`。
+- 服务端、Web、Postgres 和 RustFS 容器均须运行且 health 为 `healthy`。升级路径还核对两个应用镜像的批准内容和 registry digest，并比较升级前后的持久化挂载。
+- Web 根必须是 HTML；`/version.json` 版本必须与目标一致。公网 `/main.dart.js` 的 SHA-256 必须等于运行 Web 容器内文件的 SHA-256；候选提供 `web_main_js_sha256` 时还与候选比对，防止 CDN 或代理仍返回旧页面脚本。
+- 表统计使用 `pg_stat_user_tables.n_live_tup`，它是估计值。回执在前后使用同一方法记录，供排障参考；统计滞后或并发写入均会影响结果，不能当作精确记录数，也不能证明没有数据丢失。恢复验证仍要实际查询数据并读取对象。
+
+`just deploy-check` 只验证 playbook 语法，不连接主机、不拉镜像、不执行以上运行时验收。`doctor-deploy` 也不代表升级已完成。
 
 **Windows 不能直接当 Ansible 控制节点。** `ansible-playbook` 只在 POSIX 上运行，Windows
 只是被管理端（走 WinRM，与本项目无关）。因此 `just deploy` 在 Windows 上用
@@ -442,6 +465,8 @@ playbook 的第一步是比对目标 `.env` 里的 `CORMEX_VERSION` 与传入 ta
 本机自测（不需要远端）：
 
 ```bash
+DEPLOY_HOST=localhost \
+DEPLOY_USER=REPLACE_WITH_LOCAL_USER \
 DEPLOY_CONNECTION=local \
 DEPLOY_DIR=$PWD/.deploy-rehearsal \
 DEPLOY_API=http://127.0.0.1:18080 \

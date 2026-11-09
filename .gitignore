@@ -17,6 +17,9 @@ dist/
 
 # 本地部署演练目录（生成的凭据与卷映射）—— 绝不入库
 .deploy-rehearsal/
+/.deploy-expectations.*.json
+**/compose.release.json
+**/release-backups/
 
 .next/
 *.tsbuildinfo

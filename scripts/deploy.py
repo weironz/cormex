@@ -15,6 +15,7 @@ development stack. It is how this file gets tested somewhere other than producti
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
@@ -99,7 +101,7 @@ def compose(directory, *args, project=None, capture=False):
     # Both override names, because an explicit -f switches off compose's own
     # auto-loading of docker-compose.override.yml. A host that keeps the master key
     # there must not be started without it.
-    for override in ("docker-compose.override.yml", "compose.override.yaml"):
+    for override in ("docker-compose.override.yml", "compose.override.yaml", "compose.release.json"):
         if (directory / override).is_file():
             command += ["-f", override]
     shadowed = set(load_env(directory)) if (directory / ".env").is_file() else set()
@@ -121,50 +123,61 @@ def fetch(url, timeout=10):
         return response.headers.get("content-type", ""), response.read()
 
 
-def health(base, timeout=240):
+def health(base, timeout=300, expected_version=None):
     deadline = time.monotonic() + timeout
     last = "no attempt"
-    while time.monotonic() < deadline:
+    while True:
         try:
             content_type, body = fetch(f"{base}/api/health")
-        except (urllib.error.URLError, OSError) as error:
+            if not content_type.startswith("application/json"):
+                last = f"proxy answered {content_type}, not API JSON"
+            else:
+                status = json.loads(body)
+                if expected_version is None or status.get("version") == expected_version:
+                    return status
+                last = f"running version is {status.get('version')!r}, expected {expected_version!r}"
+        except (urllib.error.URLError, OSError, ValueError) as error:
             last = str(error)
-        else:
-            require(content_type.startswith("application/json"),
-                    f"/api/health answered {content_type}, so the proxy is handing /api to the web "
-                    "image instead of the server")
-            return json.loads(body)
-        time.sleep(2)
-    raise DeployError(f"{base}/api/health did not answer within {timeout}s; last error: {last}")
+        if time.monotonic() >= deadline:
+            raise DeployError(f"health did not become ready within {timeout}s; last error: {last}")
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
-def verify(directory, tag=None):
+def verify_runtime(directory, base, tag, expectations=None, project=None, timeout=300):
+    spec = importlib.util.spec_from_file_location("cormex_deploy_runtime", Path(__file__).with_name("deploy_runtime.py"))
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    stack = SimpleNamespace(compose=compose, run=run, fetch=fetch)
+    try:
+        return runtime.check_containers(stack, directory, base, tag, expectations, project, timeout)
+    except RuntimeError as error:
+        raise DeployError(str(error)) from error
+
+
+def verify(directory, tag=None, *, api=None, require_encryption=True, expectations=None, project=None, timeout=300):
     env = load_env(directory)
     require(env.get("CORMEX_VERSION"), "CORMEX_VERSION is not set in .env")
     pin = tag or env["CORMEX_VERSION"]
     validate_tag(pin)
-    # /health reports the Cargo version, which carries no `v`; the pin does.
-    expected = pin[1:]
-    base = base_url(env)
-    status = health(base)
+    require(env["CORMEX_VERSION"] == pin, "the configured pin differs from the requested version")
+    base = api or base_url(env)
+    status = health(base, timeout, expected_version=pin[1:])
     require(status.get("role") == "cormexd", f"the stack is not talking to cormexd: {status.get('role')!r}")
-    require(status.get("version") == expected,
-            f"running version is {status.get('version')!r}, but {pin!r} was deployed")
+    require(status.get("status") == "ok" and status.get("database") == "ok", "database or service health is not ok")
+    require(status.get("blob_backend") == "s3", "the server fell back from S3 to local storage")
+    if require_encryption:
+        require(status.get("capture_encryption") == "encrypted", "capture encryption is required but is not enabled")
     content_type, body = fetch(f"{base}/")
     require(content_type.startswith("text/html") and b"<title>" in body.lower(),
             "the web root did not return an HTML document")
+    report = verify_runtime(directory, base, pin, expectations, project, timeout)
+    status = dict(status, deployment=report)
     print(f"stack: {base}  version {status['version']}  role {status['role']}")
-    print(f"database: {status.get('database')}  blobs: {status.get('blob_backend')}  auth: {status.get('auth')}")
-    if status.get("capture_encryption") == "plaintext":
-        print("WARNING: capture_encryption is plaintext -- CORMEX_SECRET_KEY is not reaching cormexd")
-    else:
-        print(f"capture: {status.get('capture_encryption')}")
+    print(f"database: {status['database']}  blobs: {status['blob_backend']}  capture: {status.get('capture_encryption')}")
     embedding = status.get("embedding") or {}
     model = embedding.get("model") if isinstance(embedding, dict) else None
-    if not model:
-        print("WARNING: no embedding model is configured; vector search will fail on first use")
-    else:
-        print(f"embedding: {model}")
+    print(f"embedding: {model or 'not configured'}")
+    print(f"Web version and public bundle verified; statistics: {report.get('statistics', {}).get('method', 'unavailable')}")
     return status
 
 
@@ -182,7 +195,7 @@ def up(tag, directory, project=None):
     compose(directory, "pull", "cormex", "web", project=project)
     compose(directory, "up", "-d", project=project)
     print(f"waiting for {base_url(env)}/api/health ...")
-    verify(directory, tag)
+    verify(directory, tag, project=project)
     stop = "just deploy-rehearsal-down" if project else "just deploy-down"
     print(f"deployed {tag}; stop with `{stop}`")
 
@@ -230,10 +243,12 @@ def rehearsal_files(tag):
         # every run would also invalidate the encrypted data it is there to exercise.
         values = load_env(REHEARSAL)
         values["CORMEX_VERSION"] = tag
+        values["COMPOSE_PROJECT_NAME"] = REHEARSAL_PROJECT
         write_env(env_file, values.items())
         return
     write_env(env_file, {
         "CORMEX_VERSION": tag,
+        "COMPOSE_PROJECT_NAME": REHEARSAL_PROJECT,
         "CORMEX_BIND_ADDR": "127.0.0.1",
         "CORMEX_PORT": str(REHEARSAL_PORT),
         "CORMEX_S3_PORT": str(REHEARSAL_S3_PORT),
@@ -296,6 +311,9 @@ def main():
     verify_cmd = commands.add_parser("verify", help="check role, version, web root and the /api split")
     verify_cmd.add_argument("directory", type=Path, nargs="?", default=ROOT / "deploy")
     verify_cmd.add_argument("--tag", help="expected version; defaults to the CORMEX_VERSION in .env")
+    verify_cmd.add_argument("--api", help="explicit API/Web base URL")
+    verify_cmd.add_argument("--project", help="explicit compose project")
+    verify_cmd.add_argument("--allow-plaintext", action="store_true", help="explicitly allow an unencrypted test stack")
     down_cmd = commands.add_parser("down", help="stop the stack, keep the volumes")
     down_cmd.add_argument("directory", type=Path, nargs="?", default=ROOT / "deploy")
     rehearsal_cmd = commands.add_parser("rehearsal", help="deploy on an isolated project and verify")
@@ -304,7 +322,8 @@ def main():
     args = parser.parse_args()
     actions = {
         "up": lambda: up(args.tag, args.directory),
-        "verify": lambda: verify(args.directory, args.tag),
+        "verify": lambda: verify(args.directory, args.tag, api=args.api,
+                                project=args.project, require_encryption=not args.allow_plaintext),
         "down": lambda: down(args.directory),
         "rehearsal": lambda: rehearsal(args.tag),
         "rehearsal-down": lambda: rehearsal_down(),

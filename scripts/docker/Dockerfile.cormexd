@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # ══════════════════════════════════════════════════════════
 #  cormexd 生产镜像
 #
@@ -40,41 +42,9 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 WORKDIR /build
 
-# 先只拷清单，让「依赖没变就复用上一层」这件事真的发生。
-# 直接 COPY . . 会让任何一次源码改动都重编全部依赖树（Cormex 依赖 goose
-# 供应商层，那是几百个 crate，冷编按十分钟计）。
+# Cache mounts survive manifest changes, including release-only workspace version bumps.
+# Compile real sources only: placeholder workspace artifacts must never enter this cache.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/cormex-core/Cargo.toml   crates/cormex-core/
-COPY crates/cormex-llm/Cargo.toml    crates/cormex-llm/
-COPY crates/cormex-store/Cargo.toml  crates/cormex-store/
-COPY crates/cormex-memory/Cargo.toml crates/cormex-memory/
-COPY crates/cormex-blob/Cargo.toml   crates/cormex-blob/
-COPY crates/cormex-proto/Cargo.toml  crates/cormex-proto/
-COPY crates/cormex-import/Cargo.toml crates/cormex-import/
-COPY crates/cormexd/Cargo.toml       crates/cormexd/
-COPY crates/cormex/Cargo.toml        crates/cormex/
-COPY crates/e2e-capture/Cargo.toml   crates/e2e-capture/
-COPY crates/cormex-transcript/Cargo.toml crates/cormex-transcript/
-COPY evals/Cargo.toml                evals/
-
-# Stub every manifest-declared target, including disabled examples/tests:
-# cargo build validates their paths before selecting cormexd.
-RUN set -eux; \
-    for d in crates/*/ evals/; do \
-        mkdir -p "$d/src"; \
-        echo '' > "$d/src/lib.rs"; \
-        echo 'fn main() {}' > "$d/src/main.rs"; \
-    done; \
-    for f in \
-        crates/cormex-memory/examples/embed_bench.rs \
-        crates/cormex-memory/tests/fastembed.rs \
-        crates/cormex-memory/tests/embed_env_empty.rs; do \
-        mkdir -p "$(dirname "$f")"; \
-        echo 'fn main() {}' > "$f"; \
-    done; \
-    cargo build --release --locked -p cormexd
-
-# 真正的源码。上面那层的产物在依赖没变时命中缓存
 COPY crates/ crates/
 COPY evals/ evals/
 COPY migrations/ migrations/
@@ -83,17 +53,24 @@ COPY migrations/ migrations/
 # 而本机构建照样是绿的（目录在那儿）。v0.1.5 发版时实际撞到过
 COPY migrations-global/ migrations-global/
 
-# 触碰一下自家 crate 的时间戳，否则 cargo 会拿上一步的空壳当成已构建
+# Copied sources can be older than the persistent target cache (e.g. another checkout).
+# Refresh workspace source mtimes so Cargo cannot reuse stale local crate artifacts.
 # ★ `--locked` 不能省。这个仓库有一颗**跨 semver 组**的依赖范围：
 #   pgvector 声明的 sqlx 范围会把 sqlx 解回 0.8，于是构建里同时存在两份
 #   sqlx-core，`pgvector::Vector` 实现的是另一份的 `Decode` —— 报出来是
 #   几十条「trait not implemented」，而**本机是绿的**（Cargo.lock 钉住了）。
 #   没有 --locked 时 docker 构建允许重新解析，这个仓库刚从上游拆出来时
 #   就是这么炸的第一次。
-RUN set -eux; \
+ARG TARGETARCH
+RUN --mount=type=cache,id=cormex-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cormex-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cormexd-target-rust1.97.1-trixie-${TARGETARCH},target=/build/target,sharing=locked \
+    set -eux; \
     find crates evals -name '*.rs' -exec touch {} +; \
     cargo build --release --locked -p cormexd; \
-    strip target/release/cormexd target/release/cormex || true
+    mkdir -p /out; \
+    cp target/release/cormexd /out/cormexd; \
+    strip /out/cormexd
 
 # ── sqlx-cli ──────────────────────────────────────────────
 # 独立一个 stage 而不是塞进 builder：它与本项目源码毫无关系，
@@ -137,7 +114,8 @@ RUN set -eux; \
 # 不用 root 跑。容器逃逸的门槛低得惊人，而 cormexd 完全不需要特权。
 RUN useradd --system --uid 10001 --create-home --home-dir /home/cormex cormex
 
-COPY --from=builder /build/target/release/cormexd /usr/local/bin/cormexd
+# Cache mounts are absent from stage snapshots; export the binary during the build RUN.
+COPY --from=builder /out/cormexd /usr/local/bin/cormexd
 COPY --from=sqlx    /usr/local/cargo/bin/sqlx     /usr/local/bin/sqlx
 # migration 随镜像走：`just prod-migrate` 直接在容器里跑，
 # 部署机上不需要另外弄一份仓库

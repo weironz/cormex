@@ -1,180 +1,84 @@
 ---
-# Deploy one published Cormex version, then make the running service say what it is.
-#
-# Release and deploy are separate: nothing here builds, tags or uploads. It pulls the
-# images the Release already published, restarts the stack from the deployment
-# directory on the host, and fails unless /api/health answers with the version that
-# was asked for.
-#
-# Usage (through just):
-#     just deploy vX.Y.Z
-#     just deploy-check          # --syntax-check, no host needed
-#
-# Variables (inventory group `cormex`, or -e):
-#     cormex_version  required, vX.Y.Z
-#     cormex_dir      deployment directory holding docker-compose.yml and .env
-#     cormex_api_base loopback base URL the stack answers on *that host*
-#     cormex_project  compose project, only when it differs from `name:` in the file
-#     cormex_pull     false when the images came from the release archives (docker load)
-#
-# The assertions here mirror `scripts/deploy.py verify`, which is what the local
-# rehearsal uses. Keep the two in step: they answer the same question, and a deploy
-# that passes one while failing the other is a gate nobody can trust.
+# Both deployment modes use the same host-side lock, receipts and verification.
+# No build or registry publication runs on the managed host.
 - name: Deploy Cormex
   hosts: cormex
   gather_facts: false
-  vars:
-    # Only what the run itself derives. Defaults for the rest are applied with
-    # `| default(...)` at the use site: a play-level `vars` entry outranks the
-    # inventory, so a default written here would silently ignore the host's settings.
-    expected_version: "{{ cormex_version[1:] }}"
   tasks:
-    - name: A pinned version is required
+    - name: Require a pinned release and explicit upgrade approval
       ansible.builtin.assert:
         that:
           - cormex_version is defined
           - cormex_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
-        fail_msg: "pass -e cormex_version=vX.Y.Z"
+          - cormex_from_version is not defined or cormex_expectations is defined
+        fail_msg: "use deploy TAG for an existing pin, or deploy-upgrade FROM TAG BUNDLE_SHA256"
         quiet: true
 
     - name: Look for the deployment files
       ansible.builtin.stat:
         path: "{{ cormex_dir }}/{{ item }}"
-      # Both override names are checked on purpose: `compose.override.yaml` is what this
-      # repository's template uses, and `docker-compose.override.yml` is what compose
-      # auto-loads by default -- which an explicit `-f` turns off. A host that keeps the
-      # master key in that file would otherwise be deployed without it.
-      loop: [docker-compose.yml, .env, docker-compose.override.yml, compose.override.yaml]
+      loop: [docker-compose.yml, .env]
       register: deployment_files
 
-    - name: The deployment directory must hold the stack
+    - name: Require the existing stack
       ansible.builtin.assert:
         that:
           - deployment_files.results[0].stat.exists
           - deployment_files.results[1].stat.exists
-        fail_msg: "{{ cormex_dir }} must contain docker-compose.yml and .env (from deploy/.env.example)"
+        fail_msg: "the deployment directory must contain docker-compose.yml and .env"
         quiet: true
 
-    - name: Read the version the stack is pinned to
-      ansible.builtin.slurp:
-        src: "{{ cormex_dir }}/.env"
-      register: env_file
-
-    - name: The host must already pin this version
-      ansible.builtin.set_fact:
-        pinned_version: >-
-          {{ (env_file.content | b64decode | regex_findall('(?m)^CORMEX_VERSION=(.+)$'))
-             | first | default('') | trim }}
-
-    - name: Refuse to deploy over a different pin
-      ansible.builtin.assert:
-        that:
-          - pinned_version == cormex_version
-        fail_msg: >-
-          {{ cormex_dir }}/.env pins {{ pinned_version | default('nothing') }}, not {{ cormex_version }}.
-          Change the pin deliberately; the playbook will not leave the file and the running
-          stack disagreeing about which version is deployed.
-        quiet: true
-
-    - name: Build the compose command
-      ansible.builtin.set_fact:
-        compose_args: >-
-          {{ ['docker', 'compose']
-             + (['-p', cormex_project] if (cormex_project | default('') | length) > 0 else [])
-             + ['-f', 'docker-compose.yml']
-             + (['-f', 'docker-compose.override.yml'] if deployment_files.results[2].stat.exists else [])
-             + (['-f', 'compose.override.yaml'] if deployment_files.results[3].stat.exists else []) }}
-
-    - name: Pull the published images
-      when: cormex_pull | default(true) | bool
-      ansible.builtin.command:
-        argv: "{{ compose_args + ['pull', 'cormex', 'web'] }}"
-        chdir: "{{ cormex_dir }}"
-      register: compose_pull
-      # A registry blip is not a deploy: retry before failing, and say so in the log.
-      retries: 3
-      delay: 5
-      until: compose_pull.rc == 0
+    - name: Create a private directory for the shared deployment helpers
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: cormex-deploy-
+      register: helper_directory
       changed_when: false
 
-    - name: Start the stack
-      # Only the services this playbook deployed: a bare `up -d` also reconciles
-      # postgres and rustfs, and one deployment's project had a rustfs service whose
-      # container name belonged to another stack -- the whole `up` aborted on the
-      # conflict, half-way through a release.
-      ansible.builtin.command:
-        argv: "{{ compose_args + ['up', '-d', 'cormex', 'web'] }}"
-        chdir: "{{ cormex_dir }}"
-      register: compose_up
-      changed_when: >-
-        ('Created' in compose_up.stdout) or ('Recreate' in compose_up.stdout)
-        or ('Started' in compose_up.stdout)
+    - name: Run the shared deployment operation
+      block:
+        - name: Copy the stdlib deployment and identity checks
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../../scripts/{{ item }}"
+            dest: "{{ helper_directory.path }}/{{ item }}"
+            mode: "0600"
+          loop: [deploy.py, deploy_runtime.py, image_identity.py]
+          changed_when: false
 
-    - name: Ask the running service what it is
-      ansible.builtin.uri:
-        url: "{{ cormex_api_base | default('http://127.0.0.1:8080') }}/api/health"
-        status_code: 200
-        return_content: true
-      register: health
-      # 200 is not enough: while cormex is still starting, the edge routes /api to the
-      # web image, whose SPA fallback answers 200 with a page. Only JSON means the
-      # request reached the server, so that is the condition to wait on.
-      until: health.status == 200 and 'json' in (health.content_type | default(''))
-      # Five minutes, not two: a release that carries a migration can spend that long
-      # building an index on transcript_events (1.4 M rows / 2.3 GB on the production
-      # node) before the port answers, and timing out there would report a failure for
-      # a deploy that is merely still migrating.
-      retries: 150
-      delay: 2
-      changed_when: false
+        - name: Copy only the approved public candidate expectations
+          when: cormex_from_version is defined
+          ansible.builtin.copy:
+            content: "{{ cormex_expectations | to_nice_json }}"
+            dest: "{{ helper_directory.path }}/expectations.json"
+            mode: "0600"
+          changed_when: false
 
-    - name: The running version must be the deployed one
-      ansible.builtin.assert:
-        that:
-          - health.json.role == 'cormexd'
-          - health.json.version == expected_version
-        fail_msg: >-
-          running {{ health.json.role }} {{ health.json.version }},
-          expected cormexd {{ expected_version }} (pin {{ cormex_version }})
-        quiet: true
+        - name: Assemble the operation arguments
+          ansible.builtin.set_fact:
+            operation_args: >-
+              {{ ['python3', '-I', helper_directory.path + '/deploy_runtime.py']
+                 + (['upgrade', cormex_from_version, cormex_version, cormex_dir,
+                     '--expectations', helper_directory.path + '/expectations.json']
+                    if cormex_from_version is defined else ['reapply', cormex_version, cormex_dir])
+                 + ['--base', cormex_api_base]
+                 + (['--project', cormex_project] if (cormex_project | default('') | length) > 0 else [])
+                 + (['--no-pull'] if cormex_from_version is not defined and not (cormex_pull | default(true) | bool) else [])
+                 + (['--allow-plaintext'] if not (cormex_require_encryption | default(true) | bool) else []) }}
 
-    - name: The object store must be the one in use
-      # cormexd falls back to the local filesystem when S3 is unreachable at startup,
-      # with a warning in the log and nothing else -- uploads would then live inside
-      # the container and never reach the bucket. The health endpoint says which
-      # backend it actually attached to, so a deploy that landed on the fallback is a
-      # failed deploy even though the version is right.
-      ansible.builtin.assert:
-        that:
-          - health.json.blob_backend == 's3'
-        fail_msg: >-
-          cormexd started with blob_backend={{ health.json.blob_backend }}, not s3:
-          the object store was unreachable when it started. Start the store, then
-          `docker compose restart cormex` -- `up -d` does not recreate an unchanged
-          container, so a plain redeploy would leave the fallback in place.
-        quiet: true
+        - name: Deploy and verify the running server and Web
+          ansible.builtin.command:
+            argv: "{{ operation_args }}"
+          register: deployment
+          # Container IDs, rather than Compose's version-dependent progress text,
+          # decide whether the operation changed the running stack.
+          changed_when: deployment.rc == 0 and ((deployment.stdout_lines | last | from_json).changed | bool)
 
-    - name: The web root must be a page
-      ansible.builtin.uri:
-        url: "{{ cormex_api_base | default('http://127.0.0.1:8080') }}/"
-        status_code: 200
-        return_content: true
-      register: web
-      changed_when: false
-
-    - name: The web root must return HTML
-      ansible.builtin.assert:
-        that:
-          - "'<title>' in (web.content | lower)"
-        fail_msg: "the web root did not return an HTML document"
-        quiet: true
-
-    - name: Report what is running
-      ansible.builtin.debug:
-        msg:
-          - "{{ inventory_hostname }}: cormexd {{ health.json.version }} on {{ cormex_api_base | default('http://127.0.0.1:8080') }}"
-          - "database {{ health.json.database }} · blobs {{ health.json.blob_backend }} · auth {{ health.json.auth }}"
-          - "capture {{ health.json.capture_encryption | default('unknown') }} · embedding {{ health.json.embedding.model | default('none') }}"
-          - >-
-            {{ 'WARNING: capture is plaintext -- CORMEX_SECRET_KEY is not reaching cormexd'
-               if health.json.capture_encryption == 'plaintext' else 'capture encryption configured' }}
+        - name: Report the completed operation and persistent receipt
+          ansible.builtin.debug:
+            msg: "{{ deployment.stdout_lines | last | from_json }}"
+      always:
+        - name: Remove temporary helpers while retaining the host receipt
+          ansible.builtin.file:
+            path: "{{ helper_directory.path }}"
+            state: absent
+          changed_when: false

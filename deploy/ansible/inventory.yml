@@ -31,3 +31,4 @@ all:
       # false for hosts that take their images from the release archives (docker load)
       # instead of a registry.
       cormex_pull: "{{ lookup('env', 'DEPLOY_PULL') | default('true', true) }}"
+      cormex_require_encryption: "{{ lookup('env', 'DEPLOY_REQUIRE_ENCRYPTION') | default('true', true) }}"
