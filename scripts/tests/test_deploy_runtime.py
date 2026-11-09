@@ -239,3 +239,26 @@ class ReapplyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TargetInterpreterTests(unittest.TestCase):
+    """These files run on the deployment host's own python3, not the control
+    machine's. The production host of the v0.1.20 upgrade had 3.10, and
+    `hashlib.file_digest` (3.11+) stopped the upgrade right after its backup."""
+
+    TARGET_FILES = ('deploy_runtime.py', 'deploy.py', 'image_identity.py')
+
+    def test_target_side_files_parse_as_python_3_10(self):
+        import ast
+        for name in self.TARGET_FILES:
+            source = (Path(runtime.__file__).parent / name).read_text(encoding='utf-8')
+            with self.subTest(name=name):
+                ast.parse(source, filename=name, feature_version=(3, 10))
+                self.assertNotIn('hashlib.file_digest(', source, f'{name}: hashlib.file_digest needs Python 3.11')
+
+    def test_digest_is_the_sha256_of_the_whole_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'blob'
+            data = b'x' * (3 << 20) + b'tail'
+            path.write_bytes(data)
+            self.assertEqual(runtime.digest(path), hashlib.sha256(data).hexdigest())

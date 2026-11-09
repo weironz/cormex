@@ -42,8 +42,14 @@ def now():
 
 
 def digest(path):
+    # Not hashlib.file_digest: it is Python 3.11+, and this file runs on the
+    # deployment host's own interpreter. The v0.1.20 upgrade met a 3.10 host and
+    # stopped right after its backup
+    hasher = hashlib.sha256()
     with Path(path).open('rb') as file:
-        return hashlib.file_digest(file, 'sha256').hexdigest()
+        for block in iter(lambda: file.read(1 << 20), b''):
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def write_private(path, data):
