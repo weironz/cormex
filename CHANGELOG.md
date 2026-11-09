@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.20 — 2026-11-09
+
 ### Memory: a same-day update dated only "today" supersedes again
 
 - When the extractor wrote an update's event time as a bare date ("now" becomes `2026-11-08`, which parses to midnight), contradiction resolution ordered the update *before* the statement it replaced. That statement had been made earlier the same day and ordered by the moment it was said. The update was filed as backfilled history, superseded nothing, and both values stayed current, so replay showed stale answers as present. A date-only event time within a day of when it was said now orders at the moment it was said. A date further back is still a real event time, so backfills keep their place. Found while recording the README's `as_of` walkthrough.
