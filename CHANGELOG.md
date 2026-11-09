@@ -4,6 +4,7 @@
 
 ### Release tooling
 
+- `build-local` starts the selected buildx builder before recording the build runtime identity. A stopped builder reports no BuildKit version until the first image build starts it, which made the end-of-build check refuse the first v0.1.20 candidate with "runtime changed during local build".
 - `deploy-upgrade` runs on Python 3.10 deployment hosts again: the host-side script no longer uses `hashlib.file_digest` (3.11+), which stopped the first v0.1.20 upgrade right after its backup and before any configuration change.
 - Ask the registry again when a tag lookup is ambiguous before failing closed. Docker Hub intermittently answers a lookup for a missing tag with 401 instead of 404, which stopped the v0.1.20 publication twice before any push.
 

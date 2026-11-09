@@ -1013,6 +1013,9 @@ class ResumeBuildTests(unittest.TestCase):
             shutil.copyfile(self.directory / entry["file"], output / entry["file"])
             release.write_json(output / f"{name}.image.json", {**context, "image": entry})
         stack.enter_context(mock.patch.object(release, "ROOT", root))
+        # Starting the builder is not a build step: kept out of `events`, which
+        # the resume tests read as "work done", and checked on its own below
+        stack.enter_context(mock.patch.object(release, "start_builder"))
         stack.enter_context(mock.patch.object(release, "preflight", return_value={"checks": []}))
         stack.enter_context(mock.patch.object(release, "doctor", return_value={"checks": []}))
         stack.enter_context(mock.patch.object(release, "build_runtime_identity", return_value={"tools": "fixed"}))
@@ -1041,6 +1044,25 @@ class ResumeBuildTests(unittest.TestCase):
             self.assertEqual(events.count("cormex"), 1)
             self.assertEqual(events.count("cormex-web"), 2)
             release.verify_bundle(root / "dist" / self.tag, self.tag)
+
+    def test_builder_is_started_before_its_identity_is_recorded(self):
+        # A stopped builder reports no BuildKit version until the first image
+        # build starts it; recording the identity before that made v0.1.20's
+        # end-of-build check report a runtime change that never happened
+        with ExitStack() as stack:
+            _, events = self.harness(stack, fail_web=False)
+            order = []
+            stack.enter_context(mock.patch.object(release, "start_builder", side_effect=lambda: order.append("start-builder")))
+            stack.enter_context(mock.patch.object(release, "build_runtime_identity",
+                                                  side_effect=lambda report: order.append("identity") or {"tools": "fixed"}))
+            release.build_local(self.tag)
+        self.assertEqual(order[:2], ["start-builder", "identity"], "the builder must run before its identity is read")
+        self.assertEqual(order.count("start-builder"), 1)
+
+    def test_start_builder_bootstraps_the_selected_builder(self):
+        with mock.patch.object(release, "run") as runner:
+            release.start_builder()
+        runner.assert_called_once_with("docker", "buildx", "inspect", "--bootstrap", capture=True)
 
     def test_resume_rejects_artifact_corruption(self):
         with ExitStack() as stack:

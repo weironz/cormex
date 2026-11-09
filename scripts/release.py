@@ -1059,10 +1059,24 @@ def build_runtime_identity(report):
             "python": sys.version, "platform": sys.platform, "targets": local_targets()}
 
 
+def start_builder():
+    """Start the selected buildx builder before its identity is recorded.
+
+    `doctor` only reads the builder (bootstrapping is a state change it must not
+    make), and a stopped docker-container builder reports no BuildKit version.
+    The first image build then starts it, the version line appears, and the
+    end-of-build check refused v0.1.20 with "runtime changed during local
+    build" although nothing had changed. Building starts this same builder
+    anyway, so starting it first changes nothing a build would not.
+    """
+    run("docker", "buildx", "inspect", "--bootstrap", capture=True)
+
+
 def build_local(tag, resume=False):
     with version_lock(tag):
         started_at = datetime.now(timezone.utc).isoformat()
         started = time.monotonic()
+        start_builder()
         report = preflight(tag, "local")
         context = source_context(tag)
         identity = {**context, "runtime": build_runtime_identity(report)}
