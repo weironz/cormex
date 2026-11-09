@@ -11,6 +11,7 @@ import '../settings/settings_page.dart';
 import 'import_dialog.dart';
 import 'session_detail_page.dart';
 import 'widgets/archive_source_label.dart';
+import '../lookup/id_lookup.dart';
 
 /// 聊天档案：左边「项目 → 聊天」，右边读选中的那一段。
 ///
@@ -160,6 +161,7 @@ class _SessionsPageState extends ConsumerState<SessionsPage> {
     );
 
     final actions = [
+      const IdLookupButton(),
       IconButton(
         tooltip: '导入聊天记录',
         icon: const Icon(Icons.upload_file_outlined),

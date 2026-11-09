@@ -6,6 +6,7 @@ import '../../models/memory_extraction_status.dart';
 import '../../state/connection_controller.dart';
 import '../../state/memory_extraction.dart';
 import '../sessions/session_detail_page.dart';
+import '../../models/session_memory.dart';
 
 final memoryDependenciesProvider = FutureProvider<Map<String, dynamic>>(
   (ref) => ref.watch(apiProvider).memoryExtractionDependencies(),
@@ -191,7 +192,9 @@ class _MemoryTrialSectionState extends ConsumerState<MemoryTrialSection> {
           const SizedBox(height: 14),
           Text(label, style: theme.textTheme.titleMedium),
           Text(
-            '已检查 ${j['processed_chats'] ?? 0} / ${selections.length} 个聊天 · 已处理 $processedMessages / $totalMessages 条消息',
+            isSessionJob(j)
+                ? '单会话生成：已分析 $processedMessages / $totalMessages 轮问答'
+                : '已检查 ${j['processed_chats'] ?? 0} / ${selections.length} 个聊天 · 已处理 $processedMessages / $totalMessages 条消息',
           ),
           const SizedBox(height: 8),
           Wrap(

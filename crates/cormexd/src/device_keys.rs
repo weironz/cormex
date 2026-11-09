@@ -191,10 +191,18 @@ impl DeviceScope {
             }
         }
 
+        // A session's memories and an id lookup join both sides. Starting a
+        // per-session job (POST .../memory) is not here: it spends the
+        // account's model budget, which a device key never may
         if self.has(Scope::MemoryRead)
             && self.has(Scope::SessionRead)
             && is(Method::GET)
-            && matches!(path, "/memory/context" | "/memory/artifacts")
+            && (matches!(path, "/memory/context" | "/memory/artifacts")
+                || matches!(
+                    segs.as_slice(),
+                    ["archive", "sessions", _, "memory" | "memories"]
+                )
+                || matches!(segs.as_slice(), ["lookup", _]))
         {
             return true;
         }
@@ -510,6 +518,29 @@ mod tests {
         assert!(!scope(&[Scope::SessionRead]).allows(&Method::GET, "/memory/context"));
         assert!(
             scope(&[Scope::MemoryRead, Scope::SessionRead]).allows(&Method::GET, "/memory/context")
+        );
+        for path in [
+            "/archive/sessions/X/memories",
+            "/archive/sessions/X/memory",
+            "/lookup/X",
+        ] {
+            assert!(
+                scope(&[Scope::MemoryRead, Scope::SessionRead]).allows(&Method::GET, path),
+                "a key with both read scopes reads {path}"
+            );
+            assert!(
+                !scope(&[Scope::MemoryRead]).allows(&Method::GET, path),
+                "{path} needs session:read too"
+            );
+            assert!(
+                !scope(&[Scope::SessionRead]).allows(&Method::GET, path),
+                "{path} needs memory:read too"
+            );
+        }
+        assert!(
+            !scope(&[Scope::MemoryRead, Scope::SessionRead])
+                .allows(&Method::POST, "/archive/sessions/X/memory"),
+            "a device key never starts a paid memory job"
         );
         let capture = scope(&[Scope::CaptureWrite]);
         for (method, path) in [

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Memories per session, and finding things by id
+
+- **Generate memories for one conversation.** Each archived session has a "生成记忆" button: it runs the automatic worker's own per-session pass on that conversation, at most 30 QA turns per click, resuming where the last click stopped. It asks first and states how many turns it will send. `POST /archive/sessions/{id}/memory` starts it, `GET` reports pending turns, memory count and the job; it shares the one explicit-job slot with small-sample runs and works whether automatic extraction is on or off.
+- A session-scoped advisory lock (4274) keeps the automatic worker and a per-session job from analysing the same session at once. Already-analysed turns are never sent again.
+- **Session ↔ memory mapping.** `GET /archive/sessions/{id}/memories` lists the memories a conversation produced (superseded ones marked, not hidden); the session page shows its count and opens the list, and a memory's detail shows its own id and its session's id.
+- **Look up any id.** `GET /lookup/{id}` says whether an id is a session, memory, summary or source episode; "按 ID 定位" in the memory and archive pages opens it. Memory cards and rows show a short id that copies the full one.
+- The memory page switches between cards and a compact list; the choice is remembered.
+
 ### Release tooling
 
 - `build-local` starts the selected buildx builder before recording the build runtime identity. A stopped builder reports no BuildKit version until the first image build starts it, which made the end-of-build check refuse the first v0.1.20 candidate with "runtime changed during local build".

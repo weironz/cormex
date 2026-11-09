@@ -49,6 +49,7 @@ pub mod redact;
 pub mod reembed;
 pub mod request_tenant;
 pub mod routes;
+pub mod session_memory;
 pub mod snapshots;
 pub mod state;
 pub mod sync_notify;

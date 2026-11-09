@@ -34,3 +34,111 @@ impl Store {
             .bind(ids).fetch_all(self.pool()).await?)
     }
 }
+
+/// One memory as `GET /memory/search` returns it, so a client renders both the
+/// same way. `invalidated` is "not in `active_facts` now": a session's history
+/// keeps the facts a later turn superseded, marked rather than hidden.
+#[derive(sqlx::FromRow, Serialize)]
+pub struct SessionMemory {
+    pub id: String,
+    pub statement: String,
+    pub predicate: String,
+    pub domain: Option<String>,
+    pub confidence: f32,
+    pub valid_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub source_episode_id: String,
+    pub source_channel: String,
+    pub trust_tier: Option<i16>,
+    pub invalidated: bool,
+}
+
+/// What an id names. Sessions and memories are both ULIDs from one space, so a
+/// pasted id is resolved by looking, not by its shape.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct IdLookup {
+    pub kind: &'static str,
+    pub id: String,
+    /// The conversation it belongs to; the session itself for `session`.
+    pub session_id: Option<String>,
+    pub title: Option<String>,
+}
+
+impl Store {
+    /// Every memory extracted from one session, newest first. A fact belongs to
+    /// the session of the episode it was extracted from (`source_episode_id`).
+    pub async fn session_memories(&self, session: &str, limit: i64) -> Result<Vec<SessionMemory>> {
+        Ok(sqlx::query_as(
+            "SELECT f.id::text AS id,f.statement,f.predicate,f.domain,f.confidence,f.valid_at,f.created_at,
+                    f.source_episode_id::text AS source_episode_id,f.source_channel,f.trust_tier,
+                    NOT EXISTS(SELECT 1 FROM active_facts a WHERE a.id=f.id) AS invalidated
+             FROM episodes e JOIN facts f ON f.source_episode_id=e.id
+             WHERE e.session_id=$1 ORDER BY f.created_at DESC,f.id DESC LIMIT $2",
+        )
+        .bind(session)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Resolve an id to a session, memory, summary or source episode.
+    pub async fn lookup_id(&self, id: &str) -> Result<Option<IdLookup>> {
+        let session: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT s.id::text,(SELECT left(m.title,160) FROM capture_session_ui_metadata m
+               WHERE m.session_id=s.id ORDER BY m.updated_at DESC LIMIT 1)
+             FROM capture_sessions s WHERE s.id=$1::ulid",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        if let Some((sid, title)) = session {
+            return Ok(Some(IdLookup {
+                kind: "session",
+                id: sid.clone(),
+                session_id: Some(sid),
+                title,
+            }));
+        }
+        let fact: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT f.id::text,e.session_id,left(f.statement,160) FROM facts f
+             JOIN episodes e ON e.id=f.source_episode_id WHERE f.id=$1::ulid",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        if let Some((fid, sid, statement)) = fact {
+            return Ok(Some(IdLookup {
+                kind: "memory",
+                id: fid,
+                session_id: Some(sid),
+                title: Some(statement),
+            }));
+        }
+        let summary: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT id,session_id,left(title,160) FROM memory_qa_summaries WHERE id=$1
+             UNION ALL SELECT id,session_id,left(title,160) FROM memory_qa_artifacts WHERE id=$1 LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        if let Some((aid, sid, title)) = summary {
+            return Ok(Some(IdLookup {
+                kind: "summary",
+                id: aid,
+                session_id: Some(sid),
+                title: Some(title),
+            }));
+        }
+        let episode: Option<(String, String)> =
+            sqlx::query_as("SELECT id::text,session_id FROM episodes WHERE id=$1::ulid")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(episode.map(|(eid, sid)| IdLookup {
+            kind: "episode",
+            id: eid,
+            session_id: Some(sid),
+            title: None,
+        }))
+    }
+}

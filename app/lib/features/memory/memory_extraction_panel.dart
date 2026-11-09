@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../api/api_exception.dart';
 import '../../models/memory_extraction_status.dart';
+import '../../models/session_memory.dart';
 import '../../state/connection_controller.dart';
 import '../../state/memory_extraction.dart';
 
@@ -192,13 +193,13 @@ class _MemoryExtractionPanelState extends ConsumerState<MemoryExtractionPanel> {
                           const SizedBox(height: 10),
                           if (s.trial case final trial?) ...[
                             Text(
-                              '最近一次小样本${trial['status'] == 'completed'
+                              '最近一次${isSessionJob(trial) ? '单会话生成' : '小样本'}${trial['status'] == 'completed'
                                   ? '分析完成'
                                   : trial['status'] == 'running'
                                   ? '提取中'
                                   : trial['status'] == 'cancelled'
                                   ? '已停止'
-                                  : '未完成'} · ${trial['processed_chats'] ?? 0} / ${(trial['selections'] as List? ?? []).length} 个聊天 · ${trial['processed_messages'] ?? 0} / ${trial['total_messages'] ?? 0} 条消息',
+                                  : '未完成'} · ${trial['processed_chats'] ?? 0} / ${(trial['selections'] as List? ?? []).length} 个聊天 · ${trial['processed_messages'] ?? 0} / ${trial['total_messages'] ?? 0} ${isSessionJob(trial) ? '轮问答' : '条消息'}',
                               style: theme.textTheme.bodySmall,
                             ),
                             Wrap(

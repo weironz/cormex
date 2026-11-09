@@ -170,6 +170,13 @@ protected_routes! {
     "/archive/sessions/{id}/events" [GET] => get(crate::archive_api::get_events),
     "/archive/sessions/{id}/brief" [GET] => get(crate::archive_api::get_brief),
     "/archive/sessions/{id}/export" [GET] => get(crate::archive_api::export),
+    // One conversation's memories: generate on request (a bounded, paid job
+    // that resumes where the last one stopped), and list what it produced
+    "/archive/sessions/{id}/memory" [GET, POST] => get(crate::session_memory::status)
+        .post(crate::session_memory::start),
+    "/archive/sessions/{id}/memories" [GET] => get(crate::session_memory::memories),
+    // Resolve a pasted id: sessions and memories share one ULID space
+    "/lookup/{id}" [GET] => get(crate::session_memory::lookup),
     // **The one destructive archive operation.** `DELETE` rather than `POST`:
     // the verb has to match what happens, and a POST that erases a conversation
     // is the kind of thing that gets called by accident from a retry

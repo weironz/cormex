@@ -12,6 +12,7 @@ import '../../state/sessions_controller.dart';
 import '../../widgets/empty_state.dart';
 import 'widgets/event_tile.dart';
 import 'widgets/archive_source_label.dart';
+import 'widgets/session_memory_panel.dart';
 
 /// 一段聊天的对话视图。
 ///
@@ -323,11 +324,23 @@ class _SessionDetailPageState extends ConsumerState<SessionDetailPage> {
                         (_loadingMore ? 1 : 0),
                     itemBuilder: (context, index) {
                       if (index == 0) {
-                        return _SessionHeader(
-                          detail: detail,
-                          label: ref
-                              .watch(sessionsControllerProvider)
-                              .sourceName,
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _SessionHeader(
+                              detail: detail,
+                              label: ref
+                                  .watch(sessionsControllerProvider)
+                                  .sourceName,
+                            ),
+                            // 不进拖选范围：按钮与 ID 不是对话内容
+                            SelectionContainer.disabled(
+                              child: SessionMemoryPanel(
+                                key: ValueKey('memory-${widget.sessionId}'),
+                                sessionId: widget.sessionId,
+                              ),
+                            ),
+                          ],
                         );
                       }
                       final i = index - 1;

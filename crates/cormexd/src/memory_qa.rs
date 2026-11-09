@@ -393,6 +393,177 @@ pub async fn retire_legacy(store: &Store, session: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How far one pass over a session got.
+#[derive(Debug, Default, PartialEq)]
+pub struct SessionPass {
+    /// Turns sent to the analyser in this pass.
+    pub processed: usize,
+    /// Every complete turn up to the session's end is analysed. False when
+    /// stopped by the budget or `keep_going`, or when the tail is still open.
+    pub caught_up: bool,
+    /// Another pass holds this session; nothing was done.
+    pub busy: bool,
+}
+
+/// Analyse the not-yet-analysed complete turns of one session, from its QA
+/// cursor, at most `budget` of them. The automatic worker and the per-session
+/// "generate memories" job both run this, so one session can never be
+/// extracted two different ways.
+///
+/// `keep_going` is asked before every paid call; returning false stops the
+/// pass cleanly at a turn boundary. `job` attributes the analyses to an
+/// explicit job (its counts are read through it).
+#[allow(clippy::too_many_arguments)] // Explicit, testable model/gate dependencies.
+pub async fn extract_session(
+    st: &AppState,
+    store: &Store,
+    session: &str,
+    budget: usize,
+    model_key: &str,
+    analyzer: &dyn DialogueAnalyzer,
+    extractor: &Extractor,
+    gate: &tokio::sync::Semaphore,
+    job: Option<&str>,
+    keep_going: &mut (
+             dyn FnMut() -> futures::future::BoxFuture<'static, anyhow::Result<bool>> + Send
+         ),
+) -> anyhow::Result<SessionPass> {
+    // The automatic worker and a per-session job may pick the same session at
+    // once. Both would read one cursor and pay for the same turns, and the
+    // second write of a fact is not deduplicated. A session-scoped lock makes
+    // the second one skip instead. 4274: a lock of its own, not the sync
+    // (4272) or archive-append (4273) lock, which guard other things.
+    let mut lock = store.pool().acquire().await?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(4274, hashtext($1))")
+        .bind(session)
+        .fetch_one(&mut *lock)
+        .await?;
+    if !locked {
+        return Ok(SessionPass {
+            processed: 0,
+            caught_up: false,
+            busy: true,
+        });
+    }
+    let result = extract_locked(
+        st, store, session, budget, model_key, analyzer, extractor, gate, job, keep_going,
+    )
+    .await;
+    // Unlock on the same connection before it returns to the pool: a pooled
+    // connection keeps a session-level lock for its whole life otherwise.
+    let unlocked = sqlx::query("SELECT pg_advisory_unlock(4274, hashtext($1))")
+        .bind(session)
+        .execute(&mut *lock)
+        .await;
+    if unlocked.is_err() {
+        lock.detach();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn extract_locked(
+    st: &AppState,
+    store: &Store,
+    session: &str,
+    budget: usize,
+    model_key: &str,
+    analyzer: &dyn DialogueAnalyzer,
+    extractor: &Extractor,
+    gate: &tokio::sync::Semaphore,
+    job: Option<&str>,
+    keep_going: &mut (
+             dyn FnMut() -> futures::future::BoxFuture<'static, anyhow::Result<bool>> + Send
+         ),
+) -> anyhow::Result<SessionPass> {
+    let mut pass = SessionPass::default();
+    let Some(row) = store.archive_session(session).await? else {
+        return Ok(pass);
+    };
+    let Some(version) = crate::archive_api::parser_version_for_agent(&row.agent) else {
+        return Ok(pass);
+    };
+    let cursor = store.qa_cursor(session, dialogue::RULE_VERSION).await?;
+    let Some((latest,last_at)):Option<(i64,chrono::DateTime<chrono::Utc>)>=sqlx::query_as("SELECT seq,created_at FROM transcript_events WHERE session_id=$1 AND parser_version=$2 ORDER BY seq DESC LIMIT 1")
+   .bind(session).bind(version).fetch_optional(store.pool()).await? else {return Ok(pass)};
+    let raw = store
+        .conversation_candidates(session, version, cursor)
+        .await?;
+    let whole_window = raw.len() < 200;
+    let preceding:Vec<TranscriptEvent>=sqlx::query_as("SELECT * FROM transcript_events WHERE session_id=$1 AND parser_version=$2 AND seq<=$3 AND kind IN ('user_message','agent_message') ORDER BY seq DESC LIMIT 32")
+   .bind(session).bind(version).bind(cursor).fetch_all(store.pool()).await?;
+    let mut context = preceding;
+    context.reverse();
+    context.extend(raw);
+    let display = crate::archive_api::memory_conversation_events(st, store, &row.agent, context)
+        .await
+        .map_err(|_| anyhow::anyhow!("archive source unreadable"))?;
+    let turns = dialogue::qa_turns(&display.iter().map(message).collect::<Vec<_>>());
+    let idle = last_at < chrono::Utc::now() - chrono::Duration::seconds(60);
+    let mut all_done = true;
+    for (i, turn) in turns.iter().enumerate() {
+        let last = turn.last().expect("turn nonempty");
+        if last.seq <= cursor {
+            continue;
+        }
+        // An open tail can still grow; analysing it now would analyse it
+        // again, as a different input, once it is complete.
+        if i + 1 == turns.len()
+            && (!whole_window || !idle || !turn.iter().any(|m| m.role == "assistant"))
+        {
+            all_done = false;
+            break;
+        }
+        if pass.processed >= budget || !keep_going().await? {
+            return Ok(pass);
+        }
+        let _permit = gate.acquire().await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            process(
+                store,
+                input(&row, &turns, i),
+                model_key,
+                analyzer,
+                extractor,
+                job,
+            ),
+        )
+        .await??;
+        store
+            .advance_qa_progress(session, dialogue::RULE_VERSION, last.seq)
+            .await?;
+        pass.processed += 1;
+    }
+    if whole_window && idle && all_done {
+        retire_legacy(store, session).await?;
+        store
+            .advance_qa_progress(session, dialogue::RULE_VERSION, latest)
+            .await?;
+        store
+            .archive_txn(async |t| t.insert_promote_progress(session, latest).await)
+            .await?;
+        pass.caught_up = true;
+    } else {
+        // An open tail or a further window remains: come back after the backoff
+        store
+            .defer_qa_progress(session, dialogue::RULE_VERSION)
+            .await?;
+    }
+    Ok(pass)
+}
+
+pub(crate) fn model_key(
+    settings: &cormex_store::memory_control::MemoryExtractionSettings,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        settings.provider,
+        settings.model,
+        settings.base_url.as_deref().unwrap_or_default()
+    )
+}
+
 /// Automatic imports use the same QA processor as explicit trials. The cursor
 /// advances only after a complete turn; active, unanswered tails are deferred.
 pub async fn normal_round(
@@ -404,99 +575,42 @@ pub async fn normal_round(
     gate: &tokio::sync::Semaphore,
 ) -> anyhow::Result<usize> {
     let mut processed = 0;
-    let model_key = format!(
-        "{}:{}:{}",
-        settings.provider,
-        settings.model,
-        settings.base_url.as_deref().unwrap_or_default()
-    );
-    for (session, cursor) in store
+    let model_key = model_key(settings);
+    let per_round = st.distill_config().promote_per_round.max(1) as usize;
+    for (session, _cursor) in store
         .qa_pending(dialogue::RULE_VERSION, 3, settings.since)
         .await?
     {
-        let current = store.memory_extraction_settings().await?;
-        if current
-            .as_ref()
-            .is_some_and(|s| !s.enabled || s.id != settings.id)
-        {
+        if processed >= per_round {
+            break;
+        }
+        let (check, revision) = (store.clone(), settings.id.clone());
+        let mut keep_going = move || {
+            let (check, revision) = (check.clone(), revision.clone());
+            Box::pin(async move {
+                let current = check.memory_extraction_settings().await?;
+                Ok(!current
+                    .as_ref()
+                    .is_some_and(|s| !s.enabled || s.id != revision))
+            }) as futures::future::BoxFuture<'static, anyhow::Result<bool>>
+        };
+        if !keep_going().await? {
             return Ok(processed);
         }
-        let Some(row) = store.archive_session(&session).await? else {
-            continue;
-        };
-        let Some(version) = crate::archive_api::parser_version_for_agent(&row.agent) else {
-            continue;
-        };
-        let Some((latest,last_at)):Option<(i64,chrono::DateTime<chrono::Utc>)>=sqlx::query_as("SELECT seq,created_at FROM transcript_events WHERE session_id=$1 AND parser_version=$2 ORDER BY seq DESC LIMIT 1")
-   .bind(&session).bind(version).fetch_optional(store.pool()).await? else {continue};
-        let raw = store
-            .conversation_candidates(&session, version, cursor)
-            .await?;
-        let whole_window = raw.len() < 200;
-        let preceding:Vec<TranscriptEvent>=sqlx::query_as("SELECT * FROM transcript_events WHERE session_id=$1 AND parser_version=$2 AND seq<=$3 AND kind IN ('user_message','agent_message') ORDER BY seq DESC LIMIT 32")
-   .bind(&session).bind(version).bind(cursor).fetch_all(store.pool()).await?;
-        let mut context = preceding;
-        context.reverse();
-        context.extend(raw);
-        let display =
-            crate::archive_api::memory_conversation_events(st, store, &row.agent, context)
-                .await
-                .map_err(|_| anyhow::anyhow!("archive source unreadable"))?;
-        let turns = dialogue::qa_turns(&display.iter().map(message).collect::<Vec<_>>());
-        let idle = last_at < chrono::Utc::now() - chrono::Duration::seconds(60);
-        let mut all_done = true;
-        for (i, turn) in turns.iter().enumerate() {
-            let last = turn.last().expect("turn nonempty");
-            if last.seq <= cursor {
-                continue;
-            }
-            if i + 1 == turns.len()
-                && (!whole_window || !idle || !turn.iter().any(|m| m.role == "assistant"))
-            {
-                all_done = false;
-                break;
-            }
-            if processed >= st.distill_config().promote_per_round.max(1) as usize {
-                return Ok(processed);
-            }
-            let current = store.memory_extraction_settings().await?;
-            if current
-                .as_ref()
-                .is_some_and(|s| !s.enabled || s.id != settings.id)
-            {
-                return Ok(processed);
-            }
-            let _permit = gate.acquire().await?;
-            tokio::time::timeout(
-                std::time::Duration::from_secs(90),
-                process(
-                    store,
-                    input(&row, &turns, i),
-                    &model_key,
-                    analyzer,
-                    extractor,
-                    None,
-                ),
-            )
-            .await??;
-            store
-                .advance_qa_progress(&session, dialogue::RULE_VERSION, last.seq)
-                .await?;
-            processed += 1;
-        }
-        if whole_window && idle && all_done {
-            retire_legacy(store, &session).await?;
-            store
-                .advance_qa_progress(&session, dialogue::RULE_VERSION, latest)
-                .await?;
-            store
-                .archive_txn(async |t| t.insert_promote_progress(&session, latest).await)
-                .await?;
-        } else {
-            store
-                .defer_qa_progress(&session, dialogue::RULE_VERSION)
-                .await?;
-        }
+        let pass = extract_session(
+            st,
+            store,
+            &session,
+            per_round - processed,
+            &model_key,
+            analyzer,
+            extractor,
+            gate,
+            None,
+            &mut keep_going,
+        )
+        .await?;
+        processed += pass.processed;
     }
     Ok(processed)
 }

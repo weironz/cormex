@@ -154,6 +154,10 @@ void main() {
       var calls = 0;
       final controller = _Connection();
       final client = MockClient((request) async {
+        // The memory panel's own status request is not what this counts
+        if (request.url.path.endsWith('/memory')) {
+          return http.Response('{"supported":false}', 200);
+        }
         calls++;
         if (calls == 1) return http.Response('{"error":"expired"}', 401);
         if (request.url.path.endsWith('/events')) {

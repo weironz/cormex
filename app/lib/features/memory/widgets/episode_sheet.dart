@@ -12,6 +12,7 @@ import '../../../state/memory_controller.dart';
 import '../../../state/memory_context.dart';
 import '../../../widgets/empty_state.dart';
 import '../../sessions/session_detail_page.dart';
+import '../../../widgets/id_chip.dart';
 import 'memory_reading.dart';
 
 final _sourceChatProvider = FutureProvider.family<ArchiveSession, String>(
@@ -99,7 +100,10 @@ class _MemoryDetail extends ConsumerWidget {
                       if (c != null) Text('证据：${c.verificationLabel}'),
                     ],
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 8),
+                  IdLine(label: '记忆 ID', id: f.id),
+                  if (c != null) IdLine(label: '会话 ID', id: c.sessionId),
+                  const SizedBox(height: 12),
                   MemoryTextPanel(child: MemoryMarkdown(f.statement)),
                   const SizedBox(height: 20),
                   if (c?.reason case final String reason

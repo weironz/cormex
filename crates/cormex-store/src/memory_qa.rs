@@ -92,6 +92,12 @@ impl Store {
    .bind(session).bind(version).bind(through).execute(self.pool()).await?;
         Ok(())
     }
+    /// Where analysis of one session stands: the last analysed source event,
+    /// -1 when none. The same cursor `qa_pending` compares against.
+    pub async fn qa_cursor(&self, session: &str, version: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT coalesce((SELECT through_seq FROM memory_qa_progress WHERE session_id=$1 AND rule_version=$2),-1)")
+            .bind(session).bind(version).fetch_one(self.pool()).await?)
+    }
     /// Sessions with turns not yet analysed, most recently captured first.
     ///
     /// `since` is the extraction scope: a session is in it when its last event

@@ -4,6 +4,7 @@ import '../../../core/formatting.dart';
 import '../../../models/memory_fact.dart';
 import '../../../models/memory_context.dart';
 import '../../../models/memory_search_result.dart';
+import '../../../widgets/id_chip.dart';
 import 'episode_sheet.dart';
 
 class FactCard extends StatelessWidget {
@@ -125,6 +126,8 @@ class FactCard extends StatelessWidget {
                       formatDate(c?.sourceTime ?? fact.createdAt),
                       style: theme.textTheme.labelSmall,
                     ),
+                    const SizedBox(width: 6),
+                    IdChip(id: fact.id, label: '记忆'),
                     const Spacer(),
                     if (canOpen)
                       Text(

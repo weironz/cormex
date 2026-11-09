@@ -14,7 +14,9 @@ import '../models/json.dart';
 import '../models/memory_artifact.dart';
 import '../models/memory_search_result.dart';
 import '../models/memory_context.dart';
+import '../models/session_memory.dart';
 import '../models/memory_extraction_status.dart';
+import '../models/memory_fact.dart';
 import '../models/transcript_event.dart';
 import 'api_exception.dart';
 import 'http_client_factory.dart';
@@ -488,6 +490,31 @@ class CormexApi {
         .map((m) => MemoryContext.fromJson(m.cast<String, dynamic>()))
         .toList();
   }
+
+  // ─────────────────────── 单个会话的记忆与 ID 定位 ───────────────────────
+
+  Future<SessionMemoryStatus> sessionMemoryStatus(String sessionId) async =>
+      SessionMemoryStatus.fromJson(
+        await _getJson(
+          '/archive/sessions/${Uri.encodeComponent(sessionId)}/memory',
+        ),
+      );
+
+  /// 为这个会话生成记忆：花模型费用，由人点按钮触发。
+  Future<void> startSessionMemory(String sessionId) => _memoryTrialPost(
+    '/archive/sessions/${Uri.encodeComponent(sessionId)}/memory',
+    const {},
+  );
+
+  Future<List<MemoryFact>> sessionMemories(String sessionId) async => factsOf(
+    await _getJson(
+      '/archive/sessions/${Uri.encodeComponent(sessionId)}/memories',
+    ),
+  );
+
+  Future<IdLookup> lookupId(String id) async => IdLookup.fromJson(
+    await _getJson('/lookup/${Uri.encodeComponent(id.trim())}'),
+  );
 
   Future<List<Map<String, dynamic>>> memoryTrialCandidates() async {
     final j = await _getJson('/settings/memory-extraction/trial/candidates');

@@ -10,9 +10,12 @@ import '../../state/memory_artifacts.dart';
 import '../../state/memory_controller.dart';
 import '../../state/memory_extraction.dart';
 import '../../state/memory_context.dart';
+import '../../state/memory_view.dart';
+import '../lookup/id_lookup.dart';
 import '../../widgets/empty_state.dart';
 import '../settings/settings_page.dart';
 import 'widgets/fact_card.dart';
+import 'widgets/fact_row.dart';
 import 'memory_artifacts_list.dart';
 
 /// 整页的记忆浏览器 —— 这个应用的全部。
@@ -174,6 +177,8 @@ class _MemoryBrowserState extends ConsumerState<MemoryBrowser> {
                 ],
               ),
         actions: [
+          if (_kind == null) const _ViewToggle(),
+          const IdLookupButton(),
           IconButton(
             tooltip: '设置',
             icon: const Icon(Icons.settings_outlined),
@@ -519,6 +524,22 @@ class _Grid extends ConsumerWidget {
         .watch(memoryContextsProvider(facts.map((f) => f.id).join(',')))
         .asData
         ?.value;
+    if (ref.watch(memoryViewProvider) == MemoryViewMode.list) {
+      return Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 900),
+          child: ListView.separated(
+            key: const ValueKey('memory-list-view'),
+            primary: false,
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+            itemCount: facts.length,
+            separatorBuilder: (_, _) => const Divider(height: 1),
+            itemBuilder: (context, i) =>
+                FactRow(fact: facts[i], contextInfo: contexts?[facts[i].id]),
+          ),
+        ),
+      );
+    }
     return LayoutBuilder(
       builder: (context, box) {
         // 一列 420px 上下。再宽就让列变宽而不是加列 —— 一条事实是一句话，
@@ -550,6 +571,25 @@ class _Grid extends ConsumerWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// 卡片 / 列表切换。
+class _ViewToggle extends ConsumerWidget {
+  const _ViewToggle();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final mode = ref.watch(memoryViewProvider);
+    final cards = mode == MemoryViewMode.cards;
+    return IconButton(
+      key: const ValueKey('memory-view-toggle'),
+      tooltip: cards ? '切换为列表' : '切换为卡片',
+      icon: Icon(cards ? Icons.view_list_rounded : Icons.grid_view_rounded),
+      onPressed: () => ref
+          .read(memoryViewProvider.notifier)
+          .set(cards ? MemoryViewMode.list : MemoryViewMode.cards),
     );
   }
 }
