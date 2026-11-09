@@ -539,18 +539,29 @@ def load_images(directory, manifest):
     return loaded
 
 
+# Docker Hub sometimes answers the HEAD for a tag that does not exist with
+# "401 Unauthorized" instead of 404: about one lookup in 24 when measured during
+# the v0.1.20 publication, which failed twice on it. An ambiguous answer is asked
+# again; one that stays ambiguous still fails closed
+REGISTRY_LOOKUP_DELAYS = (2, 5, 10)
+
+
 def registry_image(reference):
     """Read registry content through its immutable digest, never a cached local tag."""
-    result = subprocess.run(["docker", "buildx", "imagetools", "inspect", reference,
-                             "--format", "{{json .Manifest}}"], cwd=ROOT,
-                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if result.returncode:
+    for delay in (*REGISTRY_LOOKUP_DELAYS, None):
+        result = subprocess.run(["docker", "buildx", "imagetools", "inspect", reference,
+                                 "--format", "{{json .Manifest}}"], cwd=ROOT,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if not result.returncode:
+            break
         message = result.stderr.lower()
         absent = any(text in message for text in ("no such manifest", "manifest unknown"))
         absent = absent or message.strip().endswith(reference.lower() + ": not found")
-        require(absent and not any(text in message for text in ("unauthorized", "denied", "timeout")),
-                f"cannot determine whether registry image exists: {reference}")
-        return None
+        if absent and not any(text in message for text in ("unauthorized", "denied", "timeout")):
+            return None
+        require(delay is not None, f"cannot determine whether registry image exists: {reference}: "
+                                   f"{result.stderr.strip()[-300:]}")
+        time.sleep(delay)
     descriptor = json.loads(result.stdout)
     identity = descriptor.get("digest")
     require(isinstance(identity, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", identity),

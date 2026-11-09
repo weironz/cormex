@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Release tooling
+
+- Ask the registry again when a tag lookup is ambiguous before failing closed. Docker Hub intermittently answers a lookup for a missing tag with 401 instead of 404, which stopped the v0.1.20 publication twice before any push.
+
 ## 0.1.20 — 2026-11-09
 
 ### Operations: validated local builds and explicit deployment upgrades

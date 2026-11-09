@@ -497,10 +497,26 @@ class ReleaseOperationTests(unittest.TestCase):
     def test_registry_image_fails_closed_on_ambiguous_errors(self):
         for message in ("unauthorized", "permission denied", "connection timed out"):
             with self.subTest(message=message), \
+                    mock.patch.object(release.time, "sleep") as sleep, \
                     mock.patch.object(release.subprocess, "run", return_value=mock.Mock(
-                        returncode=1, stdout="", stderr=message)):
+                        returncode=1, stdout="", stderr=message)) as lookup:
                 with self.assertRaises(release.ReleaseError):
                     release.registry_image("example/cormex:v0.1.17")
+                self.assertEqual(lookup.call_count, len(release.REGISTRY_LOOKUP_DELAYS) + 1,
+                                 "an ambiguous answer must be asked again before failing closed")
+                self.assertEqual(sleep.call_count, len(release.REGISTRY_LOOKUP_DELAYS))
+
+    def test_registry_image_retries_a_spurious_docker_hub_401(self):
+        # Docker Hub's real answer for a missing tag, seen intermittently during
+        # the v0.1.20 publication, followed by the 404 the next lookup gets
+        spurious = mock.Mock(returncode=1, stdout="", stderr=(
+            "ERROR: unexpected status from HEAD request to https://registry-1.docker.io/v2/"
+            "example/cormex/manifests/v0.1.17: 401 Unauthorized\n"))
+        missing = mock.Mock(returncode=1, stdout="", stderr="ERROR: docker.io/example/cormex:v0.1.17: not found\n")
+        with mock.patch.object(release.time, "sleep"), \
+                mock.patch.object(release.subprocess, "run", side_effect=[spurious, missing]) as lookup:
+            self.assertIsNone(release.registry_image("example/cormex:v0.1.17"))
+        self.assertEqual(lookup.call_count, 2)
 
     def test_partial_push_records_verified_digest_before_later_failure(self):
         remote = {"digest": "sha256:" + "d" * 64, "content_sha256": "a" * 64,
