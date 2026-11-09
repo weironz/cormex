@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.21 — 2026-11-09
+
 ### Memories per session, and finding things by id
 
 - **Generate memories for one conversation.** Each archived session has a "生成记忆" button: it runs the automatic worker's own per-session pass on that conversation, at most 30 QA turns per click, resuming where the last click stopped. It asks first and states how many turns it will send. `POST /archive/sessions/{id}/memory` starts it, `GET` reports pending turns, memory count and the job; it shares the one explicit-job slot with small-sample runs and works whether automatic extraction is on or off.
