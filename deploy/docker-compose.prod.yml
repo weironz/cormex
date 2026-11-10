@@ -298,6 +298,10 @@ services:
       S3_PUBLIC_ENDPOINT: https://${S3_DOMAIN}
       S3_BUCKET: ${S3_BUCKET:-cormex-blobs}
       S3_REGION: ${S3_REGION:-us-east-1}
+      # rmcp 默认只放行 loopback Host（防 DNS rebinding）。域名部署不显式声明
+      # 自己的主机，/mcp 的每次请求都会被 403 拒绝：客户端看着配置齐全，却
+      # 一次都连不上。loopback 仍由默认值保留，仅追加这里声明的域名。
+      CORMEX_MCP_ALLOWED_HOSTS: ${CORMEX_DOMAIN:?在 .env 里设 CORMEX_DOMAIN}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-cormexadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
 

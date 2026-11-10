@@ -9,6 +9,25 @@ import 'package:flutter/material.dart';
 /// 记忆相关的东西另有一支青色（[memoryAccentLight] / [memoryAccentDark]）：
 /// 出处、信任级、时间回放这些是这个产品的主角，让它们跟「主按钮」抢同一种
 /// 颜色，等于让主角和布景穿一样的衣服。
+/// 间距节奏：4 的倍数，但刻意不匀速。列表内紧、区块之间松，靠差值而不是
+/// 靠加边框来分层 —— 均匀间距是「一个 Flutter demo」最明显的特征。
+abstract final class CormexSpacing {
+  static const double xs = 4;
+  static const double sm = 8;
+  static const double md = 12;
+  static const double lg = 20;
+  static const double xl = 32;
+  static const double gutter = 24;
+}
+
+/// 圆角：卡片比控件大，控件比标签大。全线统一，避免每个页面各写各的 10/12/14。
+abstract final class CormexRadii {
+  static const double control = 10;
+  static const double card = 16;
+  static const double sheet = 20;
+  static const double chip = 8;
+}
+
 abstract final class CormexTheme {
   static const _indigo = Color(0xFF5B62F4);
   static const _indigoLight = Color(0xFF7A80FF);
@@ -182,6 +201,92 @@ abstract final class CormexTheme {
         thumbColor: WidgetStatePropertyAll(
           scheme.onSurfaceVariant.withValues(alpha: 0.35),
         ),
+      ),
+      // 组件层：让「没被单独设计过」的页面也继承同一套形状与留白，而不是
+      // 掉回 Material 默认值。卡片不再靠投影分层，用一道细边框 + 表面色差。
+      cardTheme: CardThemeData(
+        elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        color: scheme.surfaceContainerLow,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(CormexRadii.card),
+          side: BorderSide(color: scheme.outlineVariant),
+        ),
+        margin: const EdgeInsets.symmetric(
+          horizontal: CormexSpacing.md,
+          vertical: CormexSpacing.sm,
+        ),
+      ),
+      listTileTheme: ListTileThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(CormexRadii.control),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: CormexSpacing.md,
+          vertical: CormexSpacing.xs,
+        ),
+        minVerticalPadding: CormexSpacing.sm,
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(CormexRadii.control),
+          ),
+          side: BorderSide(color: scheme.outlineVariant),
+          padding: const EdgeInsets.symmetric(
+            horizontal: CormexSpacing.lg - 2,
+            vertical: CormexSpacing.md,
+          ),
+          textStyle: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(CormexRadii.control),
+          ),
+          padding: const EdgeInsets.symmetric(
+            horizontal: CormexSpacing.md,
+            vertical: CormexSpacing.sm,
+          ),
+        ),
+      ),
+      dialogTheme: DialogThemeData(
+        elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(CormexRadii.sheet),
+          side: BorderSide(color: scheme.outlineVariant),
+        ),
+      ),
+      bottomSheetTheme: BottomSheetThemeData(
+        elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        backgroundColor: scheme.surface,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(
+            top: Radius.circular(CormexRadii.sheet),
+          ),
+        ),
+      ),
+      tabBarTheme: TabBarThemeData(
+        indicatorColor: scheme.primary,
+        labelColor: scheme.onSurface,
+        unselectedLabelColor: scheme.onSurfaceVariant,
+        dividerColor: scheme.outlineVariant,
+        labelStyle: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        elevation: 0,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(CormexRadii.control),
+        ),
+      ),
+      progressIndicatorTheme: ProgressIndicatorThemeData(
+        color: scheme.primary,
+        linearTrackColor: scheme.surfaceContainerHighest,
       ),
       splashFactory: InkSparkle.splashFactory,
     );

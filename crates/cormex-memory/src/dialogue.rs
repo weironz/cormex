@@ -151,39 +151,10 @@ pub fn evidence_rank(value: &str) -> u8 {
         _ => 1,
     }
 }
-/// One sentence of plain text, whatever shape the model answered in.
-///
-/// The statement is read by a person in the memory browser **and** pasted into
-/// an agent's context. Markdown headings, bold labels and paragraph breaks make
-/// both worse: the list row flattens them into a run of `**` markers, and an
-/// injected prompt gets a structured report where one fact belongs. A new
-/// prompt is not retroactive either — this also cleans up whatever the model
-/// still answers in the old format.
-#[must_use]
-pub fn plain_statement(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for raw_line in raw.lines() {
-        let line = raw_line.trim().replace("**", "");
-        let line = line.trim_start_matches('#').trim_start();
-        let line = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(line);
-    }
-    out.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace("来源报告", "助手自述，未独立核实")
-        .trim()
-        .to_owned()
-}
+/// One definition of "what a statement looks like", shared by the extractor
+/// here and every prompt-injection path in `cormex-core`. Re-exported so
+/// existing callers keep `dialogue::plain_statement`.
+pub use cormex_core::injection::plain_statement;
 
 /// Exact source checks and automatic filtering; there is no human approval gate.
 pub fn validate_analysis(mut analysis: TurnAnalysis, input: &TurnInput) -> TurnAnalysis {

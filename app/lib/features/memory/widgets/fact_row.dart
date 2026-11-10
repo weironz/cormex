@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../../core/formatting.dart';
+import '../../../core/theme.dart';
 import '../../../models/memory_context.dart';
 import '../../../models/memory_fact.dart';
 import '../../../widgets/id_chip.dart';
@@ -21,6 +22,9 @@ class FactRow extends StatelessWidget {
     final scheme = theme.colorScheme;
     final c = contextInfo;
     final episode = fact.sourceEpisodeId;
+    final accent = fact.invalidated
+        ? scheme.error
+        : CormexTheme.memoryAccent(theme.brightness);
     final meta = [
       fact.invalidated ? '已失效' : memoryCategory(fact.predicate),
       ?c?.subject,
@@ -37,44 +41,57 @@ class FactRow extends StatelessWidget {
               contextInfo: c,
             ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+        padding: const EdgeInsets.symmetric(
+          horizontal: CormexSpacing.sm,
+          vertical: CormexSpacing.md,
+        ),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: accent.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(CormexRadii.chip),
+              ),
               child: Icon(
                 fact.invalidated
                     ? Icons.history_rounded
                     : Icons.bookmark_outline_rounded,
-                size: 16,
-                color: fact.invalidated ? scheme.error : scheme.primary,
+                size: 15,
+                color: accent,
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: CormexSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
                     plainStatement(fact.statement),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(
+                      height: 1.55,
                       decoration: fact.invalidated
                           ? TextDecoration.lineThrough
                           : null,
                     ),
                   ),
-                  const SizedBox(height: 3),
+                  const SizedBox(height: CormexSpacing.sm - 2),
                   Wrap(
                     crossAxisAlignment: WrapCrossAlignment.center,
-                    spacing: 8,
+                    spacing: CormexSpacing.sm,
                     children: [
                       Text(
                         meta.join(' · '),
                         style: theme.textTheme.labelSmall?.copyWith(
-                          color: fact.invalidated ? scheme.error : null,
+                          color: fact.invalidated
+                              ? scheme.error
+                              : scheme.onSurfaceVariant,
+                          fontFamilyFallback: CormexTheme.monoFallback,
                         ),
                       ),
                       IdChip(id: fact.id, label: '记忆'),

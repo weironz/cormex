@@ -39,15 +39,15 @@ class MemoryContext {
   String get roleLabel => memorySourceRoleLabel(sourceRole);
   String get verificationLabel => switch (verification) {
     'evidence_supported' => '归档工具佐证',
-    'reported' => '来源报告',
+    'reported' => '助手自述',
     'user_stated' => '原对话给定',
-    _ => sourceRole == 'assistant' ? '来源报告' : '依据原对话',
+    _ => sourceRole == 'assistant' ? '助手自述' : '依据原对话',
   };
   String? get verificationDescription => switch (verification) {
     'evidence_supported' => '原对话包含归档的工具或测试记录。',
-    'reported' => '来源报告，未经独立验证。',
+    'reported' => '来自助手自述，未经独立验证。',
     'user_stated' => '来自原对话给定的信息。',
-    _ => sourceRole == 'assistant' ? '来源报告，未经独立验证。' : null,
+    _ => sourceRole == 'assistant' ? '来自助手自述，未经独立验证。' : null,
   };
 }
 

@@ -133,10 +133,10 @@ void main() {
       });
       expect(contextWith('evidence_supported').verificationLabel, '归档工具佐证');
       expect(contextWith('user_stated').verificationLabel, '原对话给定');
-      expect(contextWith('reported').verificationDescription, '来源报告，未经独立验证。');
+      expect(contextWith('reported').verificationDescription, '来自助手自述，未经独立验证。');
       expect(
         contextWith(null, role: 'assistant').verificationDescription,
-        '来源报告，未经独立验证。',
+        '来自助手自述，未经独立验证。',
       );
       expect(contextWith('future_verification').verificationLabel, '依据原对话');
     },
@@ -504,7 +504,7 @@ void main() {
       label: '归档工具佐证',
       description: '原对话包含归档的工具或测试记录。',
     ),
-    (verification: 'reported', label: '来源报告', description: '来源报告，未经独立验证。'),
+    (verification: 'reported', label: '助手自述', description: '来自助手自述，未经独立验证。'),
     (verification: 'user_stated', label: '原对话给定', description: '来自原对话给定的信息。'),
   ]) {
     testWidgets(

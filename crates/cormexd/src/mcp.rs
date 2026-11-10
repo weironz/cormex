@@ -1036,6 +1036,16 @@ fn to_mcp_error(e: cormex_core::CormexError) -> ErrorData {
 /// `every_protected_route_rejects_anonymous_requests` is the only thing capable
 /// of catching this, so `/mcp` has to be on that list.
 pub fn service(state: AppState) -> StreamableHttpService<MemoryMcp, LocalSessionManager> {
+    // rmcp validates the `Host` header against DNS rebinding and, by default,
+    // allows only loopback. A deployment behind a real hostname therefore
+    // answered **every** `/mcp` request with 403 "Host header is not allowed"
+    // — the MCP frontage looked configured but no agent could ever connect.
+    // Public deployments name their own host(s) in CORMEX_MCP_ALLOWED_HOSTS;
+    // loopback stays allowed so local development is unchanged.
+    let mut config = StreamableHttpServerConfig::default();
+    config.allowed_hosts.extend(parse_allowed_hosts(
+        &std::env::var("CORMEX_MCP_ALLOWED_HOSTS").unwrap_or_default(),
+    ));
     StreamableHttpService::new(
         move || Ok(MemoryMcp::new(state.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -1048,8 +1058,38 @@ pub fn service(state: AppState) -> StreamableHttpService<MemoryMcp, LocalSession
         // It cannot be written out here: the struct is `#[non_exhaustive]`, so
         // a struct expression is refused and there is no `with_…` for this
         // field. A test pins the default instead of a comment asserting it.
-        StreamableHttpServerConfig::default(),
+        config,
     )
+}
+
+/// `CORMEX_MCP_ALLOWED_HOSTS` is a comma-separated list of hostnames or
+/// `host:port` authorities. Empty entries are ignored so a trailing comma or
+/// an unset variable cannot accidentally widen anything.
+fn parse_allowed_hosts(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::parse_allowed_hosts;
+
+    #[test]
+    fn an_unset_or_blank_value_widens_nothing() {
+        assert!(parse_allowed_hosts("").is_empty());
+        assert!(parse_allowed_hosts(" , , ").is_empty());
+    }
+
+    #[test]
+    fn public_hosts_are_listed_explicitly() {
+        assert_eq!(
+            parse_allowed_hosts(" cormex.example.com, cormex.example.com:8443 ,"),
+            ["cormex.example.com", "cormex.example.com:8443"]
+        );
+    }
 }
 
 #[cfg(test)]

@@ -64,6 +64,40 @@ impl Budget {
     }
 }
 
+/// One sentence of plain text, whatever shape the extractor wrote.
+///
+/// Memories used to be Markdown "audit reports" (`**来源报告**`, `## 主题`,
+/// blank-line sections). The UI and the injected prompt both read this field,
+/// and the archive still holds those old rows. Cleaning it here means every
+/// injection path — MCP tool results, the profile resource, turn retrieval —
+/// gives the model a sentence, without each caller having to remember.
+/// Inline code markers are kept: they stay readable as plain text.
+#[must_use]
+pub fn plain_statement(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for raw_line in raw.lines() {
+        let line = raw_line.trim().replace("**", "");
+        let line = line.trim_start_matches('#').trim_start();
+        let line = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("来源报告", "助手自述，未独立核实")
+        .trim()
+        .to_owned()
+}
+
 /// One retrieved memory.
 ///
 /// # ⚠️ Adding a field **does not** make the model see it
@@ -145,7 +179,7 @@ pub fn render_profile_block(items: &[MemoryItem]) -> String {
     }
     let mut s = String::from("<user_profile>\n关于用户的长期事实：\n");
     for it in items {
-        let _ = writeln!(s, "- [{}] {}", it.id, it.statement);
+        let _ = writeln!(s, "- [{}] {}", it.id, plain_statement(&it.statement));
     }
     s.push_str("</user_profile>");
     s
@@ -166,7 +200,7 @@ pub fn render_turn_block(items: &[MemoryItem]) -> String {
     s.push_str(FRAMING);
     s.push('\n');
     for it in items {
-        let _ = write!(s, "\n- [{}] {}", it.id, it.statement);
+        let _ = write!(s, "\n- [{}] {}", it.id, plain_statement(&it.statement));
         if let Some(v) = &it.valid_at {
             let _ = write!(s, "（自 {v} 起为真");
             let _ = write!(s, "；{} 获知）", it.known_since);
@@ -362,6 +396,26 @@ mod tests {
             confidence: Some(0.42),
             source_channel: Some("tool_output".into()),
             trust_tier: Some(3),
+        }
+    }
+
+    /// The archive still holds Markdown audit reports. An agent reading one
+    /// through MCP or the profile resource should get a sentence, not `**`.
+    #[test]
+    fn injected_blocks_clean_old_audit_reports() {
+        let items = [item(
+            "01JF1",
+            "**来源报告**\n\n## 主题\n\n对象存储使用 RustFS，不再使用 MinIO。",
+        )];
+        // The framing sentence itself legitimately uses ** for emphasis;
+        // only the rendered memory line must be free of it.
+        for block in [render_turn_block(&items), render_profile_block(&items)] {
+            assert!(!block.contains("- [01JF1] **"), "{block}");
+            assert!(!block.contains("- [01JF1] ##"), "{block}");
+            assert!(
+                block.contains("- [01JF1] 助手自述，未独立核实 主题 对象存储使用 RustFS"),
+                "{block}"
+            );
         }
     }
 

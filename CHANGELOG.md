@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed: `/mcp` answered 403 on every hostname deployment
+
+- `rmcp` validates the `Host` header against DNS rebinding and allows only loopback by default. A deployment behind a real hostname therefore rejected every `/mcp` request with "Host header is not allowed" — the MCP frontage looked configured, `doctor` was green, and no agent could ever connect. `mcp::service` now appends `CORMEX_MCP_ALLOWED_HOSTS` (comma-separated) to that list; loopback stays as before. The production compose template sets it to `${CORMEX_DOMAIN}`.
+
+### Memory: clean statements everywhere they are read
+
+- `plain_statement` now lives in `cormex-core::injection` and is applied by `render_profile_block` / `render_turn_block` as well as the extractor. Old Markdown audit reports are therefore cleaned when an agent reads them over MCP, not only in the browser. One definition, one re-export from `dialogue`.
+- The verification label "来源报告" is now "助手自述" ("来自助手自述，未经独立验证。"), including the card's accent rule and its tests.
+
+### UI: editorial archive instead of default Material
+
+- Added `CormexSpacing` / `CormexRadii` tokens and component themes (card, list tile, outlined/text buttons, dialog, bottom sheet, tab bar, snack bar, progress) so pages that were never individually designed inherit a consistent shape and rhythm instead of Material defaults. Cards separate by a hairline border and surface tone, not generic shadows.
+- `FactCard` and `FactRow` were rebuilt around an editorial hierarchy: a thin accent rule marks the category, subject / statement / provenance get distinct type sizes, metadata uses the mono stack, and the 108px scrolling Markdown box is gone (a one-sentence memory does not need one). All text and the `MarkdownBody` are intact.
+
 ### Diagnostics: doctor notices a machine that never reads its memories
 
 - `cormex doctor` gains an `mcp` check. Previously every check could pass on a machine that captured conversations, distilled them into memories, and never surfaced one: registration as an MCP server is done by `cormex init`, but those installers are skipped when no credential exists yet, so setting up hooks before logging in silently leaves no consumer at all.
