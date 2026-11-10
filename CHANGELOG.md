@@ -8,6 +8,11 @@
 - The check reads the files hosts actually use (`~/.claude.json`, `~/.claude/settings.json`, a project `.mcp.json`, `~/.codex/config.toml`, plus `CLAUDE_CONFIG_DIR` / `CODEX_HOME` overrides) and shares its notion of "registered" with the installers. A machine with no agent config is a capture-only host and passes. A failing check points at `cormex init`, reloading the host and starting a new session.
 - A project path containing the word "cormex" is not an MCP entry; the check reads `mcpServers` rather than searching the file. A config that cannot be parsed is named in the detail instead of being treated as empty.
 
+### Fixed: SQLite sources open again on Windows
+
+- Cursor's `state.vscdb`, OpenCode's `opencode.db` and Goose's `sessions.db` could not be read on Windows. `catalog::discover` canonicalises agent homes, which yields a verbatim `\\?\C:\...` path; turning that into a `file:...?mode=ro` URI let the `?` in the prefix start the URI's query string, so SQLite saw a path of `\\` and failed with `SQLITE_CANTOPEN`. A `#` anywhere in a path broke it the same way.
+- The connection now passes the path directly with `SQLITE_OPEN_READ_ONLY`, which already enforces read-only at the SQLite level (a catalog query containing an `UPDATE` is still refused). Both readers share one `open_read_only` helper so the flags cannot drift apart. `busy_timeout` is unchanged.
+
 ## 0.1.21 — 2026-11-09
 
 ### Memories per session, and finding things by id

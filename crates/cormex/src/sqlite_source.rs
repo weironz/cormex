@@ -13,8 +13,16 @@
 //!
 //! The host has the database open. Opening it read-write would let a bug here
 //! corrupt somebody's editor state, and the whole point of this client is that
-//! it never modifies what it reads. `mode=ro` is enforced by SQLite itself, so
-//! it holds even if a query in the catalog turns out to be an `UPDATE`.
+//! it never modifies what it reads. `SQLITE_OPEN_READ_ONLY` is enforced by
+//! SQLite itself, so it holds even if a query in the catalog turns out to be an
+//! `UPDATE`.
+//!
+//! **The path is passed as a path, never as a `file:...?mode=ro` URI.** On
+//! Windows `std::fs::canonicalize` returns a verbatim path (`\\?\C:\...`), and
+//! the `?` in that prefix starts the URI's query string — SQLite then sees a
+//! path of `\\` and fails with `SQLITE_CANTOPEN`. A `#` anywhere in the path
+//! breaks it the same way. Since the open flag already guarantees read-only,
+//! the URI buys nothing and costs Windows support.
 //!
 //! `busy_timeout` matters for the same reason: a host writing in
 //! rollback-journal mode locks the whole database for the duration of a write,
@@ -38,6 +46,20 @@ pub struct RowFile {
     pub bytes: Vec<u8>,
 }
 
+/// Open a host's database without ever being able to write to it.
+///
+/// Shared by both readers so the open flags cannot drift apart. The path is
+/// passed as a path: see the module comment for why a `file:` URI is not safe
+/// here.
+fn open_read_only(db_path: &Path, busy_timeout_ms: u64) -> Result<rusqlite::Connection> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("cannot open {} read-only", db_path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))
+        .context("cannot set busy_timeout")?;
+    Ok(conn)
+}
+
 /// Read every row `spec` selects out of `db_path`.
 ///
 /// `db_rel` is the database's path relative to the agent's home, and is what
@@ -48,18 +70,7 @@ pub struct RowFile {
 /// The database cannot be opened read-only, the query fails, or the spec names
 /// a column that is not in the result.
 pub fn read_rows(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<RowFile>> {
-    // A URI, because `mode=ro` is a URI parameter. `immutable=1` is
-    // deliberately **not** set: it tells SQLite the file cannot change, which
-    // is false for a database a running editor is writing to
-    let uri = format!("file:{}?mode=ro", db_path.display());
-    let conn = rusqlite::Connection::open_with_flags(
-        &uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("cannot open {} read-only", db_path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_millis(spec.busy_timeout_ms))
-        .context("cannot set busy_timeout")?;
-
+    let conn = open_read_only(db_path, spec.busy_timeout_ms)?;
     read_rows_conn(&conn, db_rel, spec)
 }
 
@@ -132,13 +143,7 @@ fn read_rows_conn(
 /// Read both OpenCode generations. A database can contain legacy messages
 /// alongside a partially populated newer projection.
 pub fn read_opencode(db_path: &Path, db_rel: &str, spec: &SqliteSpec) -> Result<Vec<RowFile>> {
-    let uri = format!("file:{}?mode=ro", db_path.display());
-    let conn = rusqlite::Connection::open_with_flags(
-        &uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("cannot open {} read-only", db_path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_millis(spec.busy_timeout_ms))?;
+    let conn = open_read_only(db_path, spec.busy_timeout_ms)?;
     let has = |name: &str| -> Result<bool> {
         Ok(conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -344,8 +349,9 @@ mod tests {
     /// The database is opened **read-only**, so a query that writes fails.
     ///
     /// That is what protects the host's own state: this client never modifies
-    /// what it reads, and `mode=ro` enforces it even if a catalog query turns
-    /// out to be an UPDATE.
+    /// what it reads, and `SQLITE_OPEN_READ_ONLY` enforces it even if a catalog
+    /// query turns out to be an UPDATE. Dropping the `file:` URI must not
+    /// weaken this.
     #[test]
     fn the_database_is_opened_read_only() {
         let (dir, path) = fixture();
@@ -387,6 +393,72 @@ mod tests {
         s.text_column = Some("nope".into());
         assert!(read_rows(&path, "state.vscdb", &s).is_err());
         drop(dir);
+    }
+
+    /// `catalog::discover` canonicalises homes. On Windows that produces a
+    /// verbatim path (`\\?\C:\...`), whose `?` used to be read as the start of
+    /// a SQLite URI query string: the path became `\\` and the open failed with
+    /// SQLITE_CANTOPEN. This is the regression for that exact call chain.
+    #[test]
+    fn a_canonicalised_path_can_be_read() {
+        let (dir, path) = fixture();
+        let real = std::fs::canonicalize(&path).expect("canonicalize");
+        let rows = read_rows(&real, "state.vscdb", &spec(Some("value")))
+            .expect("a canonicalised path must open read-only");
+        assert_eq!(rows.len(), 2);
+        drop(dir);
+    }
+
+    /// A `#` in a filename is legal on Windows and terminates a URI's fragment.
+    /// Passing a path, not a URI, makes those characters ordinary again.
+    #[test]
+    fn a_path_with_uri_special_characters_can_be_read() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("state #1.vscdb");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO kv VALUES ('a', 'hello');",
+            )
+            .expect("seed");
+        }
+        let real = std::fs::canonicalize(&path).expect("canonicalize");
+        let rows = read_rows(&real, "state #1.vscdb", &spec(Some("value")))
+            .expect("a path containing # and a space must open");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bytes, b"hello");
+    }
+
+    /// The OpenCode reader takes the same path shape, and it is the one that
+    /// failed on a real machine (`~/.local/share/opencode/opencode.db`).
+    #[test]
+    fn opencode_opens_a_canonicalised_path() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("opencode.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+                 CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+                 INSERT INTO message VALUES('m1','s',1,'{\"role\":\"user\"}');",
+            )
+            .expect("seed");
+        }
+        let catalog = cormex_proto::catalog::Catalog::builtin();
+        let spec = catalog
+            .agents
+            .iter()
+            .find(|a| a.id == "opencode")
+            .expect("opencode in the catalog")
+            .sources[0]
+            .sqlite
+            .as_ref()
+            .expect("an sqlite source");
+        let real = std::fs::canonicalize(&path).expect("canonicalize");
+        let rows = read_opencode(&real, "opencode.db", spec)
+            .expect("OpenCode must open a canonicalised path");
+        assert!(rows.iter().any(|r| r.logical_path.ends_with("#m1")));
     }
 
     /// The relative path goes into the logical path, not the absolute one.
