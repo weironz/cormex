@@ -86,7 +86,7 @@ class FactCard extends StatelessWidget {
                   constraints: const BoxConstraints(maxHeight: 108),
                   child: SingleChildScrollView(
                     child: MarkdownBody(
-                      data: fact.statement,
+                      data: plainStatement(fact.statement),
                       softLineBreak: true,
                       selectable: false,
                       styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(

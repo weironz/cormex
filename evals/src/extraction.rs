@@ -33,6 +33,11 @@
 //!   "do not use X", so an avoid fragment is a detail a correct memory has no
 //!   reason to repeat (the declined value, the secret), never the name of a
 //!   thing a correct constraint may mention.
+//! - `unreadable`: shape problems in retained statements (Markdown audit
+//!   reports, internal labels, walls of text). Recall and leak rate are both
+//!   keyword checks: the production suite once scored 100% recall / 0% leak
+//!   while every memory began with `**来源报告**`. This is the check that can
+//!   see that.
 //!
 //! Matching is by substring, case-insensitive, over a memory's statement and
 //! its object text. The model words its own statements, so the fragments are
@@ -296,6 +301,11 @@ pub struct CaseResult {
     pub missed: Vec<String>,
     /// The `avoid` fragments some retained memory contains.
     pub leaked: Vec<String>,
+    /// Statements that matched every keyword but are still not something a
+    /// person can read: Markdown audit reports, internal labels, walls of text.
+    /// Recall alone cannot see this — the production suite once scored 100%
+    /// while every memory started with `**来源报告**`.
+    pub unreadable: Vec<String>,
     pub has_avoid: bool,
     /// The credential scan blocked the whole analysis, as production does.
     pub blocked: bool,
@@ -312,6 +322,10 @@ pub struct Totals {
     pub avoid_cases: usize,
     pub leaked_cases: usize,
     pub retained: usize,
+    /// Cases with at least one unreadable retained statement.
+    pub unreadable_cases: usize,
+    /// How many statements were flagged.
+    pub unreadable: usize,
 }
 
 impl Totals {
@@ -326,6 +340,8 @@ impl Totals {
         self.avoid_cases += usize::from(r.has_avoid);
         self.leaked_cases += usize::from(!r.leaked.is_empty());
         self.retained += r.retained.len();
+        self.unreadable_cases += usize::from(!r.unreadable.is_empty());
+        self.unreadable += r.unreadable.len();
     }
 
     /// Met groups / all groups. `None` with no groups to meet.
@@ -353,6 +369,38 @@ pub struct ExtractionReport {
     pub totals: Totals,
     pub by_category: BTreeMap<String, Totals>,
     pub cases: Vec<CaseResult>,
+}
+
+/// What makes a statement hard for a person to read, independent of whether it
+/// contains the expected keywords.
+///
+/// Substring recall can be 100% while every retained memory is a Markdown
+/// audit report — that is exactly how the old prompt shipped. These are shape
+/// checks a machine can make without a second model call, so a prompt change
+/// that regresses readability shows up in the same run as the recall numbers.
+#[must_use]
+pub fn readability_issues(statement: &str) -> Vec<&'static str> {
+    let s = statement.trim();
+    if s.is_empty() {
+        return vec!["empty"];
+    }
+    let mut out = Vec::new();
+    if s.contains("**") || s.starts_with('#') || s.contains("\n#") || s.contains("\n- ") {
+        out.push("markdown");
+    }
+    if s.contains('\n') {
+        out.push("multiline");
+    }
+    if ["来源报告", "适用场景", "必要边界", "本轮任务"]
+        .iter()
+        .any(|p| s.contains(p))
+    {
+        out.push("internal-label");
+    }
+    if s.chars().count() > 200 {
+        out.push("too-long");
+    }
+    out
 }
 
 /// Score one analysis against one case. Pure, so it is tested without a model.
@@ -389,6 +437,22 @@ pub fn score(case: &Case, analysis: &TurnAnalysis) -> CaseResult {
         .map(|group| group[0].clone())
         .collect();
     let leaked: Vec<String> = case.avoid.iter().filter(|a| contains(a)).cloned().collect();
+    let unreadable: Vec<String> = if blocked {
+        Vec::new()
+    } else {
+        analysis
+            .memories
+            .iter()
+            .filter(|m| m.status == "retain")
+            .flat_map(|m| {
+                let statement = m.fact["statement"].as_str().unwrap_or_default();
+                let snippet: String = statement.chars().take(80).collect();
+                readability_issues(statement)
+                    .into_iter()
+                    .map(move |issue| format!("{issue}: {snippet}"))
+            })
+            .collect()
+    };
     CaseResult {
         id: case.id.clone(),
         category: case.category.clone(),
@@ -397,6 +461,7 @@ pub fn score(case: &Case, analysis: &TurnAnalysis) -> CaseResult {
         expect_met: case.expect.len() - missed.len(),
         missed,
         leaked,
+        unreadable,
         has_avoid: !case.avoid.is_empty(),
         blocked,
         retained,
@@ -439,6 +504,7 @@ pub async fn run(
                 expect_met: 0,
                 missed: Vec::new(),
                 leaked: Vec::new(),
+                unreadable: Vec::new(),
                 has_avoid: !case.avoid.is_empty(),
                 blocked: false,
                 error: Some(format!("{e:#}")),
@@ -483,40 +549,45 @@ pub fn render(report: &ExtractionReport) -> String {
     );
     let _ = writeln!(
         out,
-        "recall {} ({}/{} expected memories) · leak rate {} ({}/{} cases with something to avoid) · {} memories retained\n",
+        "recall {} ({}/{} expected memories) · leak rate {} ({}/{} cases with something to avoid) · {} memories retained · unreadable {}/{} cases ({} statements)\n",
         pct(t.recall()),
         t.expect_met,
         t.expect_total,
         pct(t.leak_rate()),
         t.leaked_cases,
         t.avoid_cases,
-        t.retained
+        t.retained,
+        t.unreadable_cases,
+        t.cases.saturating_sub(t.errors),
+        t.unreadable
     );
     let _ = writeln!(
         out,
-        "| category | cases | recall | leak rate | retained |\n|---|---:|---:|---:|---:|"
+        "| category | cases | recall | leak rate | retained | unreadable |\n|---|---:|---:|---:|---:|---:|"
     );
     for (category, c) in &report.by_category {
         let _ = writeln!(
             out,
-            "| {category} | {} | {} | {} | {} |",
+            "| {category} | {} | {} | {} | {} | {} |",
             c.cases,
             pct(c.recall()),
             pct(c.leak_rate()),
-            c.retained
+            c.retained,
+            c.unreadable
         );
     }
     for r in &report.cases {
         if let Some(e) = &r.error {
             let _ = writeln!(out, "\n{} failed to run: {e}", r.id);
-        } else if !r.missed.is_empty() || !r.leaked.is_empty() {
+        } else if !r.missed.is_empty() || !r.leaked.is_empty() || !r.unreadable.is_empty() {
             let _ = writeln!(
                 out,
-                "\n{} ({}): missed {:?} leaked {:?}{}",
+                "\n{} ({}): missed {:?} leaked {:?} unreadable {:?}{}",
                 r.id,
                 r.category,
                 r.missed,
                 r.leaked,
+                r.unreadable,
                 if r.blocked {
                     " (blocked by the credential scan)"
                 } else {
@@ -628,6 +699,59 @@ mod tests {
             "and nothing from the turn is written"
         );
         assert_eq!(r.expect_met, 0);
+    }
+
+    /// The regression that motivated this metric: every keyword matches, so
+    /// recall is perfect and nothing leaks, yet a person cannot read it.
+    #[test]
+    fn a_markdown_report_is_unreadable_even_with_perfect_recall() {
+        let c = case(&[&["RustFS"]], &[]);
+        let r = score(
+            &c,
+            &analysis(&[(
+                "retain",
+                "**来源报告**\n\n**对象存储**\n\n## 结论\n\n对象存储使用 RustFS，不再使用 MinIO。适用于后续部署。",
+            )]),
+        );
+        assert_eq!((r.expect_met, r.expect_total), (1, 1));
+        assert!(r.leaked.is_empty());
+        assert!(!r.unreadable.is_empty(), "recall cannot see the shape");
+        assert!(
+            r.unreadable.iter().any(|s| s.contains("markdown")),
+            "{:?}",
+            r.unreadable
+        );
+        assert!(
+            r.unreadable.iter().any(|s| s.contains("internal-label")),
+            "{:?}",
+            r.unreadable
+        );
+    }
+
+    #[test]
+    fn a_one_sentence_memory_has_no_readability_issues() {
+        let c = case(&[&["RustFS"]], &[]);
+        let r = score(
+            &c,
+            &analysis(&[("retain", "对象存储使用 RustFS，不再使用 MinIO。")]),
+        );
+        assert!(r.unreadable.is_empty(), "{:?}", r.unreadable);
+    }
+
+    #[test]
+    fn totals_count_unreadable_cases_separately_from_leaks() {
+        let mut t = Totals::default();
+        let c = case(&[&["RustFS"]], &[]);
+        t.add(&score(
+            &c,
+            &analysis(&[("retain", "对象存储使用 RustFS。")]),
+        ));
+        t.add(&score(
+            &c,
+            &analysis(&[("retain", "**来源报告**\n\nRustFS")]),
+        ));
+        assert_eq!(t.unreadable_cases, 1);
+        assert!(t.unreadable >= 3, "markdown, multiline and a label: {t:?}");
     }
 
     #[test]

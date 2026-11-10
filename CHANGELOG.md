@@ -8,6 +8,15 @@
 - The check reads the files hosts actually use (`~/.claude.json`, `~/.claude/settings.json`, a project `.mcp.json`, `~/.codex/config.toml`, plus `CLAUDE_CONFIG_DIR` / `CODEX_HOME` overrides) and shares its notion of "registered" with the installers. A machine with no agent config is a capture-only host and passes. A failing check points at `cormex init`, reloading the host and starting a new session.
 - A project path containing the word "cormex" is not an MCP entry; the check reads `mcpServers` rather than searching the file. A config that cannot be parsed is named in the detail instead of being treated as empty.
 
+### Memory: one readable sentence instead of an audit report
+
+- The automatic extractor was asked to write each memory as a Markdown report with a bold subject, "适用场景 / 必要边界" sections and a `**来源报告**` label, and `validate_analysis` added that label in code. The same `statement` is shown in the UI and injected into an agent's context, so both got a document written for a verifier. A production sample: `**来源报告** / **MSYS/Git Bash 下 Docker 路径转换** / …本次需禁用…本次实际出现…` — one-off debugging detail, not something a later task can reuse.
+- The prompt now uses one criterion ("would the next conversation make a wrong decision without this?"), explicitly excludes one-off debugging detail and execution logs, and asks for a single plain-text Chinese sentence. Source qualifications, evidence strength and bounds belong in `reason`. The `up to 3 memories per turn` wording is gone, and `validate_analysis` no longer discards a fourth valid candidate on top of its `take(6)` ceiling.
+- `validate_analysis` now runs `plain_statement` over whatever the model returned, so a new prompt cannot leave old-format output in the archive. An assistant-only report gets a readable `（助手自述，未独立核实）` prefix instead of a Markdown label.
+- The memory card, list row and detail sheet render `plainStatement(...)`, which also cleans the memories already in the database. Inline code markers are kept; bold labels, headings, lists and blank-line paragraph breaks are not.
+- `cormex-evals extract` reports `unreadable` alongside recall and leak rate. Both of those are keyword checks: the suite previously scored 100% recall / 0% leak while every memory began with `**来源报告**`. The new check needs no second model call.
+- `RULE_VERSION` stays `qa@4` on purpose. Bumping it would re-analyse every archived session through a paid model, and two SQL queries still pin `qa@4`. New-format memories therefore start with newly analysed turns; existing sessions keep their progress cursor. The UI cleaning above improves the 679 existing memories' display, but re-generating their content is a separate, deliberate decision.
+
 ### Fixed: SQLite sources open again on Windows
 
 - Cursor's `state.vscdb`, OpenCode's `opencode.db` and Goose's `sessions.db` could not be read on Windows. `catalog::discover` canonicalises agent homes, which yields a verbatim `\\?\C:\...` path; turning that into a `file:...?mode=ro` URI let the `?` in the prefix start the URI's query string, so SQLite saw a path of `\\` and failed with `SQLITE_CANTOPEN`. A `#` anywhere in a path broke it the same way.

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:cormex_app/api/cormex_api.dart';
+import 'package:cormex_app/core/formatting.dart';
 import 'package:cormex_app/features/memory/memory_browser.dart';
 import 'package:cormex_app/features/settings/settings_page.dart';
 import 'package:cormex_app/features/memory/widgets/artifact_sheet.dart';
@@ -559,7 +560,7 @@ void main() {
         expect(find.textContaining('memory/sandbox-runtime'), findsNothing);
         expect(
           find.byWidgetPredicate(
-            (w) => w is MarkdownBody && w.data == topicMarkdown,
+            (w) => w is MarkdownBody && w.data == plainStatement(topicMarkdown),
           ),
           findsOneWidget,
         );
@@ -573,7 +574,7 @@ void main() {
           find.descendant(
             of: find.byType(Dialog),
             matching: find.byWidgetPredicate(
-              (w) => w is MarkdownBody && w.data == topicMarkdown,
+              (w) => w is MarkdownBody && w.data == plainStatement(topicMarkdown),
             ),
           ),
           findsOneWidget,

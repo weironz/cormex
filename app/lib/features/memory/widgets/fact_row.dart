@@ -57,7 +57,7 @@ class FactRow extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    fact.statement.replaceAll(RegExp(r'\s+'), ' '),
+                    plainStatement(fact.statement),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(

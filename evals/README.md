@@ -166,6 +166,12 @@ retained against `evals/suites/extraction-zh-en-v1.json`:
 |---|---|---|
 | `expect` | groups of alternatives; a group is met when some retained memory contains one | **recall** = met groups / groups |
 | `avoid` | fragments no retained memory may contain | **leak rate** = cases that leaked / cases with an avoid |
+| `unreadable` | retained statements whose shape a person cannot read: Markdown audit reports (`**`, `##`), internal labels (来源报告 / 适用场景 / 必要边界), multiple lines, or >200 characters | **unreadable** = cases affected / statements flagged, printed alongside recall and in the per-category table |
+
+Recall and leak rate are both keyword checks. The 100% / 0% baseline below was measured
+before `unreadable` existed, and the memories it scored still opened with `**来源报告**`.
+A perfect score here does not mean a person can use the result; read the `unreadable`
+column too. It needs no second model call, so it comes along with every `extract` run.
 
 Two rules keep the cases honest, enforced by `validate --extraction`:
 

@@ -27,6 +27,29 @@ String formatCompactDate(DateTime? when, {DateTime? now}) {
 
 String formatConfidence(double? c) => c == null ? '' : '${(c * 100).round()}%';
 
+/// 记忆的正文：一句纯文本结论，不管库里存的是新格式还是老格式。
+///
+/// 老版本让提取器写 Markdown「审计报告」（`**来源报告**`、`## 主题`、空行
+/// 分段），列表行把它压平后就剩一串 `**`，卡片又塞进 108px 的滚动框。新版
+/// 提取器写一句话，但库里已有的记忆不会自动变，所以展示层统一净化。
+/// 反引号保留：行内代码在纯文本里仍读得懂，去掉反而让标识符与正文粘连。
+String plainStatement(String statement) {
+  final joined = statement
+      .split('\n')
+      .map((raw) {
+        var line = raw.trim().replaceAll('**', '');
+        line = line.replaceFirst(RegExp(r'^#{1,6}\s*'), '');
+        line = line.replaceFirst(RegExp(r'^[-*+]\s+'), '');
+        return line.trim();
+      })
+      .where((line) => line.isNotEmpty)
+      .join(' ');
+  return joined
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .replaceAll('来源报告', '助手自述，未独立核实')
+      .trim();
+}
+
 /// 把 ULID 缩短成 `01KZC66ZT7…R6C`。
 String shortId(String? id, {int head = 8, int tail = 4}) {
   if (id == null || id.isEmpty) return '—';

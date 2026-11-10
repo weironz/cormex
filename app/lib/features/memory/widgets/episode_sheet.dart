@@ -104,7 +104,7 @@ class _MemoryDetail extends ConsumerWidget {
                   IdLine(label: '记忆 ID', id: f.id),
                   if (c != null) IdLine(label: '会话 ID', id: c.sessionId),
                   const SizedBox(height: 12),
-                  MemoryTextPanel(child: MemoryMarkdown(f.statement)),
+                  MemoryTextPanel(child: MemoryMarkdown(plainStatement(f.statement))),
                   const SizedBox(height: 20),
                   if (c?.reason case final String reason
                       when reason.trim().isNotEmpty) ...[
