@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.22 — 2026-11-11
+
 ### Fixed: `/mcp` answered 403 on every hostname deployment
 
 - `rmcp` validates the `Host` header against DNS rebinding and allows only loopback by default. A deployment behind a real hostname therefore rejected every `/mcp` request with "Host header is not allowed" — the MCP frontage looked configured, `doctor` was green, and no agent could ever connect. `mcp::service` now appends `CORMEX_MCP_ALLOWED_HOSTS` (comma-separated) to that list; loopback stays as before. The production compose template sets it to `${CORMEX_DOMAIN}`.
