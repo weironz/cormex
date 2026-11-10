@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.23 — 2026-11-11
+
 ### Fixed: "生成记忆" was a dead end on sessions that produced nothing
 
 - **409 "无法启动任务"**: `memory_extraction_one_trial` allows exactly one `running` row across the whole table, but `start` checked only the newest row. An older running job (or a concurrent click) therefore passed the check and then hit the unique index, surfacing an opaque conflict. `start_memory_trial` now claims the slot with `INSERT ... ON CONFLICT DO NOTHING RETURNING id`, and the pre-check asks the whole table.
