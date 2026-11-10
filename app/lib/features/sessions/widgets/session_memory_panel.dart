@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../api/api_exception.dart';
+import '../../../core/formatting.dart';
+import '../../../core/theme.dart';
 import '../../../models/memory_fact.dart';
 import '../../../models/session_memory.dart';
 import '../../../state/connection_controller.dart';
@@ -84,18 +86,25 @@ class _SessionMemoryPanelState extends ConsumerState<SessionMemoryPanel> {
   Future<void> _start() async {
     final status = _status;
     if (status == null) return;
-    final turns = status.pendingTurns < status.maxTurnsPerJob
+    // A redo resets the cursor: the server has not counted those turns yet,
+    // so the honest number to show is the per-job ceiling.
+    final turns = status.canRedo
+        ? status.maxTurnsPerJob
+        : status.pendingTurns < status.maxTurnsPerJob
         ? status.pendingTurns
         : status.maxTurnsPerJob;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('为这个会话生成记忆'),
+        title: Text(status.canRedo ? '重新分析这个会话' : '为这个会话生成记忆'),
         content: Text(
-          '将用设置页配置的模型分析这个会话里还没分析过的对话：'
-          '这次最多 $turns 轮'
-          '${status.pendingTurns > status.maxTurnsPerJob ? '（约还有 ${status.pendingTurns} 轮未分析，剩下的可以再点「继续生成」）' : ''}。\n\n'
-          '会产生模型费用。已经分析过的部分不会重复计费。',
+          status.canRedo
+              ? '这个会话之前已分析完，但没有提炼出任何记忆。将重置分析进度并重新分析整个会话，'
+                  '这次最多 $turns 轮。\n\n会产生模型费用。'
+              : '将用设置页配置的模型分析这个会话里还没分析过的对话：'
+                  '这次最多 $turns 轮'
+                  '${status.pendingTurns > status.maxTurnsPerJob ? '（约还有 ${status.pendingTurns} 轮未分析，剩下的可以再点「继续生成」）' : ''}。\n\n'
+                  '会产生模型费用。已经分析过的部分不会重复计费。',
         ),
         actions: [
           TextButton(
@@ -113,7 +122,9 @@ class _SessionMemoryPanelState extends ConsumerState<SessionMemoryPanel> {
     if (confirmed != true || !mounted) return;
     setState(() => _starting = true);
     try {
-      await ref.read(apiProvider).startSessionMemory(widget.sessionId);
+      await ref
+          .read(apiProvider)
+          .startSessionMemory(widget.sessionId, redo: status.canRedo);
       await _refresh();
     } on CormexApiException catch (e) {
       if (mounted) {
@@ -169,7 +180,7 @@ class _SessionMemoryPanelState extends ConsumerState<SessionMemoryPanel> {
           TextButton(onPressed: _stop, child: const Text('停止')),
         ],
       );
-    } else if (status.pendingTurns == 0) {
+    } else if (status.pendingTurns == 0 && !status.canRedo) {
       action = Text(
         '已全部分析',
         key: const ValueKey('session-memory-caught-up'),
@@ -184,15 +195,27 @@ class _SessionMemoryPanelState extends ConsumerState<SessionMemoryPanel> {
         child: FilledButton.tonalIcon(
           key: const ValueKey('session-memory-generate'),
           onPressed: _starting || status.otherJobRunning ? null : _start,
-          icon: const Icon(Icons.auto_awesome_outlined, size: 16),
-          label: Text(resume ? '继续生成记忆' : '生成记忆'),
+          icon: Icon(
+            status.canRedo ? Icons.refresh_rounded : Icons.auto_awesome_outlined,
+            size: 16,
+          ),
+          label: Text(
+            status.canRedo ? '重新生成记忆' : resume ? '继续生成记忆' : '生成记忆',
+          ),
         ),
       );
     }
 
+    final s = status;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      child: Wrap(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (s?.summary case final String digest when digest.trim().isNotEmpty)
+            _Digest(title: s?.summaryTitle, text: digest),
+          Wrap(
         crossAxisAlignment: WrapCrossAlignment.center,
         spacing: 12,
         runSpacing: 8,
@@ -222,7 +245,68 @@ class _SessionMemoryPanelState extends ConsumerState<SessionMemoryPanel> {
               job!.error!,
               style: theme.textTheme.labelSmall?.copyWith(color: scheme.error),
             ),
+          ],
+          ),
         ],
+      ),
+    );
+  }
+}
+
+/// 会话要点：一段能独立读懂的精炼总结，排在 ID / 计数 / 按钮那一行之前。
+/// 这是「这个会话到底说了什么」的答案，比一堆属性和零条事实更有用。
+class _Digest extends StatelessWidget {
+  const _Digest({this.title, required this.text});
+  final String? title;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final accent = CormexTheme.memoryAccent(theme.brightness);
+    return Container(
+      margin: const EdgeInsets.only(bottom: CormexSpacing.md),
+      padding: const EdgeInsets.all(CormexSpacing.md + 2),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(CormexRadii.card),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              width: 3,
+              decoration: BoxDecoration(
+                color: accent,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(width: CormexSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title?.trim().isNotEmpty == true ? title! : '本会话要点',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: accent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: CormexSpacing.sm - 2),
+                  Text(
+                    plainStatement(text),
+                    style: theme.textTheme.bodyMedium?.copyWith(height: 1.6),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

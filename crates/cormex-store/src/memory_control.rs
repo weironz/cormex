@@ -57,15 +57,52 @@ impl Store {
         .await?)
     }
 
+    /// Claim the single explicit-job slot.
+    ///
+    /// `memory_extraction_one_trial` is a partial unique index over *all*
+    /// running rows. Checking only the newest row before inserting lets an
+    /// older running job block the INSERT with an opaque database error; asking
+    /// the index directly makes "who holds the slot" a single, honest answer.
     pub async fn start_memory_trial(
         &self,
         id: &str,
         selections: &serde_json::Value,
         events: &serde_json::Value,
         total: i32,
-    ) -> Result<()> {
-        sqlx::query("INSERT INTO memory_extraction_trials(id,status,selections,event_ids,total_messages) VALUES($1,'running',$2,$3,$4)")
-            .bind(id).bind(selections).bind(events).bind(total).execute(self.pool()).await?;
+    ) -> Result<bool> {
+        let claimed: Option<String> = sqlx::query_scalar(
+            "INSERT INTO memory_extraction_trials(id,status,selections,event_ids,total_messages) \
+             VALUES($1,'running',$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id",
+        )
+        .bind(id)
+        .bind(selections)
+        .bind(events)
+        .bind(total)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(claimed.is_some())
+    }
+
+    /// Whether *any* job holds the slot, not just the newest one.
+    pub async fn memory_trial_any_running(&self) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM memory_extraction_trials WHERE status='running')",
+        )
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    /// Forget a session's extraction cursor so its turns can be analysed again.
+    ///
+    /// Used only when a session was fully analysed but yielded no memory at
+    /// all: without this the user is stuck on "已全部分析" with zero results
+    /// and no button to retry.
+    pub async fn reset_qa_cursor(&self, session: &str, version: &str) -> Result<()> {
+        sqlx::query("DELETE FROM memory_qa_progress WHERE session_id=$1 AND rule_version=$2")
+            .bind(session)
+            .bind(version)
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 

@@ -88,38 +88,46 @@ class _MemoryDetail extends ConsumerWidget {
                     c?.subject ?? '记忆',
                     style: theme.textTheme.headlineSmall,
                   ),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 16,
-                    runSpacing: 6,
-                    children: [
-                      Text('类型：${memoryCategory(f.predicate)}'),
-                      Text('项目：${c?.projectName ?? '未分类'}'),
-                      if (c != null)
-                        Text('来源：${c.agentLabel} · ${c.roleLabel}'),
-                      if (c != null) Text('证据：${c.verificationLabel}'),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  IdLine(label: '记忆 ID', id: f.id),
-                  if (c != null) IdLine(label: '会话 ID', id: c.sessionId),
+                  // 正文先读。属性是审计用的，统一降为灰色小字放在后面，
+                  // 而不是让类型 / 项目 / 证据 / 两个 ID 抢在内容前面。
                   const SizedBox(height: 12),
                   MemoryTextPanel(child: MemoryMarkdown(plainStatement(f.statement))),
                   const SizedBox(height: 20),
+                  DefaultTextStyle(
+                    style: theme.textTheme.labelSmall!.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 6,
+                          children: [
+                            Text('类型：${memoryCategory(f.predicate)}'),
+                            Text('项目：${c?.projectName ?? '未分类'}'),
+                            if (c != null)
+                              Text('来源：${c.agentLabel} · ${c.roleLabel}'),
+                            if (c != null) Text('证据：${c.verificationLabel}'),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        IdLine(label: '记忆 ID', id: f.id),
+                        if (c != null) IdLine(label: '会话 ID', id: c.sessionId),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   if (c?.reason case final String reason
                       when reason.trim().isNotEmpty) ...[
-                    Text('自动保留依据', style: theme.textTheme.titleMedium),
+                    Text('自动保留依据', style: theme.textTheme.titleSmall),
                     const SizedBox(height: 8),
                     MemoryMarkdown(reason),
                   ] else ...[
-                    Text('这条记忆可能用于什么', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 8),
+                    Text('用途', style: theme.textTheme.titleSmall),
+                    const SizedBox(height: 6),
                     Text(memoryPurpose(f.predicate)),
-                    const SizedBox(height: 8),
-                    Text(
-                      '这里显示的是类型用途，具体内容可结合下方原始问答与来源聊天理解。',
-                      style: theme.textTheme.bodySmall,
-                    ),
                   ],
                   const SizedBox(height: 16),
                   if (c?.extractionUnit == 'single_message')
@@ -141,7 +149,7 @@ class _MemoryDetail extends ConsumerWidget {
                       Align(
                         alignment: Alignment.centerLeft,
                         child: Text(
-                          '关系类型：${memoryCategory(f.predicate)} · 领域：${f.domain ?? '未记录'}\n模型自评忠实度：${f.confidence == null ? '未记录' : '${(f.confidence! * 100).round()}%'}。自评分数用于说明内容与来源的匹配程度。',
+                          '关系类型：${memoryCategory(f.predicate)} · 领域：${f.domain ?? '未记录'}\n模型自评忠实度：${f.confidence == null ? '未记录' : '${(f.confidence! * 100).round()}%'}',
                         ),
                       ),
                     ],

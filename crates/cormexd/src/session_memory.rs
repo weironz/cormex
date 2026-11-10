@@ -48,6 +48,15 @@ fn require_read(p: &Principal) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// `POST .../memory?redo=1` re-analyses a session that was fully analysed but
+/// produced nothing. It costs another model call per turn, so it is explicit
+/// and the button says so before it is pressed.
+#[derive(Debug, Default, Deserialize)]
+pub struct StartOptions {
+    #[serde(default)]
+    pub redo: bool,
+}
+
 /// The latest explicit job, when it was started for this session.
 fn job_for<'a>(
     job: &'a Option<cormex_store::memory_control::MemoryExtractionTrial>,
@@ -107,6 +116,17 @@ pub async fn status(
     let other_running = latest
         .as_ref()
         .is_some_and(|j| j.status == "running" && job_for(&latest, &id).is_none());
+    // The conversation's own distilled account. It is the "what was this
+    // session about" answer, not the fact list; showing it here is what makes
+    // a session with zero extracted facts still explain itself.
+    let summary: Option<(String, String)> = sqlx::query_as(
+        "SELECT title, markdown FROM memory_qa_summaries WHERE session_id=$1 \
+         ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(db_error)?;
     Ok(Json(serde_json::json!({
         "session_id": id,
         "supported": supported.is_some(),
@@ -115,6 +135,8 @@ pub async fn status(
         "memory_count": memories,
         "job": job_for(&latest, &id),
         "other_job_running": other_running,
+        "summary": summary.as_ref().map(|(t, m)| serde_json::json!({"title": t, "markdown": m})),
+        "can_redo": pending == 0 && memories == 0,
     })))
 }
 
@@ -123,6 +145,7 @@ pub async fn start(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
+    Query(opts): Query<StartOptions>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     crate::memory_settings::require_user(&p)?;
     valid_id(&id)?;
@@ -135,21 +158,40 @@ pub async fn start(
         .ok_or_else(|| ApiError::not_found("会话不存在或尚未解析"))?;
     let version = crate::archive_api::parser_version_for_agent(&row.agent)
         .ok_or_else(|| ApiError::bad_request("暂不支持为这个来源的会话生成记忆"))?;
-    if store
-        .latest_memory_trial()
-        .await
-        .map_err(db_error)?
-        .is_some_and(|j| j.status == "running")
-    {
+    // `latest_memory_trial` sweeps running rows older than six minutes into
+    // `failed`. Ask the whole table afterwards: the unique index covers every
+    // running row, and checking only the newest one used to let an older job
+    // block the INSERT with a confusing "无法启动任务".
+    let _ = store.latest_memory_trial().await.map_err(db_error)?;
+    if store.memory_trial_any_running().await.map_err(db_error)? {
         return Err(ApiError::conflict(
             "已有记忆生成任务在运行，请等它结束或先停止",
         ));
     }
-    let pending = pending_turns(&store, &id, version).await?;
+    let memories: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM episodes e JOIN facts f ON f.source_episode_id=e.id WHERE e.session_id=$1",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .map_err(db_error)?;
+    let mut pending = pending_turns(&store, &id, version).await?;
     if pending == 0 {
-        return Err(ApiError::bad_request(
-            "这个会话已经全部分析过，没有新的对话",
-        ));
+        // Fully analysed with nothing to show. Without an explicit redo the
+        // cursor makes this terminal: "已全部分析" and zero memories forever.
+        if !opts.redo || memories > 0 {
+            return Err(ApiError::bad_request(
+                "这个会话已经全部分析过，没有新的对话",
+            ));
+        }
+        store
+            .reset_qa_cursor(&id, cormex_memory::dialogue::RULE_VERSION)
+            .await
+            .map_err(db_error)?;
+        pending = pending_turns(&store, &id, version).await?;
+        if pending == 0 {
+            return Err(ApiError::bad_request("这个会话没有可用于生成记忆的对话"));
+        }
     }
     let settings = store
         .memory_extraction_settings()
@@ -187,10 +229,15 @@ pub async fn start(
     let selections =
         serde_json::json!([{"mode":"session","session_id":id,"agent":row.agent,"title":title}]);
     let total = pending.min(MAX_TURNS as i64) as i32;
-    store
+    if !store
         .start_memory_trial(&job, &selections, &serde_json::json!([]), total)
         .await
-        .map_err(|_| ApiError::conflict("无法启动任务，请确认没有其他任务在运行"))?;
+        .map_err(db_error)?
+    {
+        return Err(ApiError::conflict(
+            "已有另一个记忆生成任务占用了生成槽位，请稍后重试",
+        ));
+    }
     let started = store.latest_memory_trial().await.map_err(db_error)?;
     let revision = settings.id.clone();
     let model_key = memory_qa::model_key(&settings);

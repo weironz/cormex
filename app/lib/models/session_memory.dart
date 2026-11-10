@@ -11,6 +11,9 @@ class SessionMemoryStatus {
     required this.memoryCount,
     this.job,
     this.otherJobRunning = false,
+    this.canRedo = false,
+    this.summaryTitle,
+    this.summary,
   });
 
   /// The source's parser feeds extraction; some sources have none yet.
@@ -27,6 +30,14 @@ class SessionMemoryStatus {
   /// Another job (another session, or a small-sample run) holds the slot.
   final bool otherJobRunning;
 
+  /// Fully analysed but nothing was extracted. The only way out is an
+  /// explicit re-run that resets this session's cursor.
+  final bool canRedo;
+
+  /// The conversation's distilled account, shown as the session's headline.
+  final String? summaryTitle;
+  final String? summary;
+
   bool get running => job?.running ?? false;
 
   factory SessionMemoryStatus.fromJson(Map<String, dynamic> j) =>
@@ -39,6 +50,13 @@ class SessionMemoryStatus {
             ? SessionMemoryJob.fromJson((j['job'] as Map).cast())
             : null,
         otherJobRunning: asBool(j['other_job_running']),
+        canRedo: asBool(j['can_redo']),
+        summaryTitle: j['summary'] is Map
+            ? asString((j['summary'] as Map)['title'])
+            : null,
+        summary: j['summary'] is Map
+            ? asString((j['summary'] as Map)['markdown'])
+            : null,
       );
 }
 

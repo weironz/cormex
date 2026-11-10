@@ -587,7 +587,8 @@ void main() {
         await tester.tap(find.text('提取属性'));
         await tester.pumpAndSettle();
         expect(find.textContaining('人工核实'), findsNothing);
-        expect(find.textContaining('自评分数用于说明'), findsOneWidget);
+        // 冗余的解释性长句已从提取属性里移除：数值本身还在，说明不再占篇幅。
+        expect(find.textContaining('自评分数用于说明'), findsNothing);
         expect(find.textContaining('关系类型：项目记忆'), findsOneWidget);
         expect(find.textContaining('memory/sandbox-runtime'), findsNothing);
         expect(find.text('查看来源聊天'), findsOneWidget);

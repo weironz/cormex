@@ -501,10 +501,14 @@ class CormexApi {
       );
 
   /// 为这个会话生成记忆：花模型费用，由人点按钮触发。
-  Future<void> startSessionMemory(String sessionId) => _memoryTrialPost(
-    '/archive/sessions/${Uri.encodeComponent(sessionId)}/memory',
-    const {},
-  );
+  ///
+  /// [redo] 重新分析「已全部分析却一条记忆都没有」的会话，会重置该会话的
+  /// 分析游标，因此确认框必须写明会重新计费。
+  Future<void> startSessionMemory(String sessionId, {bool redo = false}) =>
+      _memoryTrialPost(
+        '/archive/sessions/${Uri.encodeComponent(sessionId)}/memory${redo ? '?redo=1' : ''}',
+        const {},
+      );
 
   Future<List<MemoryFact>> sessionMemories(String sessionId) async => factsOf(
     await _getJson(

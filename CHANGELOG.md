@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed: "生成记忆" was a dead end on sessions that produced nothing
+
+- **409 "无法启动任务"**: `memory_extraction_one_trial` allows exactly one `running` row across the whole table, but `start` checked only the newest row. An older running job (or a concurrent click) therefore passed the check and then hit the unique index, surfacing an opaque conflict. `start_memory_trial` now claims the slot with `INSERT ... ON CONFLICT DO NOTHING RETURNING id`, and the pre-check asks the whole table.
+- **"已全部分析" with 0 memories, forever**: strict extraction can legitimately retain nothing from a session, but the cursor still advances to the end. `start` then refused every retry and the UI showed no button at all. Status now returns `can_redo` when a session is fully analysed with zero memories; the panel offers 「重新生成记忆」, the confirmation says it re-analyses the whole session and costs model calls, and `?redo=1` resets that session's cursor before the pass.
+- The last production job (`01M737RQ`, analysed 1 turn) had `facts_created=0 / memory_count=0` — exactly this state.
+
+### Memory: a session's headline is a digest, not a transcript
+
+- `summary_markdown` used to be a four-section `## 背景 / ## 讨论 / ## 结果 / ## 后续事项` recap that restated the conversation turn by turn ("用户给出…助手建议…助手指出…"). The prompt now asks for 3–5 plain Chinese sentences answering what the session was about, what was actually concluded, and what is worth knowing next time — no headings, no per-turn recap, no command/hash/path dumps. `validate_analysis` caps it at 500 characters and cleans Markdown.
+- The session page now shows that digest as a 「本会话要点」 card above the id/count/action row. It was generated all along but never displayed, which is why a session with zero extracted facts looked empty.
+- The memory detail sheet leads with the statement; type / project / source / evidence / ids are demoted to small grey metadata, and the redundant confidence explanation and "type purpose" footnote are gone.
+
 ## 0.1.22 — 2026-11-11
 
 ### Fixed: `/mcp` answered 403 on every hostname deployment
