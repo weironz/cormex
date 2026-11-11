@@ -162,7 +162,6 @@ pub async fn start(
     // `failed`. Ask the whole table afterwards: the unique index covers every
     // running row, and checking only the newest one used to let an older job
     // block the INSERT with a confusing "无法启动任务".
-    let _ = store.latest_memory_trial().await.map_err(db_error)?;
     if store.memory_trial_any_running().await.map_err(db_error)? {
         return Err(ApiError::conflict(
             "已有记忆生成任务在运行，请等它结束或先停止",
@@ -702,6 +701,79 @@ mod tests {
         assert_eq!(
             done, 1,
             "the complete first turn is analysed, the open last one is not"
+        );
+        db.drop().await;
+    }
+
+    /// A session analysed down to **zero** memories used to be a dead end.
+    ///
+    /// The cursor advanced anyway, so `start()` answered "这个会话已经全部分析过"
+    /// and the panel rendered "已全部分析" with no button — the state production
+    /// got stuck in. The 409s were a second half of the same bug: the slot was
+    /// checked against the newest row only, while a unique index covers every
+    /// running row. Both halves are pinned here, because fixing one is what
+    /// left the other in place.
+    #[tokio::test]
+    #[ignore = "needs a database"]
+    async fn a_redo_reopens_a_session_that_was_analysed_into_nothing() {
+        let db =
+            crate::test_support::FreshDb::create(&crate::test_support::database_url().unwrap())
+                .await;
+        let (st, _rt, _objects) = crate::test_support::live_state_with_blobs(&db.url).await;
+        let store = st.public_store().unwrap().clone();
+        let (session, _) = seed_projected_session(&st, &store, &chat(&["Rust"])).await;
+        settle(&store, &session).await;
+        let version: String =
+            sqlx::query_scalar("SELECT parser_version FROM transcript_events WHERE session_id=$1")
+                .bind(&session)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+
+        let selections = serde_json::json!([{"mode":"session","session_id":session}]);
+        let first = Id::new().to_string();
+        assert!(
+            store
+                .start_memory_trial(&first, &selections, &serde_json::json!([]), 1)
+                .await
+                .unwrap()
+        );
+        let second = Id::new().to_string();
+        assert!(
+            !store
+                .start_memory_trial(&second, &selections, &serde_json::json!([]), 1)
+                .await
+                .unwrap(),
+            "a second job is refused, not an error: the insert must not surface the index violation"
+        );
+        assert!(
+            store.memory_trial_any_running().await.unwrap(),
+            "the slot is held by whichever row is running, not only the newest"
+        );
+        store
+            .finish_memory_trial(&first, "completed", None)
+            .await
+            .unwrap();
+        assert!(!store.memory_trial_any_running().await.unwrap());
+
+        // The analysis ran and kept nothing, but the cursor still moved.
+        let last: i64 =
+            sqlx::query_scalar("SELECT max(seq) FROM transcript_events WHERE session_id=$1")
+                .bind(&session)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        store
+            .advance_qa_progress(&session, RULE_VERSION, last)
+            .await
+            .unwrap();
+        assert_eq!(pending_turns(&store, &session, &version).await.unwrap(), 0);
+
+        store.reset_qa_cursor(&session, RULE_VERSION).await.unwrap();
+        assert_eq!(
+            pending_turns(&store, &session, &version).await.unwrap(),
+            1,
+            "redo gives every turn back, so the button can produce a different answer"
         );
         db.drop().await;
     }
